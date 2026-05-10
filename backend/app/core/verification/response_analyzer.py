@@ -1,0 +1,463 @@
+"""
+Response Analyzer: Reusable utilities for comparing responses and detecting evidence of exploitation.
+
+Provides functions for:
+- Body similarity comparison
+- Timing analysis
+- Reflection detection
+- Database error detection
+- Command output detection
+- Differential analysis
+"""
+
+import re
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from typing import Optional
+
+
+@dataclass
+class ResponseData:
+    """Encapsulates HTTP response metadata."""
+    status_code: int
+    headers: dict[str, str]
+    body: str
+    response_time_ms: float
+
+
+@dataclass
+class DifferentialAnalysis:
+    """Results of comparing baseline vs injected response."""
+    status_code_changed: bool
+    body_length_changed: bool
+    body_similarity: float  # 0-1, where 1 is identical
+    keywords_appeared: list[str]
+    keywords_disappeared: list[str]
+    error_patterns_detected: list[str]
+    reflection_detected: bool
+    reflection_locations: list[int]  # Byte offsets where payload was reflected
+    is_significant_change: bool
+
+
+class ResponseAnalyzer:
+    """Analyzes responses to detect evidence of injection vulnerability exploitation."""
+
+    # -----------------------------------------------------------------------
+    # Database Error Patterns
+    # -----------------------------------------------------------------------
+
+    # MySQL error patterns
+    MYSQL_ERRORS = re.compile(
+        r"(mysql|syntax error|sql syntax|table.*not exist|unknown column|"
+        r"column.*not recognized|constraint.*foreign key|"
+        r"\"mysql\"|'mysql'|mysql_fetch|mysql_error)",
+        re.IGNORECASE
+    )
+
+    # MSSQL error patterns
+    MSSQL_ERRORS = re.compile(
+        r"(mssql|sqlserver|sql server|server error|conversion failed|"
+        r"incorrect syntax|object.*not found|permission denied|"
+        r"sqlexception|system\.data\.sqlclient)",
+        re.IGNORECASE
+    )
+
+    # PostgreSQL error patterns
+    POSTGRES_ERRORS = re.compile(
+        r"(postgresql|postgres|psycopg|pgerror|error.*line|"
+        r"relation.*does not exist|column.*does not exist|"
+        r"syntax error|unexpected end of input)",
+        re.IGNORECASE
+    )
+
+    # Oracle error patterns
+    ORACLE_ERRORS = re.compile(
+        r"(oracle|ora-\d{5}|not a valid month|invalid datatype|"
+        r"table or view does not exist|column ambiguously defined)",
+        re.IGNORECASE
+    )
+
+    # SQLite error patterns
+    SQLITE_ERRORS = re.compile(
+        r"(sqlite|sql error|near.*syntax error|table.*already exists|"
+        r"no such table|no such column)",
+        re.IGNORECASE
+    )
+
+    # Generic SQL errors
+    GENERIC_SQL_ERRORS = re.compile(
+        r"(database error|db error|sql exception|jdbc|odbc|"
+        r"warning.*mysql|fatal error)",
+        re.IGNORECASE
+    )
+
+    # -----------------------------------------------------------------------
+    # Command Output Patterns
+    # -----------------------------------------------------------------------
+
+    # Unix/Linux command output patterns
+    UNIX_PATTERNS = {
+        r"uid=\d+.*gid=\d+": "id output",
+        r"root|www-data|nobody|nginx|apache": "Unix username",
+        r"^total \d+": "ls -la output",
+        r"/bin/\w+|/usr/bin|/sbin": "Unix path",
+        r"Linux.*\d+\.\d+": "uname output",
+        r"eth\d+|lo|wlan\d+": "ifconfig interface",
+    }
+
+    # Windows command output patterns
+    WINDOWS_PATTERNS = {
+        r"C:\\(?:Windows|Users|Program Files)": "Windows path",
+        r"NT AUTHORITY|BUILTIN": "Windows account",
+        r"inet addr:|IPv4 Address": "Windows ipconfig",
+        r"Active Connections": "netstat output",
+    }
+
+    # -----------------------------------------------------------------------
+    # Reflection and Injection Detection
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def detect_payload_reflection(
+        payload: str,
+        response_body: str,
+        threshold: float = 0.8
+    ) -> tuple[bool, list[int]]:
+        """
+        Detect if payload is reflected in response body.
+
+        Args:
+            payload: The injected payload
+            response_body: The response HTML/content
+            threshold: Minimum similarity (0-1) to consider as reflection
+
+        Returns:
+            (is_reflected, list of byte offsets where payload appears)
+        """
+        locations = []
+        payload_lower = payload.lower()
+        response_lower = response_body.lower()
+
+        # Exact match first
+        offset = 0
+        while True:
+            pos = response_lower.find(payload_lower, offset)
+            if pos == -1:
+                break
+            locations.append(pos)
+            offset = pos + 1
+
+        # If exact match found, high confidence reflection
+        if locations:
+            return True, locations
+
+        # Fuzzy matching for partial/encoded reflections
+        chunks = [payload[i:i+5] for i in range(0, len(payload), 5)]
+        matched_chunks = 0
+        for chunk in chunks:
+            if chunk.lower() in response_lower:
+                matched_chunks += 1
+
+        if matched_chunks / len(chunks) >= threshold:
+            return True, []
+
+        return False, locations
+
+    # -----------------------------------------------------------------------
+    # Body Similarity Analysis
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def calculate_similarity(text1: str, text2: str) -> float:
+        """
+        Calculate similarity between two strings using SequenceMatcher.
+
+        Args:
+            text1: First string
+            text2: Second string
+
+        Returns:
+            Similarity score (0-1, where 1 is identical)
+        """
+        if not text1 and not text2:
+            return 1.0
+        if not text1 or not text2:
+            return 0.0
+
+        matcher = SequenceMatcher(None, text1, text2)
+        return matcher.ratio()
+
+    @staticmethod
+    def extract_differences(baseline: str, injected: str, context_chars: int = 100) -> list[str]:
+        """
+        Extract segments that differ between baseline and injected responses.
+
+        Args:
+            baseline: Baseline response body
+            injected: Injected response body
+            context_chars: Characters of context around differences
+
+        Returns:
+            List of difference segments with context
+        """
+        matcher = SequenceMatcher(None, baseline, injected)
+        differences = []
+
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag != "equal":
+                start = max(0, i1 - context_chars)
+                end = min(len(baseline), i2 + context_chars)
+                diff_segment = baseline[start:end]
+                differences.append(f"[{tag.upper()}] {diff_segment[:200]}")
+
+        return differences
+
+    # -----------------------------------------------------------------------
+    # Timing Analysis
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def calculate_timing_statistics(
+        response_times: list[float],
+    ) -> dict[str, float]:
+        """
+        Calculate statistical measures for timing analysis.
+
+        Args:
+            response_times: List of response times in milliseconds
+
+        Returns:
+            Dict with mean, median, stdev, min, max
+        """
+        if not response_times:
+            return {"mean": 0, "median": 0, "stdev": 0, "min": 0, "max": 0}
+
+        sorted_times = sorted(response_times)
+        n = len(sorted_times)
+
+        mean = sum(response_times) / n
+        median = sorted_times[n // 2]
+        variance = sum((x - mean) ** 2 for x in response_times) / n
+        stdev = variance ** 0.5
+
+        return {
+            "mean": mean,
+            "median": median,
+            "stdev": stdev,
+            "min": min(response_times),
+            "max": max(response_times),
+        }
+
+    @staticmethod
+    def is_timing_significant(
+        baseline_times: list[float],
+        injected_times: list[float],
+        threshold_ms: float = 2000.0,
+        min_stddev: float = 0.5
+    ) -> tuple[bool, dict]:
+        """
+        Determine if timing difference is statistically significant.
+
+        Args:
+            baseline_times: Response times for normal requests
+            injected_times: Response times for requests with sleep payload
+            threshold_ms: Minimum difference (ms) to consider significant
+            min_stddev: Minimum standard deviation to consider legitimate variation
+
+        Returns:
+            (is_significant, analysis_dict)
+        """
+        baseline_stats = ResponseAnalyzer.calculate_timing_statistics(baseline_times)
+        injected_stats = ResponseAnalyzer.calculate_timing_statistics(injected_times)
+
+        mean_diff = injected_stats["mean"] - baseline_stats["mean"]
+        is_significant = mean_diff >= threshold_ms
+
+        analysis = {
+            "baseline_mean": baseline_stats["mean"],
+            "injected_mean": injected_stats["mean"],
+            "diff_ms": mean_diff,
+            "is_significant": is_significant,
+            "baseline_stats": baseline_stats,
+            "injected_stats": injected_stats,
+        }
+
+        return is_significant, analysis
+
+    # -----------------------------------------------------------------------
+    # Error Detection
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def detect_sql_errors(response_body: str) -> list[str]:
+        """
+        Detect SQL error patterns in response.
+
+        Returns:
+            List of error types detected
+        """
+        errors = []
+
+        if ResponseAnalyzer.MYSQL_ERRORS.search(response_body):
+            errors.append("MySQL")
+        if ResponseAnalyzer.MSSQL_ERRORS.search(response_body):
+            errors.append("MSSQL")
+        if ResponseAnalyzer.POSTGRES_ERRORS.search(response_body):
+            errors.append("PostgreSQL")
+        if ResponseAnalyzer.ORACLE_ERRORS.search(response_body):
+            errors.append("Oracle")
+        if ResponseAnalyzer.SQLITE_ERRORS.search(response_body):
+            errors.append("SQLite")
+        if ResponseAnalyzer.GENERIC_SQL_ERRORS.search(response_body):
+            errors.append("Generic SQL")
+
+        return errors
+
+    @staticmethod
+    def detect_command_output(response_body: str) -> tuple[bool, list[str], list[str]]:
+        """
+        Detect Unix/Windows command output patterns.
+
+        Returns:
+            (output_detected, unix_patterns_found, windows_patterns_found)
+        """
+        unix_found = []
+        windows_found = []
+
+        for pattern, name in ResponseAnalyzer.UNIX_PATTERNS.items():
+            if re.search(pattern, response_body, re.MULTILINE | re.IGNORECASE):
+                unix_found.append(name)
+
+        for pattern, name in ResponseAnalyzer.WINDOWS_PATTERNS.items():
+            if re.search(pattern, response_body, re.MULTILINE | re.IGNORECASE):
+                windows_found.append(name)
+
+        detected = len(unix_found) > 0 or len(windows_found) > 0
+        return detected, unix_found, windows_found
+
+    # -----------------------------------------------------------------------
+    # Differential Analysis (Main Method)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def analyze_differential(
+        baseline: ResponseData,
+        injected: ResponseData,
+        payload: str,
+        significance_keywords: Optional[list[str]] = None
+    ) -> DifferentialAnalysis:
+        """
+        Comprehensive analysis comparing baseline vs injected response.
+
+        Args:
+            baseline: Baseline response (normal request)
+            injected: Response after injection
+            payload: The payload that was injected
+            significance_keywords: Keywords that indicate vulnerability if changed
+
+        Returns:
+            DifferentialAnalysis object with comprehensive results
+        """
+        significance_keywords = significance_keywords or []
+
+        # Basic changes
+        status_changed = baseline.status_code != injected.status_code
+        length_changed = len(baseline.body) != len(injected.body)
+        similarity = ResponseAnalyzer.calculate_similarity(baseline.body, injected.body)
+
+        # Reflection analysis
+        payload_reflected, reflection_locations = ResponseAnalyzer.detect_payload_reflection(
+            payload, injected.body
+        )
+
+        # Error detection
+        error_patterns = ResponseAnalyzer.detect_sql_errors(injected.body)
+        baseline_errors = ResponseAnalyzer.detect_sql_errors(baseline.body)
+        new_errors = [e for e in error_patterns if e not in baseline_errors]
+
+        # Keyword tracking
+        keywords_appeared = []
+        keywords_disappeared = []
+
+        for keyword in significance_keywords:
+            in_baseline = keyword.lower() in baseline.body.lower()
+            in_injected = keyword.lower() in injected.body.lower()
+
+            if not in_baseline and in_injected:
+                keywords_appeared.append(keyword)
+            elif in_baseline and not in_injected:
+                keywords_disappeared.append(keyword)
+
+        # Determine significance
+        is_significant = (
+            status_changed
+            or (length_changed and abs(len(injected.body) - len(baseline.body)) > 50)
+            or similarity < 0.9
+            or payload_reflected
+            or len(new_errors) > 0
+            or len(keywords_appeared) > 0
+        )
+
+        return DifferentialAnalysis(
+            status_code_changed=status_changed,
+            body_length_changed=length_changed,
+            body_similarity=similarity,
+            keywords_appeared=keywords_appeared,
+            keywords_disappeared=keywords_disappeared,
+            error_patterns_detected=new_errors,
+            reflection_detected=payload_reflected,
+            reflection_locations=reflection_locations,
+            is_significant_change=is_significant,
+        )
+
+    # -----------------------------------------------------------------------
+    # Boolean-Based Blind SQLi Detection
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def analyze_boolean_differential(
+        baseline: ResponseData,
+        true_payload_response: ResponseData,
+        false_payload_response: ResponseData,
+    ) -> tuple[bool, dict]:
+        """
+        Analyze boolean-based blind SQL injection indicators.
+
+        Compares:
+        - Baseline response (normal)
+        - True condition response (payload that should evaluate to true)
+        - False condition response (payload that should evaluate to false)
+
+        Returns:
+            (is_vulnerable, analysis_dict)
+        """
+        analysis = {
+            "baseline_length": len(baseline.body),
+            "true_length": len(true_payload_response.body),
+            "false_length": len(false_payload_response.body),
+            "baseline_similarity_to_true": ResponseAnalyzer.calculate_similarity(
+                baseline.body, true_payload_response.body
+            ),
+            "baseline_similarity_to_false": ResponseAnalyzer.calculate_similarity(
+                baseline.body, false_payload_response.body
+            ),
+            "true_vs_false_similarity": ResponseAnalyzer.calculate_similarity(
+                true_payload_response.body, false_payload_response.body
+            ),
+        }
+
+        # Key indicator: true and false responses should differ more than baseline differs from either
+        true_false_diff = analysis["true_vs_false_similarity"]
+        baseline_to_true = analysis["baseline_similarity_to_true"]
+        baseline_to_false = analysis["baseline_similarity_to_false"]
+
+        # Vulnerable if: true and false are different, but one matches baseline
+        is_vulnerable = (
+            true_false_diff < 0.95  # True and false responses differ
+            and (
+                (baseline_to_true > 0.8 and baseline_to_false < 0.8)  # Baseline matches true
+                or (baseline_to_false > 0.8 and baseline_to_true < 0.8)  # Baseline matches false
+            )
+        )
+
+        return is_vulnerable, analysis

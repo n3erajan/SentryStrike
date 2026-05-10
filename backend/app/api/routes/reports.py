@@ -1,0 +1,61 @@
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
+
+from app.analyzers.report_generator import AiReportGenerator
+from app.api.dependencies import get_scan_repository, json_response
+from app.database.repositories.scan_repository import ScanRepository
+from app.utils.pdf_generator import build_scan_pdf
+
+router = APIRouter(prefix="/reports", tags=["reports"])
+
+
+@router.get("/{scan_id}")
+async def get_report_data(scan_id: str, repo: ScanRepository = Depends(get_scan_repository)) -> dict:
+    scan = await repo.get_by_id(scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    data = {
+        "scan_id": scan_id,
+        "generated_at": scan.report_metadata.generated_at,
+        "executive_summary": scan.report_metadata.summary,
+        "statistics": scan.statistics.model_dump(),
+        "risk_score": scan.overall_risk_score,
+        "vulnerabilities": [v.model_dump() for v in scan.vulnerabilities],
+    }
+    return json_response(data)
+
+
+@router.post("/{scan_id}/generate")
+async def generate_ai_report(scan_id: str, repo: ScanRepository = Depends(get_scan_repository)) -> dict:
+    scan = await repo.get_by_id(scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    report = await AiReportGenerator().generate(scan)
+    scan.report_metadata.generated_at = datetime.now()
+    scan.report_metadata.summary = report.get("executive_summary")
+    await scan.save()
+    return json_response(report, "report generated")
+
+
+@router.get("/{scan_id}/pdf")
+async def generate_pdf_report(scan_id: str, repo: ScanRepository = Depends(get_scan_repository)) -> Response:
+    scan = await repo.get_by_id(scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    sections = [
+        ("Executive Summary", scan.report_metadata.summary or "No summary available"),
+        ("Risk Score", f"Overall risk score: {scan.overall_risk_score}"),
+        ("Statistics", str(scan.statistics.model_dump())),
+        ("Top Findings", "\n".join([f"- {v.vuln_type} ({v.severity.value}) @ {v.location.url}" for v in scan.vulnerabilities[:20]]) or "None"),
+    ]
+    payload = build_scan_pdf(title=f"Sentry Strike Report - {scan.target_url}", sections=sections)
+    return Response(
+        content=payload,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=scan-{scan_id}.pdf"},
+    )
