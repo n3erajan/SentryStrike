@@ -1,7 +1,12 @@
+import asyncio
+import logging
 from urllib.parse import parse_qsl, urlparse
 
+from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.models.vulnerability import OwaspCategory, SeverityLevel
+
+logger = logging.getLogger(__name__)
 
 
 class AuthenticationFailuresDetector(BaseDetector):
@@ -157,8 +162,138 @@ class AuthenticationFailuresDetector(BaseDetector):
     # Main detect method
     # ---------------------------------------------------------------------------
 
+    async def _test_active_auth(self, form_url: str, method: str, raw_inputs: list, session_cookies: dict) -> list[Finding]:
+        findings = []
+        from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder
+
+        # Construct credentials payload
+        payload = {}
+        username_param = None
+        password_param = None
+        csrf_param = None
+
+        for inp in raw_inputs:
+            name = getattr(inp, "name", "")
+            inp_type = getattr(inp, "input_type", "text").lower()
+            if not name:
+                continue
+            name_lower = name.lower()
+            if "user" in name_lower or "email" in name_lower or ("login" in name_lower and inp_type == "text"):
+                username_param = name
+                payload[name] = "sntry_invalid_user_xyz"
+            elif "pass" in name_lower:
+                password_param = name
+                payload[name] = "sntry_wrong_password_xyz"
+            elif inp_type == "hidden":
+                payload[name] = getattr(inp, "value", "")
+                if "csrf" in name_lower or "token" in name_lower:
+                    csrf_param = name
+
+        if not username_param or not password_param:
+            return []
+
+        verifier = HttpVerifier(cookies=session_cookies)
+        try:
+            # Test 1: CSRF on Auth Form
+            csrf_payload = payload.copy()
+            if csrf_param:
+                csrf_payload[csrf_param] = "invalid_token_123"
+            
+            csrf_url, csrf_params, csrf_data = URLParameterBuilder.inject_parameter(form_url, username_param, "test", method)
+            if method == "POST":
+                csrf_data = csrf_payload
+            else:
+                csrf_params = csrf_payload
+            
+            csrf_resp = await verifier.send_request(csrf_url, method, csrf_params, csrf_data)
+            body_lower = csrf_resp.body.lower()
+            if csrf_resp.status_code in [200, 302]:
+                if csrf_param and not any(err in body_lower for err in ["csrf", "token invalid", "bad request"]):
+                    findings.append(
+                        self._finding(
+                            vuln_type="Authentication Form Lacks CSRF Protection",
+                            url=form_url,
+                            method=method,
+                            severity=SeverityLevel.high,
+                            evidence=f"Authentication form at '{form_url}' accepted login submission even when CSRF token '{csrf_param}' was tampered.",
+                            parameter=csrf_param
+                        )
+                    )
+                elif not csrf_param:
+                    findings.append(
+                        self._finding(
+                            vuln_type="Authentication Form Lacks CSRF Protection",
+                            url=form_url,
+                            method=method,
+                            severity=SeverityLevel.high,
+                            evidence=f"Authentication form at '{form_url}' has no CSRF token parameter, allowing credentials to be submitted without validation."
+                        )
+                    )
+
+            # Test 2: Active Brute-Force Testing
+            responses = []
+            for _ in range(5):
+                brute_url, brute_params, brute_data = URLParameterBuilder.inject_parameter(form_url, username_param, "test", method)
+                if method == "POST":
+                    brute_data = payload
+                else:
+                    brute_params = payload
+                
+                resp = await verifier.send_request(brute_url, method, brute_params, brute_data)
+                responses.append(resp)
+                await asyncio.sleep(0.05)
+            
+            rate_limited = any(r.status_code == 429 for r in responses)
+            locked_out = any("lock" in r.body.lower() or "too many attempts" in r.body.lower() for r in responses)
+            times = [r.response_time_ms for r in responses]
+            has_progressive_delay = len(times) >= 2 and times[-1] > times[0] + 1000
+            
+            if not (rate_limited or locked_out or has_progressive_delay):
+                findings.append(
+                    self._finding(
+                        vuln_type="Lack of Brute-Force Protection on Login Form",
+                        url=form_url,
+                        method=method,
+                        severity=SeverityLevel.high,
+                        evidence=f"Sent 5 rapid authentication attempts to '{form_url}' and received no account lockout, rate-limiting (429), or progressive delays."
+                    )
+                )
+
+            # Test 3: Session Cookie Attributes check
+            for r in responses:
+                set_cookie_headers = [v for k, v in r.headers.items() if k.lower() == "set-cookie"]
+                for header in set_cookie_headers:
+                    cookie_parts = [p.strip().lower() for p in header.split(";")]
+                    cookie_name = cookie_parts[0].split("=")[0] if "=" in cookie_parts[0] else ""
+                    
+                    if any(name in cookie_name for name in ["session", "token", "phpsessid", "jsessionid", "jwt"]):
+                        missing_attrs = []
+                        if "httponly" not in cookie_parts:
+                            missing_attrs.append("HttpOnly")
+                        if "secure" not in cookie_parts:
+                            missing_attrs.append("Secure")
+                        if not any(p.startswith("samesite") for p in cookie_parts):
+                            missing_attrs.append("SameSite")
+                        
+                        if missing_attrs:
+                            findings.append(
+                                self._finding(
+                                    vuln_type="Insecure Session Cookie Attributes",
+                                    url=form_url,
+                                    severity=SeverityLevel.medium,
+                                    evidence=f"Session cookie '{cookie_name}' set in response lacks secure attributes: {', '.join(missing_attrs)}."
+                                )
+                            )
+        except Exception as e:
+            logger.error("Active auth verification failed for %s: %s", form_url, e)
+        finally:
+            await verifier.close()
+
+        return findings
+
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
+        session_cookies = kwargs.get("session_cookies") or {}
 
         # -----------------------------------------------------------------------
         # Form analysis
@@ -192,6 +327,8 @@ class AuthenticationFailuresDetector(BaseDetector):
                         "Verify account lockout, rate limiting, CAPTCHA, and MFA enforcement."
                     ),
                 ))
+                active_findings = await self._test_active_auth(form_url, form_method, raw_inputs, session_cookies)
+                findings.extend(active_findings)
 
             # 2. Password field without username → partial auth form (password-only SSO, PIN, etc.)
             if has_password and not has_username:
@@ -574,5 +711,28 @@ class AuthenticationFailuresDetector(BaseDetector):
                         "Verify that responses are identical for existing and non-existing accounts."
                     ),
                 ))
+
+        # Filter purely informational/observational findings in verified scan mode
+        settings = get_settings()
+        scan_mode = getattr(settings, "scan_mode", "verified")
+        if scan_mode == "verified":
+            unverified_vuln_types = {
+                "Login Form Discovered — Brute-Force Protection Required",
+                "Password-Only Authentication Form Detected",
+                "MFA / OTP Verification Form Detected",
+                "Persistent Session ('Remember Me') Detected",
+                "Login Form Lacks Visible CAPTCHA",
+                "Registration Endpoint Discovered",
+                "Password Field May Allow Browser Autocomplete",
+                "Authentication Endpoint Discovered",
+                "Password Reset Endpoint Discovered",
+                "User Registration Endpoint Discovered",
+                "MFA / OTP Verification Endpoint Discovered",
+                "Potential Account Enumeration via Auth Endpoint",
+                "Password Reset Endpoint Without Token Parameter",
+                "Logout Endpoint May Lack CSRF Protection",
+                "API Authentication / Token Endpoint Discovered",
+            }
+            findings = [f for f in findings if f.vuln_type not in unverified_vuln_types]
 
         return findings

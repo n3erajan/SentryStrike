@@ -24,6 +24,9 @@ class Finding:
     reproducible: bool = field(default=False)  # Whether finding can be reliably reproduced
     response_time_ms: float = field(default=0.0)  # For timing-based detection
     detection_evidence: dict = field(default_factory=dict)  # Detailed metadata: baseline_resp, injected_resp, timing_data, error_patterns, etc.
+    verified: bool = field(default=False)  # Distinguish confirmed vs suspected
+    verification_request_snippet: str | None = field(default=None)  # The actual HTTP request sent
+    verification_response_snippet: str | None = field(default=None)  # The relevant response excerpt
 
 
 class BaseDetector(ABC):

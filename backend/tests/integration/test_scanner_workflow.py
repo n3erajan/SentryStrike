@@ -60,6 +60,7 @@ class FakeDetector:
                 severity=SeverityLevel.high,
                 url=urls[0],
                 evidence="test evidence",
+                verified=True,
             )
         ]
 

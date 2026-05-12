@@ -7,6 +7,7 @@ Implements:
 - Encoding detection
 """
 
+import asyncio
 import logging
 import re
 from typing import Optional
@@ -56,6 +57,18 @@ class XSSVerifier(BaseVerifier):
         """
         findings = []
 
+        # Check DOM XSS on baseline page
+        try:
+            baseline_url, baseline_params, baseline_data = URLParameterBuilder.inject_parameter(
+                url, parameter, value, method
+            )
+            baseline = await self.http_verifier.send_request(baseline_url, method, baseline_params, baseline_data)
+            dom_finding = self._check_dom_xss(url, baseline.body)
+            if dom_finding:
+                findings.append(dom_finding)
+        except Exception as e:
+            logger.debug("Failed to perform DOM XSS check: %s", e)
+
         for payload_type, payload in self.XSS_PAYLOADS.items():
             result = await self._test_payload(url, parameter, method, value, payload, payload_type)
 
@@ -84,6 +97,41 @@ class XSSVerifier(BaseVerifier):
             evidence={},
         )
 
+    def _check_dom_xss(self, url: str, html: str) -> Optional[Finding]:
+        """Perform basic analysis of HTML/scripts for DOM-based XSS vulnerability indicators."""
+        # Common sources: location.hash, location.search, document.URL, document.referrer, window.location
+        sources = [r"location\.hash", r"location\.search", r"document\.URL", r"document\.referrer", r"window\.location"]
+        # Common sinks: eval, setTimeout, setInterval, document.write, document.writeln, innerHTML, outerHTML
+        sinks = [r"eval\(", r"document\.write\(", r"document\.writeln\(", r"\.innerHTML\s*=", r"\.outerHTML\s*="]
+
+        # Scan scripts for sources and sinks
+        # First check if any source and sink exist in the code
+        found_sources = [src for src in sources if re.search(src, html, re.I)]
+        found_sinks = [sink for sink in sinks if re.search(sink, html, re.I)]
+
+        if found_sources and found_sinks:
+            evidence = (
+                f"Page source contains potential DOM XSS sources {found_sources} "
+                f"and sinks {found_sinks}. This indicates client-side JavaScript "
+                "might dynamically render unvalidated input."
+            )
+            return self._create_finding(
+                category=OwaspCategory.a03,
+                vuln_type="DOM-Based XSS",
+                severity=SeverityLevel.medium,
+                url=url,
+                parameter="javascript",
+                payload="location.hash",
+                evidence=evidence,
+                confidence_score=60.0,
+                detection_method="dom_xss_heuristics",
+                method="GET",
+                detection_evidence={"found_sources": found_sources, "found_sinks": found_sinks},
+                reproducible=True,
+                verified=False,
+            )
+        return None
+
     async def _test_payload(
         self,
         url: str,
@@ -109,6 +157,18 @@ class XSSVerifier(BaseVerifier):
 
             # Check for reflection
             is_reflected, locations = ResponseAnalyzer.detect_payload_reflection(payload, injected.body)
+            is_stored = False
+
+            # If not reflected immediately, or for any POST request, verify stored XSS
+            if not is_reflected or method.upper() == "POST":
+                await asyncio.sleep(0.1)
+                stored_resp = await self.http_verifier.send_request(url, "GET")
+                stored_reflected, stored_locations = ResponseAnalyzer.detect_payload_reflection(payload, stored_resp.body)
+                if stored_reflected:
+                    is_reflected = True
+                    locations = stored_locations
+                    injected = stored_resp
+                    is_stored = True
 
             if not is_reflected:
                 return VerificationResult(
@@ -128,7 +188,7 @@ class XSSVerifier(BaseVerifier):
 
             finding = self._create_finding(
                 category=OwaspCategory.a03,
-                vuln_type="Reflected XSS",
+                vuln_type="Stored XSS" if is_stored else "Reflected XSS",
                 severity=severity,
                 url=url,
                 parameter=parameter,
@@ -139,6 +199,9 @@ class XSSVerifier(BaseVerifier):
                 method=method,
                 detection_evidence=context_analysis,
                 reproducible=True,
+                verified=True,
+                verification_request_snippet=injected.request_snippet,
+                verification_response_snippet=injected.response_snippet,
             )
 
             return VerificationResult(

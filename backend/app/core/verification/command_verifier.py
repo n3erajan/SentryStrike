@@ -150,6 +150,9 @@ class CommandInjectionVerifier(BaseVerifier):
                             "response_snippet": injected.body[:300],
                         },
                         reproducible=True,
+                        verified=True,
+                        verification_request_snippet=injected.request_snippet,
+                        verification_response_snippet=injected.response_snippet,
                     )
 
                     return VerificationResult(
@@ -232,6 +235,9 @@ class CommandInjectionVerifier(BaseVerifier):
                         method=method,
                         detection_evidence=timing_analysis,
                         reproducible=True,
+                        verified=True,
+                        verification_request_snippet=resp.request_snippet,
+                        verification_response_snippet=resp.response_snippet,
                     )
 
                     return VerificationResult(

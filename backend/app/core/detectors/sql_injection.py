@@ -59,6 +59,8 @@ class SQLInjectionDetector(BaseDetector):
         Returns only verified findings with confidence scores >= 50.
         """
         findings: list[Finding] = []
+        session_cookies = kwargs.get("session_cookies") or {}
+        self.verifier.http_verifier.cookies = session_cookies
 
         # Phase 1: Reconnaissance - Extract candidates
         candidates = self._extract_candidates(urls, forms)

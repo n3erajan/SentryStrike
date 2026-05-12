@@ -42,22 +42,34 @@ class HttpVerifier:
         timeout_seconds: float = 10.0,
         max_retries: int = 2,
         retry_delay_ms: int = 100,
+        cookies: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        follow_redirects: bool = True,
     ):
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.retry_delay_ms = retry_delay_ms
+        self.cookies = cookies or {}
+        self.headers = headers or {"User-Agent": "SentryStrikeScanner/1.0"}
+        self.follow_redirects = follow_redirects
         self._client: Optional[httpx.AsyncClient] = None
 
     async def get_client(self) -> httpx.AsyncClient:
         """Get or create async HTTP client."""
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self.timeout_seconds)
+            self._client = httpx.AsyncClient(
+                timeout=self.timeout_seconds,
+                cookies=self.cookies,
+                headers=self.headers,
+                follow_redirects=self.follow_redirects,
+            )
         return self._client
 
     async def close(self):
         """Close HTTP client."""
         if self._client:
             await self._client.aclose()
+            self._client = None
 
     async def send_request(
         self,
@@ -66,6 +78,8 @@ class HttpVerifier:
         params: Optional[dict] = None,
         data: Optional[dict] = None,
         capture_timing: bool = True,
+        headers: Optional[dict] = None,
+        cookies: Optional[dict] = None,
     ) -> ResponseData:
         """
         Send HTTP request and capture response with timing.
@@ -76,12 +90,31 @@ class HttpVerifier:
             params: Query parameters
             data: POST body data
             capture_timing: Whether to measure response time
+            headers: Dynamic headers for this request
+            cookies: Dynamic cookies for this request
 
         Returns:
             ResponseData object
         """
         client = await self.get_client()
         import time
+        from urllib.parse import urlencode, urlparse
+
+        # Prepare request snippet for evidence
+        parsed = urlparse(url)
+        req_path = parsed.path or "/"
+        if parsed.query:
+            req_path += f"?{parsed.query}"
+        if params:
+            req_path += ("&" if "?" in req_path else "?") + urlencode(params)
+        
+        all_headers = {**self.headers, **(headers or {})}
+        headers_str = "\n".join([f"{k}: {v}" for k, v in all_headers.items()])
+        body_str = ""
+        if data:
+            body_str = urlencode(data)
+        
+        request_snippet = f"{method} {req_path} HTTP/1.1\nHost: {parsed.netloc}\n{headers_str}\n\n{body_str}"
 
         try:
             start_time = time.time() if capture_timing else None
@@ -91,16 +124,24 @@ class HttpVerifier:
                 url=url,
                 params=params,
                 data=data,
+                headers=headers,
+                cookies=cookies,
             )
 
             end_time = time.time() if capture_timing else None
             response_time_ms = (end_time - start_time) * 1000 if capture_timing else 0
+
+            response_snippet = f"HTTP/1.1 {response.status_code} {response.reason_phrase}\n" + \
+                               "\n".join([f"{k}: {v}" for k, v in response.headers.items()]) + \
+                               f"\n\n{response.text[:1000]}"
 
             return ResponseData(
                 status_code=response.status_code,
                 headers=dict(response.headers),
                 body=response.text,
                 response_time_ms=response_time_ms,
+                request_snippet=request_snippet,
+                response_snippet=response_snippet,
             )
         except asyncio.TimeoutError:
             logger.warning(f"Request timeout for {url}")
@@ -109,6 +150,8 @@ class HttpVerifier:
                 headers={},
                 body="",
                 response_time_ms=self.timeout_seconds * 1000,
+                request_snippet=request_snippet,
+                response_snippet="HTTP/1.1 0 Timeout Error\n\n",
             )
         except Exception as e:
             logger.error(f"Request failed for {url}: {e}")
@@ -117,6 +160,8 @@ class HttpVerifier:
                 headers={},
                 body="",
                 response_time_ms=0,
+                request_snippet=request_snippet,
+                response_snippet=f"HTTP/1.1 0 Error: {str(e)}\n\n",
             )
 
     async def send_requests_batch(
@@ -180,6 +225,9 @@ class BaseVerifier(ABC):
         method: str = "GET",
         detection_evidence: Optional[dict] = None,
         reproducible: bool = False,
+        verified: bool = True,
+        verification_request_snippet: Optional[str] = None,
+        verification_response_snippet: Optional[str] = None,
     ) -> Finding:
         """Factory method to create Finding with verification fields."""
         return Finding(
@@ -195,6 +243,9 @@ class BaseVerifier(ABC):
             detection_method=detection_method,
             detection_evidence=detection_evidence or {},
             reproducible=reproducible,
+            verified=verified,
+            verification_request_snippet=verification_request_snippet,
+            verification_response_snippet=verification_response_snippet,
         )
 
 

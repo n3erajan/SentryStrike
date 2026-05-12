@@ -23,6 +23,8 @@ class ResponseData:
     headers: dict[str, str]
     body: str
     response_time_ms: float
+    request_snippet: str | None = None
+    response_snippet: str | None = None
 
 
 @dataclass

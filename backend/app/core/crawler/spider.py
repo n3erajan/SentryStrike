@@ -31,11 +31,13 @@ class HtmlForm:
 class CrawlResult:
     urls: list[str] = field(default_factory=list)
     forms: list[HtmlForm] = field(default_factory=list)
+    session_cookies: dict[str, str] = field(default_factory=dict)
 
 
 class WebSpider:
     def __init__(self) -> None:
         self.settings = get_settings()
+        self.session_cookies = {}
 
     async def crawl(self, root_url: str, max_depth: int | None = None) -> CrawlResult:
         max_depth = max_depth if max_depth is not None else self.settings.crawl_depth
@@ -51,6 +53,48 @@ class WebSpider:
             follow_redirects=True,
             headers={"User-Agent": "SentryStrikeScanner/1.0"},
         ) as client:
+            # Perform authentication if configured
+            await self._authenticate_session(client, root_url)
+
+            # 1. Parse Sitemap directives from robots.txt if possible
+            sitemap_urls = []
+            try:
+                robots_url = normalize_url(root_url, "/robots.txt")
+                robots_response = await client.get(robots_url)
+                if robots_response.status_code == 200:
+                    for line in robots_response.text.splitlines():
+                        if line.lower().startswith("sitemap:"):
+                            parts = line.split(":", 1)
+                            if len(parts) > 1:
+                                sitemap_urls.append(parts[1].strip())
+            except Exception as e:
+                logger.warning("Failed to check sitemaps from robots.txt: %s", e)
+
+            for sitemap_url in sitemap_urls:
+                try:
+                    resp = await client.get(sitemap_url)
+                    if resp.status_code == 200:
+                        locs = re.findall(r"<loc>(.*?)</loc>", resp.text, re.I)
+                        for loc in locs:
+                            loc_clean = loc.strip()
+                            if loc_clean and same_domain(root_url, loc_clean):
+                                queue.append((loc_clean, 0))
+                except Exception as e:
+                    logger.warning("Failed to fetch sitemap %s: %s", sitemap_url, e)
+
+            # 2. Add common directory brute force paths
+            common_paths = [
+                "/admin", "/api", "/backup", "/db", "/config", "/settings", 
+                "/setup", "/install", "/administrator", "/console", "/panel",
+                "/private", "/db_backup", "/wp-admin", "/robots.txt", "/sitemap.xml",
+                "/api/v1", "/phpmyadmin", "/.env", "/.git", "/backup.sql"
+            ]
+            for path in common_paths:
+                brute_url = normalize_url(root_url, path)
+                if brute_url not in visited and brute_url not in [q[0] for q in queue]:
+                    queue.append((brute_url, 0))
+
+            # 3. Main crawling loop
             while queue and len(discovered_urls) < self.settings.crawl_max_urls:
                 url, depth = queue.pop(0)
                 if url in visited or depth > max_depth:
@@ -65,12 +109,23 @@ class WebSpider:
                     logger.warning("crawl failed for %s: %s", url, exc)
                     continue
 
+                # Add to discovered_urls if request was successful/interesting
+                if response.status_code in [200, 301, 302, 403]:
+                    if url not in discovered_urls:
+                        discovered_urls.append(url)
+
                 if "text/html" not in response.headers.get("content-type", ""):
                     continue
+                
+                # Update cookies in case session updated
+                self.session_cookies.update(dict(client.cookies))
 
-                discovered_urls.append(url)
                 page_forms, links = self._parse_html(url, response.text)
                 forms.extend(page_forms)
+
+                # Add form actions as links so we can scan the endpoints
+                for form in page_forms:
+                    links.append(form.action)
 
                 for link in links:
                     normalized = normalize_url(url, link)
@@ -79,7 +134,117 @@ class WebSpider:
 
                 await asyncio.sleep(max(0.01, 1.0 / self.settings.crawl_rate_limit_per_second))
 
-        return CrawlResult(urls=discovered_urls, forms=forms)
+        return CrawlResult(urls=discovered_urls, forms=forms, session_cookies=self.session_cookies)
+
+    async def _authenticate_session(self, client: httpx.AsyncClient, root_url: str):
+        """Authenticate session using cookies or credentials."""
+        # 1. Parse cookie string if provided
+        if self.settings.authentication_cookie:
+            cookies = {}
+            for cookie in self.settings.authentication_cookie.split(";"):
+                cookie = cookie.strip()
+                if "=" in cookie:
+                    k, v = cookie.split("=", 1)
+                    cookies[k] = v
+            client.cookies.update(cookies)
+            self.session_cookies.update(cookies)
+            logger.info("Session authenticated via provided cookie string")
+            return
+
+        # 2. Check if username and password are provided
+        username = self.settings.authentication_username
+        password = self.settings.authentication_password
+        if username and password:
+            try:
+                # First, request login page to extract CSRF tokens and baseline cookies
+                login_urls = [
+                    normalize_url(root_url, "/login.php"),
+                    normalize_url(root_url, "/login"),
+                    root_url
+                ]
+                
+                login_response = None
+                login_url = root_url
+                for l_url in login_urls:
+                    try:
+                        resp = await client.get(l_url)
+                        if resp.status_code == 200 and ("login" in resp.text.lower() or "username" in resp.text.lower()):
+                            login_response = resp
+                            login_url = l_url
+                            break
+                    except Exception:
+                        continue
+                
+                if not login_response:
+                    # Fallback to root url
+                    login_url = root_url
+                    login_response = await client.get(login_url)
+
+                # Parse HTML for login form and input fields
+                soup = BeautifulSoup(login_response.text, "html.parser")
+                form = soup.find("form")
+                
+                # Build payload
+                payload = {}
+                action = login_url
+                method = "POST"
+                
+                if form:
+                    action = normalize_url(login_url, form.get("action", ""))
+                    method = form.get("method", "POST").upper()
+                    
+                    # Fill inputs
+                    for inp in form.find_all(["input", "select", "textarea"]):
+                        name = inp.get("name")
+                        if not name:
+                            continue
+                        val = inp.get("value", "")
+                        
+                        # Identify fields
+                        name_lower = name.lower()
+                        if "user" in name_lower or "email" in name_lower or ("login" in name_lower and inp.get("type") == "text"):
+                            payload[name] = username
+                        elif "pass" in name_lower:
+                            payload[name] = password
+                        elif inp.get("type") == "hidden":
+                            payload[name] = val
+                        elif inp.get("type") in ["submit", "button"] and "submit" in name_lower:
+                            payload[name] = val or "Submit"
+                
+                # Fallback / hardcode common DVWA fields if form parsing missed them
+                if "username" not in [k.lower() for k in payload.keys()]:
+                    payload["username"] = username
+                if "password" not in [k.lower() for k in payload.keys()]:
+                    payload["password"] = password
+                if "login" not in [k.lower() for k in payload.keys()]:
+                    # DVWA login form submit button
+                    payload["Login"] = "Login"
+
+                # Check if there is a CSRF token (user_token in DVWA)
+                user_token_input = soup.find("input", attrs={"name": "user_token"})
+                if user_token_input:
+                    payload["user_token"] = user_token_input.get("value", "")
+
+                # Send POST request
+                if method == "POST":
+                    resp = await client.post(action, data=payload)
+                else:
+                    resp = await client.get(action, params=payload)
+                
+                # Check for successful authentication
+                if resp.status_code in [200, 302]:
+                    logger.info("Authentication request sent. Session cookies: %s", dict(client.cookies))
+                
+            except Exception as e:
+                logger.error("Authentication failed: %s", e)
+
+        # 3. For DVWA specifically, set security level to low if not specified, to facilitate comprehensive scanning
+        if "security" not in client.cookies:
+            client.cookies.set("security", "low")
+            self.session_cookies["security"] = "low"
+            logger.info("Forced DVWA security level cookie 'security=low'")
+        
+        self.session_cookies.update(dict(client.cookies))
 
     async def _load_robots(self, root_url: str) -> robotparser.RobotFileParser | None:
         robots_url = normalize_url(root_url, "/robots.txt")
@@ -97,8 +262,29 @@ class WebSpider:
     def _parse_html(self, page_url: str, html: str) -> tuple[list[HtmlForm], list[str]]:
         soup = BeautifulSoup(html, "html.parser")
 
-        links = [a.get("href", "") for a in soup.find_all("a") if a.get("href")]
-        links = [link for link in links if not link.startswith("javascript:")]
+        # Extract links from multiple tags: a, iframe, script, link, img
+        links = []
+        for tag, attr in [("a", "href"), ("iframe", "src"), ("script", "src"), ("link", "href"), ("img", "src")]:
+            for element in soup.find_all(tag):
+                val = element.get(attr, "")
+                if val and not val.startswith("javascript:"):
+                    links.append(val)
+
+        # Follow meta refresh redirects
+        meta_refresh = soup.find("meta", attrs={"http-equiv": re.compile("^refresh$", re.I)})
+        if meta_refresh:
+            content = meta_refresh.get("content", "")
+            match = re.search(r"url=['\"]?([^'\";]+)", content, re.I)
+            if match:
+                links.append(match.group(1))
+
+        # Follow JS redirects
+        for script in soup.find_all("script"):
+            if script.string:
+                for match in re.finditer(r"(?:window|document)\.location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]", script.string, re.I):
+                    links.append(match.group(1))
+                for match in re.finditer(r"location\.replace\(['\"]([^'\"]+)['\"]\)", script.string, re.I):
+                    links.append(match.group(1))
 
         forms: list[HtmlForm] = []
         for form in soup.find_all("form"):

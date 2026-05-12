@@ -4,6 +4,8 @@ import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from app.config import get_settings
+
 from app.analyzers.ai_client import OllamaClient
 from app.analyzers.report_generator import AiReportGenerator
 from app.core.crawler.spider import WebSpider
@@ -16,6 +18,10 @@ from app.core.detectors.security_headers import SecurityHeadersDetector
 from app.core.detectors.sql_injection import SQLInjectionDetector
 from app.core.detectors.supply_chain import SupplyChainDetector
 from app.core.detectors.xss_detector import XSSDetector
+from app.core.detectors.command_injection import CommandInjectionDetector
+from app.core.detectors.file_inclusion import FileInclusionDetector
+from app.core.detectors.csrf_detector import CSRFDetector
+from app.core.detectors.ssrf_detector import SSRFDetector
 from app.core.verification.verification_framework import FindingDeduplicator
 from app.database.repositories.scan_repository import ScanRepository
 from app.integrations.cve_database import CveDatabaseService
@@ -47,6 +53,10 @@ class ScanOrchestrator:
             XSSDetector(),
             AuthenticationFailuresDetector(),
             ExceptionHandlingDetector(),
+            CommandInjectionDetector(),
+            FileInclusionDetector(),
+            CSRFDetector(),
+            SSRFDetector(),
         ]
         self.supply_chain_detector = SupplyChainDetector()
 
@@ -102,7 +112,7 @@ class ScanOrchestrator:
                 )
 
             detector_tasks = [
-                detector.detect(crawl_result.urls, crawl_result.forms)
+                detector.detect(crawl_result.urls, crawl_result.forms, session_cookies=getattr(crawl_result, "session_cookies", {}))
                 for detector in self.detectors
                 if not isinstance(detector, (CryptoFailuresDetector, SecurityHeadersDetector))
             ]
@@ -116,17 +126,18 @@ class ScanOrchestrator:
             # Provide the scan root URL so site-wide detectors can avoid duplicate page-level findings.
             crypto_detector = next((detector for detector in self.detectors if isinstance(detector, CryptoFailuresDetector)), None)
             if crypto_detector is not None:
-                findings.extend(await crypto_detector.detect(crawl_result.urls, crawl_result.forms, root_url=scan.target_url))
+                findings.extend(await crypto_detector.detect(crawl_result.urls, crawl_result.forms, root_url=scan.target_url, session_cookies=getattr(crawl_result, "session_cookies", {})))
 
             header_detector = next((detector for detector in self.detectors if isinstance(detector, SecurityHeadersDetector)), None)
             if header_detector is not None:
-                findings.extend(await header_detector.detect(crawl_result.urls, crawl_result.forms, root_url=scan.target_url))
+                findings.extend(await header_detector.detect(crawl_result.urls, crawl_result.forms, root_url=scan.target_url, session_cookies=getattr(crawl_result, "session_cookies", {})))
 
             supply_chain_findings = await self.supply_chain_detector.detect(
                 crawl_result.urls,
                 crawl_result.forms,
                 technologies=scan.technology_stack,
                 root_url=scan.target_url,
+                session_cookies=getattr(crawl_result, "session_cookies", {}),
             )
             findings.extend(supply_chain_findings)
 
@@ -138,6 +149,13 @@ class ScanOrchestrator:
             # Findings with same (url, parameter, vuln_type) are consolidated
             findings = FindingDeduplicator.deduplicate(findings)
             logger.info("deduplication complete: %d findings after merging", len(findings))
+
+            # scan_mode filtering: If verified, keep only verified findings
+            settings = get_settings()
+            scan_mode = getattr(settings, "scan_mode", "verified")
+            if scan_mode == "verified":
+                findings = [f for f in findings if getattr(f, "verified", False)]
+                logger.info("filtered findings for verified scan mode: %d findings remaining", len(findings))
 
             # PHASE 1: Detect all vulnerabilities
             vulnerabilities = [self._to_vulnerability(f) for f in findings]
@@ -164,7 +182,15 @@ class ScanOrchestrator:
             scan.statistics.severity_breakdown.info = len([v for v in vulnerabilities if v.severity.value == "Info"])
 
             if vulnerabilities:
-                scan.overall_risk_score = min(100.0, round(sum(v.cvss_score for v in vulnerabilities) / len(vulnerabilities) * 10, 2))
+                total_weighted_score = 0.0
+                total_weight = 0.0
+                for v in vulnerabilities:
+                    is_verified = v.evidence.request_snippet is not None
+                    weight = 1.0 if is_verified else 0.5
+                    total_weighted_score += v.cvss_score * weight
+                    total_weight += weight
+                
+                scan.overall_risk_score = min(100.0, round((total_weighted_score / total_weight) * 10, 2)) if total_weight > 0 else 0.0
             else:
                 scan.overall_risk_score = 0.0
 
@@ -249,12 +275,33 @@ class ScanOrchestrator:
         return analyzed
 
     def _to_vulnerability(self, finding: Finding) -> Vulnerability:
+        cvss_score = 0.0
+        if finding.severity == SeverityLevel.critical:
+            cvss_score = 9.5
+        elif finding.severity == SeverityLevel.high:
+            cvss_score = 8.0
+        elif finding.severity == SeverityLevel.medium:
+            cvss_score = 5.5
+        elif finding.severity == SeverityLevel.low:
+            cvss_score = 2.5
+        elif finding.severity == SeverityLevel.info:
+            cvss_score = 0.0
+        
+        # If finding is unverified, reduce score by 30% to weight verified findings more heavily
+        if not getattr(finding, "verified", False):
+            cvss_score = max(1.0, round(cvss_score * 0.7, 1)) if cvss_score > 0 else 0.0
+
         return Vulnerability(
             id=str(uuid4()),
             category=finding.category,
             vuln_type=finding.vuln_type,
             severity=finding.severity,
+            cvss_score=cvss_score,
             location=LocationInfo(url=finding.url, parameter=finding.parameter, http_method=finding.method),
-            evidence=Evidence(payload=finding.payload, response_snippet=finding.evidence),
+            evidence=Evidence(
+                payload=finding.payload,
+                request_snippet=getattr(finding, "verification_request_snippet", None),
+                response_snippet=getattr(finding, "verification_response_snippet", None) or finding.evidence
+            ),
             detected_at=datetime.now(timezone.utc),
         )

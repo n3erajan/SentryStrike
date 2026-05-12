@@ -21,10 +21,17 @@ class Settings(BaseSettings):
     ai_max_retries: int = Field(default=2, alias="AI_MAX_RETRIES")
 
     crawl_depth: int = Field(default=3, alias="CRAWL_DEPTH")
-    crawl_max_urls: int = Field(default=120, alias="CRAWL_MAX_URLS")
+    crawl_max_urls: int = Field(default=200, alias="CRAWL_MAX_URLS")
     crawl_rate_limit_per_second: float = Field(default=3.0, alias="CRAWL_RATE_LIMIT_PER_SECOND")
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     scanner_concurrency: int = Field(default=8, alias="SCANNER_CONCURRENCY")
+
+    # Verification / Scanning Settings
+    scan_mode: str = Field(default="verified", alias="SCAN_MODE")  # verified / heuristic / aggressive
+    authentication_username: str | None = Field(default=None, alias="SCAN_AUTH_USERNAME")
+    authentication_password: str | None = Field(default=None, alias="SCAN_AUTH_PASSWORD")
+    authentication_cookie: str | None = Field(default=None, alias="SCAN_AUTH_COOKIE")  # Format: "security=low; PHPSESSID=..."
+    max_verification_requests_per_param: int = Field(default=10, alias="MAX_VERIFICATION_REQUESTS")
 
     cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
 
