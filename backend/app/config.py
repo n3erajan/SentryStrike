@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
     ollama_model: str = Field(default="qwen2.5-coder:7b", alias="OLLAMA_MODEL")
-    ollama_timeout_seconds: float = Field(default=45.0, alias="OLLAMA_TIMEOUT_SECONDS")
+    ollama_timeout_seconds: float = Field(default=120.0, alias="OLLAMA_TIMEOUT_SECONDS")
     ai_max_retries: int = Field(default=2, alias="AI_MAX_RETRIES")
 
     crawl_depth: int = Field(default=3, alias="CRAWL_DEPTH")

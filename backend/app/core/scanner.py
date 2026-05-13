@@ -231,16 +231,43 @@ class ScanOrchestrator:
             raise asyncio.CancelledError
 
     async def _analyze_high_confidence_findings(self, vulnerabilities: list[Vulnerability]) -> list[Vulnerability]:
-        """Analyze high-confidence (Critical/High) findings with AI in a single call per finding."""
-        analyzed = []
-        for idx, vuln in enumerate(vulnerabilities, start=1):
+        """Analyze high-confidence (Critical/High) findings with AI using batched calls.
+
+        Instead of one AI call per vulnerability, vulnerabilities are grouped
+        into batches (up to ``_AI_BATCH_SIZE`` each) and each batch is sent as
+        a single prompt.  This typically reduces AI calls from N to 1-2.
+        """
+        if not vulnerabilities:
+            return vulnerabilities
+
+        BATCH_SIZE = 10  # max vulns per AI call — keeps prompts within context limits
+        analyzed: list[Vulnerability] = []
+
+        for batch_start in range(0, len(vulnerabilities), BATCH_SIZE):
+            batch = vulnerabilities[batch_start : batch_start + BATCH_SIZE]
+            logger.info(
+                "analyzing batch %d–%d of %d vulnerabilities",
+                batch_start + 1,
+                batch_start + len(batch),
+                len(vulnerabilities),
+            )
+
+            # Build a single prompt listing every vulnerability in this batch
+            vuln_descriptions = []
+            for i, vuln in enumerate(batch):
+                vuln_descriptions.append(
+                    f"[{i}] type={vuln.vuln_type}; category={vuln.category.value}; "
+                    f"severity={vuln.severity.value}; url={vuln.location.url}; "
+                    f"evidence={vuln.evidence.response_snippet or vuln.evidence.payload or 'n/a'}"
+                )
+
             prompt = (
-                "You are a security analyst. Analyze this vulnerability and return strict JSON with keys: "
+                "You are a security analyst. Analyze the following vulnerabilities and return a strict JSON object "
+                "with a single key \"results\" whose value is an array of objects — one per vulnerability, in the "
+                "same order as listed below. Each object MUST have keys: "
                 "exploitability(Easy|Medium|Hard), business_impact(string), confidence(0-1), "
-                "false_positive_probability(0-1), remediation(string), verification_steps(array), references(array).\n"
-                f"Vulnerability: {vuln.vuln_type}; Category: {vuln.category.value}; "
-                f"Severity: {vuln.severity.value}; Location: {vuln.location.url}; "
-                f"Evidence: {vuln.evidence.response_snippet or vuln.evidence.payload or 'n/a'}"
+                "false_positive_probability(0-1), remediation(string).\n\n"
+                "Vulnerabilities:\n" + "\n".join(vuln_descriptions)
             )
             fallback = {
                 "exploitability": "Medium",
@@ -248,30 +275,28 @@ class ScanOrchestrator:
                 "confidence": 0.8,
                 "false_positive_probability": 0.1,
                 "remediation": "Apply input validation, output encoding, and secure-by-default configuration.",
-                "verification_steps": ["Re-test the endpoint with the same payloads"],
-                "references": ["https://owasp.org/www-project-top-ten/"],
             }
-            
-            result = await self.ai_client.generate_json(prompt, fallback=fallback)
-            
-            # Update vulnerability with AI analysis
-            confidence = float(result.get("confidence", 0.8))
-            impact = 0.9 if vuln.severity.value in {"Critical", "High"} else 0.5
-            cvss = CvssCalculator.from_confidence_impact(confidence=confidence, impact=impact)
-            
-            vuln.cvss_score = cvss.score
-            vuln.cvss_vector = cvss.vector
-            vuln.ai_analysis.priority_rank = idx
-            vuln.ai_analysis.exploitability = normalize_exploitability(result.get("exploitability", "Medium"))
-            vuln.ai_analysis.business_impact = result.get("business_impact", fallback["business_impact"])
-            vuln.ai_analysis.false_positive_probability = float(result.get("false_positive_probability", 0.1))
-            vuln.ai_analysis.remediation = result.get("remediation", fallback["remediation"])
-            
-            analyzed.append(vuln)
-            logger.debug("analyzed finding %d/%d: %s (confidence=%.2f, fp_prob=%.2f)", 
-                        idx, len(vulnerabilities), vuln.vuln_type, confidence, 
-                        vuln.ai_analysis.false_positive_probability)
-        
+
+            results = await self.ai_client.generate_json_list(prompt, expected_count=len(batch), fallback=fallback)
+
+            # Apply AI results back to each vulnerability
+            for idx, (vuln, result) in enumerate(zip(batch, results), start=batch_start + 1):
+                confidence = float(result.get("confidence", 0.8))
+                impact = 0.9 if vuln.severity.value in {"Critical", "High"} else 0.5
+                cvss = CvssCalculator.from_confidence_impact(confidence=confidence, impact=impact)
+
+                vuln.cvss_score = cvss.score
+                vuln.cvss_vector = cvss.vector
+                vuln.ai_analysis.priority_rank = idx
+                vuln.ai_analysis.exploitability = normalize_exploitability(result.get("exploitability", "Medium"))
+                vuln.ai_analysis.business_impact = result.get("business_impact", fallback["business_impact"])
+                vuln.ai_analysis.false_positive_probability = float(result.get("false_positive_probability", 0.1))
+                vuln.ai_analysis.remediation = result.get("remediation", fallback["remediation"])
+
+                analyzed.append(vuln)
+
+            logger.info("batch analysis complete — %d findings processed so far", len(analyzed))
+
         return analyzed
 
     def _to_vulnerability(self, finding: Finding) -> Vulnerability:
