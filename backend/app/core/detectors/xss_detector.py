@@ -55,6 +55,8 @@ class XSSDetector(BaseDetector):
         "ref", "callback", "jsonp", "output", "error", "param",
     )
 
+    _form_input_prefixes = ("txt", "mtx", "inp", "tb", "tf", "ta", "fld", "ctl")
+
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
@@ -79,8 +81,11 @@ class XSSDetector(BaseDetector):
             for inp in raw_inputs:
                 inp_name = getattr(inp, "name", "")
                 inp_type = getattr(inp, "input_type", "text").lower()
-                if inp_name and inp_type in {"text", "search", "url", "email", "textarea", "tel", "hidden"}:
-                    candidates.add((form_url, inp_name, form_method, ""))
+                if inp_name and (
+                    inp_type in {"text", "search", "url", "email", "textarea", "tel", "hidden", ""}
+                    or inp_name.lower()[:3] in self._form_input_prefixes
+                ):
+                    candidates.add((form_url, inp_name, form_method, "", raw_inputs))
 
         if not candidates:
             return []
@@ -92,10 +97,14 @@ class XSSDetector(BaseDetector):
         verifier.http_verifier.cookies = session_cookies
 
         async def verify_candidate(cand) -> list[Finding]:
-            cand_url, param, method, val = cand
+            form_inputs = None
+            if len(cand) == 5:
+                cand_url, param, method, val, form_inputs = cand
+            else:
+                cand_url, param, method, val = cand
             async with semaphore:
                 try:
-                    result = await verifier.verify(cand_url, param, method, val)
+                    result = await verifier.verify(cand_url, param, method, val, form_inputs=form_inputs)
                     if result.is_vulnerable:
                         return result.findings
                 except Exception as e:

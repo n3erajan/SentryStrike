@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     authentication_password: str | None = Field(default=None, alias="SCAN_AUTH_PASSWORD")
     authentication_cookie: str | None = Field(default=None, alias="SCAN_AUTH_COOKIE")  # Format: "security=low; PHPSESSID=..."
     max_verification_requests_per_param: int = Field(default=10, alias="MAX_VERIFICATION_REQUESTS")
+    blind_injection_timing_threshold: float = Field(
+        default=0.7,
+        alias="BLIND_INJECTION_TIMING_THRESHOLD",
+        description=(
+            "Fraction of expected delay to use as threshold (0.0-1.0). "
+            "Default 0.7 = 70% of expected delay."
+        ),
+    )
 
     cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
 

@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import re
 from urllib.parse import parse_qsl, urlparse
 
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.verification.response_analyzer import ResponseAnalyzer
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
@@ -19,8 +21,13 @@ class AccessControlDetector(BaseDetector):
 
     idor_param_tokens = {
         "id", "user", "user_id", "account", "account_id", "order", "order_id",
-        "record", "record_id", "doc", "file", "item", "profile", "uid",
+        "record", "record_id", "profile", "uid",
     }
+
+    NON_ID_VALUES = {"on", "off", "true", "false", "yes", "no"}
+    IDOR_VALUE_PATTERN = re.compile(
+        r"^(\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-zA-Z0-9]{1,8})$"
+    )
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
@@ -77,7 +84,14 @@ class AccessControlDetector(BaseDetector):
             for param_name, param_value in query_params:
                 param_lower = param_name.lower()
                 if param_lower in self.idor_param_tokens or any(token in param_lower for token in ["id", "user", "account", "order", "record"]):
-                    idor_candidates.add((url, param_name, "GET", param_value))
+                    val = str(param_value or "")
+                    if not val:
+                        continue
+                    if val.lower() in self.NON_ID_VALUES:
+                        continue
+                    if not self.IDOR_VALUE_PATTERN.match(val):
+                        continue
+                    idor_candidates.add((url, param_name, "GET", val))
 
         # Collect Form parameter candidates
         for form in forms:
@@ -127,6 +141,9 @@ class AccessControlDetector(BaseDetector):
                         body_lower = unauth_resp.body.lower()
                         # Make sure it's not a generic login/auth redirect returning a 200
                         if not ("login" in body_lower and ("password" in body_lower or "username" in body_lower)):
+                            similarity = ResponseAnalyzer.calculate_similarity(authed_resp.body, unauth_resp.body)
+                            if similarity > 0.95:
+                                return []
                             cand_findings.append(
                                 Finding(
                                     category=OwaspCategory.a01,

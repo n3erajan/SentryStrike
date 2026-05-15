@@ -259,6 +259,53 @@ class AuthenticationFailuresDetector(BaseDetector):
                     )
                 )
 
+            # Test 4: CAPTCHA Bypass
+            captcha_param = None
+            for inp in raw_inputs:
+                name = getattr(inp, "name", "").lower()
+                if any(tok in name for tok in [
+                    "captcha", "recaptcha", "g-recaptcha-response",
+                    "h-captcha-response", "cf-turnstile-response",
+                    "captcha_token", "captcha_code", "verify_code",
+                ]):
+                    captcha_param = getattr(inp, "name", "")
+                    break
+
+            if captcha_param:
+                bypass_payload = payload.copy()
+                bypass_payload.pop(captcha_param, None)
+
+                bypass_url, bypass_params, bypass_data = URLParameterBuilder.inject_parameter(
+                    form_url, username_param, "test", method
+                )
+                if method == "POST":
+                    bypass_data = bypass_payload
+                else:
+                    bypass_params = bypass_payload
+
+                resp = await verifier.send_request(bypass_url, method, bypass_params, bypass_data)
+                body_lower = resp.body.lower()
+
+                if resp.status_code in [200, 302]:
+                    captcha_error_terms = [
+                        "captcha", "verification failed", "human verification",
+                        "robot", "bot detection", "challenge required",
+                    ]
+                    if not any(term in body_lower for term in captcha_error_terms):
+                        findings.append(
+                            self._finding(
+                                vuln_type="CAPTCHA Bypass — Form Accepts Submission Without CAPTCHA",
+                                url=form_url,
+                                method=method,
+                                severity=SeverityLevel.high,
+                                parameter=captcha_param,
+                                evidence=(
+                                    f"Form with CAPTCHA field '{captcha_param}' accepted submission "
+                                    "when the CAPTCHA value was omitted entirely."
+                                ),
+                            )
+                        )
+
             # Test 3: Session Cookie Attributes check
             for r in responses:
                 set_cookie_headers = [v for k, v in r.headers.items() if k.lower() == "set-cookie"]

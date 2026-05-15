@@ -35,6 +35,7 @@ class CryptoFailuresDetector(BaseDetector):
 
         # Perform active checking for Secure cookies and mixed content on the pages
         verifier = HttpVerifier(cookies=session_cookies)
+        reported_session_cookies: set[str] = set()
         try:
             # Only test up to 5 URLs to keep it fast
             for url in urls[:5]:
@@ -75,6 +76,47 @@ class CryptoFailuresDetector(BaseDetector):
                             reproducible=True
                         )
                     )
+
+                # 3. Check session cookie attributes on page load
+                set_cookie_headers = [v for k, v in response.headers.items() if k.lower() == "set-cookie"]
+                for header in set_cookie_headers:
+                    cookie_parts = [p.strip().lower() for p in header.split(";")]
+                    cookie_name = cookie_parts[0].split("=")[0] if "=" in cookie_parts[0] else ""
+
+                    session_cookie_names = {
+                        "session", "phpsessid", "jsessionid", "asp.net_sessionid",
+                        "token", "auth", "jwt", "sid", "sessid",
+                    }
+                    if any(tok in cookie_name.lower() for tok in session_cookie_names):
+                        if cookie_name in reported_session_cookies:
+                            continue
+
+                        missing_attrs = []
+                        if "httponly" not in cookie_parts:
+                            missing_attrs.append("HttpOnly")
+                        if "secure" not in cookie_parts:
+                            missing_attrs.append("Secure")
+                        if not any(p.startswith("samesite") for p in cookie_parts):
+                            missing_attrs.append("SameSite")
+
+                        if missing_attrs:
+                            reported_session_cookies.add(cookie_name)
+                            findings.append(
+                                Finding(
+                                    category=OwaspCategory.a02,
+                                    vuln_type="Insecure Session Cookie Attributes",
+                                    severity=SeverityLevel.medium,
+                                    url=url,
+                                    evidence=(
+                                        f"Session cookie '{cookie_name}' is missing security attributes: "
+                                        f"{', '.join(missing_attrs)}."
+                                    ),
+                                    verified=True,
+                                    verification_request_snippet=response.request_snippet,
+                                    verification_response_snippet=response.response_snippet,
+                                    reproducible=True,
+                                )
+                            )
 
                 # 2. Check Set-Cookie secure flags
                 set_cookie_headers = [v for k, v in response.headers.items() if k.lower() == "set-cookie"]

@@ -1,0 +1,279 @@
+import logging
+import re
+from urllib.parse import urljoin, urlparse
+
+import httpx
+
+from app.config import get_settings
+from app.core.detectors.base_detector import BaseDetector, Finding
+from app.models.vulnerability import OwaspCategory, SeverityLevel
+
+logger = logging.getLogger(__name__)
+
+
+class FileUploadDetector(BaseDetector):
+    name = "file_upload"
+
+    _upload_paths = [
+        "/uploads/",
+        "/files/",
+        "/upload/",
+        "/file/",
+        "/userfiles/",
+        "/static/uploads/",
+        "/content/uploads/",
+        "/hackable/uploads/",
+    ]
+
+    _error_terms = [
+        "invalid",
+        "not allowed",
+        "rejected",
+        "forbidden",
+        "denied",
+        "failed",
+        "unsupported",
+        "not permitted",
+        "error",
+    ]
+
+    async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
+        findings: list[Finding] = []
+        session_cookies = kwargs.get("session_cookies") or {}
+        settings = get_settings()
+
+        candidates = []
+        for form in forms:
+            form_url = getattr(form, "action", getattr(form, "page_url", ""))
+            form_method = getattr(form, "method", "POST").upper()
+            raw_inputs = list(getattr(form, "inputs", []))
+            file_inputs = [inp for inp in raw_inputs if getattr(inp, "input_type", "").lower() == "file"]
+            if file_inputs:
+                candidates.append((form_url, form_method, raw_inputs, file_inputs[0].name))
+
+        if not candidates:
+            return []
+
+        async with httpx.AsyncClient(
+            timeout=settings.request_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "SentryStrikeScanner/1.0"},
+            cookies=session_cookies,
+        ) as client:
+            for form_url, method, raw_inputs, file_field in candidates:
+                try:
+                    await self._test_uploads(client, findings, form_url, method, raw_inputs, file_field)
+                except Exception as exc:
+                    logger.error("File upload test failed for %s: %s", form_url, exc)
+
+        return findings
+
+    async def _test_uploads(
+        self,
+        client: httpx.AsyncClient,
+        findings: list[Finding],
+        form_url: str,
+        method: str,
+        raw_inputs: list,
+        file_field: str,
+    ) -> None:
+        php_name = "sentry_test.php"
+        php_content = b'<?php echo "SENTRY_UPLOAD_TEST_CANARY"; ?>'
+        txt_name = "sentry_test.txt"
+        txt_content = b"SENTRY_UPLOAD_TEST_CANARY"
+
+        accepted, response_text = await self._send_upload(
+            client,
+            form_url,
+            method,
+            raw_inputs,
+            file_field,
+            php_name,
+            php_content,
+            "application/x-php",
+        )
+
+        if accepted:
+            candidate_urls = self._extract_candidate_urls(response_text, form_url, php_name)
+            for path in self._upload_paths:
+                candidate_urls.append(urljoin(form_url, path + php_name))
+
+            accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
+            if accessible_url:
+                findings.append(
+                    Finding(
+                        category=OwaspCategory.a04,
+                        vuln_type="Unrestricted File Upload",
+                        severity=SeverityLevel.critical,
+                        url=form_url,
+                        parameter=file_field,
+                        method=method,
+                        payload=php_name,
+                        evidence=(
+                            "Executable file upload accepted and accessible. "
+                            f"Canary found at {accessible_url}."
+                        ),
+                        confidence_score=95.0,
+                        detection_method="file_upload_execution",
+                        reproducible=True,
+                        verified=True,
+                    )
+                )
+                return
+
+        accepted, _ = await self._send_upload(
+            client,
+            form_url,
+            method,
+            raw_inputs,
+            file_field,
+            php_name,
+            php_content,
+            "image/jpeg",
+        )
+        if accepted:
+            findings.append(
+                Finding(
+                    category=OwaspCategory.a04,
+                    vuln_type="Weak File Upload Validation",
+                    severity=SeverityLevel.high,
+                    url=form_url,
+                    parameter=file_field,
+                    method=method,
+                    payload=php_name,
+                    evidence="Dangerous extension accepted with spoofed image content-type.",
+                    confidence_score=80.0,
+                    detection_method="content_type_bypass",
+                    reproducible=True,
+                    verified=True,
+                )
+            )
+
+        accepted, _ = await self._send_upload(
+            client,
+            form_url,
+            method,
+            raw_inputs,
+            file_field,
+            "sentry_test.php.jpg",
+            php_content,
+            "image/jpeg",
+        )
+        if accepted:
+            findings.append(
+                Finding(
+                    category=OwaspCategory.a04,
+                    vuln_type="Double Extension Bypass",
+                    severity=SeverityLevel.high,
+                    url=form_url,
+                    parameter=file_field,
+                    method=method,
+                    payload="sentry_test.php.jpg",
+                    evidence="Double extension upload accepted with dangerous inner extension.",
+                    confidence_score=80.0,
+                    detection_method="double_extension",
+                    reproducible=True,
+                    verified=True,
+                )
+            )
+
+        accepted, response_text = await self._send_upload(
+            client,
+            form_url,
+            method,
+            raw_inputs,
+            file_field,
+            txt_name,
+            txt_content,
+            "text/plain",
+        )
+        if accepted and not self._has_error_terms(response_text):
+            findings.append(
+                Finding(
+                    category=OwaspCategory.a04,
+                    vuln_type="Missing File Type Validation",
+                    severity=SeverityLevel.medium,
+                    url=form_url,
+                    parameter=file_field,
+                    method=method,
+                    payload=txt_name,
+                    evidence="Upload endpoint accepts arbitrary file types without validation feedback.",
+                    confidence_score=60.0,
+                    detection_method="no_type_validation",
+                    reproducible=True,
+                    verified=True,
+                )
+            )
+
+    async def _send_upload(
+        self,
+        client: httpx.AsyncClient,
+        form_url: str,
+        method: str,
+        raw_inputs: list,
+        file_field: str,
+        filename: str,
+        content: bytes,
+        content_type: str,
+    ) -> tuple[bool, str]:
+        data = self._build_form_payload(raw_inputs, file_field)
+        files = {file_field: (filename, content, content_type)}
+
+        response = await client.request(
+            method="POST" if method != "POST" else method,
+            url=form_url,
+            data=data,
+            files=files,
+        )
+        body = response.text or ""
+        accepted = response.status_code in {200, 201, 202, 204, 302, 303} and not self._has_error_terms(body)
+        return accepted, body
+
+    def _build_form_payload(self, raw_inputs: list, file_field: str) -> dict:
+        payload: dict[str, str] = {}
+        for inp in raw_inputs:
+            name = getattr(inp, "name", "")
+            if not name or name == file_field:
+                continue
+            inp_type = getattr(inp, "input_type", "text").lower()
+            if inp_type == "password":
+                payload[name] = "sntry_password123"
+            elif inp_type in ("submit", "button"):
+                payload[name] = "Submit"
+            else:
+                payload[name] = "sntry_test_val"
+        return payload
+
+    def _has_error_terms(self, body: str) -> bool:
+        lowered = body.lower()
+        return any(term in lowered for term in self._error_terms)
+
+    def _extract_candidate_urls(self, body: str, base_url: str, filename: str) -> list[str]:
+        urls: list[str] = []
+        if not body:
+            return urls
+
+        for match in re.findall(r"https?://[^\"'\s>]+", body, re.I):
+            if filename in match:
+                urls.append(match)
+
+        for match in re.findall(r"/[^\"'\s>]+", body):
+            if filename in match:
+                urls.append(urljoin(base_url, match))
+
+        return urls
+
+    async def _find_canary(
+        self,
+        client: httpx.AsyncClient,
+        candidate_urls: list[str],
+        canary: str,
+    ) -> str | None:
+        for url in candidate_urls:
+            try:
+                resp = await client.get(url)
+                if resp.status_code == 200 and canary in (resp.text or ""):
+                    return url
+            except Exception:
+                continue
+        return None

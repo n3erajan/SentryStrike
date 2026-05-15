@@ -13,6 +13,7 @@ import asyncio
 import logging
 from typing import Optional
 
+from app.config import get_settings
 from app.core.detectors.base_detector import Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
 from app.core.verification.verification_framework import (
@@ -334,8 +335,10 @@ class SQLiVerifier(BaseVerifier):
                     await asyncio.sleep(0.1)
 
                 # Analyze timing
+                settings = get_settings()
+                threshold_fraction = settings.blind_injection_timing_threshold
                 is_significant, timing_analysis = ResponseAnalyzer.is_timing_significant(
-                    baseline_times, injected_times, threshold_ms=expected_delay_ms * 0.8
+                    baseline_times, injected_times, threshold_ms=expected_delay_ms * threshold_fraction
                 )
 
                 if is_significant:

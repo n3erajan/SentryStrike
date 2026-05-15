@@ -199,31 +199,27 @@ class WebSpider:
                         if not name:
                             continue
                         val = inp.get("value", "")
+                        inp_type = inp.get("type", "text").lower()
+                        autocomplete = inp.get("autocomplete", "").lower()
                         
                         # Identify fields
                         name_lower = name.lower()
-                        if "user" in name_lower or "email" in name_lower or ("login" in name_lower and inp.get("type") == "text"):
+                        if inp_type == "email" or autocomplete in ("username", "email"):
+                            payload[name] = username
+                        elif inp_type == "password" or autocomplete in ("current-password", "password"):
+                            payload[name] = password
+                        elif "user" in name_lower or "email" in name_lower or "login" in name_lower:
                             payload[name] = username
                         elif "pass" in name_lower:
                             payload[name] = password
-                        elif inp.get("type") == "hidden":
+                        elif inp_type == "hidden":
                             payload[name] = val
-                        elif inp.get("type") in ["submit", "button"] and "submit" in name_lower:
+                        elif inp_type in ["submit", "button"] and "submit" in name_lower:
                             payload[name] = val or "Submit"
-                
-                # Fallback / hardcode common DVWA fields if form parsing missed them
-                if "username" not in [k.lower() for k in payload.keys()]:
-                    payload["username"] = username
-                if "password" not in [k.lower() for k in payload.keys()]:
-                    payload["password"] = password
-                if "login" not in [k.lower() for k in payload.keys()]:
-                    # DVWA login form submit button
-                    payload["Login"] = "Login"
 
-                # Check if there is a CSRF token (user_token in DVWA)
-                user_token_input = soup.find("input", attrs={"name": "user_token"})
-                if user_token_input:
-                    payload["user_token"] = user_token_input.get("value", "")
+                    submit_btn = form.find("input", attrs={"type": "submit"})
+                    if submit_btn and submit_btn.get("name"):
+                        payload[submit_btn["name"]] = submit_btn.get("value", "Submit")
 
                 # Send POST request
                 if method == "POST":
@@ -238,12 +234,6 @@ class WebSpider:
             except Exception as e:
                 logger.error("Authentication failed: %s", e)
 
-        # 3. For DVWA specifically, set security level to low if not specified, to facilitate comprehensive scanning
-        if "security" not in client.cookies:
-            client.cookies.set("security", "low")
-            self.session_cookies["security"] = "low"
-            logger.info("Forced DVWA security level cookie 'security=low'")
-        
         self.session_cookies.update(dict(client.cookies))
 
     async def _load_robots(self, root_url: str) -> robotparser.RobotFileParser | None:
@@ -295,7 +285,13 @@ class WebSpider:
                 name = inp.get("name")
                 if not name:
                     continue
-                inputs.append(FormInput(name=name, input_type=inp.get("type", "text")))
+                if inp.name == "textarea":
+                    inp_type = "textarea"
+                elif inp.name == "select":
+                    inp_type = "select"
+                else:
+                    inp_type = inp.get("type", "text")
+                inputs.append(FormInput(name=name, input_type=inp_type))
             forms.append(HtmlForm(page_url=page_url, action=normalize_url(page_url, action), method=method, inputs=inputs))
 
         if re.search(r"\.php\?|\.aspx\?", page_url, flags=re.I):

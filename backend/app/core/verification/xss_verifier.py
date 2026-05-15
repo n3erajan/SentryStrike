@@ -49,6 +49,7 @@ class XSSVerifier(BaseVerifier):
         parameter: str,
         method: str = "GET",
         value: str = "",
+        form_inputs: Optional[list] = None,
     ) -> VerificationResult:
         """
         Verify Reflected XSS vulnerability.
@@ -70,7 +71,7 @@ class XSSVerifier(BaseVerifier):
             logger.debug("Failed to perform DOM XSS check: %s", e)
 
         for payload_type, payload in self.XSS_PAYLOADS.items():
-            result = await self._test_payload(url, parameter, method, value, payload, payload_type)
+            result = await self._test_payload(url, parameter, method, value, payload, payload_type, form_inputs)
 
             if result.is_vulnerable:
                 findings.extend(result.findings)
@@ -140,19 +141,30 @@ class XSSVerifier(BaseVerifier):
         value: str,
         payload: str,
         payload_type: str,
+        form_inputs: Optional[list],
     ) -> VerificationResult:
         """Test a single XSS payload."""
         try:
             # Get baseline response
-            baseline_url, baseline_params, baseline_data = URLParameterBuilder.inject_parameter(
-                url, parameter, value, method
-            )
+            if method.upper() == "POST" and form_inputs is not None:
+                baseline_url = url
+                baseline_params = None
+                baseline_data = self._build_form_payload(form_inputs, parameter, value)
+            else:
+                baseline_url, baseline_params, baseline_data = URLParameterBuilder.inject_parameter(
+                    url, parameter, value, method
+                )
             baseline = await self.http_verifier.send_request(baseline_url, method, baseline_params, baseline_data)
 
             # Inject XSS payload
-            injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
-                url, parameter, payload, method
-            )
+            if method.upper() == "POST" and form_inputs is not None:
+                injected_url = url
+                injected_params = None
+                injected_data = self._build_form_payload(form_inputs, parameter, payload)
+            else:
+                injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
+                    url, parameter, payload, method
+                )
             injected = await self.http_verifier.send_request(injected_url, method, injected_params, injected_data)
 
             # Check for reflection
@@ -161,8 +173,9 @@ class XSSVerifier(BaseVerifier):
 
             # If not reflected immediately, or for any POST request, verify stored XSS
             if not is_reflected or method.upper() == "POST":
-                await asyncio.sleep(0.1)
-                stored_resp = await self.http_verifier.send_request(url, "GET")
+                await asyncio.sleep(0.2)
+                display_url = url.split("?")[0]
+                stored_resp = await self.http_verifier.send_request(display_url, "GET")
                 stored_reflected, stored_locations = ResponseAnalyzer.detect_payload_reflection(payload, stored_resp.body)
                 if stored_reflected:
                     is_reflected = True
@@ -270,6 +283,28 @@ class XSSVerifier(BaseVerifier):
             analysis["is_executable"] = analysis["encoding_type"] == "unencoded"
 
         return analysis
+
+    def _build_form_payload(self, form_inputs: list, target_param: str, target_value: str) -> dict:
+        payload: dict[str, str] = {}
+        for inp in form_inputs:
+            name = getattr(inp, "name", "")
+            if not name:
+                continue
+            inp_type = getattr(inp, "input_type", "text").lower()
+            if name == target_param:
+                payload[name] = target_value
+                continue
+            if inp_type == "password":
+                payload[name] = "sntry_password123"
+            elif inp_type in ("submit", "button"):
+                payload[name] = "Submit"
+            else:
+                payload[name] = "sntry_test_val"
+
+        if target_param not in payload:
+            payload[target_param] = target_value
+
+        return payload
 
     @staticmethod
     def _calculate_xss_confidence(payload: str, context: dict) -> float:

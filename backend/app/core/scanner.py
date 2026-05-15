@@ -20,6 +20,7 @@ from app.core.detectors.supply_chain import SupplyChainDetector
 from app.core.detectors.xss_detector import XSSDetector
 from app.core.detectors.command_injection import CommandInjectionDetector
 from app.core.detectors.file_inclusion import FileInclusionDetector
+from app.core.detectors.file_upload import FileUploadDetector
 from app.core.detectors.csrf_detector import CSRFDetector
 from app.core.detectors.ssrf_detector import SSRFDetector
 from app.core.verification.verification_framework import FindingDeduplicator
@@ -28,7 +29,15 @@ from app.integrations.cve_database import CveDatabaseService
 from app.integrations.sslyze_wrapper import SslAnalyzer
 from app.integrations.wappalyzer import TechnologyDetector
 from app.models.scan import ScanStatus
-from app.models.vulnerability import Evidence, LocationInfo, OwaspCategory, SeverityLevel, Vulnerability, normalize_exploitability
+from app.models.vulnerability import (
+    Evidence,
+    Exploitability,
+    LocationInfo,
+    OwaspCategory,
+    SeverityLevel,
+    Vulnerability,
+    normalize_exploitability,
+)
 from app.utils.cvss_calculator import CvssCalculator
 
 logger = logging.getLogger(__name__)
@@ -57,11 +66,54 @@ class ScanOrchestrator:
             FileInclusionDetector(),
             CSRFDetector(),
             SSRFDetector(),
+            FileUploadDetector(),
         ]
         self.supply_chain_detector = SupplyChainDetector()
 
         self._tasks: dict[str, asyncio.Task] = {}
         self._cancel_flags: dict[str, bool] = {}
+
+        self._remediation_fallbacks: dict[str, str] = {
+            "Cross-Site Request Forgery (CSRF)": (
+                "Add CSRF tokens (synchronizer token pattern) to all state-changing forms; "
+                "validate Origin/Referer headers."
+            ),
+            "Insecure Direct Object Reference (IDOR)": (
+                "Implement object-level authorization and verify the authenticated user has "
+                "permission to access the referenced resource."
+            ),
+            "OS Command Injection": (
+                "Never pass user input to shell commands. Use parameterized APIs "
+                "(e.g., subprocess with shell=False) and strict allowlists."
+            ),
+            "SQL Injection": (
+                "Use parameterized queries / prepared statements. Never concatenate user input into SQL."
+            ),
+            "Reflected XSS": (
+                "Apply context-aware output encoding. Use Content-Security-Policy to restrict inline scripts."
+            ),
+            "Stored XSS": (
+                "Sanitize input on storage and apply context-aware output encoding on display. Use CSP."
+            ),
+            "Local File Inclusion (LFI)": (
+                "Validate and whitelist allowed file paths. Never use user input directly in file operations."
+            ),
+            "Insecure Transport": (
+                "Enforce HTTPS via HSTS with a long max-age and redirect all HTTP traffic to HTTPS."
+            ),
+            "Missing Security Header": (
+                "Add the missing security header with appropriate directives per OWASP guidance."
+            ),
+            "Server-Side Request Forgery (SSRF)": (
+                "Validate and whitelist allowed destination URLs/IPs and block internal/private ranges."
+            ),
+            "Unrestricted File Upload": (
+                "Validate extension, MIME type, and content. Store uploads outside webroot and randomize names."
+            ),
+            "Insecure Session Cookie Attributes": (
+                "Set HttpOnly, Secure, and SameSite=Strict (or Lax) on session cookies."
+            ),
+        }
 
     async def queue_scan(self, scan_id: str) -> None:
         task = asyncio.create_task(self.run_scan(scan_id), name=f"scan-{scan_id}")
@@ -154,24 +206,23 @@ class ScanOrchestrator:
             settings = get_settings()
             scan_mode = getattr(settings, "scan_mode", "verified")
             if scan_mode == "verified":
-                findings = [f for f in findings if getattr(f, "verified", False)]
+                findings = [
+                    f for f in findings
+                    if getattr(f, "verified", False)
+                    or f.severity in (SeverityLevel.info, SeverityLevel.low)
+                ]
                 logger.info("filtered findings for verified scan mode: %d findings remaining", len(findings))
 
             # PHASE 1: Detect all vulnerabilities
             vulnerabilities = [self._to_vulnerability(f) for f in findings]
             logger.info("phase 1 complete: detected %d vulnerabilities", len(vulnerabilities))
 
-            # PHASE 2: Analyze only high-confidence (High/Critical) findings with AI
-            high_confidence = [v for v in vulnerabilities if v.severity.value in {"Critical", "High"}]
-            low_confidence = [v for v in vulnerabilities if v.severity.value not in {"Critical", "High"}]
-            
-            logger.info("phase 2 starting: analyzing %d high-confidence findings", len(high_confidence))
-            analyzed_high = await self._analyze_high_confidence_findings(high_confidence)
-            logger.info("phase 2 complete: analyzed %d findings", len(analyzed_high))
-
-            # Combine: analyzed high-confidence + unanalyzed low-confidence
-            vulnerabilities = analyzed_high + low_confidence
+            # PHASE 2: Analyze all findings with AI
+            logger.info("phase 2 starting: analyzing %d findings", len(vulnerabilities))
+            vulnerabilities = await self._analyze_all_findings(vulnerabilities)
+            vulnerabilities = self._compute_priority_ranks(vulnerabilities)
             vulnerabilities.sort(key=lambda v: v.cvss_score, reverse=True)
+            logger.info("phase 2 complete: analyzed %d findings", len(vulnerabilities))
 
             scan.vulnerabilities = vulnerabilities
             scan.statistics.total_vulnerabilities = len(vulnerabilities)
@@ -230,8 +281,8 @@ class ScanOrchestrator:
         if self._cancel_flags.get(scan_id):
             raise asyncio.CancelledError
 
-    async def _analyze_high_confidence_findings(self, vulnerabilities: list[Vulnerability]) -> list[Vulnerability]:
-        """Analyze high-confidence (Critical/High) findings with AI using batched calls.
+    async def _analyze_all_findings(self, vulnerabilities: list[Vulnerability]) -> list[Vulnerability]:
+        """Analyze findings with AI using batched calls.
 
         Instead of one AI call per vulnerability, vulnerabilities are grouped
         into batches (up to ``_AI_BATCH_SIZE`` each) and each batch is sent as
@@ -262,42 +313,106 @@ class ScanOrchestrator:
                 )
 
             prompt = (
-                "You are a security analyst. Analyze the following vulnerabilities and return a strict JSON object "
-                "with a single key \"results\" whose value is an array of objects — one per vulnerability, in the "
-                "same order as listed below. Each object MUST have keys: "
-                "exploitability(Easy|Medium|Hard), business_impact(string), confidence(0-1), "
-                "false_positive_probability(0-1), remediation(string).\n\n"
+                "You are a senior application security analyst. Analyze each vulnerability below and return "
+                "a JSON object with key \"results\" containing an array of objects, one per vulnerability, in the "
+                "SAME ORDER.\n\n"
+                "Each object MUST have these keys:\n"
+                "- exploitability: 'Easy' (no auth required, trivial payload, public exploit exists), "
+                "'Medium' (requires valid session or multi-step attack), or 'Hard' (requires chained exploits, "
+                "race conditions, or specific server config)\n"
+                "- business_impact: A SPECIFIC 1-2 sentence impact statement for THIS vulnerability at THIS URL. "
+                "Describe what an attacker can achieve. Do NOT use generic statements.\n"
+                "- confidence: float 0-1, probability this is a real vulnerability (not a false positive)\n"
+                "- false_positive_probability: float 0-1, probability this is NOT a real vulnerability\n"
+                "- remediation: A SPECIFIC fix for THIS vulnerability type. For CSRF say 'add CSRF tokens'; "
+                "for SQLi say 'use parameterized queries'; do NOT say 'implement HTTPS' unless it is transport.\n\n"
                 "Vulnerabilities:\n" + "\n".join(vuln_descriptions)
             )
-            fallback = {
-                "exploitability": "Medium",
-                "business_impact": "Could impact confidentiality, integrity, or availability.",
-                "confidence": 0.8,
-                "false_positive_probability": 0.1,
-                "remediation": "Apply input validation, output encoding, and secure-by-default configuration.",
-            }
 
-            results = await self.ai_client.generate_json_list(prompt, expected_count=len(batch), fallback=fallback)
+            results = await self.ai_client.generate_json_list(
+                prompt,
+                expected_count=len(batch),
+                fallback=self._get_fallback_for(""),
+            )
 
             # Apply AI results back to each vulnerability
             for idx, (vuln, result) in enumerate(zip(batch, results), start=batch_start + 1):
-                confidence = float(result.get("confidence", 0.8))
+                fallback = self._get_fallback_for(vuln.vuln_type)
+                confidence = float(result.get("confidence", fallback["confidence"]))
                 impact = 0.9 if vuln.severity.value in {"Critical", "High"} else 0.5
-                cvss = CvssCalculator.from_confidence_impact(confidence=confidence, impact=impact)
+                cvss = CvssCalculator.from_vulnerability_context(
+                    vuln_type=vuln.vuln_type,
+                    requires_auth=False,
+                    confidence=confidence,
+                    impact=impact,
+                )
 
                 vuln.cvss_score = cvss.score
                 vuln.cvss_vector = cvss.vector
-                vuln.ai_analysis.priority_rank = idx
-                vuln.ai_analysis.exploitability = normalize_exploitability(result.get("exploitability", "Medium"))
+                vuln.ai_analysis.exploitability = normalize_exploitability(
+                    result.get("exploitability", fallback["exploitability"])
+                )
                 vuln.ai_analysis.business_impact = result.get("business_impact", fallback["business_impact"])
-                vuln.ai_analysis.false_positive_probability = float(result.get("false_positive_probability", 0.1))
+                vuln.ai_analysis.false_positive_probability = float(
+                    result.get("false_positive_probability", fallback["false_positive_probability"])
+                )
                 vuln.ai_analysis.remediation = result.get("remediation", fallback["remediation"])
+                vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
 
                 analyzed.append(vuln)
 
             logger.info("batch analysis complete — %d findings processed so far", len(analyzed))
 
         return analyzed
+
+    def _get_fallback_for(self, vuln_type: str) -> dict:
+        remediation = "Apply defense-in-depth controls appropriate to this vulnerability class."
+        for key, value in self._remediation_fallbacks.items():
+            if key.lower() in vuln_type.lower() or vuln_type.lower() in key.lower():
+                remediation = value
+                break
+        return {
+            "exploitability": "Medium",
+            "business_impact": f"Potential security impact from {vuln_type or 'this issue'}.",
+            "confidence": 0.8,
+            "false_positive_probability": 0.1,
+            "remediation": remediation,
+        }
+
+    def _compute_priority_ranks(self, vulnerabilities: list[Vulnerability]) -> list[Vulnerability]:
+        exploitability_weight = {"Easy": 3.0, "Medium": 2.0, "Hard": 1.0}
+
+        def risk_score(vuln: Vulnerability) -> float:
+            exploit_value = vuln.ai_analysis.exploitability.value if vuln.ai_analysis.exploitability else "Medium"
+            exploit_w = exploitability_weight.get(exploit_value, 2.0)
+            fp_penalty = 1.0 - (vuln.ai_analysis.false_positive_probability or 0.1)
+            return vuln.cvss_score * exploit_w * fp_penalty
+
+        vulnerabilities.sort(key=risk_score, reverse=True)
+        for rank, vuln in enumerate(vulnerabilities, start=1):
+            vuln.ai_analysis.priority_rank = rank
+        return vulnerabilities
+
+    def _calibrate_exploitability(self, vuln: Vulnerability) -> Exploitability:
+        vuln_type_lower = vuln.vuln_type.lower()
+        severity = vuln.severity
+
+        if severity == SeverityLevel.critical and any(
+            tok in vuln_type_lower
+            for tok in ["command injection", "sql injection", "file inclusion", "file upload"]
+        ):
+            return Exploitability.easy
+
+        if "xss" in vuln_type_lower:
+            return Exploitability.medium
+
+        if severity in (SeverityLevel.info, SeverityLevel.low):
+            return Exploitability.hard
+
+        if severity == SeverityLevel.high and vuln.evidence.request_snippet:
+            return Exploitability.easy
+
+        return vuln.ai_analysis.exploitability or Exploitability.medium
 
     def _to_vulnerability(self, finding: Finding) -> Vulnerability:
         cvss_score = 0.0

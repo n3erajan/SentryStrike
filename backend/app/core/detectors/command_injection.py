@@ -39,10 +39,12 @@ class CommandInjectionDetector(BaseDetector):
             raw_inputs = list(getattr(form, "inputs", []))
             for inp in raw_inputs:
                 inp_name = getattr(inp, "name", "")
-                inp_type = getattr(inp, "input_type", "text").lower()
                 if inp_name:
                     inp_name_lower = inp_name.lower()
-                    if inp_name_lower in self.cmd_param_tokens or inp_type in {"text"}:
+                    if inp_name_lower in self.cmd_param_tokens or any(
+                        token in inp_name_lower
+                        for token in ["cmd", "command", "exec", "run", "shell", "ping"]
+                    ):
                         candidates.add((form_url, inp_name, form_method, ""))
 
         if not candidates:

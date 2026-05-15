@@ -23,12 +23,22 @@ class FileInclusionDetector(BaseDetector):
         ("../../../../etc/passwd", r"root:x:0:0:", "Linux /etc/passwd LFI"),
         ("....//....//....//....//etc/passwd", r"root:x:0:0:", "Linux nested traversal LFI"),
         ("/etc/passwd", r"root:x:0:0:", "Linux absolute LFI"),
+        ("../../../../etc/passwd%00", r"root:x:0:0:", "Null-byte LFI bypass"),
+        ("../../../../etc/passwd\x00.jpg", r"root:x:0:0:", "Null-byte + extension LFI bypass"),
         # Windows
         ("../../../../windows/win.ini", r"\[fonts\]|\[extensions\]", "Windows win.ini LFI"),
         ("C:\\windows\\win.ini", r"\[fonts\]|\[extensions\]", "Windows absolute win.ini LFI"),
         ("..\\..\\..\\..\\..\\..\\..\\..\\windows\\win.ini", r"\[fonts\]|\[extensions\]", "Windows traversal LFI"),
         # Wrapper
         ("php://filter/convert.base64-encode/resource=index.php", r"[a-zA-Z0-9+/=]{20,}", "PHP Filter Base64 LFI"),
+        ("php://input", None, "PHP input stream injection"),
+        ("data://text/plain;base64,U2VudHJ5VGVzdA==", r"SentryTest", "PHP data wrapper"),
+        ("expect://id", r"uid=", "PHP expect wrapper"),
+    ]
+
+    RFI_PAYLOADS = [
+        ("http://0.0.0.0:0/sentry_rfi_test", None, "Remote HTTP include attempt"),
+        ("https://0.0.0.0:0/sentry_rfi_test", None, "Remote HTTPS include attempt"),
     ]
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
@@ -75,10 +85,21 @@ class FileInclusionDetector(BaseDetector):
                         cand_url, param, val, method
                     )
                     baseline = await verifier.send_request(baseline_url, method, baseline_params, baseline_data)
+
+                    rfi_error_terms = re.compile(
+                        r"(failed to open stream|connection refused|timed out|"
+                        r"php_network_getaddresses|allow_url_include|"
+                        r"failed to open|name or service not known)",
+                        re.IGNORECASE,
+                    )
+                    wrapper_error_terms = re.compile(
+                        r"(php://input|failed to open|wrapper|warning)",
+                        re.IGNORECASE,
+                    )
                     
                     for payload, regex_pattern, desc in self.LFI_PAYLOADS:
                         # Make sure payload isn't already matching in baseline to avoid false positives
-                        if re.search(regex_pattern, baseline.body, re.I):
+                        if regex_pattern and re.search(regex_pattern, baseline.body, re.I):
                             continue
 
                         injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
@@ -86,7 +107,7 @@ class FileInclusionDetector(BaseDetector):
                         )
                         injected = await verifier.send_request(injected_url, method, injected_params, injected_data)
 
-                        if injected.status_code == 200 and re.search(regex_pattern, injected.body, re.I):
+                        if regex_pattern and injected.status_code == 200 and re.search(regex_pattern, injected.body, re.I):
                             # Verified LFI!
                             cand_findings.append(
                                 Finding(
@@ -107,6 +128,53 @@ class FileInclusionDetector(BaseDetector):
                                 )
                             )
                             # Stop testing this parameter once LFI is found
+                            break
+                        if regex_pattern is None and injected.status_code == 200:
+                            if wrapper_error_terms.search(injected.body) and not wrapper_error_terms.search(baseline.body):
+                                cand_findings.append(
+                                    Finding(
+                                        category=OwaspCategory.a01,
+                                        vuln_type="Local File Inclusion (LFI)",
+                                        severity=SeverityLevel.high,
+                                        url=cand_url,
+                                        parameter=param,
+                                        method=method,
+                                        payload=payload,
+                                        evidence=f"Possible wrapper-based file inclusion ({desc}).",
+                                        confidence_score=70.0,
+                                        detection_method="wrapper_error",
+                                        reproducible=True,
+                                        verified=True,
+                                        verification_request_snippet=injected.request_snippet,
+                                        verification_response_snippet=injected.response_snippet,
+                                    )
+                                )
+                                break
+
+                    for payload, _, desc in self.RFI_PAYLOADS:
+                        injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
+                            cand_url, param, payload, method
+                        )
+                        injected = await verifier.send_request(injected_url, method, injected_params, injected_data)
+                        if rfi_error_terms.search(injected.body) and not rfi_error_terms.search(baseline.body):
+                            cand_findings.append(
+                                Finding(
+                                    category=OwaspCategory.a01,
+                                    vuln_type="Remote File Inclusion (RFI)",
+                                    severity=SeverityLevel.high,
+                                    url=cand_url,
+                                    parameter=param,
+                                    method=method,
+                                    payload=payload,
+                                    evidence=f"Possible RFI attempt triggered error response ({desc}).",
+                                    confidence_score=70.0,
+                                    detection_method="remote_include",
+                                    reproducible=True,
+                                    verified=True,
+                                    verification_request_snippet=injected.request_snippet,
+                                    verification_response_snippet=injected.response_snippet,
+                                )
+                            )
                             break
                 except Exception as e:
                     logger.error("LFI verification failed for %s param %s: %s", cand_url, param, e)

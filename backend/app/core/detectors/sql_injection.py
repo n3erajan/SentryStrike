@@ -44,8 +44,13 @@ class SQLInjectionDetector(BaseDetector):
 
     PRIORITY_2_PARAMS = {
         "name", "email", "username", "user", "account",
-        "category", "product", "item", "page",
+        "category", "product", "item",
         "date", "time", "from", "to",
+    }
+
+    EXCLUDED_PARAMS = {
+        "page", "file", "path", "include", "template", "doc", "dir", "load",
+        "cmd", "exec", "command", "run", "shell", "ping",
     }
 
     def __init__(self):
@@ -138,6 +143,9 @@ class SQLInjectionDetector(BaseDetector):
             2 = high priority (P1), 1 = medium (P2), 0 = low/generic, -1 = skip
         """
         lowered = param_name.lower()
+
+        if lowered in self.EXCLUDED_PARAMS:
+            return -1
 
         # P1 params
         if lowered in self.PRIORITY_1_PARAMS:

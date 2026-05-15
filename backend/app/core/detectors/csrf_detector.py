@@ -14,6 +14,7 @@ class CSRFDetector(BaseDetector):
 
     csrf_keywords = {"token", "csrf", "xsrf", "user_token", "session_token"}
     state_changing_actions = {"password", "update", "change", "profile", "user", "admin", "delete", "add", "create", "settings", "save"}
+    login_indicators = {"login", "signin", "sign-in", "authenticate", "auth", "session"}
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
@@ -33,10 +34,19 @@ class CSRFDetector(BaseDetector):
             form_url = getattr(form, "action", getattr(form, "page_url", ""))
             form_method = getattr(form, "method", "POST").upper()
             raw_inputs = list(getattr(form, "inputs", []))
+            input_names_lower = {getattr(inp, "name", "").lower() for inp in raw_inputs}
             
             # Check if form controls state-changing action
             url_path_lower = urlparse(form_url).path.lower()
             is_state_changing = any(kw in url_path_lower for kw in self.state_changing_actions)
+
+            # Skip login/auth forms (handled by auth detector)
+            if any(tok in url_path_lower for tok in self.login_indicators):
+                continue
+            if "password" in input_names_lower and (
+                "username" in input_names_lower or "email" in input_names_lower
+            ):
+                continue
             
             if form_method == "POST" or is_state_changing:
                 form_candidates.append((form_url, form_method, raw_inputs))
@@ -93,7 +103,12 @@ class CSRFDetector(BaseDetector):
                     # 2. Response body doesn't contain a clear CSRF/token validation error (like "CSRF token invalid", "Forbidden", etc.)
                     if response.status_code in [200, 302, 303]:
                         body_lower = response.body.lower()
-                        error_terms = ["csrf token", "invalid token", "csrf validation failed", "unauthorized request", "token mismatch"]
+                        error_terms = [
+                            "csrf token", "invalid token", "csrf validation failed",
+                            "unauthorized request", "token mismatch", "forbidden",
+                            "access denied", "request verification", "invalid request",
+                            "security token", "form token",
+                        ]
                         if not any(term in body_lower for term in error_terms):
                             evidence_msg = "Form submitted successfully with a tampered/missing CSRF token."
                             if csrf_param:
