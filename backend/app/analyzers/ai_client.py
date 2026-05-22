@@ -12,7 +12,7 @@ class OllamaClient:
     def __init__(self) -> None:
         self.settings = get_settings()
 
-    async def generate_json(self, prompt: str, fallback: dict) -> dict:
+    async def generate_json(self, prompt: str) -> dict:
         payload = {
             "model": self.settings.ollama_model,
             "prompt": prompt,
@@ -31,15 +31,15 @@ class OllamaClient:
                 text = response.json().get("response", "")
                 return self._extract_json(text)
             except Exception as exc:
-                logger.warning("ollama call attempt %s failed: %s", attempt, exc)
+                logger.warning("ollama call attempt %s failed: %s: %s", attempt, type(exc).__name__, exc)
 
-        return fallback
+        raise RuntimeError("Ollama failed to generate JSON after retries")
 
-    async def generate_json_list(self, prompt: str, expected_count: int, fallback: dict) -> list[dict]:
+    async def generate_json_list(self, prompt: str, expected_count: int) -> list[dict]:
         """Send a single prompt expecting a JSON array response with *expected_count* items.
 
-        Falls back to a list of *fallback* dicts if the AI response cannot be
-        parsed or has the wrong length.
+        Raises RuntimeError if the AI response cannot be
+        parsed or has the wrong length after retries.
         """
         payload = {
             "model": self.settings.ollama_model,
@@ -47,7 +47,6 @@ class OllamaClient:
             "stream": False,
             "format": "json",
         }
-        fallback_list = [fallback.copy() for _ in range(expected_count)]
 
         for attempt in range(1, self.settings.ai_max_retries + 2):
             try:
@@ -63,9 +62,9 @@ class OllamaClient:
                     return items
                 logger.warning("ollama batch response had wrong structure; retrying (attempt %s)", attempt)
             except Exception as exc:
-                logger.warning("ollama batch call attempt %s failed: %s", attempt, exc)
+                logger.warning("ollama batch call attempt %s failed: %s: %s", attempt, type(exc).__name__, exc)
 
-        return fallback_list
+        raise RuntimeError(f"Ollama failed to return a list of {expected_count} items after retries")
 
     # ------------------------------------------------------------------
     # JSON extraction helpers
@@ -123,11 +122,10 @@ class OllamaClient:
         if not isinstance(parsed, list):
             return None
 
-        # Pad or truncate to expected length
-        if len(parsed) < expected_count:
-            logger.warning("batch response had %d items, expected %d — padding with last item", len(parsed), expected_count)
-            last = parsed[-1] if parsed else {}
-            parsed.extend([last.copy() for _ in range(expected_count - len(parsed))])
+        # If length doesn't match, return None to trigger a retry
+        if len(parsed) != expected_count:
+            logger.warning("batch response had %d items, expected %d", len(parsed), expected_count)
+            return None
         return [item if isinstance(item, dict) else {} for item in parsed[:expected_count]]
 
     def _extract_json(self, text: str) -> dict:

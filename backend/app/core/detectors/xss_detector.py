@@ -73,78 +73,20 @@ class XSSDetector(BaseDetector):
                 "via kwargs to enable authenticated scanning."
             )
 
-        # BUG 1 FIX: Use a list + seen set instead of a bare set().
-        # The original code used set() for deduplication, but form candidates
-        # are 5-tuples whose 5th element is a list (raw_inputs). Lists are not
-        # hashable, so every form candidate raised TypeError: unhashable type:
-        # 'list' and was silently dropped, meaning forms were never tested.
-        candidates: list[tuple] = []
-        seen_keys: set[tuple] = set()  # hashable dedup key: (url, param, method)
+        from app.core.crawler.param_discovery import ParamDiscovery
 
-        def _add_candidate(*args) -> None:
-            """Add a candidate only if (url, param, method) not already seen."""
-            key = (args[0], args[1], args[2])  # url, param, method
-            if key not in seen_keys:
-                seen_keys.add(key)
-                candidates.append(args)
+        def xss_filter(param_name: str) -> bool:
+            param_lower = param_name.lower()
+            is_reflective = (
+                param_lower in self.reflective_param_names
+                or any(tok in param_lower for tok in self._reflective_tokens)
+            )
+            has_xss_prefix = param_lower[:3] in self._form_input_prefixes
+            return is_reflective or has_xss_prefix
 
-        # ------------------------------------------------------------------ #
-        # 1. URL Parameter Candidate Selection
-        #    Picks up params that already appear in crawled URLs with query
-        #    strings (e.g. /search?q=foo captured during crawl).
-        # ------------------------------------------------------------------ #
-        for url in urls:
-            parsed = urlparse(url)
-            query_params = parse_qsl(parsed.query, keep_blank_values=True)
-            for param_name, param_value in query_params:
-                param_lower = param_name.lower()
-                if (
-                    param_lower in self.reflective_param_names
-                    or any(tok in param_lower for tok in self._reflective_tokens)
-                ):
-                    _add_candidate(url, param_name, "GET", param_value)
-
-        # ------------------------------------------------------------------ #
-        # 2. Form Input Candidate Selection
-        #    BUG 2 FIX: GET forms are now also added as URL parameter
-        #    candidates instead of only as form-POST candidates.
-        #    Previously, GET forms (e.g. DVWA /xss_r/?name=) would only
-        #    appear in the URL list if the crawler had already submitted them
-        #    and recorded the resulting URL with the query string. That rarely
-        #    happens, so GET form inputs were effectively invisible.
-        # ------------------------------------------------------------------ #
-        for form in forms:
-            form_url = getattr(form, "action", getattr(form, "page_url", ""))
-            form_method = getattr(form, "method", "POST").upper()
-            raw_inputs = list(getattr(form, "inputs", []))
-
-            for inp in raw_inputs:
-                inp_name = getattr(inp, "name", "")
-                inp_type = getattr(inp, "input_type", "text").lower()
-
-                if not inp_name:
-                    continue
-
-                is_testable_type = inp_type in {
-                    "text", "search", "url", "email", "textarea",
-                    "tel", "hidden", "",
-                }
-                has_xss_prefix = inp_name.lower()[:3] in self._form_input_prefixes
-
-                if not (is_testable_type or has_xss_prefix):
-                    continue
-
-                if form_method == "GET":
-                    # BUG 2 FIX: Treat GET form fields as URL query parameters.
-                    # Inject directly into the URL query string — no form_inputs
-                    # needed because GET params are self-contained.
-                    _add_candidate(form_url, inp_name, "GET", "")
-                else:
-                    # POST form: pass the full raw_inputs list so the verifier
-                    # can reconstruct the complete form body.
-                    # BUG 1 FIX: raw_inputs is stored in a list-based candidate
-                    # tuple, not in a set, so the unhashable-list crash is gone.
-                    _add_candidate(form_url, inp_name, form_method, "", raw_inputs)
+        candidates = ParamDiscovery.build_candidates(
+            urls, forms, filter_fn=xss_filter
+        )
 
         if not candidates:
             logger.debug("XSSDetector: no testable candidates found across %d URLs and %d forms.", len(urls), len(forms))

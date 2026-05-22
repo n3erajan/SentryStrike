@@ -1,16 +1,34 @@
 import asyncio
 import logging
+import pathlib
 import re
 from dataclasses import dataclass, field
 from urllib import robotparser
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 from app.config import get_settings
-from app.core.crawler.url_parser import normalize_url, same_domain
+from app.core.crawler.url_parser import normalize_url, same_domain, normalize_for_dedupe
 
 logger = logging.getLogger(__name__)
+
+STATIC_EXTENSIONS = {
+    # Stylesheets & scripts
+    ".css", ".js", ".map",
+    # Images
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".webp", ".bmp", ".tiff",
+    # Fonts
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    # Media
+    ".mp4", ".mp3", ".ogg", ".webm", ".avi",
+    # Documents & data (not web endpoints)
+    ".pdf", ".xml", ".json", ".csv", ".xls", ".xlsx",
+    # Archives
+    ".zip", ".tar", ".gz",
+}
 
 
 @dataclass
@@ -42,9 +60,27 @@ class WebSpider:
     async def crawl(self, root_url: str, max_depth: int | None = None) -> CrawlResult:
         max_depth = max_depth if max_depth is not None else self.settings.crawl_depth
         visited: set[str] = set()
-        queue: list[tuple[str, int]] = [(root_url, 0)]
+        queue: list[tuple[str, int]] = []
         forms: list[HtmlForm] = []
         discovered_urls: list[str] = []
+
+        def enqueue(url_candidate: str, depth: int):
+            if max_depth is not None and depth > max_depth:
+                return
+            
+            p = urlparse(url_candidate)
+            ext = pathlib.PurePosixPath(p.path).suffix.lower()
+            if ext in STATIC_EXTENSIONS:
+                logger.debug("skipping static asset: %s", url_candidate)
+                return
+
+            norm = normalize_for_dedupe(url_candidate)
+            if norm not in visited:
+                visited.add(norm)
+                queue.append((url_candidate, depth))
+
+        enqueue(root_url, 0)
+
 
         robots = await self._load_robots(root_url)
 
@@ -78,7 +114,7 @@ class WebSpider:
                         for loc in locs:
                             loc_clean = loc.strip()
                             if loc_clean and same_domain(root_url, loc_clean):
-                                queue.append((loc_clean, 0))
+                                enqueue(loc_clean, 0)
                 except Exception as e:
                     logger.warning("Failed to fetch sitemap %s: %s", sitemap_url, e)
 
@@ -91,18 +127,14 @@ class WebSpider:
             ]
             for path in common_paths:
                 brute_url = normalize_url(root_url, path)
-                if brute_url not in visited and brute_url not in [q[0] for q in queue]:
-                    queue.append((brute_url, 0))
+                enqueue(brute_url, 0)
 
             # 3. Main crawling loop
             while queue and len(discovered_urls) < self.settings.crawl_max_urls:
                 url, depth = queue.pop(0)
-                if url in visited or depth > max_depth:
-                    continue
                 if robots is not None and not robots.can_fetch("*", url):
                     continue
 
-                visited.add(url)
                 try:
                     response = await client.get(url)
                 except Exception as exc:
@@ -129,8 +161,8 @@ class WebSpider:
 
                 for link in links:
                     normalized = normalize_url(url, link)
-                    if same_domain(root_url, normalized) and normalized not in visited:
-                        queue.append((normalized, depth + 1))
+                    if same_domain(root_url, normalized):
+                        enqueue(normalized, depth + 1)
 
                 await asyncio.sleep(max(0.01, 1.0 / self.settings.crawl_rate_limit_per_second))
 
@@ -281,7 +313,7 @@ class WebSpider:
             action = form.get("action", page_url)
             method = form.get("method", "GET").upper()
             inputs = []
-            for inp in form.find_all(["input", "textarea", "select"]):
+            for inp in form.find_all(["input", "textarea", "select", "button"]):
                 name = inp.get("name")
                 if not name:
                     continue
@@ -289,12 +321,11 @@ class WebSpider:
                     inp_type = "textarea"
                 elif inp.name == "select":
                     inp_type = "select"
+                elif inp.name == "button":
+                    inp_type = getattr(inp, "type", "button") if hasattr(inp, "type") else "button"
                 else:
                     inp_type = inp.get("type", "text")
                 inputs.append(FormInput(name=name, input_type=inp_type))
             forms.append(HtmlForm(page_url=page_url, action=normalize_url(page_url, action), method=method, inputs=inputs))
-
-        if re.search(r"\.php\?|\.aspx\?", page_url, flags=re.I):
-            links.append(page_url)
 
         return forms, links

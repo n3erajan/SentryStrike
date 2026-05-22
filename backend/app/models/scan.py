@@ -29,10 +29,18 @@ class ScanStatistics(BaseModel):
     severity_breakdown: SeverityBreakdown = Field(default_factory=SeverityBreakdown)
 
 
+class AttackChain(BaseModel):
+    id: str
+    description: str
+    vulnerability_ids: list[str]
+    severity: str
+
+
 class ReportMetadata(BaseModel):
     generated_at: datetime | None = None
     generated_by: str = "ai"
     summary: str | None = None
+    attack_chains: list[AttackChain] = Field(default_factory=list)
 
 
 class Scan(Document):

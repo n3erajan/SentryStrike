@@ -386,19 +386,19 @@ class ExceptionHandlingDetector(BaseDetector):
 
         # A bare 500 with no body markers is Low if not require_body_match
         is_bare_500 = status == 500 and not matched
-        has_sensitive_header_only = sensitive_hdrs and not matched and status not in (500,)
 
+        # If we require a body match (e.g. 404 probes) and none found, ignore
         if require_body_match and not matched:
             return None
 
-        if not matched and not is_bare_500 and not has_sensitive_header_only:
+        # Do not flag non-500 responses unless there's an actual error pattern in the body.
+        # Merely having `x-powered-by` on a 200 OK is NOT verbose error handling (it's A05 Info Disclosure).
+        if not matched and not is_bare_500:
             return None
 
         # Determine final severity
         if not severity:
             if is_bare_500:
-                severity = SeverityLevel.low
-            elif has_sensitive_header_only:
                 severity = SeverityLevel.low
             else:
                 severity = SeverityLevel.low

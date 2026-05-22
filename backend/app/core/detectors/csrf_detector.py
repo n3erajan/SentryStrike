@@ -48,11 +48,16 @@ class CSRFDetector(BaseDetector):
             ):
                 continue
             
+            # Phase 3: Setup routes
+            setup_tokens = {"setup", "install", "wizard", "onboarding"}
+            is_setup_route = any(tok in url_path_lower for tok in setup_tokens)
+
+            
             if form_method == "POST" or is_state_changing:
-                form_candidates.append((form_url, form_method, raw_inputs))
+                form_candidates.append((form_url, form_method, raw_inputs, is_setup_route))
 
         async def verify_csrf(candidate) -> list[Finding]:
-            form_url, method, raw_inputs = candidate
+            form_url, method, raw_inputs, is_setup_route = candidate
             cand_findings = []
 
             # Identify if a CSRF token parameter exists
@@ -98,11 +103,24 @@ class CSRFDetector(BaseDetector):
 
                     response = await verifier.send_request(injected_url, method, injected_params, injected_data)
 
+                    # Phase 3: Add optional Origin/Referer bypass test
+                    bypass_headers = {
+                        "Origin": "https://evil.example",
+                        "Referer": "https://evil.example/malicious"
+                    }
+                    # Send bypass request if the original request succeeded (to minimize requests), 
+                    # but we can also just send it and check its success.
+                    bypass_response = await verifier.send_request(
+                        injected_url, method, injected_params, injected_data, headers=bypass_headers
+                    )
+
                     # Criteria for CSRF vulnerability:
                     # 1. HTTP 200 or 302 redirect (success indicator)
-                    # 2. Response body doesn't contain a clear CSRF/token validation error (like "CSRF token invalid", "Forbidden", etc.)
-                    if response.status_code in [200, 302, 303]:
-                        body_lower = response.body.lower()
+                    # 2. Response body doesn't contain a clear CSRF/token validation error
+                    response_to_check = bypass_response if bypass_response.status_code in [200, 302, 303] else response
+
+                    if response_to_check.status_code in [200, 302, 303]:
+                        body_lower = response_to_check.body.lower()
                         error_terms = [
                             "csrf token", "invalid token", "csrf validation failed",
                             "unauthorized request", "token mismatch", "forbidden",
@@ -114,11 +132,43 @@ class CSRFDetector(BaseDetector):
                             if csrf_param:
                                 evidence_msg = f"Form contains CSRF token parameter '{csrf_param}', but successfully accepted submission when it was tampered with."
                             
+                            # Phase 3: SameSite and Exploitation Context
+                            samesite_attr = None
+                            for resp in [response, bypass_response]:
+                                set_cookie_headers = [v for k, v in resp.headers.items() if k.lower() == "set-cookie"]
+                                for header in set_cookie_headers:
+                                    cookie_parts = [p.strip().lower() for p in header.split(";")]
+                                    cookie_name = cookie_parts[0].split("=")[0] if "=" in cookie_parts[0] else ""
+                                    if cookie_name in session_cookies or any(tok in cookie_name for tok in ["session", "token", "sess"]):
+                                        for p in cookie_parts:
+                                            if p.startswith("samesite"):
+                                                samesite_attr = p.split("=")[1] if "=" in p else "strict"
+
+                            severity = SeverityLevel.low # CVSS profile alignment
+                            if samesite_attr == "strict":
+                                evidence_msg += " (Note: SameSite=Strict provides partial mitigation)."
+                            elif samesite_attr == "lax" and method == "GET":
+                                evidence_msg += " (Note: SameSite=Lax provides mitigation for safe HTTP methods)."
+                            elif samesite_attr == "lax" and method == "POST":
+                                severity = SeverityLevel.medium
+                                evidence_msg += " (Note: SameSite=Lax mitigates some cross-site POSTs in modern browsers)."
+                            else:
+                                if bypass_response.status_code in [200, 302, 303] and not is_setup_route:
+                                    severity = SeverityLevel.high
+                                elif is_setup_route:
+                                    evidence_msg += " (Downgraded: Setup/onboarding route)."
+                                    severity = SeverityLevel.low
+                                else:
+                                    severity = SeverityLevel.medium
+
+                            if bypass_response.status_code in [200, 302, 303]:
+                                evidence_msg += " Exploit succeeded even with foreign Origin/Referer."
+
                             cand_findings.append(
                                 Finding(
                                     category=OwaspCategory.a01,
                                     vuln_type="Cross-Site Request Forgery (CSRF)",
-                                    severity=SeverityLevel.high,
+                                    severity=severity,
                                     url=form_url,
                                     parameter=csrf_param or "missing_token",
                                     method=method,
@@ -127,8 +177,8 @@ class CSRFDetector(BaseDetector):
                                     detection_method="token_bypass",
                                     reproducible=True,
                                     verified=True,
-                                    verification_request_snippet=response.request_snippet,
-                                    verification_response_snippet=response.response_snippet,
+                                    verification_request_snippet=response_to_check.request_snippet,
+                                    verification_response_snippet=response_to_check.response_snippet,
                                 )
                             )
                 except Exception as e:

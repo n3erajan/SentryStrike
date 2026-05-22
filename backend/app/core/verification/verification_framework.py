@@ -268,10 +268,12 @@ class FindingDeduplicator:
         if not findings:
             return []
 
-        # Group by (url, parameter, vuln_type)
+        # Group by (canonical_url, parameter, vuln_type)
         groups: dict[tuple, list[Finding]] = {}
         for finding in findings:
-            key = (finding.url, finding.parameter, finding.vuln_type)
+            parsed_url = urlparse(finding.url)
+            canonical_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+            key = (canonical_url, finding.parameter, finding.vuln_type)
             if key not in groups:
                 groups[key] = []
             groups[key].append(finding)
@@ -350,3 +352,54 @@ class URLParameterBuilder:
         else:
             # For POST, put params in body
             return base_url, {}, query_params
+
+
+class FormPayloadBuilder:
+    """Shared utility for building full form POST bodies with sibling fields.
+
+    Extracted from XSSVerifier._build_form_payload so that SQLi, XSS, and
+    other verifiers all construct form payloads the same way.
+    """
+
+    @staticmethod
+    def build(
+        form_inputs: list,
+        target_param: str,
+        target_value: str,
+    ) -> dict[str, str]:
+        """Build a form payload dict from *form_inputs*, injecting
+        *target_value* into *target_param* and filling siblings with
+        benign defaults.
+
+        Args:
+            form_inputs: List of form input objects (must have ``.name``
+                and optionally ``.input_type`` / ``.value``).
+            target_param: The parameter name to inject into.
+            target_value: The value to inject.
+
+        Returns:
+            Dict suitable for ``data=`` in an ``httpx`` POST request.
+        """
+        payload: dict[str, str] = {}
+        for inp in form_inputs:
+            name = getattr(inp, "name", "")
+            if not name:
+                continue
+            inp_type = getattr(inp, "input_type", "text").lower()
+            if name == target_param:
+                payload[name] = target_value
+            elif inp_type == "password":
+                payload[name] = "sntry_password123"
+            elif inp_type in ("submit", "button"):
+                payload[name] = "Submit"
+            elif inp_type == "hidden":
+                # Preserve hidden fields (CSRF tokens, etc.)
+                payload[name] = getattr(inp, "value", "")
+            else:
+                payload[name] = "sntry_test_val"
+
+        # Ensure the target parameter is always present
+        if target_param not in payload:
+            payload[target_param] = target_value
+
+        return payload

@@ -17,6 +17,7 @@ from app.core.detectors.base_detector import Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
 from app.core.verification.verification_framework import (
     BaseVerifier,
+    FormPayloadBuilder,
     URLParameterBuilder,
     VerificationResult,
 )
@@ -85,6 +86,45 @@ class XSSVerifier(BaseVerifier):
                 findings.append(dom_finding)
         except Exception as e:
             logger.debug("Failed to perform DOM XSS check: %s", e)
+
+        # Check for simple reflection using a benign canary first.
+        # If the parameter isn't reflected at all, there's no point in testing active payloads.
+        try:
+            canary_payload = "sntry_xss_test_123"
+            if method.upper() == "POST" and form_inputs is not None:
+                canary_url = url
+                canary_params = None
+                canary_data = self._build_form_payload(form_inputs, parameter, canary_payload)
+            else:
+                canary_url, canary_params, canary_data = URLParameterBuilder.inject_parameter(
+                    url, parameter, canary_payload, method
+                )
+            
+            canary_resp = await self.http_verifier.send_request(
+                canary_url, method, canary_params, canary_data
+            )
+            
+            is_canary_reflected, _, _ = self._detect_reflection(canary_payload, canary_resp.body)
+            
+            # For POST requests, also check if it's stored and reflected via GET
+            if not is_canary_reflected or method.upper() == "POST":
+                display_url = url.split("?")[0]
+                stored_resp = await self.http_verifier.send_request(display_url, "GET")
+                is_stored_reflected, _, _ = self._detect_reflection(canary_payload, stored_resp.body)
+                if is_stored_reflected:
+                    is_canary_reflected = True
+
+            if not is_canary_reflected:
+                return VerificationResult(
+                    is_vulnerable=False,
+                    confidence_score=0.0,
+                    detection_method="canary_check",
+                    findings=[],
+                    evidence={"reflected": False, "reason": "Canary payload not reflected"},
+                )
+        except Exception as e:
+            logger.debug("Failed to perform canary reflection check: %s", e)
+            # If canary check fails completely, we'll continue and let active payloads fail too
 
         for payload_type, payload in self.XSS_PAYLOADS.items():
             result = await self._test_payload(
@@ -375,26 +415,8 @@ class XSSVerifier(BaseVerifier):
     def _build_form_payload(
         self, form_inputs: list, target_param: str, target_value: str
     ) -> dict:
-        payload: dict[str, str] = {}
-        for inp in form_inputs:
-            name = getattr(inp, "name", "")
-            if not name:
-                continue
-            inp_type = getattr(inp, "input_type", "text").lower()
-            if name == target_param:
-                payload[name] = target_value
-            elif inp_type == "password":
-                payload[name] = "sntry_password123"
-            elif inp_type in ("submit", "button"):
-                payload[name] = "Submit"
-            else:
-                payload[name] = "sntry_test_val"
-
-        # Ensure the target parameter is always present even if not in form_inputs
-        if target_param not in payload:
-            payload[target_param] = target_value
-
-        return payload
+        """Delegate to shared FormPayloadBuilder."""
+        return FormPayloadBuilder.build(form_inputs, target_param, target_value)
 
     # ---------------------------------------------------------------------- #
     # Confidence and severity

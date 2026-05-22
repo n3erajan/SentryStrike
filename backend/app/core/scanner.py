@@ -23,6 +23,7 @@ from app.core.detectors.file_inclusion import FileInclusionDetector
 from app.core.detectors.file_upload import FileUploadDetector
 from app.core.detectors.csrf_detector import CSRFDetector
 from app.core.detectors.ssrf_detector import SSRFDetector
+from app.core.detectors.sensitive_paths import SensitivePathsDetector
 from app.core.verification.verification_framework import FindingDeduplicator
 from app.database.repositories.scan_repository import ScanRepository
 from app.integrations.cve_database import CveDatabaseService
@@ -37,6 +38,7 @@ from app.models.vulnerability import (
     SeverityLevel,
     Vulnerability,
     normalize_exploitability,
+    AiAnalysisStatus,
 )
 from app.utils.cvss_calculator import CvssCalculator
 
@@ -67,6 +69,7 @@ class ScanOrchestrator:
             CSRFDetector(),
             SSRFDetector(),
             FileUploadDetector(),
+            SensitivePathsDetector(),
         ]
         self.supply_chain_detector = SupplyChainDetector()
 
@@ -219,12 +222,21 @@ class ScanOrchestrator:
 
             # PHASE 2: Analyze all findings with AI
             logger.info("phase 2 starting: analyzing %d findings", len(vulnerabilities))
-            vulnerabilities = await self._analyze_all_findings(vulnerabilities)
+            vulnerabilities = await self._analyze_all_findings(vulnerabilities, scan)
+
+            # Phase 1.4: Sync severity from CVSS
+            for v in vulnerabilities:
+                severity_str = CvssCalculator.get_severity(v.cvss_score)
+                v.severity = SeverityLevel(severity_str)
+
             vulnerabilities = self._compute_priority_ranks(vulnerabilities)
             vulnerabilities.sort(key=lambda v: v.cvss_score, reverse=True)
             logger.info("phase 2 complete: analyzed %d findings", len(vulnerabilities))
 
             scan.vulnerabilities = vulnerabilities
+            
+            # Phase 4.4 Attack chain synthesis
+            scan.report_metadata.attack_chains = self._synthesize_attack_chains(vulnerabilities)
             scan.statistics.total_vulnerabilities = len(vulnerabilities)
             scan.statistics.severity_breakdown.critical = len([v for v in vulnerabilities if v.severity.value == "Critical"])
             scan.statistics.severity_breakdown.high = len([v for v in vulnerabilities if v.severity.value == "High"])
@@ -281,18 +293,21 @@ class ScanOrchestrator:
         if self._cancel_flags.get(scan_id):
             raise asyncio.CancelledError
 
-    async def _analyze_all_findings(self, vulnerabilities: list[Vulnerability]) -> list[Vulnerability]:
+    async def _analyze_all_findings(self, vulnerabilities: list[Vulnerability], scan: 'Scan') -> list[Vulnerability]:
         """Analyze findings with AI using batched calls.
 
         Instead of one AI call per vulnerability, vulnerabilities are grouped
-        into batches (up to ``_AI_BATCH_SIZE`` each) and each batch is sent as
-        a single prompt.  This typically reduces AI calls from N to 1-2.
+        into batches (up to ``BATCH_SIZE`` each) and each batch is sent as
+        a single prompt. If a batch fails, it falls back to analyzing them
+        individually. If individual analysis fails, it marks the status as failed.
         """
         if not vulnerabilities:
             return vulnerabilities
 
-        BATCH_SIZE = 10  # max vulns per AI call — keeps prompts within context limits
+        BATCH_SIZE = 3  # max vulns per AI call — keeps prompts within context limits
         analyzed: list[Vulnerability] = []
+        
+        tech_stack_str = ", ".join(t.name for t in scan.technology_stack) if scan.technology_stack else "Unknown"
 
         for batch_start in range(0, len(vulnerabilities), BATCH_SIZE):
             batch = vulnerabilities[batch_start : batch_start + BATCH_SIZE]
@@ -303,41 +318,37 @@ class ScanOrchestrator:
                 len(vulnerabilities),
             )
 
-            # Build a single prompt listing every vulnerability in this batch
-            vuln_descriptions = []
-            for i, vuln in enumerate(batch):
-                vuln_descriptions.append(
-                    f"[{i}] type={vuln.vuln_type}; category={vuln.category.value}; "
-                    f"severity={vuln.severity.value}; url={vuln.location.url}; "
-                    f"evidence={vuln.evidence.response_snippet or vuln.evidence.payload or 'n/a'}"
-                )
-
-            prompt = (
-                "You are a senior application security analyst. Analyze each vulnerability below and return "
-                "a JSON object with key \"results\" containing an array of objects, one per vulnerability, in the "
-                "SAME ORDER.\n\n"
-                "Each object MUST have these keys:\n"
-                "- exploitability: 'Easy' (no auth required, trivial payload, public exploit exists), "
-                "'Medium' (requires valid session or multi-step attack), or 'Hard' (requires chained exploits, "
-                "race conditions, or specific server config)\n"
-                "- business_impact: A SPECIFIC 1-2 sentence impact statement for THIS vulnerability at THIS URL. "
-                "Describe what an attacker can achieve. Do NOT use generic statements.\n"
-                "- confidence: float 0-1, probability this is a real vulnerability (not a false positive)\n"
-                "- false_positive_probability: float 0-1, probability this is NOT a real vulnerability\n"
-                "- remediation: A SPECIFIC fix for THIS vulnerability type. For CSRF say 'add CSRF tokens'; "
-                "for SQLi say 'use parameterized queries'; do NOT say 'implement HTTPS' unless it is transport.\n\n"
-                "Vulnerabilities:\n" + "\n".join(vuln_descriptions)
-            )
-
-            results = await self.ai_client.generate_json_list(
-                prompt,
-                expected_count=len(batch),
-                fallback=self._get_fallback_for(""),
-            )
+            results = []
+            try:
+                results = await self._analyze_batch(batch, tech_stack_str)
+            except Exception as e:
+                logger.warning("Batch analysis failed for %d-%d, falling back to individual: %s: %s", batch_start + 1, batch_start + len(batch), type(e).__name__, e)
+                for vuln in batch:
+                    try:
+                        res = await self._analyze_single(vuln, tech_stack_str)
+                        results.append(res)
+                    except Exception as single_e:
+                        logger.warning("Single analysis failed for %s: %s: %s", vuln.id, type(single_e).__name__, single_e)
+                        results.append({"ai_analysis_status": "failed"})
 
             # Apply AI results back to each vulnerability
             for idx, (vuln, result) in enumerate(zip(batch, results), start=batch_start + 1):
-                fallback = self._get_fallback_for(vuln.vuln_type)
+                if result.get("ai_analysis_status") == "failed":
+                    vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.failed
+                    # Set CVSS without AI enrichments
+                    cvss = CvssCalculator.from_vulnerability_context(
+                        vuln_type=vuln.vuln_type,
+                        requires_auth=False,
+                        confidence=0.8,
+                        impact=0.9 if vuln.severity.value in {"Critical", "High"} else 0.5,
+                    )
+                    vuln.cvss_score = cvss.score
+                    vuln.cvss_vector = cvss.vector
+                    vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
+                    analyzed.append(vuln)
+                    continue
+
+                fallback = self._get_fallback_for(vuln.vuln_type, scan.technology_stack)
                 confidence = float(result.get("confidence", fallback["confidence"]))
                 impact = 0.9 if vuln.severity.value in {"Critical", "High"} else 0.5
                 cvss = CvssCalculator.from_vulnerability_context(
@@ -356,8 +367,11 @@ class ScanOrchestrator:
                 vuln.ai_analysis.false_positive_probability = float(
                     result.get("false_positive_probability", fallback["false_positive_probability"])
                 )
+                vuln.ai_analysis.false_positive_reasoning = result.get("false_positive_reasoning")
+                vuln.ai_analysis.exploitability_reasoning = result.get("exploitability_reasoning")
                 vuln.ai_analysis.remediation = result.get("remediation", fallback["remediation"])
                 vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
+                vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.success
 
                 analyzed.append(vuln)
 
@@ -365,12 +379,110 @@ class ScanOrchestrator:
 
         return analyzed
 
-    def _get_fallback_for(self, vuln_type: str) -> dict:
+    async def _analyze_batch(self, batch: list[Vulnerability], tech_stack_str: str) -> list[dict]:
+        vuln_descriptions = []
+        for i, vuln in enumerate(batch):
+            auth_ctx = "requires_auth" if "cookie" in (vuln.evidence.request_snippet or "").lower() else "unknown_auth"
+            vuln_descriptions.append(
+                f"[{i}] type={vuln.vuln_type}; category={vuln.category.value}; "
+                f"severity={vuln.severity.value}; url={vuln.location.url}; "
+                f"method={vuln.location.http_method}; param={vuln.location.parameter or 'none'}; "
+                f"auth_context={auth_ctx}; "
+                f"evidence={vuln.evidence.response_snippet or vuln.evidence.payload or 'n/a'}"
+            )
+            
+        prompt = self._build_prompt(tech_stack_str, vuln_descriptions, is_batch=True)
+        return await self.ai_client.generate_json_list(prompt, expected_count=len(batch))
+
+    async def _analyze_single(self, vuln: Vulnerability, tech_stack_str: str) -> dict:
+        auth_ctx = "requires_auth" if "cookie" in (vuln.evidence.request_snippet or "").lower() else "unknown_auth"
+        vuln_desc = (
+            f"type={vuln.vuln_type}; category={vuln.category.value}; "
+            f"severity={vuln.severity.value}; url={vuln.location.url}; "
+            f"method={vuln.location.http_method}; param={vuln.location.parameter or 'none'}; "
+            f"auth_context={auth_ctx}; "
+            f"evidence={vuln.evidence.response_snippet or vuln.evidence.payload or 'n/a'}"
+        )
+        prompt = self._build_prompt(tech_stack_str, [vuln_desc], is_batch=False)
+        return await self.ai_client.generate_json(prompt)
+
+    def _build_prompt(self, tech_stack_str: str, vuln_descriptions: list[str], is_batch: bool) -> str:
+        if is_batch:
+            return (
+                "You are a senior application security analyst. Analyze each vulnerability below and return "
+                "a JSON object with key \"results\" containing an array of objects, one per vulnerability, in the "
+                "SAME ORDER.\n\n"
+                f"Technology Stack: {tech_stack_str}\n\n"
+                "Each object MUST have these keys:\n"
+                "- exploitability: 'Easy' (no auth required, trivial payload, public exploit exists), "
+                "'Medium' (requires valid session or multi-step attack), or 'Hard' (requires chained exploits, "
+                "race conditions, or specific server config)\n"
+                "- exploitability_reasoning: Provide a 1 sentence reasoning justifying the exploitability rating.\n"
+                "- business_impact: A SPECIFIC 1-2 sentence impact statement for THIS vulnerability at THIS URL. "
+                "Describe what an attacker can achieve (e.g., 'An attacker can exfiltrate the users table'). "
+                "CRITICAL: REJECT generic business_impact statements like 'potential security impact'. "
+                "You MUST require a concrete attacker outcome.\n"
+                "- confidence: float 0-1, probability this is a real vulnerability (not a false positive)\n"
+                "- false_positive_probability: float 0-1, probability this is NOT a real vulnerability\n"
+                "- false_positive_reasoning: Provide a 1 sentence reasoning justifying the false_positive_probability.\n"
+                "- remediation: A SPECIFIC fix for THIS vulnerability type referencing the Technology Stack where applicable. "
+                "For CSRF say 'add CSRF tokens'; for SQLi say 'use parameterized queries'; do NOT say 'implement HTTPS' unless it is transport.\n\n"
+                "Vulnerabilities:\n" + "\n".join(vuln_descriptions)
+            )
+        else:
+            return (
+                "You are a senior application security analyst. Analyze the vulnerability below and return "
+                "a JSON object.\n\n"
+                f"Technology Stack: {tech_stack_str}\n\n"
+                "The object MUST have these keys:\n"
+                "- exploitability: 'Easy' (no auth required, trivial payload, public exploit exists), "
+                "'Medium' (requires valid session or multi-step attack), or 'Hard' (requires chained exploits, "
+                "race conditions, or specific server config)\n"
+                "- exploitability_reasoning: Provide a 1 sentence reasoning justifying the exploitability rating.\n"
+                "- business_impact: A SPECIFIC 1-2 sentence impact statement for THIS vulnerability at THIS URL. "
+                "Describe what an attacker can achieve (e.g., 'An attacker can exfiltrate the users table'). "
+                "CRITICAL: REJECT generic business_impact statements like 'potential security impact'. "
+                "You MUST require a concrete attacker outcome.\n"
+                "- confidence: float 0-1, probability this is a real vulnerability (not a false positive)\n"
+                "- false_positive_probability: float 0-1, probability this is NOT a real vulnerability\n"
+                "- false_positive_reasoning: Provide a 1 sentence reasoning justifying the false_positive_probability.\n"
+                "- remediation: A SPECIFIC fix for THIS vulnerability type referencing the Technology Stack where applicable. "
+                "For CSRF say 'add CSRF tokens'; for SQLi say 'use parameterized queries'; do NOT say 'implement HTTPS' unless it is transport.\n\n"
+                "Vulnerability:\n" + "\n".join(vuln_descriptions)
+            )
+
+    def _get_fallback_for(self, vuln_type: str, tech_stack: list['TechnologyComponent'] = None) -> dict:
         remediation = "Apply defense-in-depth controls appropriate to this vulnerability class."
         for key, value in self._remediation_fallbacks.items():
             if key.lower() in vuln_type.lower() or vuln_type.lower() in key.lower():
                 remediation = value
                 break
+                
+        # Phase 4.2 Framework-specific remediation
+        stack_names = [t.name.lower() for t in (tech_stack or [])]
+        if "sql injection" in vuln_type.lower():
+            if "php" in stack_names:
+                remediation = "Use mysqli_prepare() / PDO."
+            elif "django" in stack_names:
+                remediation = "Use Django ORM."
+            elif "express" in stack_names or "node.js" in stack_names:
+                remediation = "Use parameterized queries."
+            elif "spring" in stack_names or "java" in stack_names:
+                remediation = "Use PreparedStatement."
+        elif "xss" in vuln_type.lower():
+            if "php" in stack_names:
+                remediation = "Use htmlspecialchars()."
+            elif "django" in stack_names:
+                remediation = "Use escape() in templates."
+        elif "csrf" in vuln_type.lower():
+            if "php" in stack_names:
+                remediation = "Store csrf_token in session and validate on POST."
+            elif "django" in stack_names:
+                remediation = "Use @csrf_protect."
+            elif "express" in stack_names or "node.js" in stack_names:
+                remediation = "Use csurf middleware."
+            elif "spring" in stack_names or "java" in stack_names:
+                remediation = "Enable Spring Security CSRF protection."
         return {
             "exploitability": "Medium",
             "business_impact": f"Potential security impact from {vuln_type or 'this issue'}.",
@@ -397,14 +509,22 @@ class ScanOrchestrator:
         vuln_type_lower = vuln.vuln_type.lower()
         severity = vuln.severity
 
+        # Phase 4.3: Preserve AI reasoning; only override on unambiguous proof
         if severity == SeverityLevel.critical and any(
             tok in vuln_type_lower
             for tok in ["command injection", "sql injection", "file inclusion", "file upload"]
         ):
-            return Exploitability.easy
+            if vuln.evidence.response_snippet and "root:" in vuln.evidence.response_snippet.lower():
+                return Exploitability.easy
 
-        if "xss" in vuln_type_lower:
-            return Exploitability.medium
+        if "csrf" in vuln_type_lower and "samesite" in (vuln.evidence.payload or vuln.evidence.response_snippet or "").lower():
+            if vuln.ai_analysis:
+                if not vuln.ai_analysis.exploitability_reasoning:
+                    vuln.ai_analysis.exploitability_reasoning = "SameSite attribute provides partial protection, increasing exploitation difficulty."
+            return Exploitability.hard if severity in (SeverityLevel.low, SeverityLevel.info) else Exploitability.medium
+
+        if vuln.ai_analysis and vuln.ai_analysis.exploitability:
+            return vuln.ai_analysis.exploitability
 
         if severity in (SeverityLevel.info, SeverityLevel.low):
             return Exploitability.hard
@@ -412,7 +532,40 @@ class ScanOrchestrator:
         if severity == SeverityLevel.high and vuln.evidence.request_snippet:
             return Exploitability.easy
 
-        return vuln.ai_analysis.exploitability or Exploitability.medium
+        return Exploitability.medium
+
+    def _synthesize_attack_chains(self, vulnerabilities: list[Vulnerability]) -> list['AttackChain']:
+        from uuid import uuid4
+        from app.models.scan import AttackChain
+        chains = []
+        
+        # Rule-based chains
+        # 1. CSRF to Command Injection
+        csrf_vulns = [v for v in vulnerabilities if "csrf" in v.vuln_type.lower()]
+        cmdi_vulns = [v for v in vulnerabilities if "command injection" in v.vuln_type.lower()]
+        for csrf in csrf_vulns:
+            for cmdi in cmdi_vulns:
+                if csrf.location.url == cmdi.location.url:
+                    chains.append(AttackChain(
+                        id=str(uuid4()),
+                        description=f"CSRF to Command Injection chain on {csrf.location.url}. An attacker can forge a request to execute arbitrary OS commands.",
+                        vulnerability_ids=[csrf.id, cmdi.id],
+                        severity="Critical"
+                    ))
+                    
+        # 2. Stored XSS + missing CSP -> session theft chain
+        xss_vulns = [v for v in vulnerabilities if "stored xss" in v.vuln_type.lower()]
+        csp_vulns = [v for v in vulnerabilities if "content security policy" in v.vuln_type.lower() or "csp" in v.vuln_type.lower()]
+        if xss_vulns and csp_vulns:
+            for xss in xss_vulns:
+                chains.append(AttackChain(
+                    id=str(uuid4()),
+                    description=f"Stored XSS combined with missing/weak CSP on {xss.location.url} facilitates reliable session theft.",
+                    vulnerability_ids=[xss.id] + [c.id for c in csp_vulns],
+                    severity="High"
+                ))
+                
+        return chains
 
     def _to_vulnerability(self, finding: Finding) -> Vulnerability:
         cvss_score = 0.0

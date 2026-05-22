@@ -14,6 +14,16 @@ class SecurityHeadersDetector(BaseDetector):
     def __init__(self) -> None:
         self.settings = get_settings()
 
+    def _cache_controls_sensitive(self, cc: str, pragma: str, expires: str) -> bool:
+        cc_lower = cc.lower()
+        if "no-store" in cc_lower:
+            return False
+        if "no-cache" in cc_lower and "must-revalidate" in cc_lower:
+            return False  # partial protection — skip or Info only
+        if "private" in cc_lower:
+            return False
+        return True  # flag missing cache hardening
+
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         checked = set()
@@ -81,14 +91,26 @@ class SecurityHeadersDetector(BaseDetector):
 
             # Evaluate Cache-Control presence
             cc = headers.get("cache-control", "")
-            if not cc or "no-store" not in cc:
+            pragma = headers.get("pragma", "")
+            expires = headers.get("expires", "")
+            
+            # Only report on pages that appear sensitive
+            set_cookies = headers.get("set-cookie", "")
+            is_sensitive = False
+            if set_cookies:
+                for cookie in set_cookies.split(","):
+                    if any(tok in cookie.lower() for tok in ["session", "token", "auth", "sid", "sessid", "jwt"]):
+                        is_sensitive = True
+                        break
+                        
+            if is_sensitive and self._cache_controls_sensitive(cc, pragma, expires):
                 findings.append(
                     Finding(
                         category=OwaspCategory.a05,
-                        vuln_type="Missing Cache-Control No-Store Header",
+                        vuln_type="Missing Cache-Control Hardening",
                         severity=SeverityLevel.low,
                         url=root_url,
-                        evidence=f"Cache-Control header is missing 'no-store': {response.headers.get('Cache-Control', 'None')}",
+                        evidence=f"Sensitive endpoint is missing strong cache controls: Cache-Control: {response.headers.get('Cache-Control', 'None')}",
                         verified=True
                     )
                 )

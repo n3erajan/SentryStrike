@@ -6,6 +6,7 @@ import httpx
 
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.verification.verification_framework import FormPayloadBuilder
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
@@ -15,14 +16,17 @@ class FileUploadDetector(BaseDetector):
     name = "file_upload"
 
     _upload_paths = [
-        "/uploads/",
-        "/files/",
-        "/upload/",
-        "/file/",
-        "/userfiles/",
-        "/static/uploads/",
-        "/content/uploads/",
-        "/hackable/uploads/",
+        "uploads/",
+        "files/",
+        "upload/",
+        "file/",
+        "userfiles/",
+        "static/uploads/",
+        "content/uploads/",
+        "hackable/uploads/",
+        "../uploads/",
+        "../hackable/uploads/",
+        "../../hackable/uploads/"
     ]
 
     _error_terms = [
@@ -82,7 +86,7 @@ class FileUploadDetector(BaseDetector):
         txt_name = "sentry_test.txt"
         txt_content = b"SENTRY_UPLOAD_TEST_CANARY"
 
-        accepted, response_text = await self._send_upload(
+        accepted, response = await self._send_upload(
             client,
             form_url,
             method,
@@ -94,7 +98,7 @@ class FileUploadDetector(BaseDetector):
         )
 
         if accepted:
-            candidate_urls = self._extract_candidate_urls(response_text, form_url, php_name)
+            candidate_urls = self._extract_candidate_urls(response, form_url, php_name)
             for path in self._upload_paths:
                 candidate_urls.append(urljoin(form_url, path + php_name))
 
@@ -121,7 +125,7 @@ class FileUploadDetector(BaseDetector):
                 )
                 return
 
-        accepted, _ = await self._send_upload(
+        accepted, response = await self._send_upload(
             client,
             form_url,
             method,
@@ -132,24 +136,47 @@ class FileUploadDetector(BaseDetector):
             "image/jpeg",
         )
         if accepted:
-            findings.append(
-                Finding(
-                    category=OwaspCategory.a04,
-                    vuln_type="Weak File Upload Validation",
-                    severity=SeverityLevel.high,
-                    url=form_url,
-                    parameter=file_field,
-                    method=method,
-                    payload=php_name,
-                    evidence="Dangerous extension accepted with spoofed image content-type.",
-                    confidence_score=80.0,
-                    detection_method="content_type_bypass",
-                    reproducible=True,
-                    verified=True,
-                )
-            )
+            candidate_urls = self._extract_candidate_urls(response, form_url, php_name)
+            for path in self._upload_paths:
+                candidate_urls.append(urljoin(form_url, path + php_name))
 
-        accepted, _ = await self._send_upload(
+            accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
+            if accessible_url:
+                findings.append(
+                    Finding(
+                        category=OwaspCategory.a04,
+                        vuln_type="Weak File Upload Validation",
+                        severity=SeverityLevel.critical,
+                        url=form_url,
+                        parameter=file_field,
+                        method=method,
+                        payload=php_name,
+                        evidence=f"Dangerous extension accepted with spoofed image content-type. Canary executed at {accessible_url}.",
+                        confidence_score=95.0,
+                        detection_method="content_type_bypass_execution",
+                        reproducible=True,
+                        verified=True,
+                    )
+                )
+            else:
+                findings.append(
+                    Finding(
+                        category=OwaspCategory.a04,
+                        vuln_type="Weak File Upload Validation",
+                        severity=SeverityLevel.high,
+                        url=form_url,
+                        parameter=file_field,
+                        method=method,
+                        payload=php_name,
+                        evidence="Dangerous extension accepted with spoofed image content-type.",
+                        confidence_score=80.0,
+                        detection_method="content_type_bypass",
+                        reproducible=True,
+                        verified=True,
+                    )
+                )
+
+        accepted, response = await self._send_upload(
             client,
             form_url,
             method,
@@ -160,24 +187,47 @@ class FileUploadDetector(BaseDetector):
             "image/jpeg",
         )
         if accepted:
-            findings.append(
-                Finding(
-                    category=OwaspCategory.a04,
-                    vuln_type="Double Extension Bypass",
-                    severity=SeverityLevel.high,
-                    url=form_url,
-                    parameter=file_field,
-                    method=method,
-                    payload="sentry_test.php.jpg",
-                    evidence="Double extension upload accepted with dangerous inner extension.",
-                    confidence_score=80.0,
-                    detection_method="double_extension",
-                    reproducible=True,
-                    verified=True,
-                )
-            )
+            candidate_urls = self._extract_candidate_urls(response, form_url, "sentry_test.php.jpg")
+            for path in self._upload_paths:
+                candidate_urls.append(urljoin(form_url, path + "sentry_test.php.jpg"))
 
-        accepted, response_text = await self._send_upload(
+            accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
+            if accessible_url:
+                findings.append(
+                    Finding(
+                        category=OwaspCategory.a04,
+                        vuln_type="Double Extension Bypass",
+                        severity=SeverityLevel.critical,
+                        url=form_url,
+                        parameter=file_field,
+                        method=method,
+                        payload="sentry_test.php.jpg",
+                        evidence=f"Double extension upload accepted with dangerous inner extension. Canary executed at {accessible_url}.",
+                        confidence_score=95.0,
+                        detection_method="double_extension_execution",
+                        reproducible=True,
+                        verified=True,
+                    )
+                )
+            else:
+                findings.append(
+                    Finding(
+                        category=OwaspCategory.a04,
+                        vuln_type="Double Extension Bypass",
+                        severity=SeverityLevel.high,
+                        url=form_url,
+                        parameter=file_field,
+                        method=method,
+                        payload="sentry_test.php.jpg",
+                        evidence="Double extension upload accepted with dangerous inner extension.",
+                        confidence_score=80.0,
+                        detection_method="double_extension",
+                        reproducible=True,
+                        verified=True,
+                    )
+                )
+
+        accepted, response = await self._send_upload(
             client,
             form_url,
             method,
@@ -187,7 +237,7 @@ class FileUploadDetector(BaseDetector):
             txt_content,
             "text/plain",
         )
-        if accepted and not self._has_error_terms(response_text):
+        if accepted and not self._has_error_terms(response.text or ""):
             findings.append(
                 Finding(
                     category=OwaspCategory.a04,
@@ -215,7 +265,7 @@ class FileUploadDetector(BaseDetector):
         filename: str,
         content: bytes,
         content_type: str,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, httpx.Response]:
         data = self._build_form_payload(raw_inputs, file_field)
         files = {file_field: (filename, content, content_type)}
 
@@ -227,32 +277,45 @@ class FileUploadDetector(BaseDetector):
         )
         body = response.text or ""
         accepted = response.status_code in {200, 201, 202, 204, 302, 303} and not self._has_error_terms(body)
-        return accepted, body
+        return accepted, response
 
     def _build_form_payload(self, raw_inputs: list, file_field: str) -> dict:
-        payload: dict[str, str] = {}
-        for inp in raw_inputs:
-            name = getattr(inp, "name", "")
-            if not name or name == file_field:
-                continue
-            inp_type = getattr(inp, "input_type", "text").lower()
-            if inp_type == "password":
-                payload[name] = "sntry_password123"
-            elif inp_type in ("submit", "button"):
-                payload[name] = "Submit"
-            else:
-                payload[name] = "sntry_test_val"
+        payload = FormPayloadBuilder.build(raw_inputs)
+        if file_field in payload:
+            del payload[file_field]
         return payload
 
     def _has_error_terms(self, body: str) -> bool:
         lowered = body.lower()
         return any(term in lowered for term in self._error_terms)
 
-    def _extract_candidate_urls(self, body: str, base_url: str, filename: str) -> list[str]:
+    def _extract_candidate_urls(self, response: httpx.Response, base_url: str, filename: str) -> list[str]:
         urls: list[str] = []
-        if not body:
-            return urls
+        body = response.text or ""
 
+        # 1. Check Location header
+        location = response.headers.get("Location")
+        if location and filename in location:
+            urls.append(urljoin(base_url, location))
+            
+        # 2. Extract from JSON
+        import json
+        try:
+            data = response.json()
+            def find_urls(obj):
+                if isinstance(obj, dict):
+                    for v in obj.values():
+                        find_urls(v)
+                elif isinstance(obj, list):
+                    for v in obj:
+                        find_urls(v)
+                elif isinstance(obj, str) and filename in obj:
+                    urls.append(urljoin(base_url, obj))
+            find_urls(data)
+        except json.JSONDecodeError:
+            pass
+
+        # 3. HTML / regex fallback
         for match in re.findall(r"https?://[^\"'\s>]+", body, re.I):
             if filename in match:
                 urls.append(match)

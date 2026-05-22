@@ -15,3 +15,16 @@ def same_domain(url_a: str, url_b: str) -> bool:
 def extract_query_params(url: str) -> list[str]:
     parsed = urlparse(url)
     return list(parse_qs(parsed.query).keys())
+
+
+def normalize_for_dedupe(url: str) -> str:
+    p = urlparse(url.strip())
+    host = p.hostname or ""
+    port = p.port
+    if (p.scheme == "http" and port == 80) or \
+       (p.scheme == "https" and port == 443):
+        port = None
+    netloc = host if port is None else f"{host}:{port}"
+    path = p.path.rstrip("/") or "/"
+    return urlunparse((p.scheme.lower(), netloc, path,
+                       p.params, p.query, ""))

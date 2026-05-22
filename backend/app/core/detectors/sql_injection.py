@@ -53,6 +53,9 @@ class SQLInjectionDetector(BaseDetector):
         "cmd", "exec", "command", "run", "shell", "ping",
     }
 
+    # Input types to skip (submit buttons, file uploads, etc.)
+    _SKIP_INPUT_TYPES = {"submit", "button", "reset", "image", "file", "checkbox", "radio"}
+
     def __init__(self):
         super().__init__()
         self.verifier = SQLiVerifier(timeout_seconds=10.0)
@@ -89,51 +92,14 @@ class SQLInjectionDetector(BaseDetector):
         self,
         urls: list[str],
         forms: list[object],
-    ) -> list[tuple[str, str, str, str]]:
+    ) -> list[tuple]:
         """
-        Phase 1: Reconnaissance - Extract candidates without verifying.
-
-        Returns list of (url, parameter, method, baseline_value) tuples.
+        Phase 1 & 2: Reconnaissance - Extract candidates using ParamDiscovery.
         """
-        candidates = []
-
-        # --- URL parameter analysis ---
-        for url in urls:
-            parsed = urlparse(url)
-            query_params = parse_qsl(parsed.query, keep_blank_values=True)
-
-            for param_name, param_value in query_params:
-                priority = self._get_parameter_priority(param_name)
-
-                # Only test parameters with heuristic priority
-                if priority >= 0:
-                    candidates.append((url, param_name, "GET", param_value))
-
-        # --- Form parameter analysis ---
-        for form in forms:
-            form_inputs = getattr(form, "inputs", [])
-            if not form_inputs:
-                continue
-
-            form_url = getattr(form, "action", getattr(form, "page_url", ""))
-            form_method = getattr(form, "method", "POST").upper()
-
-            for input_elem in form_inputs:
-                input_name = getattr(input_elem, "name", "")
-                input_type = getattr(input_elem, "type", "text")
-
-                # Skip submit buttons, file uploads, etc.
-                if input_type in ("submit", "button", "reset", "file", "checkbox", "radio"):
-                    continue
-
-                priority = self._get_parameter_priority(input_name)
-
-                # Only test parameters with heuristic priority
-                if priority >= 0:
-                    input_value = getattr(input_elem, "value", "")
-                    candidates.append((form_url, input_name, form_method, input_value))
-
-        return candidates
+        from app.core.crawler.param_discovery import ParamDiscovery
+        return ParamDiscovery.build_candidates(
+            urls, forms, filter_fn=lambda p: self._get_parameter_priority(p) >= 0
+        )
 
     def _get_parameter_priority(self, param_name: str) -> int:
         """
@@ -172,23 +138,33 @@ class SQLInjectionDetector(BaseDetector):
 
     async def _verify_candidates(
         self,
-        candidates: list[tuple[str, str, str, str]],
+        candidates: list[tuple],
     ) -> list[Finding]:
         """
         Phase 2: Active Testing - Verify each candidate.
 
         Returns findings from successful verifications.
+        Handles both 4-tuple (GET/URL) and 5-tuple (POST form) candidates.
         """
         findings: list[Finding] = []
 
         # Process sequentially to avoid overwhelming target
-        for url, param_name, method, baseline_value in candidates:
+        for candidate in candidates:
+            # Unpack: 5-tuple means POST form candidate (has raw_inputs),
+            # 4-tuple means GET/URL candidate (no form_inputs needed).
+            if len(candidate) == 5:
+                url, param_name, method, baseline_value, form_inputs = candidate
+            else:
+                url, param_name, method, baseline_value = candidate
+                form_inputs = None
+
             try:
                 result = await self.verifier.verify(
                     url=url,
                     parameter=param_name,
                     method=method,
                     value=baseline_value,
+                    form_inputs=form_inputs,
                 )
 
                 findings.extend(result.findings)

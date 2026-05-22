@@ -4,7 +4,7 @@ import re
 from urllib.parse import parse_qsl, urlparse
 
 from app.core.detectors.base_detector import BaseDetector, Finding
-from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder
+from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder, FormPayloadBuilder
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,8 @@ class FileInclusionDetector(BaseDetector):
         ("../../../../etc/passwd", r"root:x:0:0:", "Linux /etc/passwd LFI"),
         ("....//....//....//....//etc/passwd", r"root:x:0:0:", "Linux nested traversal LFI"),
         ("/etc/passwd", r"root:x:0:0:", "Linux absolute LFI"),
+        ("../../../../../../../../etc/passwd", r"root:x:0:0:", "Linux deep traversal LFI"),
+        ("..%2f..%2f..%2f..%2f..%2f..%2fetc%2fpasswd", r"root:x:0:0:", "Linux URL-encoded deep traversal"),
         ("../../../../etc/passwd%00", r"root:x:0:0:", "Null-byte LFI bypass"),
         ("../../../../etc/passwd\x00.jpg", r"root:x:0:0:", "Null-byte + extension LFI bypass"),
         # Windows
@@ -31,6 +33,7 @@ class FileInclusionDetector(BaseDetector):
         ("..\\..\\..\\..\\..\\..\\..\\..\\windows\\win.ini", r"\[fonts\]|\[extensions\]", "Windows traversal LFI"),
         # Wrapper
         ("php://filter/convert.base64-encode/resource=index.php", r"[a-zA-Z0-9+/=]{20,}", "PHP Filter Base64 LFI"),
+        ("php://filter/read=convert.base64-encode/resource=../../../../etc/passwd", r"[a-zA-Z0-9+/=]{20,}", "PHP Filter Base64 Traversal LFI"),
         ("php://input", None, "PHP input stream injection"),
         ("data://text/plain;base64,U2VudHJ5VGVzdA==", r"SentryTest", "PHP data wrapper"),
         ("expect://id", r"uid=", "PHP expect wrapper"),
@@ -45,27 +48,16 @@ class FileInclusionDetector(BaseDetector):
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
 
-        # 1. Candidate extraction
-        candidates = set()
-
-        for url in urls:
-            parsed = urlparse(url)
-            query_params = parse_qsl(parsed.query, keep_blank_values=True)
-            for param_name, param_value in query_params:
-                param_lower = param_name.lower()
-                if param_lower in self.fi_param_tokens or any(tok in param_lower for tok in ["file", "page", "path", "inc"]):
-                    candidates.add((url, param_name, "GET", param_value))
-
-        for form in forms:
-            form_url = getattr(form, "action", getattr(form, "page_url", ""))
-            form_method = getattr(form, "method", "POST").upper()
-            raw_inputs = list(getattr(form, "inputs", []))
-            for inp in raw_inputs:
-                inp_name = getattr(inp, "name", "")
-                if inp_name:
-                    inp_name_lower = inp_name.lower()
-                    if inp_name_lower in self.fi_param_tokens or any(tok in inp_name_lower for tok in ["file", "page"]):
-                        candidates.add((form_url, inp_name, form_method, ""))
+        # 1. Candidate extraction using ParamDiscovery
+        from app.core.crawler.param_discovery import ParamDiscovery
+        
+        def fi_filter(param_name: str) -> bool:
+            param_lower = param_name.lower()
+            return param_lower in self.fi_param_tokens or any(tok in param_lower for tok in ["file", "page", "path", "inc"])
+            
+        candidates = ParamDiscovery.build_candidates(
+            urls, forms, filter_fn=fi_filter
+        )
 
         if not candidates:
             return []
@@ -75,15 +67,24 @@ class FileInclusionDetector(BaseDetector):
         verifier = HttpVerifier(cookies=session_cookies)
 
         async def verify_candidate(cand) -> list[Finding]:
-            cand_url, param, method, val = cand
+            if len(cand) == 5:
+                cand_url, param, method, val, form_inputs = cand
+            else:
+                cand_url, param, method, val = cand
+                form_inputs = None
+
             cand_findings = []
+
+            def _build_request_args(payload: str) -> tuple[str, dict | None, dict | None]:
+                if method.upper() == "POST" and form_inputs is not None:
+                    data = FormPayloadBuilder.build(form_inputs, param, payload)
+                    return cand_url, None, data
+                return URLParameterBuilder.inject_parameter(cand_url, param, payload, method)
 
             async with semaphore:
                 # Test baseline first
                 try:
-                    baseline_url, baseline_params, baseline_data = URLParameterBuilder.inject_parameter(
-                        cand_url, param, val, method
-                    )
+                    baseline_url, baseline_params, baseline_data = _build_request_args(val)
                     baseline = await verifier.send_request(baseline_url, method, baseline_params, baseline_data)
 
                     rfi_error_terms = re.compile(
@@ -102,9 +103,7 @@ class FileInclusionDetector(BaseDetector):
                         if regex_pattern and re.search(regex_pattern, baseline.body, re.I):
                             continue
 
-                        injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
-                            cand_url, param, payload, method
-                        )
+                        injected_url, injected_params, injected_data = _build_request_args(payload)
                         injected = await verifier.send_request(injected_url, method, injected_params, injected_data)
 
                         if regex_pattern and injected.status_code == 200 and re.search(regex_pattern, injected.body, re.I):
@@ -152,9 +151,7 @@ class FileInclusionDetector(BaseDetector):
                                 break
 
                     for payload, _, desc in self.RFI_PAYLOADS:
-                        injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
-                            cand_url, param, payload, method
-                        )
+                        injected_url, injected_params, injected_data = _build_request_args(payload)
                         injected = await verifier.send_request(injected_url, method, injected_params, injected_data)
                         if rfi_error_terms.search(injected.body) and not rfi_error_terms.search(baseline.body):
                             cand_findings.append(

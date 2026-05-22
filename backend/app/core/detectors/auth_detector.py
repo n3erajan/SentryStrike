@@ -142,6 +142,9 @@ class AuthenticationFailuresDetector(BaseDetector):
         method: str | None = None,
         parameter: str | None = None,
         payload: str | None = None,
+        verified: bool = False,
+        verification_request_snippet: str | None = None,
+        verification_response_snippet: str | None = None,
     ) -> Finding:
         kwargs: dict = dict(
             category=OwaspCategory.a07,
@@ -149,6 +152,9 @@ class AuthenticationFailuresDetector(BaseDetector):
             severity=severity,
             url=url,
             evidence=evidence,
+            verified=verified,
+            verification_request_snippet=verification_request_snippet,
+            verification_response_snippet=verification_response_snippet,
         )
         if method is not None:
             kwargs["method"] = method
@@ -216,7 +222,10 @@ class AuthenticationFailuresDetector(BaseDetector):
                             method=method,
                             severity=SeverityLevel.high,
                             evidence=f"Authentication form at '{form_url}' accepted login submission even when CSRF token '{csrf_param}' was tampered.",
-                            parameter=csrf_param
+                            parameter=csrf_param,
+                            verified=True,
+                            verification_request_snippet=csrf_resp.request_snippet,
+                            verification_response_snippet=csrf_resp.response_snippet,
                         )
                     )
                 elif not csrf_param:
@@ -226,7 +235,10 @@ class AuthenticationFailuresDetector(BaseDetector):
                             url=form_url,
                             method=method,
                             severity=SeverityLevel.high,
-                            evidence=f"Authentication form at '{form_url}' has no CSRF token parameter, allowing credentials to be submitted without validation."
+                            evidence=f"Authentication form at '{form_url}' has no CSRF token parameter, allowing credentials to be submitted without validation.",
+                            verified=True,
+                            verification_request_snippet=csrf_resp.request_snippet,
+                            verification_response_snippet=csrf_resp.response_snippet,
                         )
                     )
 
@@ -255,7 +267,10 @@ class AuthenticationFailuresDetector(BaseDetector):
                         url=form_url,
                         method=method,
                         severity=SeverityLevel.high,
-                        evidence=f"Sent 5 rapid authentication attempts to '{form_url}' and received no account lockout, rate-limiting (429), or progressive delays."
+                        evidence=f"Sent 5 rapid authentication attempts to '{form_url}' and received no account lockout, rate-limiting (429), or progressive delays.",
+                        verified=True,
+                        verification_request_snippet=responses[-1].request_snippet if responses else None,
+                        verification_response_snippet=responses[-1].response_snippet if responses else None,
                     )
                 )
 
@@ -303,6 +318,9 @@ class AuthenticationFailuresDetector(BaseDetector):
                                     f"Form with CAPTCHA field '{captcha_param}' accepted submission "
                                     "when the CAPTCHA value was omitted entirely."
                                 ),
+                                verified=True,
+                                verification_request_snippet=resp.request_snippet,
+                                verification_response_snippet=resp.response_snippet,
                             )
                         )
 
@@ -328,7 +346,10 @@ class AuthenticationFailuresDetector(BaseDetector):
                                     vuln_type="Insecure Session Cookie Attributes",
                                     url=form_url,
                                     severity=SeverityLevel.medium,
-                                    evidence=f"Session cookie '{cookie_name}' set in response lacks secure attributes: {', '.join(missing_attrs)}."
+                                    evidence=f"Session cookie '{cookie_name}' set in response lacks secure attributes: {', '.join(missing_attrs)}.",
+                                    verified=True,
+                                    verification_request_snippet=r.request_snippet,
+                                    verification_response_snippet=r.response_snippet,
                                 )
                             )
         except Exception as e:

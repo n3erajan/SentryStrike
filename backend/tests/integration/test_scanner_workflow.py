@@ -1,4 +1,7 @@
+import threading
+import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -135,3 +138,89 @@ async def test_scanner_workflow_completes() -> None:
     assert scan.status == ScanStatus.completed
     assert scan.statistics.total_vulnerabilities >= 1
     assert scan.overall_risk_score > 0
+
+class MockServerRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'<html><body><a href="/sqli?id=1">sqli</a><form action="/login" method="POST"><input type="text" name="username"/><input type="submit" name="submit"/></form><form action="/update" method="POST"><input type="text" name="data"/></form></body></html>')
+        elif self.path.startswith('/sqli'):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            if "'" in self.path:
+                self.wfile.write(b"SQL syntax error")
+            else:
+                self.wfile.write(b"User details")
+        else:
+            self.send_response(404)
+            self.end_headers()
+            
+    def do_POST(self):
+        if self.path == '/login':
+            self.send_response(200)
+            self.send_header('Set-Cookie', 'session=123; SameSite=Strict')
+            self.end_headers()
+            self.wfile.write(b"Logged in")
+        elif self.path == '/update':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Updated")
+            
+    def log_message(self, format, *args):
+        pass # Suppress logging
+
+def run_mock_server(httpd):
+    httpd.serve_forever()
+
+@pytest.mark.asyncio
+async def test_full_scan_against_mock_server(monkeypatch):
+    # Start mock server
+    server_address = ('127.0.0.1', 8089)
+    httpd = HTTPServer(server_address, MockServerRequestHandler)
+    server_thread = threading.Thread(target=run_mock_server, args=(httpd,))
+    server_thread.daemon = True
+    server_thread.start()
+    
+    # Wait for server to start
+    time.sleep(0.5)
+    
+    try:
+        # Mock AI Client to avoid actual LLM calls
+        from app.analyzers.ai_client import OllamaClient
+        
+        async def mock_generate_json_list(*args, **kwargs):
+            # Return empty list or fallbacks
+            expected_count = kwargs.get('expected_count', 1)
+            fallback = kwargs.get('fallback', {})
+            return [fallback for _ in range(expected_count)]
+            
+        async def mock_generate_json(*args, **kwargs):
+            return kwargs.get('fallback', {})
+            
+        monkeypatch.setattr(OllamaClient, "generate_json_list", mock_generate_json_list)
+        monkeypatch.setattr(OllamaClient, "generate_json", mock_generate_json)
+        
+        scan = FakeScan()
+        scan.target_url = "http://127.0.0.1:8089"
+        orchestrator = ScanOrchestrator(FakeRepo(scan))
+        
+        # Disable SSL check which may fail for localhost
+        orchestrator.ssl_analyzer = FakeSsl()
+        
+        # Avoid tech detector slowing things down or making external calls
+        orchestrator.technology_detector = FakeTechDetector()
+        orchestrator.cve_service = FakeCveService()
+        
+        await orchestrator.run_scan("mock-id")
+        
+        assert scan.status == ScanStatus.completed
+        # Check that SQLi or CSRF vulnerabilities were found
+        vuln_types = [v.vuln_type.lower() for v in scan.vulnerabilities]
+        assert any("sql injection" in v for v in vuln_types)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        server_thread.join()

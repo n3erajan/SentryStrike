@@ -391,11 +391,13 @@ class ResponseAnalyzer:
                 keywords_disappeared.append(keyword)
 
         # Determine significance
+        # Note: We do NOT include payload_reflected by itself. UNION payloads are often naturally
+        # reflected (e.g. in search fields or button values). We require structural changes
+        # (status code, significant length difference, similarity drop, errors, or keywords).
         is_significant = (
             status_changed
             or (length_changed and abs(len(injected.body) - len(baseline.body)) > 50)
             or similarity < 0.9
-            or payload_reflected
             or len(new_errors) > 0
             or len(keywords_appeared) > 0
         )
