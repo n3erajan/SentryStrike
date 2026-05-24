@@ -19,6 +19,12 @@ from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 from app.core.detectors.base_detector import Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
 from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.utils.http_logging import (
+    ScanRequestContext,
+    infer_payload_from_request,
+    log_http_response,
+    resolve_request_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +59,18 @@ class HttpVerifier:
         self.headers = headers or {"User-Agent": "SentryStrikeScanner/1.0"}
         self.follow_redirects = follow_redirects
         self._client: Optional[httpx.AsyncClient] = None
+        self.request_context = ScanRequestContext()
+
+    def set_request_context(self, **kwargs: str) -> None:
+        """Set default module/parameter context for subsequent requests."""
+        updates = {key: value for key, value in kwargs.items() if value}
+        if updates:
+            self.request_context = ScanRequestContext(
+                module=updates.get("module", self.request_context.module),
+                parameter=updates.get("parameter", self.request_context.parameter),
+                test_phase=updates.get("test_phase", self.request_context.test_phase),
+                payload=updates.get("payload", self.request_context.payload),
+            )
 
     async def get_client(self) -> httpx.AsyncClient:
         """Get or create async HTTP client."""
@@ -80,6 +98,11 @@ class HttpVerifier:
         capture_timing: bool = True,
         headers: Optional[dict] = None,
         cookies: Optional[dict] = None,
+        *,
+        module: str = "",
+        parameter: str = "",
+        test_phase: str = "",
+        payload: str = "",
     ) -> ResponseData:
         """
         Send HTTP request and capture response with timing.
@@ -116,6 +139,17 @@ class HttpVerifier:
         
         request_snippet = f"{method} {req_path} HTTP/1.1\nHost: {parsed.netloc}\n{headers_str}\n\n{body_str}"
 
+        ctx = resolve_request_context(
+            instance_context=self.request_context,
+            module=module,
+            parameter=parameter,
+            test_phase=test_phase,
+            payload=payload,
+        )
+        effective_payload = ctx.payload or infer_payload_from_request(
+            ctx.parameter, url, params, data
+        )
+
         try:
             start_time = time.time() if capture_timing else None
 
@@ -131,6 +165,17 @@ class HttpVerifier:
             end_time = time.time() if capture_timing else None
             response_time_ms = (end_time - start_time) * 1000 if capture_timing else 0
 
+            log_http_response(
+                method=method.upper(),
+                url=str(response.url),
+                status_code=response.status_code,
+                module=ctx.module,
+                parameter=ctx.parameter,
+                test_phase=ctx.test_phase or "request",
+                payload=effective_payload,
+                response_time_ms=response_time_ms,
+            )
+
             response_snippet = f"HTTP/1.1 {response.status_code} {response.reason_phrase}\n" + \
                                "\n".join([f"{k}: {v}" for k, v in response.headers.items()]) + \
                                f"\n\n{response.text[:1000]}"
@@ -144,6 +189,16 @@ class HttpVerifier:
                 response_snippet=response_snippet,
             )
         except asyncio.TimeoutError:
+            log_http_response(
+                method=method.upper(),
+                url=url,
+                status_code=0,
+                module=ctx.module,
+                parameter=ctx.parameter,
+                test_phase=ctx.test_phase or "request",
+                payload=effective_payload,
+                response_time_ms=self.timeout_seconds * 1000,
+            )
             logger.warning(f"Request timeout for {url}")
             return ResponseData(
                 status_code=0,
@@ -154,6 +209,15 @@ class HttpVerifier:
                 response_snippet="HTTP/1.1 0 Timeout Error\n\n",
             )
         except Exception as e:
+            log_http_response(
+                method=method.upper(),
+                url=url,
+                status_code=0,
+                module=ctx.module,
+                parameter=ctx.parameter,
+                test_phase=ctx.test_phase or "request",
+                payload=effective_payload,
+            )
             logger.error(f"Request failed for {url}: {e}")
             return ResponseData(
                 status_code=0,
@@ -167,18 +231,21 @@ class HttpVerifier:
     async def send_requests_batch(
         self,
         requests: list[tuple[str, str, Optional[dict], Optional[dict]]],
+        *,
+        test_phase: str = "",
     ) -> list[ResponseData]:
         """
         Send multiple requests concurrently.
 
         Args:
             requests: List of (url, method, params, data) tuples
+            test_phase: Optional phase label applied to each request in the batch
 
         Returns:
             List of ResponseData objects in same order
         """
         tasks = [
-            self.send_request(url, method, params, data, capture_timing=True)
+            self.send_request(url, method, params, data, capture_timing=True, test_phase=test_phase)
             for url, method, params, data in requests
         ]
         return await asyncio.gather(*tasks)
@@ -187,9 +254,70 @@ class HttpVerifier:
 class BaseVerifier(ABC):
     """Base class for vulnerability verifiers."""
 
+    module_name: str = "unknown"
+
     def __init__(self, timeout_seconds: float = 10.0):
         self.http_verifier = HttpVerifier(timeout_seconds=timeout_seconds)
         self.logger = logging.getLogger(self.__class__.__name__)
+
+    def _begin_verification(self, parameter: str) -> None:
+        """Set module/parameter context for all requests in this verification."""
+        self.http_verifier.set_request_context(
+            module=self.module_name,
+            parameter=parameter,
+        )
+
+    async def _send(
+        self,
+        url: str,
+        method: str = "GET",
+        params: Optional[dict] = None,
+        data: Optional[dict] = None,
+        *,
+        headers: Optional[dict] = None,
+        cookies: Optional[dict] = None,
+        test_phase: str = "request",
+        payload: str = "",
+    ) -> ResponseData:
+        return await self.http_verifier.send_request(
+            url,
+            method,
+            params,
+            data,
+            headers=headers,
+            cookies=cookies,
+            test_phase=test_phase,
+            payload=payload,
+        )
+
+    async def fetch_pre_test_baseline(
+        self,
+        url: str,
+        parameter: str,
+        method: str = "GET",
+        value: str = "",
+        form_inputs: Optional[list] = None,
+    ) -> ResponseData:
+        """
+        Fetch a clean snapshot immediately before the first malicious payload.
+
+        Uses benign parameter values only — no injection content.
+        """
+        if method.upper().startswith("HEADER:"):
+            return await self._send(url, "GET", None, None, test_phase="pre_test_baseline")
+
+        if method.upper() == "POST" and form_inputs is not None:
+            clean_data = FormPayloadBuilder.build(form_inputs, parameter, value or "")
+            return await self._send(
+                url, method, None, clean_data, test_phase="pre_test_baseline"
+            )
+
+        clean_url, clean_params, clean_data = URLParameterBuilder.inject_parameter(
+            url, parameter, value or "", method, form_inputs=form_inputs
+        )
+        return await self._send(
+            clean_url, method, clean_params, clean_data, test_phase="pre_test_baseline"
+        )
 
     async def close(self):
         """Cleanup resources."""
@@ -309,6 +437,88 @@ class FindingDeduplicator:
         return [f for f in findings if f.confidence_score >= min_confidence]
 
 
+class TestPollutionFilter:
+    """Downgrade reflected/similarity findings contaminated by earlier stored injections."""
+
+    _STORED_TYPES = frozenset({"Stored XSS"})
+    _REFLECTED_TYPES = frozenset({
+        "Reflected XSS",
+        "Header-Reflected XSS",
+    })
+    _SQLI_SIMILARITY_METHODS = frozenset({
+        "boolean_differential",
+        "union_based",
+    })
+
+    @staticmethod
+    def _canonical_url(url: str) -> str:
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    @classmethod
+    def _has_verified_canary(cls, finding: Finding) -> bool:
+        evidence = finding.detection_evidence or {}
+        if evidence.get("canary_verified"):
+            return True
+        if evidence.get("verification_canary") and evidence.get("canary_verified") is not False:
+            return bool(evidence.get("canary_verified"))
+        return False
+
+    @classmethod
+    def _is_similarity_sqli(cls, finding: Finding) -> bool:
+        return (
+            finding.vuln_type.startswith("SQL Injection")
+            and finding.detection_method in cls._SQLI_SIMILARITY_METHODS
+        )
+
+    @classmethod
+    def filter_cross_module_contamination(cls, findings: list[Finding]) -> list[Finding]:
+        """
+        Mark or downgrade findings on URLs with confirmed stored content when
+        the reflected/similarity evidence lacks a per-request canary proof.
+        """
+        if not findings:
+            return []
+
+        by_url: dict[str, list[Finding]] = {}
+        for finding in findings:
+            by_url.setdefault(cls._canonical_url(finding.url), []).append(finding)
+
+        filtered: list[Finding] = []
+        for url_findings in by_url.values():
+            has_stored = any(f.vuln_type in cls._STORED_TYPES for f in url_findings)
+            if not has_stored:
+                filtered.extend(url_findings)
+                continue
+
+            for finding in url_findings:
+                is_reflected_type = finding.vuln_type in cls._REFLECTED_TYPES
+                is_similarity_sqli = cls._is_similarity_sqli(finding)
+                if not (is_reflected_type or is_similarity_sqli):
+                    filtered.append(finding)
+                    continue
+
+                if cls._has_verified_canary(finding):
+                    filtered.append(finding)
+                    continue
+
+                finding.detection_evidence = {
+                    **(finding.detection_evidence or {}),
+                    "suspected_test_pollution": True,
+                    "pollution_reason": "stored_content_on_url_without_canary_proof",
+                }
+                finding.verified = False
+                finding.reproducible = False
+                finding.confidence_score = min(finding.confidence_score, 20.0)
+                finding.severity = SeverityLevel.low
+                finding.evidence = (
+                    f"[Suspected test pollution] {finding.evidence or ''}".strip()
+                )
+                filtered.append(finding)
+
+        return filtered
+
+
 class URLParameterBuilder:
     """Utilities for building URLs with injected parameters."""
 
@@ -318,6 +528,7 @@ class URLParameterBuilder:
         parameter_name: str,
         parameter_value: str,
         method: str = "GET",
+        form_inputs: Optional[list] = None,
     ) -> tuple[str, dict, dict]:
         """
         Build request with injected parameter value.
@@ -338,6 +549,18 @@ class URLParameterBuilder:
         for key in query_params:
             if isinstance(query_params[key], list):
                 query_params[key] = query_params[key][0] if query_params[key] else ""
+
+        if form_inputs is not None:
+            payload = FormPayloadBuilder.build(form_inputs, parameter_name, parameter_value)
+            merged_params = {**query_params, **payload}
+            new_query = urlencode(merged_params, doseq=False)
+            new_parsed = parsed._replace(query=new_query)
+            new_url = urlunparse(new_parsed)
+
+            if method.upper() == "GET":
+                return new_url, {}, {}
+
+            return base_url, {}, merged_params
 
         # Update or add parameter
         query_params[parameter_name] = parameter_value
@@ -391,12 +614,12 @@ class FormPayloadBuilder:
             elif inp_type == "password":
                 payload[name] = "sntry_password123"
             elif inp_type in ("submit", "button"):
-                payload[name] = "Submit"
+                payload[name] = getattr(inp, "value", "Submit") or "Submit"
             elif inp_type == "hidden":
                 # Preserve hidden fields (CSRF tokens, etc.)
                 payload[name] = getattr(inp, "value", "")
             else:
-                payload[name] = "sntry_test_val"
+                payload[name] = getattr(inp, "value", "") or "sntry_test_val"
 
         # Ensure the target parameter is always present
         if target_param not in payload:

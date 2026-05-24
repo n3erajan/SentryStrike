@@ -35,6 +35,7 @@ class CryptoFailuresDetector(BaseDetector):
 
         # Perform active checking for Secure cookies and mixed content on the pages
         verifier = HttpVerifier(cookies=session_cookies)
+        verifier.set_request_context(module="crypto_failures")
         reported_session_cookies: set[str] = set()
         try:
             # Only test up to 5 URLs to keep it fast
@@ -56,7 +57,7 @@ class CryptoFailuresDetector(BaseDetector):
                     continue
 
                 # Fetch page
-                response = await verifier.send_request(url, "GET")
+                response = await verifier.send_request(url, "GET", test_phase="transport_check")
                 if response.status_code != 200:
                     continue
 

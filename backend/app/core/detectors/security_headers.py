@@ -4,6 +4,7 @@ import logging
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.utils.http_logging import make_httpx_response_logger
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,10 @@ class SecurityHeadersDetector(BaseDetector):
         if not root_url:
             return findings
 
-        async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self.settings.request_timeout_seconds,
+            event_hooks={"response": [make_httpx_response_logger("security_headers", "header_check")]},
+        ) as client:
             if root_url in checked:
                 return findings
             checked.add(root_url)
@@ -57,7 +61,7 @@ class SecurityHeadersDetector(BaseDetector):
                 if req_header not in headers:
                     findings.append(
                         Finding(
-                            category=OwaspCategory.a05,
+                            category=OwaspCategory.a02,
                             vuln_type="Missing Security Header",
                             severity=SeverityLevel.medium if req_header in ["content-security-policy", "x-frame-options"] else SeverityLevel.low,
                             url=root_url,
@@ -80,7 +84,7 @@ class SecurityHeadersDetector(BaseDetector):
                 if weaknesses:
                     findings.append(
                         Finding(
-                            category=OwaspCategory.a05,
+                            category=OwaspCategory.a02,
                             vuln_type="Weak Content Security Policy (CSP)",
                             severity=SeverityLevel.medium,
                             url=root_url,
@@ -106,7 +110,7 @@ class SecurityHeadersDetector(BaseDetector):
             if is_sensitive and self._cache_controls_sensitive(cc, pragma, expires):
                 findings.append(
                     Finding(
-                        category=OwaspCategory.a05,
+                        category=OwaspCategory.a02,
                         vuln_type="Missing Cache-Control Hardening",
                         severity=SeverityLevel.low,
                         url=root_url,
@@ -120,7 +124,7 @@ class SecurityHeadersDetector(BaseDetector):
             if server_hdr and any(c.isdigit() for c in server_hdr):
                 findings.append(
                     Finding(
-                        category=OwaspCategory.a05,
+                        category=OwaspCategory.a02,
                         vuln_type="Information Disclosure in Header",
                         severity=SeverityLevel.low,
                         url=root_url,

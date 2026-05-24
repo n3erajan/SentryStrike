@@ -27,3 +27,7 @@ def configure_logging() -> None:
 
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
+
+    # httpx logs bare URLs without scan context; sentry.http provides detail.
+    for noisy_logger in ("httpx", "httpcore"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)

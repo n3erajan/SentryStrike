@@ -65,6 +65,7 @@ class FileInclusionDetector(BaseDetector):
         # 2. Active Verification
         semaphore = asyncio.Semaphore(4)
         verifier = HttpVerifier(cookies=session_cookies)
+        verifier.set_request_context(module="lfi")
 
         async def verify_candidate(cand) -> list[Finding]:
             if len(cand) == 5:
@@ -82,10 +83,13 @@ class FileInclusionDetector(BaseDetector):
                 return URLParameterBuilder.inject_parameter(cand_url, param, payload, method)
 
             async with semaphore:
+                verifier.set_request_context(parameter=param)
                 # Test baseline first
                 try:
                     baseline_url, baseline_params, baseline_data = _build_request_args(val)
-                    baseline = await verifier.send_request(baseline_url, method, baseline_params, baseline_data)
+                    baseline = await verifier.send_request(
+                        baseline_url, method, baseline_params, baseline_data, test_phase="baseline"
+                    )
 
                     rfi_error_terms = re.compile(
                         r"(failed to open stream|connection refused|timed out|"
@@ -104,7 +108,10 @@ class FileInclusionDetector(BaseDetector):
                             continue
 
                         injected_url, injected_params, injected_data = _build_request_args(payload)
-                        injected = await verifier.send_request(injected_url, method, injected_params, injected_data)
+                        injected = await verifier.send_request(
+                            injected_url, method, injected_params, injected_data,
+                            test_phase="lfi_injection", payload=payload,
+                        )
 
                         if regex_pattern and injected.status_code == 200 and re.search(regex_pattern, injected.body, re.I):
                             # Verified LFI!
@@ -152,7 +159,10 @@ class FileInclusionDetector(BaseDetector):
 
                     for payload, _, desc in self.RFI_PAYLOADS:
                         injected_url, injected_params, injected_data = _build_request_args(payload)
-                        injected = await verifier.send_request(injected_url, method, injected_params, injected_data)
+                        injected = await verifier.send_request(
+                            injected_url, method, injected_params, injected_data,
+                            test_phase="rfi_injection", payload=payload,
+                        )
                         if rfi_error_terms.search(injected.body) and not rfi_error_terms.search(baseline.body):
                             cand_findings.append(
                                 Finding(

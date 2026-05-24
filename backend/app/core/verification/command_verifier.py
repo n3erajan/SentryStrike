@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 class CommandInjectionVerifier(BaseVerifier):
     """Verifies OS command injection vulnerabilities through active testing."""
 
+    module_name = "command_injection"
+
     # Unix command payloads
     UNIX_PAYLOADS = [
         ";id",
@@ -75,6 +77,7 @@ class CommandInjectionVerifier(BaseVerifier):
         2. Time-based blind
         3. Error-based
         """
+        self._begin_verification(parameter)
         findings = []
 
         # Try output-based detection first
@@ -116,14 +119,19 @@ class CommandInjectionVerifier(BaseVerifier):
             baseline_url, baseline_params, baseline_data = URLParameterBuilder.inject_parameter(
                 url, parameter, value, method
             )
-            baseline = await self.http_verifier.send_request(baseline_url, method, baseline_params, baseline_data)
+            baseline = await self._send(
+                baseline_url, method, baseline_params, baseline_data, test_phase="output_baseline"
+            )
 
             # Try each payload
             for payload in payloads:
                 injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
                     url, parameter, payload, method
                 )
-                injected = await self.http_verifier.send_request(injected_url, method, injected_params, injected_data)
+                injected = await self._send(
+                    injected_url, method, injected_params, injected_data,
+                    test_phase="output_injection", payload=payload,
+                )
 
                 # Check for command output
                 cmd_detected, unix_patterns, windows_patterns = ResponseAnalyzer.detect_command_output(
@@ -135,7 +143,7 @@ class CommandInjectionVerifier(BaseVerifier):
                     confidence = 85.0 if unix_patterns else 75.0
 
                     finding = self._create_finding(
-                        category=OwaspCategory.a03,
+                        category=OwaspCategory.a05,
                         vuln_type="OS Command Injection",
                         severity=SeverityLevel.critical,
                         url=url,
@@ -199,7 +207,9 @@ class CommandInjectionVerifier(BaseVerifier):
 
             baseline_times = []
             for _ in range(2):
-                resp = await self.http_verifier.send_request(baseline_url, method, baseline_params, baseline_data)
+                resp = await self._send(
+                    baseline_url, method, baseline_params, baseline_data, test_phase="time_baseline"
+                )
                 baseline_times.append(resp.response_time_ms)
                 await asyncio.sleep(0.1)
 
@@ -211,7 +221,10 @@ class CommandInjectionVerifier(BaseVerifier):
 
                 injected_times = []
                 for _ in range(2):
-                    resp = await self.http_verifier.send_request(injected_url, method, injected_params, injected_data)
+                    resp = await self._send(
+                        injected_url, method, injected_params, injected_data,
+                        test_phase="time_injection", payload=payload,
+                    )
                     injected_times.append(resp.response_time_ms)
                     await asyncio.sleep(0.1)
 
@@ -226,7 +239,7 @@ class CommandInjectionVerifier(BaseVerifier):
                     confidence = 70.0
 
                     finding = self._create_finding(
-                        category=OwaspCategory.a03,
+                        category=OwaspCategory.a05,
                         vuln_type="OS Command Injection (Time-Based Blind)",
                         severity=SeverityLevel.high,
                         url=url,

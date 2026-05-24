@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import random
+import string
 from urllib.parse import parse_qsl, urlparse
 
 from app.core.detectors.base_detector import BaseDetector, Finding
@@ -57,14 +59,22 @@ class XSSDetector(BaseDetector):
 
     _form_input_prefixes = ("txt", "mtx", "inp", "tb", "tf", "ta", "fld", "ctl")
 
+    # Headers that are commonly reflected into response bodies.
+    # These are injected as extra headers in header-injection candidates.
+    _injectable_headers = (
+        "Referer",
+        "User-Agent",
+        "X-Forwarded-For",
+        "X-Original-URL",
+    )
+
+    # Parameters that indicate a JSONP endpoint — use a dedicated payload.
+    _jsonp_param_names = {"callback", "jsonp", "cb", "json_callback", "jsoncallback"}
+
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
 
-        # BUG 3 FIX: Warn early if session cookies are missing.
-        # Authenticated apps redirect to login without cookies, so payloads
-        # never appear in the response body and all candidates will silently
-        # produce zero findings.
         if not session_cookies:
             logger.warning(
                 "XSSDetector: no session_cookies provided. Requests to "
@@ -88,22 +98,30 @@ class XSSDetector(BaseDetector):
             urls, forms, filter_fn=xss_filter
         )
 
+        # Supplement with header-injection candidates for every discovered URL.
+        # These are 4-tuples like URL candidates but carry the header name in
+        # the ``param`` slot; XSSVerifier.verify() recognises them via the
+        # ``header_injection=True`` flag encoded in the method field.
+        header_candidates = self._build_header_candidates(urls)
+        candidates = list(candidates) + header_candidates
+
         if not candidates:
-            logger.debug("XSSDetector: no testable candidates found across %d URLs and %d forms.", len(urls), len(forms))
+            logger.debug(
+                "XSSDetector: no testable candidates found across %d URLs and %d forms.",
+                len(urls), len(forms),
+            )
             return []
 
         logger.debug("XSSDetector: testing %d candidates.", len(candidates))
 
-        # ------------------------------------------------------------------ #
-        # 3. Active Verification
-        # ------------------------------------------------------------------ #
         semaphore = asyncio.Semaphore(4)
         verifier = XSSVerifier()
         verifier.http_verifier.cookies = session_cookies
 
         async def verify_candidate(cand: tuple) -> list[Finding]:
-            # Unpack — 5-tuple means POST form candidate (has raw_inputs),
-            # 4-tuple means GET/URL candidate (no form_inputs needed).
+            # 5-tuple  → POST form candidate (has raw_inputs)
+            # 4-tuple  → GET/URL candidate (no form_inputs needed)
+            # 4-tuple with method == "HEADER" → header-injection candidate
             if len(cand) == 5:
                 cand_url, param, method, val, form_inputs = cand
             else:
@@ -131,3 +149,26 @@ class XSSDetector(BaseDetector):
 
         await verifier.close()
         return findings
+
+    # ---------------------------------------------------------------------- #
+    # Header-injection candidate builder
+    # ---------------------------------------------------------------------- #
+
+    def _build_header_candidates(self, urls: list[str]) -> list[tuple]:
+        """
+        Build 4-tuple candidates for header-based XSS testing.
+
+        The ``method`` slot is set to ``"HEADER:<header-name>"`` so that
+        XSSVerifier can route them to the header-injection code path without
+        any change to the 4-tuple contract used everywhere else.
+        """
+        seen: set[str] = set()
+        candidates: list[tuple] = []
+        for url in urls:
+            base = url.split("?")[0]
+            if base in seen:
+                continue
+            seen.add(base)
+            for header in self._injectable_headers:
+                candidates.append((base, header, f"HEADER:{header}", ""))
+        return candidates

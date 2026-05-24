@@ -8,6 +8,7 @@ from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.verification.verification_framework import FormPayloadBuilder
 from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.utils.http_logging import make_httpx_response_logger
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class FileUploadDetector(BaseDetector):
             follow_redirects=True,
             headers={"User-Agent": "SentryStrikeScanner/1.0"},
             cookies=session_cookies,
+            event_hooks={"response": [make_httpx_response_logger("file_upload", "upload_test")]},
         ) as client:
             for form_url, method, raw_inputs, file_field in candidates:
                 try:

@@ -15,7 +15,7 @@ from typing import Optional
 
 from app.config import get_settings
 from app.core.detectors.base_detector import Finding
-from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
+from app.core.verification.response_analyzer import DifferentialAnalysis, ResponseAnalyzer, ResponseData
 from app.core.verification.verification_framework import (
     BaseVerifier,
     FormPayloadBuilder,
@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 class SQLiVerifier(BaseVerifier):
     """Verifies SQL injection vulnerabilities through active testing."""
+
+    module_name = "sqli"
 
     def __init__(self, timeout_seconds: float = 10.0):
         super().__init__(timeout_seconds)
@@ -63,26 +65,39 @@ class SQLiVerifier(BaseVerifier):
         Returns:
             VerificationResult with highest confidence finding
         """
+        self._begin_verification(parameter)
         results = []
 
+        pre_test_baseline = await self.fetch_pre_test_baseline(
+            url, parameter, method, value, form_inputs
+        )
+
         # Try boolean-based first (fastest)
-        bool_result = await self._verify_boolean_based(url, parameter, method, value, form_inputs)
+        bool_result = await self._verify_boolean_based(
+            url, parameter, method, value, form_inputs, pre_test_baseline
+        )
         if bool_result.is_vulnerable:
             results.append(bool_result)
 
         # Try error-based (quick)
-        error_result = await self._verify_error_based(url, parameter, method, value, form_inputs)
+        error_result = await self._verify_error_based(
+            url, parameter, method, value, form_inputs, pre_test_baseline
+        )
         if error_result.is_vulnerable:
             results.append(error_result)
 
         # Try UNION-based (medium complexity)
-        union_result = await self._verify_union_based(url, parameter, method, value, form_inputs)
+        union_result = await self._verify_union_based(
+            url, parameter, method, value, form_inputs, pre_test_baseline
+        )
         if union_result.is_vulnerable:
             results.append(union_result)
 
         # Try time-based blind (slower, only if others fail)
         if not results:
-            time_result = await self._verify_time_based(url, parameter, method, value, form_inputs)
+            time_result = await self._verify_time_based(
+                url, parameter, method, value, form_inputs, pre_test_baseline
+            )
             if time_result.is_vulnerable:
                 results.append(time_result)
 
@@ -128,7 +143,7 @@ class SQLiVerifier(BaseVerifier):
         if method.upper() == "POST" and form_inputs is not None:
             data = FormPayloadBuilder.build(form_inputs, parameter, payload_value)
             return url, None, data
-        return URLParameterBuilder.inject_parameter(url, parameter, payload_value, method)
+        return URLParameterBuilder.inject_parameter(url, parameter, payload_value, method, form_inputs=form_inputs)
 
     async def _verify_boolean_based(
         self,
@@ -137,6 +152,7 @@ class SQLiVerifier(BaseVerifier):
         method: str,
         value: str,
         form_inputs: Optional[list] = None,
+        pre_test_baseline: Optional[ResponseData] = None,
     ) -> VerificationResult:
         """
         Verify via boolean-based blind SQL injection.
@@ -148,25 +164,29 @@ class SQLiVerifier(BaseVerifier):
         - Second confirmation pair for reproducibility
         """
         try:
-            # Get baseline response
-            baseline_url, baseline_params, baseline_data = self._build_request_args(
-                url, parameter, value, method, form_inputs
+            baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
+                url, parameter, method, value, form_inputs
             )
-            baseline = await self.http_verifier.send_request(baseline_url, method, baseline_params, baseline_data)
 
             # Get true condition response
             true_payload = "' AND 1=1--"
             true_url, true_params, true_data = self._build_request_args(
                 url, parameter, true_payload, method, form_inputs
             )
-            true_resp = await self.http_verifier.send_request(true_url, method, true_params, true_data)
+            true_resp = await self._send(
+                true_url, method, true_params, true_data,
+                test_phase="boolean_true", payload=true_payload,
+            )
 
             # Get false condition response
             false_payload = "' AND 1=2--"
             false_url, false_params, false_data = self._build_request_args(
                 url, parameter, false_payload, method, form_inputs
             )
-            false_resp = await self.http_verifier.send_request(false_url, method, false_params, false_data)
+            false_resp = await self._send(
+                false_url, method, false_params, false_data,
+                test_phase="boolean_false", payload=false_payload,
+            )
 
             # Analyze
             is_vulnerable, analysis = ResponseAnalyzer.analyze_boolean_differential(
@@ -181,11 +201,13 @@ class SQLiVerifier(BaseVerifier):
                 confirm_false_url, confirm_false_params, confirm_false_data = self._build_request_args(
                     url, parameter, "' AND 2=3--", method, form_inputs
                 )
-                confirm_true_resp = await self.http_verifier.send_request(
-                    confirm_true_url, method, confirm_true_params, confirm_true_data
+                confirm_true_resp = await self._send(
+                    confirm_true_url, method, confirm_true_params, confirm_true_data,
+                    test_phase="boolean_confirm_true", payload="' AND 2=2--",
                 )
-                confirm_false_resp = await self.http_verifier.send_request(
-                    confirm_false_url, method, confirm_false_params, confirm_false_data
+                confirm_false_resp = await self._send(
+                    confirm_false_url, method, confirm_false_params, confirm_false_data,
+                    test_phase="boolean_confirm_false", payload="' AND 2=3--",
                 )
                 confirmed, confirm_analysis = ResponseAnalyzer.analyze_boolean_differential(
                     baseline, confirm_true_resp, confirm_false_resp
@@ -200,7 +222,7 @@ class SQLiVerifier(BaseVerifier):
                 if confirmed and status_stable:
                     confidence = 80.0  # HIGH confidence — confirmed with second pair + status stability
                     finding = self._create_finding(
-                        category=OwaspCategory.a03,
+                        category=OwaspCategory.a05,
                         vuln_type="SQL Injection (Boolean-Based Blind)",
                         severity=SeverityLevel.high,
                         url=url,
@@ -256,6 +278,7 @@ class SQLiVerifier(BaseVerifier):
         method: str,
         value: str,
         form_inputs: Optional[list] = None,
+        pre_test_baseline: Optional[ResponseData] = None,
     ) -> VerificationResult:
         """
         Verify via error-based SQL injection.
@@ -281,11 +304,9 @@ class SQLiVerifier(BaseVerifier):
         ]
 
         try:
-            # Get baseline to compare against
-            baseline_url, baseline_params, baseline_data = self._build_request_args(
-                url, parameter, value, method, form_inputs
+            baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
+                url, parameter, method, value, form_inputs
             )
-            baseline = await self.http_verifier.send_request(baseline_url, method, baseline_params, baseline_data)
             baseline_errors = ResponseAnalyzer.detect_sql_errors(baseline.body)
 
             # Try error payloads
@@ -293,7 +314,10 @@ class SQLiVerifier(BaseVerifier):
                 injected_url, injected_params, injected_data = self._build_request_args(
                     url, parameter, payload, method, form_inputs
                 )
-                injected = await self.http_verifier.send_request(injected_url, method, injected_params, injected_data)
+                injected = await self._send(
+                    injected_url, method, injected_params, injected_data,
+                    test_phase="error_injection", payload=payload,
+                )
 
                 # Check for SQL errors
                 errors_detected = ResponseAnalyzer.detect_sql_errors(injected.body)
@@ -302,7 +326,7 @@ class SQLiVerifier(BaseVerifier):
                 if new_errors:
                     confidence = 85.0  # Very high for error-based
                     finding = self._create_finding(
-                        category=OwaspCategory.a03,
+                        category=OwaspCategory.a05,
                         vuln_type="SQL Injection (Error-Based)",
                         severity=SeverityLevel.critical,
                         url=url,
@@ -356,6 +380,7 @@ class SQLiVerifier(BaseVerifier):
         method: str,
         value: str,
         form_inputs: Optional[list] = None,
+        pre_test_baseline: Optional[ResponseData] = None,
     ) -> VerificationResult:
         """
         Verify via time-based blind SQL injection.
@@ -378,14 +403,19 @@ class SQLiVerifier(BaseVerifier):
         ]
 
         try:
-            # Get baseline response times (3 requests)
             baseline_url, baseline_params, baseline_data = self._build_request_args(
                 url, parameter, value, method, form_inputs
             )
 
-            baseline_times = []
-            for _ in range(3):
-                resp = await self.http_verifier.send_request(baseline_url, method, baseline_params, baseline_data)
+            baseline_times: list[float] = []
+            if pre_test_baseline is not None:
+                baseline_times.append(pre_test_baseline.response_time_ms)
+
+            samples_needed = 3 - len(baseline_times)
+            for _ in range(samples_needed):
+                resp = await self._send(
+                    baseline_url, method, baseline_params, baseline_data, test_phase="time_baseline"
+                )
                 baseline_times.append(resp.response_time_ms)
                 await asyncio.sleep(0.1)  # Small delay between requests
 
@@ -414,7 +444,10 @@ class SQLiVerifier(BaseVerifier):
 
                 injected_times = []
                 for _ in range(2):
-                    resp = await self.http_verifier.send_request(injected_url, method, injected_params, injected_data)
+                    resp = await self._send(
+                        injected_url, method, injected_params, injected_data,
+                        test_phase="time_injection", payload=payload,
+                    )
                     injected_times.append(resp.response_time_ms)
                     await asyncio.sleep(0.1)
 
@@ -428,7 +461,7 @@ class SQLiVerifier(BaseVerifier):
                 if is_significant:
                     confidence = 75.0  # Raised slightly — baseline bounds now checked
                     finding = self._create_finding(
-                        category=OwaspCategory.a03,
+                        category=OwaspCategory.a05,
                         vuln_type="SQL Injection (Time-Based Blind)",
                         severity=SeverityLevel.high,
                         url=url,
@@ -478,6 +511,7 @@ class SQLiVerifier(BaseVerifier):
         method: str,
         value: str,
         form_inputs: Optional[list] = None,
+        pre_test_baseline: Optional[ResponseData] = None,
     ) -> VerificationResult:
         """
         Verify via UNION-based SQL injection.
@@ -495,22 +529,43 @@ class SQLiVerifier(BaseVerifier):
         ]
 
         try:
-            # Get baseline
-            baseline_url, baseline_params, baseline_data = self._build_request_args(
-                url, parameter, value, method, form_inputs
+            baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
+                url, parameter, method, value, form_inputs
             )
-            baseline = await self.http_verifier.send_request(baseline_url, method, baseline_params, baseline_data)
 
-            # Phase 1.3: Track which NULL-count payloads produce significant changes
-            # to require stable column-count differential across 2+ payloads
             significant_payloads: list[tuple[str, "DifferentialAnalysis"]] = []
+            canary_hits: list[tuple[str, str, ResponseData]] = []
+
+            for null_count in range(1, 6):
+                canary = ResponseAnalyzer.generate_probe_canary()
+                cols = ["NULL"] * null_count
+                cols[0] = f"'{canary}'"
+                canary_payload = f"' UNION SELECT {','.join(cols)}--"
+                injected_url, injected_params, injected_data = self._build_request_args(
+                    url, parameter, canary_payload, method, form_inputs
+                )
+                injected = await self._send(
+                    injected_url, method, injected_params, injected_data,
+                    test_phase="union_canary", payload=canary_payload,
+                )
+                verified, reflection_evidence = ResponseAnalyzer.verify_reflection(
+                    canary_payload,
+                    injected.body,
+                    baseline_body=baseline.body,
+                    canary=canary,
+                )
+                if verified:
+                    canary_hits.append((canary_payload, canary, injected))
 
             # Try UNION payloads
             for payload in union_payloads:
                 injected_url, injected_params, injected_data = self._build_request_args(
                     url, parameter, payload, method, form_inputs
                 )
-                injected = await self.http_verifier.send_request(injected_url, method, injected_params, injected_data)
+                injected = await self._send(
+                    injected_url, method, injected_params, injected_data,
+                    test_phase="union_injection", payload=payload,
+                )
 
                 # Analyze differential
                 analysis = ResponseAnalyzer.analyze_differential(
@@ -521,6 +576,41 @@ class SQLiVerifier(BaseVerifier):
                 if analysis.is_significant_change and injected.status_code == 200:
                     significant_payloads.append((payload, analysis))
 
+            if canary_hits:
+                best_payload, best_canary, best_injected = canary_hits[-1]
+                finding = self._create_finding(
+                    category=OwaspCategory.a05,
+                    vuln_type="SQL Injection (UNION-Based)",
+                    severity=SeverityLevel.high,
+                    url=url,
+                    parameter=parameter,
+                    payload=best_payload,
+                    evidence=(
+                        f"UNION canary '{best_canary}' reflected in response, "
+                        "confirming data extraction via this request."
+                    ),
+                    confidence_score=90.0,
+                    detection_method="union_based",
+                    method=method,
+                    detection_evidence={
+                        "verification_canary": best_canary,
+                        "canary_verified": True,
+                        "canary_proof": True,
+                    },
+                    reproducible=True,
+                    verified=True,
+                    verification_request_snippet=best_injected.request_snippet,
+                    verification_response_snippet=best_injected.response_snippet,
+                )
+                return VerificationResult(
+                    is_vulnerable=True,
+                    confidence_score=90.0,
+                    detection_method="union_based",
+                    findings=[finding],
+                    evidence={"canary_verified": True},
+                    reproducible=True,
+                )
+
             if not significant_payloads:
                 return VerificationResult(
                     is_vulnerable=False,
@@ -530,8 +620,6 @@ class SQLiVerifier(BaseVerifier):
                     evidence={},
                 )
 
-            # Use the last significant payload (highest NULL count that works)
-            # to attempt version extraction
             best_payload, best_analysis = significant_payloads[-1]
             num_cols = best_payload.count("NULL")
             version_extracted = None
@@ -549,7 +637,10 @@ class SQLiVerifier(BaseVerifier):
                     ver_url, ver_params, ver_data = self._build_request_args(
                         url, parameter, injected_union, method, form_inputs
                     )
-                    ver_resp = await self.http_verifier.send_request(ver_url, method, ver_params, ver_data)
+                    ver_resp = await self._send(
+                        ver_url, method, ver_params, ver_data,
+                        test_phase="union_version_extract", payload=injected_union,
+                    )
 
                     body_lower = ver_resp.body.lower()
                     if any(indicator in body_lower for indicator in ["mysql", "postgres", "sqlite", "ubuntu", "debian", "mariadb", "microsoft"]):
@@ -588,51 +679,4 @@ class SQLiVerifier(BaseVerifier):
                     confidence_score=confidence,
                     detection_method="union_based",
                     findings=[],
-                    evidence={"suppressed": True, "reason": "weak_union_hit"},
-                )
-
-            evidence_msg = f"Response changed with UNION payload. Similarity: {best_analysis.body_similarity:.2f}, Status: 200"
-            if version_extracted:
-                evidence_msg += f". Successfully extracted database version information via payload '{best_payload}'."
-            elif len(significant_payloads) >= 2:
-                evidence_msg += f". Stable column-count differential confirmed across {len(significant_payloads)} NULL-count payloads."
-
-            finding = self._create_finding(
-                category=OwaspCategory.a03,
-                vuln_type="SQL Injection (UNION-Based)",
-                severity=SeverityLevel.high,
-                url=url,
-                parameter=parameter,
-                payload=best_payload,
-                evidence=evidence_msg,
-                confidence_score=confidence,
-                detection_method="union_based",
-                method=method,
-                detection_evidence={
-                    "similarity": best_analysis.body_similarity,
-                    "status_code_changed": best_analysis.status_code_changed,
-                    "response_length_changed": best_analysis.body_length_changed,
-                    "version_extracted": bool(version_extracted),
-                    "significant_payload_count": len(significant_payloads),
-                },
-                reproducible=reproducible,
-                verified=verified,
-            )
-            return VerificationResult(
-                is_vulnerable=True,
-                confidence_score=confidence,
-                detection_method="union_based",
-                findings=[finding],
-                evidence={"significant_payload_count": len(significant_payloads)},
-                reproducible=reproducible,
-            )
-
-        except Exception as e:
-            logger.error(f"UNION-based verification failed for {url}:{parameter}: {e}")
-            return VerificationResult(
-                is_vulnerable=False,
-                confidence_score=0.0,
-                detection_method="union_based",
-                findings=[],
-                evidence={"error": str(e)},
-            )
+                    evidence={"suppressed": True, "reason": "weak_union_hit

@@ -26,6 +26,7 @@ class CSRFDetector(BaseDetector):
 
         # Authed client to perform actions
         verifier = HttpVerifier(cookies=session_cookies)
+        verifier.set_request_context(module="csrf")
         semaphore = asyncio.Semaphore(4)
 
         # Detect candidate forms
@@ -101,7 +102,9 @@ class CSRFDetector(BaseDetector):
                     else:
                         injected_params = test_payload
 
-                    response = await verifier.send_request(injected_url, method, injected_params, injected_data)
+                    response = await verifier.send_request(
+                        injected_url, method, injected_params, injected_data, test_phase="token_tamper"
+                    )
 
                     # Phase 3: Add optional Origin/Referer bypass test
                     bypass_headers = {
@@ -111,7 +114,8 @@ class CSRFDetector(BaseDetector):
                     # Send bypass request if the original request succeeded (to minimize requests), 
                     # but we can also just send it and check its success.
                     bypass_response = await verifier.send_request(
-                        injected_url, method, injected_params, injected_data, headers=bypass_headers
+                        injected_url, method, injected_params, injected_data,
+                        headers=bypass_headers, test_phase="origin_bypass",
                     )
 
                     # Criteria for CSRF vulnerability:

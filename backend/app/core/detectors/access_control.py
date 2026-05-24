@@ -36,8 +36,10 @@ class AccessControlDetector(BaseDetector):
         # 1. Instantiate verifiers
         # Authed client (using session cookies)
         authed_verifier = HttpVerifier(cookies=session_cookies)
+        authed_verifier.set_request_context(module="access_control")
         # Unauthed client (to check access control bypasses)
         unauthed_verifier = HttpVerifier()
+        unauthed_verifier.set_request_context(module="access_control")
 
         # 2. Forced Browsing / Sensitive Directory Exposure Verification
         paths_to_test = set()
@@ -51,7 +53,7 @@ class AccessControlDetector(BaseDetector):
         for test_url in paths_to_test:
             try:
                 # Try accessing unauthenticated
-                resp = await unauthed_verifier.send_request(test_url, "GET")
+                resp = await unauthed_verifier.send_request(test_url, "GET", test_phase="forced_browsing")
                 if resp.status_code == 200:
                     body_lower = resp.body.lower()
                     # Skip if it is actually just a login redirect rendering the login page
@@ -127,15 +129,20 @@ class AccessControlDetector(BaseDetector):
                     from app.core.verification.verification_framework import URLParameterBuilder
                     
                     # A. Query with authentication to check if resource exists
+                    authed_verifier.set_request_context(parameter=param)
                     base_url, base_params, base_data = URLParameterBuilder.inject_parameter(cand_url, param, val, method)
-                    authed_resp = await authed_verifier.send_request(base_url, method, base_params, base_data)
+                    authed_resp = await authed_verifier.send_request(
+                        base_url, method, base_params, base_data, test_phase="idor_authed"
+                    )
                     
                     if authed_resp.status_code != 200:
                         return []
 
                     # B. Query unauthenticated to see if access control is broken
                     unauth_url, unauth_params, unauth_data = URLParameterBuilder.inject_parameter(cand_url, param, val, method)
-                    unauth_resp = await unauthed_verifier.send_request(unauth_url, method, unauth_params, unauth_data)
+                    unauth_resp = await unauthed_verifier.send_request(
+                        unauth_url, method, unauth_params, unauth_data, test_phase="idor_unauth"
+                    )
                     
                     if unauth_resp.status_code == 200:
                         body_lower = unauth_resp.body.lower()

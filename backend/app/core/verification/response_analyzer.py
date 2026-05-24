@@ -10,10 +10,12 @@ Provides functions for:
 - Differential analysis
 """
 
+import html
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
+from uuid import uuid4
 
 
 @dataclass
@@ -118,6 +120,118 @@ class ResponseAnalyzer:
     # -----------------------------------------------------------------------
     # Reflection and Injection Detection
     # -----------------------------------------------------------------------
+
+    @staticmethod
+    def generate_probe_canary() -> str:
+        """Return a unique per-request canary for unambiguous reflection proof."""
+        return f"sntryprobe_{uuid4().hex[:8]}"
+
+    @staticmethod
+    def verify_reflection(
+        payload: str,
+        response_body: str,
+        *,
+        baseline_body: str | None = None,
+        canary: str | None = None,
+        min_substring_len: int = 6,
+    ) -> tuple[bool, dict]:
+        """
+        Confirm that a payload (or its canary) was reflected by *this* request.
+
+        Rejects matches that already existed in the pre-test baseline body.
+        For XSS payloads, requires a meaningful unencoded substring of the
+        injected content — not merely a generic tag left by an earlier test.
+        """
+        evidence: dict = {
+            "canary": canary,
+            "canary_verified": False,
+            "payload_substring_verified": False,
+            "pre_existing_in_baseline": False,
+        }
+
+        if canary:
+            if baseline_body and canary in baseline_body:
+                evidence["pre_existing_in_baseline"] = True
+                evidence["reason"] = "canary_pre_existing_in_baseline"
+                return False, evidence
+            if canary not in response_body:
+                evidence["reason"] = "canary_not_in_response"
+                return False, evidence
+            evidence["canary_verified"] = True
+
+        probe = canary or payload
+        if not probe:
+            evidence["reason"] = "empty_probe"
+            return False, evidence
+
+        escaped = re.escape(probe)
+        if re.search(escaped, response_body):
+            if baseline_body and re.search(escaped, baseline_body):
+                evidence["pre_existing_in_baseline"] = True
+                evidence["reason"] = "probe_pre_existing_in_baseline"
+                return False, evidence
+            evidence["payload_substring_verified"] = True
+            evidence["encoding"] = "raw"
+            return True, evidence
+
+        decoded_body = html.unescape(response_body)
+        if re.search(escaped, decoded_body):
+            if baseline_body and re.search(escaped, html.unescape(baseline_body)):
+                evidence["pre_existing_in_baseline"] = True
+                evidence["reason"] = "probe_pre_existing_in_baseline_decoded"
+                return False, evidence
+            evidence["payload_substring_verified"] = True
+            evidence["encoding"] = "html_decoded"
+            return True, evidence
+
+        meaningful = ResponseAnalyzer._meaningful_payload_marker(payload, min_substring_len)
+        if meaningful:
+            for body_variant, label in (
+                (response_body, "raw"),
+                (decoded_body, "html_decoded"),
+            ):
+                if meaningful in body_variant:
+                    baseline_variant = baseline_body or ""
+                    if baseline_variant and meaningful in (
+                        baseline_variant if label == "raw" else html.unescape(baseline_variant)
+                    ):
+                        evidence["pre_existing_in_baseline"] = True
+                        evidence["reason"] = "marker_pre_existing_in_baseline"
+                        return False, evidence
+                    if label == "html_decoded" and "&lt;" in body_variant and meaningful not in body_variant:
+                        evidence["reason"] = "marker_html_encoded"
+                        return False, evidence
+                    evidence["payload_substring_verified"] = True
+                    evidence["encoding"] = label
+                    evidence["matched_marker"] = meaningful
+                    return True, evidence
+
+        evidence["reason"] = "no_verified_reflection"
+        return False, evidence
+
+    @staticmethod
+    def _meaningful_payload_marker(payload: str, min_len: int) -> str | None:
+        """Pick a distinctive, unencoded substring from an XSS/SQLi payload."""
+        candidates: list[str] = []
+        for match in re.finditer(r"<script[^>]*>([^<]+)</script>", payload, re.I):
+            inner = match.group(1).strip()
+            if len(inner) >= min_len:
+                candidates.append(inner)
+        for match in re.finditer(r"on\w+\s*=\s*([^>\s\"']+)", payload, re.I):
+            handler = match.group(1).strip()
+            if len(handler) >= min_len:
+                candidates.append(handler)
+        if "UNION SELECT" in payload.upper():
+            for match in re.finditer(r"'([^']{4,})'", payload):
+                candidates.append(match.group(1))
+        stripped = payload.strip()
+        if len(stripped) >= min_len:
+            candidates.append(stripped[: max(min_len, min(24, len(stripped)))])
+
+        for candidate in candidates:
+            if candidate and not candidate.startswith("&"):
+                return candidate
+        return None
 
     @staticmethod
     def detect_payload_reflection(

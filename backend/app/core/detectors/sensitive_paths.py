@@ -7,6 +7,7 @@ import httpx
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.utils.http_logging import make_httpx_response_logger
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,8 @@ class SensitivePathsDetector(BaseDetector):
         async with httpx.AsyncClient(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            verify=False  # Similar to other detectors, allow self-signed for scanning
+            verify=False,  # Similar to other detectors, allow self-signed for scanning
+            event_hooks={"response": [make_httpx_response_logger("sensitive_paths", "path_probe")]},
         ) as client:
             
             # Helper to check a specific path
@@ -132,7 +134,7 @@ class SensitivePathsDetector(BaseDetector):
                                     severity = SeverityLevel.low
 
                             return Finding(
-                                category=OwaspCategory.a05, # Security Misconfiguration / Info Disclosure
+                                category=OwaspCategory.a02, # Security Misconfiguration / Info Disclosure
                                 vuln_type="Sensitive File Exposure",
                                 severity=severity,
                                 url=target_url,

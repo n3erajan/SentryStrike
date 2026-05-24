@@ -17,7 +17,7 @@ class SupplyChainDetector(BaseDetector):
             if not version:
                 findings.append(
                     Finding(
-                        category=OwaspCategory.a06,
+                        category=OwaspCategory.a03,
                         vuln_type="Component Version Unknown",
                         severity=SeverityLevel.low,
                         url=root_url,
@@ -41,7 +41,7 @@ class SupplyChainDetector(BaseDetector):
 
                 findings.append(
                     Finding(
-                        category=OwaspCategory.a06,
+                        category=OwaspCategory.a03,
                         vuln_type=f"Known CVE in {name}",
                         severity=severity,
                         url=root_url,

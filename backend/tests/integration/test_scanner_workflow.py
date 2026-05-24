@@ -58,7 +58,7 @@ class FakeDetector:
     async def detect(self, urls, forms, **kwargs):
         return [
             Finding(
-                category=OwaspCategory.a03,
+                category=OwaspCategory.a05,
                 vuln_type="Potential SQL Injection",
                 severity=SeverityLevel.high,
                 url=urls[0],

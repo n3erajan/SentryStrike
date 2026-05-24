@@ -199,6 +199,7 @@ class AuthenticationFailuresDetector(BaseDetector):
             return []
 
         verifier = HttpVerifier(cookies=session_cookies)
+        verifier.set_request_context(module="auth")
         try:
             # Test 1: CSRF on Auth Form
             csrf_payload = payload.copy()
@@ -211,7 +212,10 @@ class AuthenticationFailuresDetector(BaseDetector):
             else:
                 csrf_params = csrf_payload
             
-            csrf_resp = await verifier.send_request(csrf_url, method, csrf_params, csrf_data)
+            csrf_resp = await verifier.send_request(
+                csrf_url, method, csrf_params, csrf_data,
+                test_phase="csrf_check", parameter=csrf_param or username_param,
+            )
             body_lower = csrf_resp.body.lower()
             if csrf_resp.status_code in [200, 302]:
                 if csrf_param and not any(err in body_lower for err in ["csrf", "token invalid", "bad request"]):
@@ -251,7 +255,9 @@ class AuthenticationFailuresDetector(BaseDetector):
                 else:
                     brute_params = payload
                 
-                resp = await verifier.send_request(brute_url, method, brute_params, brute_data)
+                resp = await verifier.send_request(
+                    brute_url, method, brute_params, brute_data, test_phase="brute_force"
+                )
                 responses.append(resp)
                 await asyncio.sleep(0.05)
             
@@ -298,7 +304,9 @@ class AuthenticationFailuresDetector(BaseDetector):
                 else:
                     bypass_params = bypass_payload
 
-                resp = await verifier.send_request(bypass_url, method, bypass_params, bypass_data)
+                resp = await verifier.send_request(
+                    bypass_url, method, bypass_params, bypass_data, test_phase="captcha_bypass"
+                )
                 body_lower = resp.body.lower()
 
                 if resp.status_code in [200, 302]:

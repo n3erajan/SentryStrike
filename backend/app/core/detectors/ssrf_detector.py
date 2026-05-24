@@ -54,18 +54,22 @@ class SSRFDetector(BaseDetector):
         # 2. Active Verification
         semaphore = asyncio.Semaphore(4)
         verifier = HttpVerifier(cookies=session_cookies)
+        verifier.set_request_context(module="ssrf")
 
         async def verify_candidate(cand) -> list[Finding]:
             cand_url, param, method, val = cand
             cand_findings = []
 
             async with semaphore:
+                verifier.set_request_context(parameter=param)
                 try:
                     # Retrieve baseline first
                     baseline_url, baseline_params, baseline_data = URLParameterBuilder.inject_parameter(
                         cand_url, param, val, method
                     )
-                    baseline = await verifier.send_request(baseline_url, method, baseline_params, baseline_data)
+                    baseline = await verifier.send_request(
+                        baseline_url, method, baseline_params, baseline_data, test_phase="baseline"
+                    )
 
                     for payload, regex_pattern, desc in self.SSRF_PAYLOADS:
                         # Make sure baseline doesn't already trigger the signature
@@ -75,7 +79,10 @@ class SSRFDetector(BaseDetector):
                         injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
                             cand_url, param, payload, method
                         )
-                        injected = await verifier.send_request(injected_url, method, injected_params, injected_data)
+                        injected = await verifier.send_request(
+                            injected_url, method, injected_params, injected_data,
+                            test_phase="ssrf_injection", payload=payload,
+                        )
 
                         # Check if internal content successfully loaded into the response
                         if injected.status_code == 200 and re.search(regex_pattern, injected.body, re.I):

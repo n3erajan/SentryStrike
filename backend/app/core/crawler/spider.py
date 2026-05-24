@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 
 from app.config import get_settings
 from app.core.crawler.url_parser import normalize_url, same_domain, normalize_for_dedupe
+from app.utils.http_logging import make_httpx_response_logger
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ STATIC_EXTENSIONS = {
 class FormInput:
     name: str
     input_type: str = "text"
+    value: str = ""
 
 
 @dataclass
@@ -56,6 +58,12 @@ class WebSpider:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.session_cookies = {}
+
+    def _snapshot_cookies(self, cookies: httpx.Cookies) -> dict[str, str]:
+        snapshot: dict[str, str] = {}
+        for cookie in cookies.jar:
+            snapshot[cookie.name] = cookie.value
+        return snapshot
 
     async def crawl(self, root_url: str, max_depth: int | None = None) -> CrawlResult:
         max_depth = max_depth if max_depth is not None else self.settings.crawl_depth
@@ -88,6 +96,7 @@ class WebSpider:
             timeout=self.settings.request_timeout_seconds,
             follow_redirects=True,
             headers={"User-Agent": "SentryStrikeScanner/1.0"},
+            event_hooks={"response": [make_httpx_response_logger("crawler", "crawl")]},
         ) as client:
             # Perform authentication if configured
             await self._authenticate_session(client, root_url)
@@ -150,7 +159,7 @@ class WebSpider:
                     continue
                 
                 # Update cookies in case session updated
-                self.session_cookies.update(dict(client.cookies))
+                self.session_cookies.update(self._snapshot_cookies(client.cookies))
 
                 page_forms, links = self._parse_html(url, response.text)
                 forms.extend(page_forms)
@@ -261,12 +270,12 @@ class WebSpider:
                 
                 # Check for successful authentication
                 if resp.status_code in [200, 302]:
-                    logger.info("Authentication request sent. Session cookies: %s", dict(client.cookies))
+                    logger.info("Authentication request sent. Session cookies: %s", self._snapshot_cookies(client.cookies))
                 
             except Exception as e:
                 logger.error("Authentication failed: %s", e)
 
-        self.session_cookies.update(dict(client.cookies))
+        self.session_cookies.update(self._snapshot_cookies(client.cookies))
 
     async def _load_robots(self, root_url: str) -> robotparser.RobotFileParser | None:
         robots_url = normalize_url(root_url, "/robots.txt")
@@ -325,7 +334,10 @@ class WebSpider:
                     inp_type = getattr(inp, "type", "button") if hasattr(inp, "type") else "button"
                 else:
                     inp_type = inp.get("type", "text")
-                inputs.append(FormInput(name=name, input_type=inp_type))
+                value = inp.get("value", "")
+                if inp.name == "textarea":
+                    value = inp.get_text("", strip=False)
+                inputs.append(FormInput(name=name, input_type=inp_type, value=value))
             forms.append(HtmlForm(page_url=page_url, action=normalize_url(page_url, action), method=method, inputs=inputs))
 
         return forms, links

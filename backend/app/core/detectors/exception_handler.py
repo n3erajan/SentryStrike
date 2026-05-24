@@ -5,6 +5,7 @@ import httpx
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.utils.http_logging import make_httpx_response_logger
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +212,7 @@ class ExceptionHandlingDetector(BaseDetector):
         async with httpx.AsyncClient(
             timeout=self.settings.request_timeout_seconds,
             follow_redirects=True,
+            event_hooks={"response": [make_httpx_response_logger("exception_handling", "error_probe")]},
         ) as client:
 
             # ── Technique 1: 404 / non-existent path probing ─────────────

@@ -74,7 +74,7 @@ class ParamDiscovery:
 
                 inp_value = getattr(inp, "value", "")
                 if form_method == "GET":
-                    _add_candidate(form_url, inp_name, "GET", inp_value)
+                    _add_candidate(form_url, inp_name, "GET", inp_value, form_inputs)
                 else:
                     _add_candidate(form_url, inp_name, form_method, inp_value, form_inputs)
 
