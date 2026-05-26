@@ -20,7 +20,7 @@ async def create_scan(
     payload: CreateScanRequest,
     repo: ScanRepository = Depends(get_scan_repository),
 ) -> dict:
-    scan = await repo.create(str(payload.target_url))
+    scan = await repo.create(str(payload.target_url), crawl_mode=payload.crawl_mode)
     if orchestrator is None:
         raise HTTPException(status_code=500, detail="Scanner orchestrator not initialized")
     await orchestrator.queue_scan(str(scan.id))
@@ -38,6 +38,7 @@ async def list_scans(
         {
             "id": str(scan.id),
             "target_url": scan.target_url,
+            "crawl_mode": scan.crawl_mode,
             "status": scan.status,
             "progress": scan.progress,
             "created_at": scan.created_at,

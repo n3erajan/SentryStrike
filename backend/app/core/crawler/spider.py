@@ -68,27 +68,35 @@ class WebSpider:
     async def crawl(self, root_url: str, max_depth: int | None = None) -> CrawlResult:
         max_depth = max_depth if max_depth is not None else self.settings.crawl_depth
         visited: set[str] = set()
-        queue: list[tuple[str, int]] = []
+        queue = asyncio.Queue()
         forms: list[HtmlForm] = []
         discovered_urls: list[str] = []
+        discovered_set: set[str] = set()
+        lock = asyncio.Lock()
 
-        def enqueue(url_candidate: str, depth: int):
+        def should_enqueue(url_candidate: str, depth: int) -> bool:
             if max_depth is not None and depth > max_depth:
-                return
+                return False
             
             p = urlparse(url_candidate)
             ext = pathlib.PurePosixPath(p.path).suffix.lower()
             if ext in STATIC_EXTENSIONS:
                 logger.debug("skipping static asset: %s", url_candidate)
-                return
+                return False
 
             norm = normalize_for_dedupe(url_candidate)
             if norm not in visited:
                 visited.add(norm)
-                queue.append((url_candidate, depth))
+                return True
+            return False
 
-        enqueue(root_url, 0)
+        # Helper to safely call should_enqueue and put to queue
+        async def safe_enqueue(url_candidate: str, depth: int):
+            async with lock:
+                if should_enqueue(url_candidate, depth):
+                    await queue.put((url_candidate, depth))
 
+        await safe_enqueue(root_url, 0)
 
         robots = await self._load_robots(root_url)
 
@@ -123,7 +131,7 @@ class WebSpider:
                         for loc in locs:
                             loc_clean = loc.strip()
                             if loc_clean and same_domain(root_url, loc_clean):
-                                enqueue(loc_clean, 0)
+                                await safe_enqueue(loc_clean, 0)
                 except Exception as e:
                     logger.warning("Failed to fetch sitemap %s: %s", sitemap_url, e)
 
@@ -136,44 +144,149 @@ class WebSpider:
             ]
             for path in common_paths:
                 brute_url = normalize_url(root_url, path)
-                enqueue(brute_url, 0)
+                await safe_enqueue(brute_url, 0)
 
-            # 3. Main crawling loop
-            while queue and len(discovered_urls) < self.settings.crawl_max_urls:
-                url, depth = queue.pop(0)
-                if robots is not None and not robots.can_fetch("*", url):
-                    continue
+            # 3. Main crawling loop with concurrency
+            import time
+            rate_limit = self.settings.crawl_rate_limit_per_second
+            request_interval = 1.0 / rate_limit if rate_limit > 0 else 0
+            last_request_time = time.time()
 
-                try:
-                    response = await client.get(url)
-                except Exception as exc:
-                    logger.warning("crawl failed for %s: %s", url, exc)
-                    continue
+            async def rate_limit_sleep():
+                if request_interval <= 0:
+                    return
+                nonlocal last_request_time
+                delay = 0
+                async with lock:
+                    now = time.time()
+                    if last_request_time < now:
+                        last_request_time = now
+                    next_allowed = last_request_time + request_interval
+                    delay = next_allowed - now
+                    if delay > 0:
+                        last_request_time = next_allowed
+                    else:
+                        last_request_time = now
+                        delay = 0
 
-                # Add to discovered_urls if request was successful/interesting
-                if response.status_code in [200, 301, 302, 403]:
-                    if url not in discovered_urls:
-                        discovered_urls.append(url)
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
-                if "text/html" not in response.headers.get("content-type", ""):
-                    continue
+            async def worker():
+                while True:
+                    try:
+                        async with lock:
+                            if len(discovered_urls) >= self.settings.crawl_max_urls:
+                                break
+                        
+                        item = await queue.get()
+                        if item is None:
+                            queue.task_done()
+                            break
+                        url, depth = item
+                    except asyncio.CancelledError:
+                        break
+
+                    if robots is not None and not robots.can_fetch("*", url):
+                        queue.task_done()
+                        continue
+
+                    # Respect rate limit
+                    await rate_limit_sleep()
+
+                    try:
+                        response = await client.get(url)
+                    except Exception as exc:
+                        logger.warning("crawl failed for %s: %s", url, exc)
+                        queue.task_done()
+                        continue
+
+                    async with lock:
+                        if len(discovered_urls) >= self.settings.crawl_max_urls:
+                            queue.task_done()
+                            break
+
+                        # Add to discovered_urls if request was successful/interesting
+                        if response.status_code in [200, 301, 302, 403]:
+                            if url not in discovered_set:
+                                discovered_set.add(url)
+                                discovered_urls.append(url)
+
+                    if "text/html" not in response.headers.get("content-type", ""):
+                        queue.task_done()
+                        continue
+                    
+                    async with lock:
+                        # Update cookies in case session updated
+                        self.session_cookies.update(self._snapshot_cookies(client.cookies))
+
+                    page_forms, links = self._parse_html(url, response.text)
+                    
+                    async with lock:
+                        forms.extend(page_forms)
+
+                    # Add form actions as links so we can scan the endpoints
+                    for form in page_forms:
+                        links.append(form.action)
+
+                    for link in links:
+                        normalized = normalize_url(url, link)
+                        if same_domain(root_url, normalized):
+                            await safe_enqueue(normalized, depth + 1)
+
+                    queue.task_done()
+
+            # Spawn concurrent workers
+            concurrency = self.settings.scanner_concurrency
+            workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
+
+            try:
+                # Wait until queue is empty and all tasks are done, OR we reached max URLs
+                join_task = asyncio.create_task(queue.join())
+                while not join_task.done():
+                    async with lock:
+                        if len(discovered_urls) >= self.settings.crawl_max_urls:
+                            break
+                    await asyncio.sleep(0.1)
                 
-                # Update cookies in case session updated
+                if not join_task.done():
+                    join_task.cancel()
+            except Exception as e:
+                logger.error("Error in crawl wait: %s", e)
+            finally:
+                # Cancel workers
+                for w in workers:
+                    w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+
+        return CrawlResult(urls=discovered_urls, forms=forms, session_cookies=self.session_cookies)
+
+    async def fetch_single(self, target_url: str) -> CrawlResult:
+        """Fetch one URL only — no link discovery, sitemaps, or path brute-force."""
+        forms: list[HtmlForm] = []
+        discovered_urls: list[str] = []
+
+        async with httpx.AsyncClient(
+            timeout=self.settings.request_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "SentryStrikeScanner/1.0"},
+            event_hooks={"response": [make_httpx_response_logger("crawler", "fetch_single")]},
+        ) as client:
+            await self._authenticate_session(client, target_url)
+
+            try:
+                response = await client.get(target_url)
+            except Exception as exc:
+                logger.warning("fetch_single failed for %s: %s", target_url, exc)
+                return CrawlResult(urls=[], forms=[], session_cookies=self.session_cookies)
+
+            if response.status_code in {200, 301, 302, 403}:
+                discovered_urls.append(target_url)
+
+            if "text/html" in response.headers.get("content-type", ""):
                 self.session_cookies.update(self._snapshot_cookies(client.cookies))
-
-                page_forms, links = self._parse_html(url, response.text)
+                page_forms, _ = self._parse_html(target_url, response.text)
                 forms.extend(page_forms)
-
-                # Add form actions as links so we can scan the endpoints
-                for form in page_forms:
-                    links.append(form.action)
-
-                for link in links:
-                    normalized = normalize_url(url, link)
-                    if same_domain(root_url, normalized):
-                        enqueue(normalized, depth + 1)
-
-                await asyncio.sleep(max(0.01, 1.0 / self.settings.crawl_rate_limit_per_second))
 
         return CrawlResult(urls=discovered_urls, forms=forms, session_cookies=self.session_cookies)
 
@@ -290,8 +403,18 @@ class WebSpider:
         except Exception:
             return None
 
+    @staticmethod
+    def _normalize_malformed_forms(html: str) -> str:
+        """Convert self-closing <form ... /> tags into proper open tags.
+
+        DVWA and other legacy PHP apps sometimes emit XML-style self-closing
+        form tags. HTML parsers treat those as empty elements, so every input
+        that follows becomes a sibling instead of a child of the form.
+        """
+        return re.sub(r"<form\b([^>]*?)/>", r"<form\1>", html, flags=re.I)
+
     def _parse_html(self, page_url: str, html: str) -> tuple[list[HtmlForm], list[str]]:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(self._normalize_malformed_forms(html), "html.parser")
 
         # Extract links from multiple tags: a, iframe, script, link, img
         links = []

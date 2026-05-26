@@ -71,11 +71,11 @@ class CSRFDetector(BaseDetector):
                     continue
                 # Set dummy/default value for other inputs
                 if inp_type == "password":
-                    inputs_payload[inp_name] = "sntry_password123"
+                    inputs_payload[inp_name] = "sentry_password123"
                 elif inp_type == "submit" or inp_type == "button":
                     inputs_payload[inp_name] = getattr(inp, "value", "Submit") or "Submit"
                 else:
-                    inputs_payload[inp_name] = "sntry_test_val"
+                    inputs_payload[inp_name] = "sentry_test_val"
 
                 if inp_name.lower() in self.csrf_keywords:
                     csrf_param = inp_name

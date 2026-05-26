@@ -186,10 +186,10 @@ class AuthenticationFailuresDetector(BaseDetector):
             name_lower = name.lower()
             if "user" in name_lower or "email" in name_lower or ("login" in name_lower and inp_type == "text"):
                 username_param = name
-                payload[name] = "sntry_invalid_user_xyz"
+                payload[name] = "sentry_invalid_user_xyz"
             elif "pass" in name_lower:
                 password_param = name
-                payload[name] = "sntry_wrong_password_xyz"
+                payload[name] = "sentry_wrong_password_xyz"
             elif inp_type == "hidden":
                 payload[name] = getattr(inp, "value", "")
                 if "csrf" in name_lower or "token" in name_lower:

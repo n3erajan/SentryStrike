@@ -40,7 +40,7 @@ from app.models.vulnerability import OwaspCategory, SeverityLevel
 logger = logging.getLogger(__name__)
 
 
-def _random_canary(prefix: str = "sntry", length: int = 8) -> str:
+def _random_canary(prefix: str = "sentry", length: int = 8) -> str:
     """Return a short, unpredictable canary string safe to embed in HTML."""
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
     return f"{prefix}_{suffix}"

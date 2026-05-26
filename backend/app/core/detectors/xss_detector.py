@@ -131,7 +131,12 @@ class XSSDetector(BaseDetector):
             async with semaphore:
                 try:
                     result = await verifier.verify(
-                        cand_url, param, method, val, form_inputs=form_inputs
+                        cand_url,
+                        param,
+                        method,
+                        val,
+                        form_inputs=form_inputs,
+                        stored_display_urls=urls,
                     )
                     if result.is_vulnerable:
                         return result.findings

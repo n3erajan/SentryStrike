@@ -1,13 +1,12 @@
 import re
 import asyncio
+import urllib.parse
 import httpx
 
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
-
-
 # ---------------------------------------------------------------------------
 # Detection patterns
 # ---------------------------------------------------------------------------
@@ -30,6 +29,8 @@ _HIGH_PATTERNS: list[re.Pattern] = [
         r"app/models/",                                 # MVC model path
         r"app/controllers/",                            # MVC controller path
         r"site-packages/",                              # Python package path
+        r"caught exception:",                           # PHP/generic exception dump
+        r"mysqli_error\(",                              # raw PHP function name leaking
     ]
 ]
 
@@ -76,50 +77,46 @@ _LOW_PATTERNS: list[re.Pattern] = [
     ]
 ]
 
-# HTTP response headers that leak framework / server details specifically on errors
+# HTTP response headers that leak framework / server details on errors
 _SENSITIVE_HEADERS = {
     "x-powered-by",
     "x-aspnet-version",
     "x-aspnetmvc-version",
     "x-generator",
     "x-drupal-cache",
-    "x-runtime",           # Rails response time (presence confirms Rails)
-    "x-request-id",        # can leak internal IDs
+    "x-runtime",
+    "x-request-id",
 }
 
 # Payloads designed to trigger unhandled exceptions in real endpoints.
-# Each is a (value, description) pair.  The description goes into evidence.
 _FUZZ_PAYLOADS: list[tuple[str, str]] = [
     ("'", "single quote — SQL metacharacter / template error trigger"),
-    ("\x00", "null byte — triggers path/string handling errors in many frameworks"),
+    ("\x00", "null byte — triggers path/string handling errors"),
     ("A" * 8192, "8 KB oversize string — buffer / ORM field-length exception"),
     ("[]", "array notation — type mismatch where scalar expected"),
-    ("-1", "negative integer — triggers constraint violations / unsigned cast errors"),
+    ("-1", "negative integer — constraint violations / unsigned cast errors"),
     ("9999999999999999999", "integer overflow probe"),
-    ("{{7*7}}", "template expression — triggers SSTI errors in unprotected renderers"),
-    ("<script>", "HTML/XML metacharacter — triggers XML parser or sanitiser errors"),
-    ("../../../etc/passwd", "path traversal — triggers file-handling errors"),
+    ("{{7*7}}", "template expression — SSTI errors in unprotected renderers"),
+    ("<script>", "HTML/XML metacharacter — XML parser or sanitiser errors"),
+    ("../../../etc/passwd", "path traversal — file-handling errors"),
     ("%00%0d%0a", "URL-encoded null + CRLF — header injection / parser errors"),
 ]
 
-# How many URLs to probe with 404 technique (configurable via settings fallback)
 _DEFAULT_URL_LIMIT = 20
-
-# Max characters of response body to include in evidence snippet
 _EVIDENCE_SNIPPET_LEN = 300
-
-# Concurrency cap — avoid hammering the target
 _MAX_CONCURRENT = 5
 
-
+# Status codes that indicate a gateway/proxy error — not application exceptions
+_GATEWAY_CODES = {501, 502, 503, 504}
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
 
 def _classify_body(body: str) -> tuple[SeverityLevel | None, list[str], list[str]]:
     """
-    Return (severity, matched_high_labels, matched_medium_labels) or None if
-    no patterns matched.  Checks high first so severity is not downgraded.
+    Check HIGH, then MEDIUM, then LOW patterns against the body.
+    Returns (severity, high_hits, medium_hits). Severity is None if no match.
+    NOTE: body should be passed as-is (not pre-lowercased) — patterns use IGNORECASE.
     """
     high_hits = [p.pattern for p in _HIGH_PATTERNS if p.search(body)]
     if high_hits:
@@ -134,8 +131,6 @@ def _classify_body(body: str) -> tuple[SeverityLevel | None, list[str], list[str
         return SeverityLevel.low, [], low_hits
 
     return None, [], []
-
-
 def _extract_snippet(body: str, patterns: list[re.Pattern]) -> str:
     """Return a short excerpt around the first matching pattern."""
     for pattern in patterns:
@@ -144,23 +139,15 @@ def _extract_snippet(body: str, patterns: list[re.Pattern]) -> str:
             start = max(0, m.start() - 60)
             end = min(len(body), m.end() + _EVIDENCE_SNIPPET_LEN)
             snippet = body[start:end].strip()
-            # Collapse excessive whitespace / newlines for readability
             snippet = re.sub(r"\s{3,}", " ... ", snippet)
             return snippet[:_EVIDENCE_SNIPPET_LEN]
     return body[:_EVIDENCE_SNIPPET_LEN]
-
-
 def _sensitive_headers_present(headers: httpx.Headers) -> list[str]:
-    """Return a list of sensitive header names that are present in the response."""
     return [h for h in _SENSITIVE_HEADERS if h in headers]
-
-
 def _finding_key(url: str, vuln_type: str, severity: SeverityLevel) -> tuple:
-    """Deduplication key — same host + vuln type + severity collapses to one finding."""
-    parsed = url.split("?")[0]  # strip query string
-    return (parsed, vuln_type, severity)
-
-
+    """Deduplication key — same path (no query string) + vuln type + severity."""
+    path = url.split("?")[0]
+    return (path, vuln_type, severity)
 def _build_evidence(
     url: str,
     method: str,
@@ -180,11 +167,22 @@ def _build_evidence(
     if matched_patterns:
         parts.append(f"Matched: {', '.join(matched_patterns[:3])}")
     if sensitive_hdrs:
-        parts.append(f"Sensitive headers present: {', '.join(sensitive_hdrs)}")
+        parts.append(f"Sensitive headers: {', '.join(sensitive_hdrs)}")
     parts.append(f"Excerpt: {snippet!r}")
     return " | ".join(parts)
-
-
+def _replace_param_values(url: str, replacement: str) -> str:
+    """Replace all query parameter values in a URL with `replacement`."""
+    if "?" not in url:
+        return url
+    base, qs = url.split("?", 1)
+    pairs = []
+    for part in qs.split("&"):
+        if "=" in part:
+            key, _ = part.split("=", 1)
+            pairs.append(f"{key}={urllib.parse.quote(replacement, safe='')}")
+        else:
+            pairs.append(part)
+    return f"{base}?{'&'.join(pairs)}"
 # ---------------------------------------------------------------------------
 # Detector
 # ---------------------------------------------------------------------------
@@ -196,7 +194,7 @@ class ExceptionHandlingDetector(BaseDetector):
         self.settings = get_settings()
 
     # ------------------------------------------------------------------
-    # Public interface — signature unchanged for integration compatibility
+    # Public interface
     # ------------------------------------------------------------------
 
     async def detect(
@@ -206,18 +204,24 @@ class ExceptionHandlingDetector(BaseDetector):
         **kwargs: object,
     ) -> list[Finding]:
         findings: list[Finding] = []
-        seen: set[tuple] = set()  # deduplication keys
+        seen: set[tuple] = set()
         semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+
+        # Pull auth cookies from kwargs if the scanner has already authenticated.
+        # Expected shape: {"PHPSESSID": "abc123", "security": "low"}
+        # Callers should pass these in via kwargs["auth_cookies"] after logging in.
+        auth_cookies: dict[str, str] = kwargs.get("auth_cookies") or {}
 
         async with httpx.AsyncClient(
             timeout=self.settings.request_timeout_seconds,
-            follow_redirects=True,
+            follow_redirects=False,   # CRITICAL: don't silently follow auth redirects
+            cookies=auth_cookies,
             event_hooks={"response": [make_httpx_response_logger("exception_handling", "error_probe")]},
         ) as client:
 
             # ── Technique 1: 404 / non-existent path probing ─────────────
             url_limit = getattr(self.settings, "exception_url_limit", _DEFAULT_URL_LIMIT)
-            probe_urls = self._prioritise_urls(urls)[:url_limit]
+            probe_urls = _prioritise_urls(urls)[:url_limit]
 
             tasks_404 = [
                 self._probe_404(client, semaphore, url)
@@ -225,12 +229,13 @@ class ExceptionHandlingDetector(BaseDetector):
             ]
             results_404 = await asyncio.gather(*tasks_404, return_exceptions=True)
             for result in results_404:
+                if isinstance(result, Exception):
+                    # Log but don't crash — individual probe failures are non-fatal
+                    continue
                 if isinstance(result, Finding):
-                    self._add_finding(result, findings, seen)
+                    _add_finding(result, findings, seen)
 
             # ── Technique 2: Parameter fuzzing on GET URLs ────────────────
-            # Only target URLs that already have query parameters — those
-            # are most likely to feed into DB queries / file lookups.
             param_urls = [u for u in urls if "?" in u]
             fuzz_tasks = [
                 self._probe_get_params(client, semaphore, url, payload, desc)
@@ -239,10 +244,12 @@ class ExceptionHandlingDetector(BaseDetector):
             ]
             results_fuzz = await asyncio.gather(*fuzz_tasks, return_exceptions=True)
             for result in results_fuzz:
+                if isinstance(result, Exception):
+                    continue
                 if isinstance(result, Finding):
-                    self._add_finding(result, findings, seen)
+                    _add_finding(result, findings, seen)
 
-            # ── Technique 3: Form field fuzzing (POST) ────────────────────
+            # ── Technique 3: Form field fuzzing (POST / GET forms) ────────
             form_tasks = [
                 self._probe_form(client, semaphore, form, payload, desc)
                 for form in (forms or [])
@@ -250,13 +257,33 @@ class ExceptionHandlingDetector(BaseDetector):
             ]
             results_forms = await asyncio.gather(*form_tasks, return_exceptions=True)
             for result in results_forms:
+                if isinstance(result, Exception):
+                    continue
                 if isinstance(result, Finding):
-                    self._add_finding(result, findings, seen)
+                    _add_finding(result, findings, seen)
+
+            # ── Technique 4: Co-parameter fuzzing on GET URLs ─────────────
+            # Some endpoints require ALL original parameters to be present for
+            # the request to reach application logic (e.g. a Submit=Submit flag
+            # alongside the fuzzed field). This technique preserves every existing
+            # param at its original value and only replaces one param at a time,
+            # so the request is structurally valid and the error path is reached.
+            coparam_tasks = [
+                self._probe_get_param_single(client, semaphore, url, payload, desc)
+                for url in param_urls
+                for payload, desc in _FUZZ_PAYLOADS
+            ]
+            results_coparam = await asyncio.gather(*coparam_tasks, return_exceptions=True)
+            for result in results_coparam:
+                if isinstance(result, Exception):
+                    continue
+                if isinstance(result, Finding):
+                    _add_finding(result, findings, seen)
 
         return findings
 
     # ------------------------------------------------------------------
-    # Probing helpers — each returns a single Finding or None
+    # Probing helpers
     # ------------------------------------------------------------------
 
     async def _probe_404(
@@ -265,13 +292,16 @@ class ExceptionHandlingDetector(BaseDetector):
         semaphore: asyncio.Semaphore,
         url: str,
     ) -> Finding | None:
-        """Append a random non-existent path and check the error response."""
-        test_url = f"{url.rstrip('/')}/non-existent-sentry-strike-endpoint"
+        test_url = f"{url.rstrip('/')}/non-existent-sentry-strike-endpoint-xyzzy"
         async with semaphore:
             try:
                 response = await client.get(test_url)
             except Exception:
                 return None
+
+        # Auth redirect — we don't have a valid session for this URL
+        if response.status_code in {301, 302, 303, 307, 308}:
+            return None
 
         return self._analyse_response(
             url=test_url,
@@ -280,7 +310,6 @@ class ExceptionHandlingDetector(BaseDetector):
             body=response.text,
             headers=response.headers,
             trigger="non-existent path probe",
-            # 404 is expected — only flag if body leaks details
             require_body_match=True,
         )
 
@@ -292,16 +321,18 @@ class ExceptionHandlingDetector(BaseDetector):
         payload: str,
         payload_desc: str,
     ) -> Finding | None:
-        """Replace every query parameter value with a fuzz payload."""
-        fuzzed_url = self._replace_param_values(url, payload)
+        fuzzed_url = _replace_param_values(url, payload)
         if fuzzed_url == url:
-            return None  # no substitution possible
+            return None
 
         async with semaphore:
             try:
                 response = await client.get(fuzzed_url)
             except Exception:
                 return None
+
+        if response.status_code in {301, 302, 303, 307, 308}:
+            return None
 
         return self._analyse_response(
             url=fuzzed_url,
@@ -320,7 +351,6 @@ class ExceptionHandlingDetector(BaseDetector):
         payload: str,
         payload_desc: str,
     ) -> Finding | None:
-        """Submit a form with all fields set to a fuzz payload."""
         action = getattr(form, "action", None) or getattr(form, "url", None)
         method = (getattr(form, "method", "post") or "post").upper()
         fields = getattr(form, "fields", None) or getattr(form, "inputs", None) or []
@@ -328,14 +358,11 @@ class ExceptionHandlingDetector(BaseDetector):
         if not action:
             return None
 
-        # Build the fuzzed data dict; preserve known-safe field names (tokens etc.)
         data: dict[str, str] = {}
         for field in fields:
             name = getattr(field, "name", None) or (field if isinstance(field, str) else None)
             if not name:
                 continue
-            # Don't fuzz CSRF tokens or hidden action flags — they break the
-            # request before it reaches application logic
             if any(kw in name.lower() for kw in ("token", "csrf", "_method", "utf8")):
                 data[name] = getattr(field, "value", "") or ""
             else:
@@ -353,6 +380,9 @@ class ExceptionHandlingDetector(BaseDetector):
             except Exception:
                 return None
 
+        if response.status_code in {301, 302, 303, 307, 308}:
+            return None
+
         return self._analyse_response(
             url=action,
             method=method,
@@ -362,8 +392,82 @@ class ExceptionHandlingDetector(BaseDetector):
             trigger=f"form fuzz — {payload_desc}",
         )
 
+    async def _probe_get_param_single(
+        self,
+        client: httpx.AsyncClient,
+        semaphore: asyncio.Semaphore,
+        url: str,
+        payload: str,
+        payload_desc: str,
+    ) -> Finding | None:
+        """
+        For each query parameter individually: replace ONLY that one param with
+        the fuzz payload while leaving all other params at their original crawled
+        values.
+
+        This complements _probe_get_params (which replaces ALL params at once).
+        It matters for endpoints that require other params to be present and valid
+        for the request to actually reach the vulnerable code path — for example,
+        an endpoint that needs Submit=Submit alongside the fuzzed field, or a
+        pager that needs page=N to stay valid. Technique 2 is blunt-force (every
+        param replaced simultaneously); Technique 4 is surgical (one at a time,
+        rest preserved at their crawled values). Together they cover both cases.
+        """
+        if "?" not in url:
+            return None
+
+        base, qs = url.split("?", 1)
+        original_pairs: list[tuple[str, str]] = []
+        for part in qs.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                original_pairs.append((k, urllib.parse.unquote_plus(v)))
+            else:
+                original_pairs.append((part, ""))
+
+        # Skip single-param URLs — Technique 2 already covers those fully
+        if len(original_pairs) <= 1:
+            return None
+
+        for target_idx, (target_key, _) in enumerate(original_pairs):
+            fuzzed_qs_parts = []
+            for idx, (k, v) in enumerate(original_pairs):
+                if idx == target_idx:
+                    fuzzed_qs_parts.append(
+                        f"{k}={urllib.parse.quote(payload, safe='')}"
+                    )
+                else:
+                    fuzzed_qs_parts.append(
+                        f"{k}={urllib.parse.quote(v, safe='')}"
+                    )
+
+            fuzzed_url = f"{base}?{'&'.join(fuzzed_qs_parts)}"
+
+            async with semaphore:
+                try:
+                    response = await client.get(fuzzed_url)
+                except Exception:
+                    continue
+
+            if response.status_code in {301, 302, 303, 307, 308}:
+                continue
+
+            finding = self._analyse_response(
+                url=fuzzed_url,
+                method="GET",
+                status=response.status_code,
+                body=response.text,
+                headers=response.headers,
+                trigger=f"single-param fuzz on '{target_key}' — {payload_desc}",
+            )
+            if finding:
+                # Return first hit; deduplication in the caller handles the rest
+                return finding
+
+        return None
+
     # ------------------------------------------------------------------
-    # Analysis helpers
+    # Analysis
     # ------------------------------------------------------------------
 
     def _analyse_response(
@@ -376,48 +480,35 @@ class ExceptionHandlingDetector(BaseDetector):
         trigger: str,
         require_body_match: bool = False,
     ) -> Finding | None:
-        """
-        Inspect a response for error disclosure signals.
-        Returns a Finding if anything noteworthy is detected, else None.
-        """
-        body_lower = body.lower()
-        severity, high_hits, med_hits = _classify_body(body_lower)
+        # Gateway/proxy errors are not application exceptions
+        if status in _GATEWAY_CODES:
+            return None
+
+        # Use original body (not lowercased) so snippets are readable
+        severity, high_hits, med_hits = _classify_body(body)
         matched = high_hits or med_hits
 
         sensitive_hdrs = _sensitive_headers_present(headers)
-
-        # A bare 500 with no body markers is Low if not require_body_match
         is_bare_500 = status == 500 and not matched
 
-        # If we require a body match (e.g. 404 probes) and none found, ignore
         if require_body_match and not matched:
             return None
 
-        # Do not flag non-500 responses unless there's an actual error pattern in the body.
-        # Merely having `x-powered-by` on a 200 OK is NOT verbose error handling (it's A05 Info Disclosure).
         if not matched and not is_bare_500:
             return None
 
-        # Determine final severity
         if not severity:
-            if is_bare_500:
-                severity = SeverityLevel.low
-            else:
-                severity = SeverityLevel.low
+            severity = SeverityLevel.low
 
-        # Elevate: bare 500 to medium if sensitive headers also present
+        # Elevate bare 500 + sensitive headers to medium
         if is_bare_500 and sensitive_hdrs:
             severity = SeverityLevel.medium
-
-        # Downgrade 501–504: gateway/network errors, not app exceptions
-        if status in {501, 502, 503, 504}:
-            return None
 
         evidence = _build_evidence(
             url=url,
             method=method,
             status=status,
-            body=body_lower,
+            body=body,
             matched_patterns=matched,
             sensitive_hdrs=sensitive_hdrs,
             trigger=trigger,
@@ -431,42 +522,19 @@ class ExceptionHandlingDetector(BaseDetector):
             evidence=evidence,
         )
 
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Module-level utilities (not methods, so they can be tested independently)
+# ---------------------------------------------------------------------------
 
-    @staticmethod
-    def _prioritise_urls(urls: list[str]) -> list[str]:
-        """
-        Sort URLs so those with query parameters (more likely to feed into
-        DB/file logic) are probed first.  Stable sort preserves original
-        order within each group.
-        """
-        return sorted(urls, key=lambda u: (0 if "?" in u else 1))
-
-    @staticmethod
-    def _replace_param_values(url: str, replacement: str) -> str:
-        """Replace all query parameter values in a URL with `replacement`."""
-        if "?" not in url:
-            return url
-        base, qs = url.split("?", 1)
-        pairs = []
-        for part in qs.split("&"):
-            if "=" in part:
-                key, _ = part.split("=", 1)
-                pairs.append(f"{key}={httpx.utils.urllib.parse.quote(replacement, safe='')}")
-            else:
-                pairs.append(part)
-        return f"{base}?{'&'.join(pairs)}"
-
-    @staticmethod
-    def _add_finding(
-        finding: Finding,
-        findings: list[Finding],
-        seen: set[tuple],
-    ) -> None:
-        """Add a finding only if its deduplication key hasn't been seen."""
-        key = _finding_key(finding.url, finding.vuln_type, finding.severity)
-        if key not in seen:
-            seen.add(key)
-            findings.append(finding)
+def _prioritise_urls(urls: list[str]) -> list[str]:
+    """URLs with query parameters first (more likely to exercise DB/file logic)."""
+    return sorted(urls, key=lambda u: (0 if "?" in u else 1))
+def _add_finding(
+    finding: Finding,
+    findings: list[Finding],
+    seen: set[tuple],
+) -> None:
+    key = _finding_key(finding.url, finding.vuln_type, finding.severity)
+    if key not in seen:
+        seen.add(key)
+        findings.append(finding)

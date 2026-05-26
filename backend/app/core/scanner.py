@@ -24,12 +24,12 @@ from app.core.detectors.file_upload import FileUploadDetector
 from app.core.detectors.csrf_detector import CSRFDetector
 from app.core.detectors.ssrf_detector import SSRFDetector
 from app.core.detectors.sensitive_paths import SensitivePathsDetector
-from app.core.verification.verification_framework import FindingDeduplicator
+from app.core.verification.verification_framework import FindingDeduplicator, TestPollutionFilter
 from app.database.repositories.scan_repository import ScanRepository
 from app.integrations.cve_database import CveDatabaseService
 from app.integrations.sslyze_wrapper import SslAnalyzer
 from app.integrations.wappalyzer import TechnologyDetector
-from app.models.scan import ScanStatus
+from app.models.scan import CrawlMode, ScanStatus
 from app.models.vulnerability import (
     Evidence,
     Exploitability,
@@ -141,7 +141,11 @@ class ScanOrchestrator:
             await self.repository.update_status(scan, ScanStatus.running, progress=5)
             await self._check_cancelled(scan_id)
 
-            crawl_result = await self.spider.crawl(scan.target_url)
+            if scan.crawl_mode == CrawlMode.single:
+                logger.info("single-path scan: skipping spider discovery for %s", scan.target_url)
+                crawl_result = await self.spider.fetch_single(scan.target_url)
+            else:
+                crawl_result = await self.spider.crawl(scan.target_url)
             scan.statistics.total_urls_crawled = len(crawl_result.urls)
             scan.progress = 20
             await scan.save()
@@ -166,10 +170,12 @@ class ScanOrchestrator:
                     )
                 )
 
+            skip_in_single_path = (SensitivePathsDetector,)
             detector_tasks = [
                 detector.detect(crawl_result.urls, crawl_result.forms, session_cookies=getattr(crawl_result, "session_cookies", {}))
                 for detector in self.detectors
                 if not isinstance(detector, (CryptoFailuresDetector, SecurityHeadersDetector))
+                and not (scan.crawl_mode == CrawlMode.single and isinstance(detector, skip_in_single_path))
             ]
             detector_results = await asyncio.gather(*detector_tasks, return_exceptions=True)
             for result in detector_results:
@@ -204,6 +210,12 @@ class ScanOrchestrator:
             # Findings with same (url, parameter, vuln_type) are consolidated
             findings = FindingDeduplicator.deduplicate(findings)
             logger.info("deduplication complete: %d findings after merging", len(findings))
+
+            findings = TestPollutionFilter.filter_cross_module_contamination(findings)
+            logger.info(
+                "test pollution filter complete: %d findings after contamination review",
+                len(findings),
+            )
 
             # scan_mode filtering: If verified, keep only verified findings
             settings = get_settings()

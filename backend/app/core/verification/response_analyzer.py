@@ -124,7 +124,7 @@ class ResponseAnalyzer:
     @staticmethod
     def generate_probe_canary() -> str:
         """Return a unique per-request canary for unambiguous reflection proof."""
-        return f"sntryprobe_{uuid4().hex[:8]}"
+        return f"sentryprobe_{uuid4().hex[:8]}"
 
     @staticmethod
     def verify_reflection(
@@ -164,6 +164,8 @@ class ResponseAnalyzer:
             evidence["reason"] = "empty_probe"
             return False, evidence
 
+        requires_raw = ResponseAnalyzer._requires_unencoded_match(payload)
+
         escaped = re.escape(probe)
         if re.search(escaped, response_body):
             if baseline_body and re.search(escaped, baseline_body):
@@ -175,7 +177,7 @@ class ResponseAnalyzer:
             return True, evidence
 
         decoded_body = html.unescape(response_body)
-        if re.search(escaped, decoded_body):
+        if not requires_raw and re.search(escaped, decoded_body):
             if baseline_body and re.search(escaped, html.unescape(baseline_body)):
                 evidence["pre_existing_in_baseline"] = True
                 evidence["reason"] = "probe_pre_existing_in_baseline_decoded"
@@ -185,11 +187,15 @@ class ResponseAnalyzer:
             return True, evidence
 
         meaningful = ResponseAnalyzer._meaningful_payload_marker(payload, min_substring_len)
+        if meaningful and requires_raw and canary is None and "<" not in meaningful:
+            meaningful = None
+
         if meaningful:
-            for body_variant, label in (
-                (response_body, "raw"),
-                (decoded_body, "html_decoded"),
-            ):
+            body_variants = [("raw", response_body)]
+            if not requires_raw:
+                body_variants.append(("html_decoded", decoded_body))
+
+            for label, body_variant in body_variants:
                 if meaningful in body_variant:
                     baseline_variant = baseline_body or ""
                     if baseline_variant and meaningful in (
@@ -198,7 +204,7 @@ class ResponseAnalyzer:
                         evidence["pre_existing_in_baseline"] = True
                         evidence["reason"] = "marker_pre_existing_in_baseline"
                         return False, evidence
-                    if label == "html_decoded" and "&lt;" in body_variant and meaningful not in body_variant:
+                    if label == "html_decoded" and requires_raw:
                         evidence["reason"] = "marker_html_encoded"
                         return False, evidence
                     evidence["payload_substring_verified"] = True
@@ -208,6 +214,18 @@ class ResponseAnalyzer:
 
         evidence["reason"] = "no_verified_reflection"
         return False, evidence
+
+    @staticmethod
+    def _requires_unencoded_match(payload: str) -> bool:
+        """XSS/HTML payloads must appear unencoded in the raw response body."""
+        lowered = payload.lower()
+        return (
+            "<" in payload
+            or ">" in payload
+            or "onerror" in lowered
+            or "onload" in lowered
+            or lowered.startswith("javascript:")
+        )
 
     @staticmethod
     def _meaningful_payload_marker(payload: str, min_len: int) -> str | None:

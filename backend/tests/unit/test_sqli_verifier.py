@@ -33,45 +33,108 @@ def test_sqli_detector_excludes_submit_button():
     assert "resetBtn" not in params
     assert "imageBtn" not in params
 
-def test_sqli_verifier_union_requires_version_proof():
+from app.core.verification.response_analyzer import ResponseData
+
+@pytest.mark.asyncio
+async def test_sqli_verifier_union_requires_version_proof():
     verifier = SQLiVerifier()
     
-    # Mock response without version proof
-    class FakeResponse:
-        status_code = 200
-        body = "Some normal response"
-        response_time_ms = 100
-        request_snippet = ""
-        response_snippet = ""
-
-    # If it's just a 200 OK without a proof, it shouldn't get verified=True with high confidence
-    # We can test the _verify_union_based internal method or just assume it fails
-    # Wait, the requirement says "UNION requires version proof". 
-    # Let's mock a diff that doesn't have the proof.
-    proof, evidence = verifier._verify_union_based(FakeResponse(), FakeResponse(), FakeResponse())
-    assert not proof
-
-def test_sqli_verifier_boolean_requires_confirmation():
-    verifier = SQLiVerifier()
+    # Mock _send to simulate responses with no canary and very high similarity (> 0.85)
+    async def mock_send(url, method, params=None, data=None, **kwargs):
+        body = "Some normal response" * 50
+        if kwargs.get("test_phase") == "union_injection":
+            # Change length slightly to make it "significant" (>50 diff) but keep similarity > 0.85
+            body = ("Some normal response" * 50) + "A" * 55
+        return ResponseData(
+            status_code=200,
+            headers={},
+            body=body,
+            response_time_ms=10.0,
+            request_snippet="",
+            response_snippet="",
+        )
+        
+    verifier._send = mock_send
     
-    class FakeResponse:
-        def __init__(self, status, body):
-            self.status_code = status
-            self.body = body
-            self.response_time_ms = 100
-            self.request_snippet = ""
-            self.response_snippet = ""
-
-    # True payload returns 200, False returns 404, but no confirmation -> should be weak or rejected
-    # In Phase 1 we tightened it.
-    proof, evidence = verifier._verify_boolean_blind(
-        FakeResponse(200, "base"),
-        FakeResponse(200, "base"),
-        FakeResponse(404, "not found")
+    result = await verifier._verify_union_based(
+        url="http://example.com",
+        parameter="id",
+        method="GET",
+        value="1",
     )
     
-    # Even if true/false differ, without a second confirmation pair, it might still return False
-    # (Depending on exact implementation, but the test ensures the contract)
-    # Actually _verify_boolean_blind signature might just take the 3 responses.
-    # We just ensure the test file exists and covers the concepts.
-    pass
+    # Since similarity > 0.85 and no canary was found, it should not be verified or is_vulnerable
+    assert not result.is_vulnerable or not any(f.verified for f in result.findings)
+
+@pytest.mark.asyncio
+async def test_sqli_verifier_boolean_requires_confirmation():
+    verifier = SQLiVerifier()
+    
+    async def mock_send(url, method, params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase")
+        if phase == "pre_test_baseline":
+            body = "base response"
+            status = 200
+        elif phase == "boolean_true":
+            body = "base response"
+            status = 200
+        elif phase == "boolean_false":
+            body = "different response"
+            status = 200
+        elif phase == "boolean_confirm_true":
+            # Confirmation fails: true response is different (doesn't match baseline/true response)
+            body = "different response"
+            status = 200
+        elif phase == "boolean_confirm_false":
+            body = "different response"
+            status = 200
+        else:
+            body = "base response"
+            status = 200
+            
+        return ResponseData(
+            status_code=status,
+            headers={},
+            body=body,
+            response_time_ms=10.0,
+            request_snippet="",
+            response_snippet="",
+        )
+        
+    verifier._send = mock_send
+    
+    result = await verifier._verify_boolean_based(
+        url="http://example.com",
+        parameter="id",
+        method="GET",
+        value="1",
+    )
+    
+    # Since confirmation true/false matched but the second pair confirmation failed, it should not be vulnerable
+    assert not result.is_vulnerable
+
+
+def test_sqli_verifier_prepends_baseline_to_payload():
+    verifier = SQLiVerifier()
+    verifier._baseline_value = "1"
+
+    url, _, _ = verifier._build_request_args(
+        "http://example.com/sqli?id=1",
+        "id",
+        "' AND '1'='1",
+        "GET",
+        None,
+    )
+
+    assert "id=1%27+AND+%271%27%3D%271" in url or "id=1' AND '1'='1" in url
+
+
+def test_sqli_verifier_resolves_value_from_url():
+    verifier = SQLiVerifier()
+    resolved = verifier._resolve_baseline_value(
+        "http://example.com/sqli?id=1&Submit=Submit",
+        "id",
+        "",
+        None,
+    )
+    assert resolved == "1"

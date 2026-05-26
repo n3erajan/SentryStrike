@@ -149,7 +149,7 @@ class AccessControlDetector(BaseDetector):
                         # Make sure it's not a generic login/auth redirect returning a 200
                         if not ("login" in body_lower and ("password" in body_lower or "username" in body_lower)):
                             similarity = ResponseAnalyzer.calculate_similarity(authed_resp.body, unauth_resp.body)
-                            if similarity > 0.95:
+                            if similarity <= 0.95:
                                 return []
                             cand_findings.append(
                                 Finding(

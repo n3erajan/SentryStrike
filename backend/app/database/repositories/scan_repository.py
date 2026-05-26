@@ -2,12 +2,12 @@ from datetime import datetime, timezone
 
 from beanie import PydanticObjectId
 
-from app.models.scan import Scan, ScanStatus
+from app.models.scan import CrawlMode, Scan, ScanStatus
 
 
 class ScanRepository:
-    async def create(self, target_url: str) -> Scan:
-        scan = Scan(target_url=target_url, status=ScanStatus.queued)
+    async def create(self, target_url: str, crawl_mode: CrawlMode = CrawlMode.full) -> Scan:
+        scan = Scan(target_url=target_url, crawl_mode=crawl_mode, status=ScanStatus.queued)
         await scan.insert()
         return scan
 

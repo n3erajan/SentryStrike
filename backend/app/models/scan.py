@@ -15,6 +15,11 @@ class ScanStatus(str, Enum):
     cancelled = "cancelled"
 
 
+class CrawlMode(str, Enum):
+    full = "full"
+    single = "single"
+
+
 class SeverityBreakdown(BaseModel):
     critical: int = 0
     high: int = 0
@@ -45,6 +50,7 @@ class ReportMetadata(BaseModel):
 
 class Scan(Document):
     target_url: Indexed(str)
+    crawl_mode: CrawlMode = CrawlMode.full
     status: ScanStatus = ScanStatus.queued
     progress: int = Field(default=0, ge=0, le=100)
 

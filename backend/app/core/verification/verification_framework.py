@@ -14,7 +14,7 @@ import httpx
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Optional
-from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
+from urllib.parse import urlencode, urlparse, parse_qs, parse_qsl, urlunparse
 
 from app.core.detectors.base_detector import Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
@@ -153,14 +153,20 @@ class HttpVerifier:
         try:
             start_time = time.time() if capture_timing else None
 
-            response = await client.request(
-                method=method,
-                url=url,
-                params=params,
-                data=data,
-                headers=headers,
-                cookies=cookies,
-            )
+            # httpx treats params={} as "replace query string with nothing",
+            # wiping query params already embedded in *url*. Only pass params/data
+            # when there are actual values to send.
+            request_kwargs: dict = {"method": method, "url": url}
+            if params:
+                request_kwargs["params"] = params
+            if data:
+                request_kwargs["data"] = data
+            if headers:
+                request_kwargs["headers"] = headers
+            if cookies:
+                request_kwargs["cookies"] = cookies
+
+            response = await client.request(**request_kwargs)
 
             end_time = time.time() if capture_timing else None
             response_time_ms = (end_time - start_time) * 1000 if capture_timing else 0
@@ -445,11 +451,6 @@ class TestPollutionFilter:
         "Reflected XSS",
         "Header-Reflected XSS",
     })
-    _SQLI_SIMILARITY_METHODS = frozenset({
-        "boolean_differential",
-        "union_based",
-    })
-
     @staticmethod
     def _canonical_url(url: str) -> str:
         parsed = urlparse(url)
@@ -458,18 +459,23 @@ class TestPollutionFilter:
     @classmethod
     def _has_verified_canary(cls, finding: Finding) -> bool:
         evidence = finding.detection_evidence or {}
-        if evidence.get("canary_verified"):
+        if evidence.get("canary_verified") or evidence.get("canary_proof"):
             return True
-        if evidence.get("verification_canary") and evidence.get("canary_verified") is not False:
-            return bool(evidence.get("canary_verified"))
+        if evidence.get("version_extracted"):
+            return True
         return False
 
     @classmethod
-    def _is_similarity_sqli(cls, finding: Finding) -> bool:
-        return (
-            finding.vuln_type.startswith("SQL Injection")
-            and finding.detection_method in cls._SQLI_SIMILARITY_METHODS
-        )
+    def _is_pollution_candidate(cls, finding: Finding) -> bool:
+        if finding.vuln_type in cls._REFLECTED_TYPES:
+            return True
+        if not finding.vuln_type.startswith("SQL Injection"):
+            return False
+        if finding.detection_method == "boolean_differential":
+            return True
+        if finding.detection_method == "union_based":
+            return not cls._has_verified_canary(finding)
+        return False
 
     @classmethod
     def filter_cross_module_contamination(cls, findings: list[Finding]) -> list[Finding]:
@@ -492,9 +498,11 @@ class TestPollutionFilter:
                 continue
 
             for finding in url_findings:
-                is_reflected_type = finding.vuln_type in cls._REFLECTED_TYPES
-                is_similarity_sqli = cls._is_similarity_sqli(finding)
-                if not (is_reflected_type or is_similarity_sqli):
+                if finding.vuln_type == "Stored XSS":
+                    filtered.append(finding)
+                    continue
+
+                if not cls._is_pollution_candidate(finding):
                     filtered.append(finding)
                     continue
 
@@ -521,6 +529,15 @@ class TestPollutionFilter:
 
 class URLParameterBuilder:
     """Utilities for building URLs with injected parameters."""
+
+    @staticmethod
+    def get_parameter_value(url: str, parameter: str) -> str:
+        """Return the current value of *parameter* from the URL query string."""
+        parsed = urlparse(url)
+        for name, val in parse_qsl(parsed.query, keep_blank_values=True):
+            if name == parameter:
+                return val
+        return ""
 
     @staticmethod
     def inject_parameter(
@@ -612,14 +629,14 @@ class FormPayloadBuilder:
             if name == target_param:
                 payload[name] = target_value
             elif inp_type == "password":
-                payload[name] = "sntry_password123"
+                payload[name] = "sentry_password123"
             elif inp_type in ("submit", "button"):
                 payload[name] = getattr(inp, "value", "Submit") or "Submit"
             elif inp_type == "hidden":
                 # Preserve hidden fields (CSRF tokens, etc.)
                 payload[name] = getattr(inp, "value", "")
             else:
-                payload[name] = getattr(inp, "value", "") or "sntry_test_val"
+                payload[name] = getattr(inp, "value", "") or "sentry_test_val"
 
         # Ensure the target parameter is always present
         if target_param not in payload:

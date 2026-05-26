@@ -2,17 +2,19 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, HttpUrl
 
-from app.models.scan import ScanStatus, ScanStatistics
+from app.models.scan import CrawlMode, ScanStatus, ScanStatistics
 from app.models.vulnerability import TechnologyComponent, Vulnerability
 
 
 class CreateScanRequest(BaseModel):
     target_url: HttpUrl
+    crawl_mode: CrawlMode = CrawlMode.full
 
 
 class ScanResponse(BaseModel):
     id: str
     target_url: str
+    crawl_mode: CrawlMode = CrawlMode.full
     status: ScanStatus
     progress: int
     created_at: datetime

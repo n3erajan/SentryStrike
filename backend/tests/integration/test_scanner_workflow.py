@@ -8,7 +8,7 @@ import pytest
 
 from app.core.scanner import ScanOrchestrator
 from app.core.detectors.base_detector import Finding
-from app.models.scan import ScanStatus
+from app.models.scan import CrawlMode, ScanStatus
 from app.models.vulnerability import OwaspCategory, SeverityLevel, TechnologyComponent
 
 
@@ -30,6 +30,13 @@ class FakeRepo:
 
 class FakeSpider:
     async def crawl(self, _: str):
+        class Result:
+            urls = ["https://example.com/search?q=1"]
+            forms = []
+
+        return Result()
+
+    async def fetch_single(self, _: str):
         class Result:
             urls = ["https://example.com/search?q=1"]
             forms = []
@@ -96,6 +103,7 @@ class FakeScan:
     def __init__(self) -> None:
         self.id = "mock-id"
         self.target_url = "https://example.com"
+        self.crawl_mode = CrawlMode.full
         self.status = ScanStatus.queued
         self.progress = 0
         self.created_at = datetime.now(timezone.utc)
@@ -138,6 +146,39 @@ async def test_scanner_workflow_completes() -> None:
     assert scan.status == ScanStatus.completed
     assert scan.statistics.total_vulnerabilities >= 1
     assert scan.overall_risk_score > 0
+
+
+@pytest.mark.asyncio
+async def test_single_path_scan_uses_fetch_single(monkeypatch):
+    scan = FakeScan()
+    scan.crawl_mode = CrawlMode.single
+    scan.target_url = "https://example.com/xss/"
+
+    used_fetch_single = False
+
+    class TrackingSpider(FakeSpider):
+        async def fetch_single(self, url: str):
+            nonlocal used_fetch_single
+            used_fetch_single = True
+            return await super().fetch_single(url)
+
+        async def crawl(self, url: str):
+            raise AssertionError("crawl() should not be called in single-path mode")
+
+    orchestrator = ScanOrchestrator(FakeRepo(scan))
+    orchestrator.spider = TrackingSpider()
+    orchestrator.technology_detector = FakeTechDetector()
+    orchestrator.cve_service = FakeCveService()
+    orchestrator.ssl_analyzer = FakeSsl()
+    orchestrator.detectors = [FakeDetector()]
+    orchestrator.supply_chain_detector = FakeDetector()
+    orchestrator.ai_report = FakeReport()
+
+    await orchestrator.run_scan("mock-id")
+
+    assert used_fetch_single
+    assert scan.status == ScanStatus.completed
+
 
 class MockServerRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
