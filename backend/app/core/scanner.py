@@ -306,90 +306,93 @@ class ScanOrchestrator:
             raise asyncio.CancelledError
 
     async def _analyze_all_findings(self, vulnerabilities: list[Vulnerability], scan: 'Scan') -> list[Vulnerability]:
-        """Analyze findings with AI using batched calls.
+            """Analyze findings with AI using optimized local model constraints."""
+            if not vulnerabilities:
+                return vulnerabilities
 
-        Instead of one AI call per vulnerability, vulnerabilities are grouped
-        into batches (up to ``BATCH_SIZE`` each) and each batch is sent as
-        a single prompt. If a batch fails, it falls back to analyzing them
-        individually. If individual analysis fails, it marks the status as failed.
-        """
-        if not vulnerabilities:
-            return vulnerabilities
+            # REDUCED FOR 7B MODEL: Large batches cause qwen2.5-coder:7b to hallucinate validations.
+            # Keeping it to 1-2 items per call preserves analytical accuracy.
+            BATCH_SIZE = 1 
+            analyzed: list[Vulnerability] = []
+            
+            tech_stack_str = ", ".join(t.name for t in scan.technology_stack) if scan.technology_stack else "Unknown"
 
-        BATCH_SIZE = 3  # max vulns per AI call — keeps prompts within context limits
-        analyzed: list[Vulnerability] = []
-        
-        tech_stack_str = ", ".join(t.name for t in scan.technology_stack) if scan.technology_stack else "Unknown"
+            for batch_start in range(0, len(vulnerabilities), BATCH_SIZE):
+                batch = vulnerabilities[batch_start : batch_start + BATCH_SIZE]
+                logger.info(
+                    "Analyzing batch %d–%d of %d vulnerabilities with local LLM",
+                    batch_start + 1,
+                    batch_start + len(batch),
+                    len(vulnerabilities),
+                )
 
-        for batch_start in range(0, len(vulnerabilities), BATCH_SIZE):
-            batch = vulnerabilities[batch_start : batch_start + BATCH_SIZE]
-            logger.info(
-                "analyzing batch %d–%d of %d vulnerabilities",
-                batch_start + 1,
-                batch_start + len(batch),
-                len(vulnerabilities),
-            )
+                results = []
+                try:
+                    if BATCH_SIZE == 1:
+                        result = await self._analyze_single(batch[0], tech_stack_str)
+                        results = [result]
+                    else:
+                        results = await self._analyze_batch(batch, tech_stack_str)
+                except Exception as e:
+                    logger.warning("Analysis call failed, falling back to individual processing: %s: %s", type(e).__name__, e)
+                    for vuln in batch:
+                        try:
+                            res = await self._analyze_single(vuln, tech_stack_str)
+                            results.append(res)
+                        except Exception as single_e:
+                            logger.warning("Single analysis failed for %s: %s", vuln.id, single_e)
+                            results.append({"ai_analysis_status": "failed"})
 
-            results = []
-            try:
-                results = await self._analyze_batch(batch, tech_stack_str)
-            except Exception as e:
-                logger.warning("Batch analysis failed for %d-%d, falling back to individual: %s: %s", batch_start + 1, batch_start + len(batch), type(e).__name__, e)
-                for vuln in batch:
-                    try:
-                        res = await self._analyze_single(vuln, tech_stack_str)
-                        results.append(res)
-                    except Exception as single_e:
-                        logger.warning("Single analysis failed for %s: %s: %s", vuln.id, type(single_e).__name__, single_e)
-                        results.append({"ai_analysis_status": "failed"})
+                # Apply AI results back to each vulnerability
+                for idx, (vuln, result) in enumerate(zip(batch, results), start=batch_start + 1):
+                    if result.get("ai_analysis_status") == "failed" or "results" in result:
+                        # Guard against malformed nested batch JSON structures
+                        if "results" in result and isinstance(result["results"], list) and len(result["results"]) > 0:
+                            result = result["results"][0]
+                        else:
+                            vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.failed
+                            cvss = CvssCalculator.from_vulnerability_context(
+                                vuln_type=vuln.vuln_type,
+                                requires_auth=False,
+                                confidence=0.8,
+                                impact=0.9 if vuln.severity.value in {"Critical", "High"} else 0.5,
+                            )
+                            vuln.cvss_score = cvss.score
+                            vuln.cvss_vector = cvss.vector
+                            vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
+                            analyzed.append(vuln)
+                            continue
 
-            # Apply AI results back to each vulnerability
-            for idx, (vuln, result) in enumerate(zip(batch, results), start=batch_start + 1):
-                if result.get("ai_analysis_status") == "failed":
-                    vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.failed
-                    # Set CVSS without AI enrichments
+                    fallback = self._get_fallback_for(vuln.vuln_type, scan.technology_stack)
+                    confidence = float(result.get("confidence", fallback["confidence"]))
+                    
+                    # Check for explicit AI override on false positives
+                    fp_prob = float(result.get("false_positive_probability", fallback["false_positive_probability"]))
+                    
+                    impact = 0.9 if vuln.severity.value in {"Critical", "High"} else 0.5
                     cvss = CvssCalculator.from_vulnerability_context(
                         vuln_type=vuln.vuln_type,
                         requires_auth=False,
-                        confidence=0.8,
-                        impact=0.9 if vuln.severity.value in {"Critical", "High"} else 0.5,
+                        confidence=confidence,
+                        impact=impact,
                     )
+
                     vuln.cvss_score = cvss.score
                     vuln.cvss_vector = cvss.vector
+                    vuln.ai_analysis.exploitability = normalize_exploitability(
+                        result.get("exploitability", fallback["exploitability"])
+                    )
+                    vuln.ai_analysis.business_impact = result.get("business_impact", fallback["business_impact"])
+                    vuln.ai_analysis.false_positive_probability = fp_prob
+                    vuln.ai_analysis.false_positive_reasoning = result.get("false_positive_reasoning")
+                    vuln.ai_analysis.exploitability_reasoning = result.get("exploitability_reasoning")
+                    vuln.ai_analysis.remediation = result.get("remediation", fallback["remediation"])
                     vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
+                    vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.success
+
                     analyzed.append(vuln)
-                    continue
 
-                fallback = self._get_fallback_for(vuln.vuln_type, scan.technology_stack)
-                confidence = float(result.get("confidence", fallback["confidence"]))
-                impact = 0.9 if vuln.severity.value in {"Critical", "High"} else 0.5
-                cvss = CvssCalculator.from_vulnerability_context(
-                    vuln_type=vuln.vuln_type,
-                    requires_auth=False,
-                    confidence=confidence,
-                    impact=impact,
-                )
-
-                vuln.cvss_score = cvss.score
-                vuln.cvss_vector = cvss.vector
-                vuln.ai_analysis.exploitability = normalize_exploitability(
-                    result.get("exploitability", fallback["exploitability"])
-                )
-                vuln.ai_analysis.business_impact = result.get("business_impact", fallback["business_impact"])
-                vuln.ai_analysis.false_positive_probability = float(
-                    result.get("false_positive_probability", fallback["false_positive_probability"])
-                )
-                vuln.ai_analysis.false_positive_reasoning = result.get("false_positive_reasoning")
-                vuln.ai_analysis.exploitability_reasoning = result.get("exploitability_reasoning")
-                vuln.ai_analysis.remediation = result.get("remediation", fallback["remediation"])
-                vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
-                vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.success
-
-                analyzed.append(vuln)
-
-            logger.info("batch analysis complete — %d findings processed so far", len(analyzed))
-
-        return analyzed
+            return analyzed
 
     async def _analyze_batch(self, batch: list[Vulnerability], tech_stack_str: str) -> list[dict]:
         vuln_descriptions = []
@@ -419,49 +422,54 @@ class ScanOrchestrator:
         return await self.ai_client.generate_json(prompt)
 
     def _build_prompt(self, tech_stack_str: str, vuln_descriptions: list[str], is_batch: bool) -> str:
-        if is_batch:
-            return (
-                "You are a senior application security analyst. Analyze each vulnerability below and return "
-                "a JSON object with key \"results\" containing an array of objects, one per vulnerability, in the "
-                "SAME ORDER.\n\n"
-                f"Technology Stack: {tech_stack_str}\n\n"
-                "Each object MUST have these keys:\n"
-                "- exploitability: 'Easy' (no auth required, trivial payload, public exploit exists), "
-                "'Medium' (requires valid session or multi-step attack), or 'Hard' (requires chained exploits, "
-                "race conditions, or specific server config)\n"
-                "- exploitability_reasoning: Provide a 1 sentence reasoning justifying the exploitability rating.\n"
-                "- business_impact: A SPECIFIC 1-2 sentence impact statement for THIS vulnerability at THIS URL. "
-                "Describe what an attacker can achieve (e.g., 'An attacker can exfiltrate the users table'). "
-                "CRITICAL: REJECT generic business_impact statements like 'potential security impact'. "
-                "You MUST require a concrete attacker outcome.\n"
-                "- confidence: float 0-1, probability this is a real vulnerability (not a false positive)\n"
-                "- false_positive_probability: float 0-1, probability this is NOT a real vulnerability\n"
-                "- false_positive_reasoning: Provide a 1 sentence reasoning justifying the false_positive_probability.\n"
-                "- remediation: A SPECIFIC fix for THIS vulnerability type referencing the Technology Stack where applicable. "
-                "For CSRF say 'add CSRF tokens'; for SQLi say 'use parameterized queries'; do NOT say 'implement HTTPS' unless it is transport.\n\n"
-                "Vulnerabilities:\n" + "\n".join(vuln_descriptions)
+            """Constructs an evaluation prompt with strict verification rules optimized for local 7B models."""
+            
+            # Grounding constraints designed to break the model's tendency to agree blindly
+            verification_guardrails = (
+                "CRITICAL VERIFICATION RULES TO PREVENT FALSE POSITIVES:\n"
+                "1. For SQL Injection: The 'evidence' string MUST contain an explicit database runtime error "
+                "(e.g., 'SQL syntax', 'PDOException', 'MySQL', 'PostgreSQL driver'). If the evidence merely shows "
+                "the payload reflected back dynamically in standard HTML text, you MUST mark false_positive_probability = 0.95 "
+                "and confidence = 0.05.\n"
+                "2. For Local/Remote File Inclusion (LFI/RFI): The 'evidence' MUST show contents of system files "
+                "(e.g., 'root:x:0', '[boot loader]') or file paths being evaluated. If it just reloads the base page, "
+                "mark false_positive_probability = 0.90.\n"
+                "3. Reflection does not equal Execution: If a payload is visible inside an HTTP response snippet but did "
+                "not break out of its execution context, treat it strictly as a potential False Positive.\n"
+                "4. Do not invent details: Base your reasoning solely on the verified markers present inside the 'evidence' field.\n"
             )
-        else:
-            return (
-                "You are a senior application security analyst. Analyze the vulnerability below and return "
-                "a JSON object.\n\n"
-                f"Technology Stack: {tech_stack_str}\n\n"
-                "The object MUST have these keys:\n"
-                "- exploitability: 'Easy' (no auth required, trivial payload, public exploit exists), "
-                "'Medium' (requires valid session or multi-step attack), or 'Hard' (requires chained exploits, "
-                "race conditions, or specific server config)\n"
-                "- exploitability_reasoning: Provide a 1 sentence reasoning justifying the exploitability rating.\n"
-                "- business_impact: A SPECIFIC 1-2 sentence impact statement for THIS vulnerability at THIS URL. "
-                "Describe what an attacker can achieve (e.g., 'An attacker can exfiltrate the users table'). "
-                "CRITICAL: REJECT generic business_impact statements like 'potential security impact'. "
-                "You MUST require a concrete attacker outcome.\n"
-                "- confidence: float 0-1, probability this is a real vulnerability (not a false positive)\n"
-                "- false_positive_probability: float 0-1, probability this is NOT a real vulnerability\n"
-                "- false_positive_reasoning: Provide a 1 sentence reasoning justifying the false_positive_probability.\n"
-                "- remediation: A SPECIFIC fix for THIS vulnerability type referencing the Technology Stack where applicable. "
-                "For CSRF say 'add CSRF tokens'; for SQLi say 'use parameterized queries'; do NOT say 'implement HTTPS' unless it is transport.\n\n"
-                "Vulnerability:\n" + "\n".join(vuln_descriptions)
+
+            schema_keys = (
+                "- exploitability: 'Easy' (no auth, direct execution, public exploit), "
+                "'Medium' (requires an authenticated session/multi-step workflow), or 'Hard' (requires special config or chains).\n"
+                "- exploitability_reasoning: Short, objective 1-sentence statement justifying execution capability.\n"
+                "- business_impact: A concrete 1-2 sentence statement detailing exactly what an attacker steals or executes. "
+                "Do NOT use generic filler like 'potential security risks'.\n"
+                "- confidence: float 0.0 to 1.0 (probability this finding is legitimate based strictly on the evidence).\n"
+                "- false_positive_probability: float 0.0 to 1.0 (probability this is a scanner hallucination/reflection).\n"
+                "- false_positive_reasoning: Explain exactly why this is real or why it appears to be a false positive reflection.\n"
+                "- remediation: Framework-specific mitigation step targeting the identified Technology Stack.\n"
             )
+
+            if is_batch:
+                return (
+                    "You are a critical, zero-trust application security code reviewer. Analyze each finding carefully.\n"
+                    "Return a JSON object containing a top-level \"results\" key which maps to an array of objects, "
+                    "retaining the exact same index order.\n\n"
+                    f"Target Technology Stack: {tech_stack_str}\n\n"
+                    f"{verification_guardrails}\n"
+                    f"Each object in the array MUST contain these identical keys:\n{schema_keys}\n"
+                    f"Vulnerabilities to process:\n" + "\n".join(vuln_descriptions)
+                )
+            else:
+                return (
+                    "You are a critical, zero-trust application security code reviewer. Analyze the finding below. "
+                    "Do not trust the scanner's classification blindly; look for physical proof in the evidence.\n\n"
+                    f"Target Technology Stack: {tech_stack_str}\n\n"
+                    f"{verification_guardrails}\n"
+                    f"Return a flat JSON object with exactly these keys:\n{schema_keys}\n"
+                    f"Vulnerability Data:\n" + "\n".join(vuln_descriptions)
+                )
 
     def _get_fallback_for(self, vuln_type: str, tech_stack: list['TechnologyComponent'] = None) -> dict:
         remediation = "Apply defense-in-depth controls appropriate to this vulnerability class."

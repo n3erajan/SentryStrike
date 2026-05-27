@@ -113,6 +113,11 @@ _UNION_MIN_SIGNIFICANT_PAYLOADS = 3   # raised from 2
 # Intentionally excludes generic "error", "warning", "invalid input".
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# FIX 1: Replace the two "risky" bare function-name markers with their 
+#         actual error-message forms. These are what MySQL actually outputs.
+# ---------------------------------------------------------------------------
+
 _SQL_SPECIFIC_MARKERS = frozenset({
     "you have an error in your sql syntax",
     "warning: mysql",
@@ -132,8 +137,11 @@ _SQL_SPECIFIC_MARKERS = frozenset({
     "sqlstate",
     "sqlexception",
     "division by zero in",
-    "extractvalue(",
-    "updatexml(",
+    # FIX: was "extractvalue(" and "updatexml(" — these are function NAMES that
+    # get reflected verbatim by XSS endpoints. Replace with the actual MySQL
+    # XPATH error messages that only appear on real injection.
+    "xpath syntax error",                        # MySQL extractvalue/updatexml error
+    "invalid xml",                               # alternate XPATH error form
     "invalid column name",
     "sql server",
     "odbc microsoft access",
@@ -188,16 +196,51 @@ def _has_sql_specific_error(text: str) -> bool:
     return any(m in lowered for m in _SQL_SPECIFIC_MARKERS)
 
 
-def _new_sql_errors(baseline_body: str, injected_body: str) -> list[str]:
-    """
-    Return SQL-specific error markers present in injected_body that are
-    absent from baseline_body. The baseline exclusion prevents false positives
-    on pages that already render a SQL error in their normal state.
-    """
-    bl = baseline_body.lower()
-    inj = injected_body.lower()
-    return [m for m in _SQL_SPECIFIC_MARKERS if m in inj and m not in bl]
+# ---------------------------------------------------------------------------
+# FIX 2: Strip the FULL composed injection value (baseline + payload),
+#         not just the payload suffix. Also strip %28/%29 hex-encoded parens.
+# ---------------------------------------------------------------------------
 
+def _new_sql_errors(
+    baseline_body: str,
+    injected_body: str,
+    payload: str,
+    baseline_value: str = "",
+) -> list[str]:
+    import urllib.parse
+    import html
+
+    bl  = baseline_body.lower()
+    inj = injected_body.lower()
+
+    full_injected = (baseline_value + payload).lower()
+    payload_lower = payload.lower()
+
+    # Generate an exhaustive array of reflection combinations
+    candidates = {
+        full_injected,
+        urllib.parse.quote_plus(full_injected),
+        urllib.parse.quote(full_injected),
+        full_injected.replace("(", "%28").replace(")", "%29"),
+        html.escape(full_injected),
+        full_injected.replace("'", "&#39;").replace('"', "&quot;"),
+        full_injected.replace("'", "&#039;"),
+        
+        # Suffix fallbacks
+        payload_lower,
+        urllib.parse.quote_plus(payload_lower),
+        urllib.parse.quote(payload_lower),
+        html.escape(payload_lower),
+        payload_lower.replace("'", "&#39;").replace('"', "&quot;"),
+        payload_lower.replace("'", "&#039;"),
+    }
+
+    # Atomically strip all potential echo signatures
+    for candidate in candidates:
+        if candidate:
+            inj = inj.replace(candidate, "")
+
+    return [m for m in _SQL_SPECIFIC_MARKERS if m in inj and m not in bl]
 
 def _new_version_indicators(baseline_body: str, injected_body: str) -> list[str]:
     """
@@ -692,26 +735,26 @@ class SQLiVerifier(BaseVerifier):
                 )
                 inj_body = inj_resp.body or ""
 
-                errors = _new_sql_errors(baseline_body, inj_body)
+                errors = _new_sql_errors(baseline_body, inj_body, payload, self._baseline_value or "")
                 if not errors:
                     continue
 
                 if first_hit_payload is None:
-                    # Record first hit, keep searching for confirmation.
                     first_hit_payload = payload
                     first_hit_errors  = errors
                     first_hit_resp    = inj_resp
                     continue
 
-                # Second independent payload also triggers a new SQL error.
-                # Two independent triggers → confirmed.
+                # If we get here, a second independent payload also confirmed an error
                 all_errors = list(set(first_hit_errors + errors))
                 confidence = 85.0
+
                 finding = self._create_finding(
                     category=OwaspCategory.a05,
                     vuln_type="SQL Injection (Error-Based)",
                     severity=SeverityLevel.critical,
-                    url=url, parameter=parameter, payload=first_hit_payload,
+                    url=url, parameter=parameter, 
+                    payload=payload,  # Aligning payload with the snippet below
                     evidence=(
                         f"SQL-engine error triggered by '{first_hit_payload}' "
                         f"and confirmed by '{payload}'. "
@@ -728,6 +771,7 @@ class SQLiVerifier(BaseVerifier):
                     verification_request_snippet=inj_resp.request_snippet,
                     verification_response_snippet=inj_resp.response_snippet,
                 )
+
                 return VerificationResult(
                     is_vulnerable=True, confidence_score=confidence,
                     detection_method="error_based", findings=[finding],
@@ -756,346 +800,358 @@ class SQLiVerifier(BaseVerifier):
     # ======================================================================
 
     async def _verify_union_based(
-        self,
-        url: str,
-        parameter: str,
-        method: str,
-        value: str,
-        form_inputs: Optional[list] = None,
-        pre_test_baseline: Optional[ResponseData] = None,
-    ) -> VerificationResult:
-        """
-        UNION-based SQLi detection. Three signal levels:
-
-        Level 1 (confidence 90) — Canary reflection:
-            Inject a unique random string via UNION SELECT. If it appears in
-            the response body but was absent from the baseline, this is proof
-            of data extraction. No similarity comparison needed.
-
-        Level 2 (confidence 90) — Version extraction:
-            Replace a NULL column with @@version / version(). Version indicator
-            must be NEW (absent from baseline) AND the parent NULL probe must
-            have passed the similarity gate. This prevents version-extraction
-            false positives on page-transition responses (similarity 0.01).
-
-        Level 3 (confidence 75) — Stable column-count differential:
-            Requires >= 3 NULL-count payloads in the valid similarity window
-            [0.10, 0.97] AND a cross-column confirmation probe. Anything below
-            3 payloads is suppressed — 2 payloads is not enough to rule out
-            coincidental page changes on non-SQL parameters.
-
-        The critical invariant for Levels 2 and 3:
-            is_vulnerable is NEVER set True on a response with similarity < 0.10.
-            That similarity band means the page changed completely — the query
-            failed or caused an error page, not a successful UNION injection.
-        """
-        union_null_payloads = [
-            "' UNION SELECT NULL--",
-            "' UNION SELECT NULL,NULL--",
-            "' UNION SELECT NULL,NULL,NULL--",
-            "' UNION SELECT NULL,NULL,NULL,NULL--",
-            "' UNION SELECT NULL,NULL,NULL,NULL,NULL--",
-        ]
-
-        try:
-            baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
-                url, parameter, method, value, form_inputs
-            )
-            baseline_body = baseline.body or ""
-
-            # ----------------------------------------------------------------
-            # Pass 1: Canary probes (strongest signal — no similarity gate needed)
-            # ----------------------------------------------------------------
-            for null_count in range(1, 6):
-                canary = ResponseAnalyzer.generate_probe_canary()
-                cols = ["NULL"] * null_count
-                cols[0] = f"'{canary}'"
-                canary_payload = f"' UNION SELECT {','.join(cols)}--"
-
-                inj_url, inj_params, inj_data = self._build_request_args(
-                    url, parameter, canary_payload, method, form_inputs
-                )
-                inj_resp = await self._send(
-                    inj_url, method, inj_params, inj_data,
-                    test_phase="union_canary", payload=canary_payload,
-                )
-
-                canary_reflected, _ = ResponseAnalyzer.verify_reflection(
-                    canary_payload, inj_resp.body,
-                    baseline_body=baseline_body, canary=canary,
-                )
-                if canary_reflected:
-                    finding = self._create_finding(
-                        category=OwaspCategory.a05,
-                        vuln_type="SQL Injection (UNION-Based)",
-                        severity=SeverityLevel.high,
-                        url=url, parameter=parameter, payload=canary_payload,
-                        evidence=(
-                            f"UNION canary '{canary}' reflected in response body. "
-                            f"Value absent from baseline — confirms data extraction."
-                        ),
-                        confidence_score=90.0, detection_method="union_based",
-                        method=method,
-                        detection_evidence={
-                            "verification_canary": canary,
-                            "canary_verified": True,
-                        },
-                        reproducible=True, verified=True,
-                        verification_request_snippet=inj_resp.request_snippet,
-                        verification_response_snippet=inj_resp.response_snippet,
-                    )
-                    return VerificationResult(
-                        is_vulnerable=True, confidence_score=90.0,
-                        detection_method="union_based", findings=[finding],
-                        evidence={"canary_verified": True, "canary": canary},
-                        reproducible=True,
-                    )
-
-            # ----------------------------------------------------------------
-            # Pass 2: NULL differential — collect payloads in the valid window.
-            # This is also the gate for Pass 3 version extraction.
-            # ----------------------------------------------------------------
-            # Maps payload → (response, similarity) for payloads that passed
-            # the similarity window filter.
-            valid_null_probes: list[tuple[str, ResponseData, float]] = []
-
-            for payload in union_null_payloads:
-                inj_url, inj_params, inj_data = self._build_request_args(
-                    url, parameter, payload, method, form_inputs
-                )
-                inj_resp = await self._send(
-                    inj_url, method, inj_params, inj_data,
-                    test_phase="union_null", payload=payload,
-                )
-
-                if inj_resp.status_code != 200:
-                    logger.debug(
-                        "UNION NULL '%s' non-200 status (%s) %s:%s — skip",
-                        payload, inj_resp.status_code, url, parameter,
-                    )
-                    continue
-
-                sim = _body_similarity(baseline_body, inj_resp.body or "")
-
-                if sim < _UNION_SIM_MIN:
-                    # Page transition / error page — not injection.
-                    logger.debug(
-                        "UNION NULL '%s' similarity %.2f < %.2f (page transition) %s:%s — skip",
-                        payload, sim, _UNION_SIM_MIN, url, parameter,
-                    )
-                    continue
-
-                if sim > _UNION_SIM_MAX:
-                    # UNION ignored or wrong column count.
-                    logger.debug(
-                        "UNION NULL '%s' similarity %.2f > %.2f (no change) %s:%s — skip",
-                        payload, sim, _UNION_SIM_MAX, url, parameter,
-                    )
-                    continue
-
-                valid_null_probes.append((payload, inj_resp, sim))
-
-            if not valid_null_probes:
-                return VerificationResult(
-                    is_vulnerable=False, confidence_score=0.0,
-                    detection_method="union_based", findings=[], evidence={},
-                )
-
-            # ----------------------------------------------------------------
-            # Pass 3: Version extraction.
-            # Only attempt for column counts that had a VALID null probe.
-            # ----------------------------------------------------------------
-            version_extracted_body: Optional[str] = None
-            version_payload_used:   Optional[str] = None
-
-            version_expressions = [
-                "@@version",
-                "version()",
-                "sqlite_version()",
-                "@@global.version",
+            self,
+            url: str,
+            parameter: str,
+            method: str,
+            value: str,
+            form_inputs: Optional[list] = None,
+            pre_test_baseline: Optional[ResponseData] = None,
+        ) -> VerificationResult:
+            """
+            UNION-based SQLi detection with robust text-storage/reflection guards.
+            """
+            union_null_payloads = [
+                "' UNION SELECT NULL--",
+                "' UNION SELECT NULL,NULL--",
+                "' UNION SELECT NULL,NULL,NULL--",
+                "' UNION SELECT NULL,NULL,NULL,NULL--",
+                "' UNION SELECT NULL,NULL,NULL,NULL,NULL--",
             ]
 
-            for parent_payload, parent_resp, parent_sim in valid_null_probes:
-                num_cols = parent_payload.count("NULL")
+            try:
+                baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
+                    url, parameter, method, value, form_inputs
+                )
+                baseline_body = baseline.body or ""
+                baseline_body_low = baseline_body.lower()
 
-                for v_expr in version_expressions:
-                    for col_idx in range(num_cols):
-                        cols = ["NULL"] * num_cols
-                        cols[col_idx] = v_expr
-                        ver_payload = f"' UNION SELECT {','.join(cols)}--"
+                # ----------------------------------------------------------------
+                # Pass 1: Canary probes (strongest signal — no similarity gate needed)
+                # ----------------------------------------------------------------
+                for null_count in range(1, 6):
+                    canary = ResponseAnalyzer.generate_probe_canary()
+                    cols = ["NULL"] * null_count
+                    cols[0] = f"'{canary}'"
+                    canary_payload = f"' UNION SELECT {','.join(cols)}--"
 
-                        ver_url, ver_params, ver_data = self._build_request_args(
-                            url, parameter, ver_payload, method, form_inputs
-                        )
-                        ver_resp = await self._send(
-                            ver_url, method, ver_params, ver_data,
-                            test_phase="union_version_extract", payload=ver_payload,
-                        )
+                    inj_url, inj_params, inj_data = self._build_request_args(
+                        url, parameter, canary_payload, method, form_inputs
+                    )
+                    inj_resp = await self._send(
+                        inj_url, method, inj_params, inj_data,
+                        test_phase="union_canary", payload=canary_payload,
+                    )
 
-                        # *** Critical fix: only accept version hits when the
-                        # version-extract response is itself in the valid window.
-                        ver_sim = _body_similarity(baseline_body, ver_resp.body or "")
-                        if not _similarity_in_union_window(ver_sim):
+                    canary_reflected, _ = ResponseAnalyzer.verify_reflection(
+                        canary_payload, inj_resp.body,
+                        baseline_body=baseline_body, canary=canary,
+                    )
+                    
+                    if canary_reflected:
+                        # --------------------------------------------------------
+                        # UNIVERSAL ANTI-XSS GUARD: Detect literal text reflection
+                        # --------------------------------------------------------
+                        inj_body_low = (inj_resp.body or "").lower()
+                        canary_low = canary.lower()
+                        
+                        xss_indicators = [
+                            f"'{canary_low}'",         # Raw single quotes
+                            f"\\'{canary_low}\\'",     # Escaped single quotes
+                            f"&#39;{canary_low}&#39;",   # HTML entity single quotes
+                            f"&apos;{canary_low}&apos;", # XML/HTML apostrophe
+                            f'"{canary_low}"',         # Double quotes fallback
+                            f'\\"{canary_low}\\"',     # Escaped double quotes
+                            f"&quot;{canary_low}&quot;" # HTML entity double quotes
+                        ]
+                        
+                        if any(indicator in inj_body_low for indicator in xss_indicators):
                             logger.debug(
-                                "Version extract '%s' similarity %.2f outside window %s:%s — skip",
-                                ver_payload, ver_sim, url, parameter,
+                                "UNION canary '%s' found, but it is wrapped in payload quote syntax. "
+                                "Suppressing false positive caused by XSS reflection/storage.", 
+                                canary
                             )
                             continue
 
-                        new_inds = _new_version_indicators(baseline_body, ver_resp.body or "")
-                        if new_inds:
-                            version_extracted_body = ver_resp.body
-                            version_payload_used   = ver_payload
-                            logger.debug(
-                                "Version extracted %s:%s via '%s' — new: %s",
-                                url, parameter, ver_payload, new_inds,
+                        finding = self._create_finding(
+                            category=OwaspCategory.a05,
+                            vuln_type="SQL Injection (UNION-Based)",
+                            severity=SeverityLevel.high,
+                            url=url, parameter=parameter, payload=canary_payload,
+                            evidence=(
+                                f"UNION canary '{canary}' reflected in response body. "
+                                f"Value absent from baseline — confirms data extraction."
+                            ),
+                            confidence_score=90.0, detection_method="union_based",
+                            method=method,
+                            detection_evidence={
+                                "verification_canary": canary,
+                                "canary_verified": True,
+                            },
+                            reproducible=True, verified=True,
+                            verification_request_snippet=inj_resp.request_snippet,
+                            verification_response_snippet=inj_resp.response_snippet,
+                        )
+                        return VerificationResult(
+                            is_vulnerable=True, confidence_score=90.0,
+                            detection_method="union_based", findings=[finding],
+                            evidence={"canary_verified": True, "canary": canary},
+                            reproducible=True,
+                        )
+
+                # ----------------------------------------------------------------
+                # Pass 2: NULL differential — collect payloads in the valid window.
+                # This is also the gate for Pass 3 version extraction.
+                # ----------------------------------------------------------------
+                valid_null_probes: list[tuple[str, ResponseData, float]] = []
+
+                for payload in union_null_payloads:
+                    inj_url, inj_params, inj_data = self._build_request_args(
+                        url, parameter, payload, method, form_inputs
+                    )
+                    inj_resp = await self._send(
+                        inj_url, method, inj_params, inj_data,
+                        test_phase="union_null", payload=payload,
+                    )
+
+                    # ------------------------------------------------------------
+                    # GUARD #1: Stop Stored XSS text pollution from impacting Pass 2 / 4
+                    # ------------------------------------------------------------
+                    inj_body_low = (inj_resp.body or "").lower()
+                    if "union select" in inj_body_low and "union select" not in baseline_body_low:
+                        logger.debug(
+                            "UNION NULL payload keywords 'UNION SELECT' detected literally in response body. "
+                            "Suppressing false positive caused by literal text storage/reflection."
+                        )
+                        continue
+
+                    if inj_resp.status_code != 200:
+                        logger.debug(
+                            "UNION NULL '%s' non-200 status (%s) %s:%s — skip",
+                            payload, inj_resp.status_code, url, parameter,
+                        )
+                        continue
+
+                    sim = _body_similarity(baseline_body, inj_resp.body or "")
+
+                    if sim < _UNION_SIM_MIN:
+                        logger.debug(
+                            "UNION NULL '%s' similarity %.2f < %.2f (page transition) %s:%s — skip",
+                            payload, sim, _UNION_SIM_MIN, url, parameter,
+                        )
+                        continue
+
+                    if sim > _UNION_SIM_MAX:
+                        logger.debug(
+                            "UNION NULL '%s' similarity %.2f > %.2f (no change) %s:%s — skip",
+                            payload, sim, _UNION_SIM_MAX, url, parameter,
+                        )
+                        continue
+
+                    valid_null_probes.append((payload, inj_resp, sim))
+
+                if not valid_null_probes:
+                    return VerificationResult(
+                        is_vulnerable=False, confidence_score=0.0,
+                        detection_method="union_based", findings=[], evidence={},
+                    )
+
+                # ----------------------------------------------------------------
+                # Pass 3: Version extraction.
+                # ----------------------------------------------------------------
+                version_extracted_body: Optional[str] = None
+                version_payload_used:   Optional[str] = None
+
+                version_expressions = [
+                    "@@version",
+                    "version()",
+                    "sqlite_version()",
+                    "@@global.version",
+                ]
+
+                for parent_payload, parent_resp, parent_sim in valid_null_probes:
+                    num_cols = parent_payload.count("NULL")
+
+                    for v_expr in version_expressions:
+                        for col_idx in range(num_cols):
+                            cols = ["NULL"] * num_cols
+                            cols[col_idx] = v_expr
+                            ver_payload = f"' UNION SELECT {','.join(cols)}--"
+
+                            ver_url, ver_params, ver_data = self._build_request_args(
+                                url, parameter, ver_payload, method, form_inputs
                             )
+                            ver_resp = await self._send(
+                                ver_url, method, ver_params, ver_data,
+                                test_phase="union_version_extract", payload=ver_payload,
+                            )
+
+                            # ------------------------------------------------------------
+                            # GUARD #2: Stop 'sqlite_version()' payload from text mirroring
+                            # ------------------------------------------------------------
+                            ver_body_low = (ver_resp.body or "").lower()
+                            if "union select" in ver_body_low and "union select" not in baseline_body_low:
+                                logger.debug(
+                                    "Version extract payload keywords 'UNION SELECT' detected literally. "
+                                    "Suppressing false positive caused by literal text storage/reflection."
+                                )
+                                continue
+
+                            ver_sim = _body_similarity(baseline_body, ver_resp.body or "")
+                            if not _similarity_in_union_window(ver_sim):
+                                logger.debug(
+                                    "Version extract '%s' similarity %.2f outside window %s:%s — skip",
+                                    ver_payload, ver_sim, url, parameter,
+                                )
+                                continue
+
+                            new_inds = _new_version_indicators(baseline_body, ver_resp.body or "")
+                            if new_inds:
+                                version_extracted_body = ver_resp.body
+                                version_payload_used   = ver_payload
+                                logger.debug(
+                                    "Version extracted %s:%s via '%s' — new: %s",
+                                    url, parameter, ver_payload, new_inds,
+                                )
+                                break
+
+                        if version_extracted_body:
                             break
 
                     if version_extracted_body:
                         break
 
                 if version_extracted_body:
-                    break
+                    finding = self._create_finding(
+                        category=OwaspCategory.a05,
+                        vuln_type="SQL Injection (UNION-Based)",
+                        severity=SeverityLevel.high,
+                        url=url, parameter=parameter, payload=version_payload_used,
+                        evidence=(
+                            f"UNION version extraction confirmed via '{version_payload_used}'. "
+                            f"DB version indicator absent from baseline."
+                        ),
+                        confidence_score=90.0, detection_method="union_based",
+                        method=method,
+                        detection_evidence={
+                            "version_extracted": True,
+                            "canary_verified": False,
+                        },
+                        reproducible=True, verified=True,
+                    )
+                    return VerificationResult(
+                        is_vulnerable=True, confidence_score=90.0,
+                        detection_method="union_based", findings=[finding],
+                        evidence={"version_extracted": True},
+                        reproducible=True,
+                    )
 
-            if version_extracted_body:
+                # ----------------------------------------------------------------
+                # Pass 4: Stable column-count differential.
+                # ----------------------------------------------------------------
+                n = len(valid_null_probes)
+                if n < _UNION_MIN_SIGNIFICANT_PAYLOADS:
+                    logger.debug(
+                        "UNION differential suppressed %s:%s — only %d/%d payloads in window",
+                        url, parameter, n, _UNION_MIN_SIGNIFICANT_PAYLOADS,
+                    )
+                    return VerificationResult(
+                        is_vulnerable=False, confidence_score=0.0,
+                        detection_method="union_based", findings=[],
+                        evidence={
+                            "suppressed": True,
+                            "reason": f"only_{n}_valid_null_probes",
+                        },
+                    )
+
+                best_payload, best_resp, best_sim = max(
+                    valid_null_probes, key=lambda x: abs(x[2] - 0.5)
+                )
+                best_col_count = best_payload.count("NULL")
+
+                confirm_col_count = best_col_count + 1 if best_col_count < 5 else best_col_count - 1
+                confirm_payload = "' UNION SELECT " + ",".join(["NULL"] * confirm_col_count) + "--"
+
+                conf_url, conf_params, conf_data = self._build_request_args(
+                    url, parameter, confirm_payload, method, form_inputs
+                )
+                conf_resp = await self._send(
+                    conf_url, method, conf_params, conf_data,
+                    test_phase="union_cross_column_confirm", payload=confirm_payload,
+                )
+                conf_sim = _body_similarity(baseline_body, conf_resp.body or "")
+
+                if not _similarity_in_union_window(conf_sim):
+                    logger.debug(
+                        "UNION cross-column confirm outside window (%.2f) %s:%s — suppressed",
+                        conf_sim, url, parameter,
+                    )
+                    return VerificationResult(
+                        is_vulnerable=False, confidence_score=0.0,
+                        detection_method="union_based", findings=[],
+                        evidence={
+                            "suppressed": True,
+                            "reason": "cross_column_confirm_failed",
+                            "confirm_sim": conf_sim,
+                        },
+                    )
+
+                avg_sim = sum(s for _, _, s in valid_null_probes) / n
+                confidence = 65.0 if avg_sim > 0.85 else 75.0
+
+                if confidence < 75.0:
+                    logger.debug(
+                        "UNION differential weak (avg_sim=%.2f, confidence=%.1f) %s:%s — suppressed",
+                        avg_sim, confidence, url, parameter,
+                    )
+                    return VerificationResult(
+                        is_vulnerable=False, confidence_score=confidence,
+                        detection_method="union_based", findings=[],
+                        evidence={
+                            "suppressed": True,
+                            "reason": "weak_similarity_change",
+                            "avg_sim": avg_sim,
+                        },
+                    )
+
                 finding = self._create_finding(
                     category=OwaspCategory.a05,
                     vuln_type="SQL Injection (UNION-Based)",
                     severity=SeverityLevel.high,
-                    url=url, parameter=parameter, payload=version_payload_used,
+                    url=url, parameter=parameter, payload=best_payload,
                     evidence=(
-                        f"UNION version extraction confirmed via '{version_payload_used}'. "
-                        f"DB version indicator absent from baseline."
+                        f"UNION NULL payloads produced consistent response changes "
+                        f"across {n} column-count variants (avg similarity: {avg_sim:.2f}). "
+                        f"Cross-column confirmation probe similarity: {conf_sim:.2f}."
                     ),
-                    confidence_score=90.0, detection_method="union_based",
+                    confidence_score=confidence, detection_method="union_based",
                     method=method,
                     detection_evidence={
-                        "version_extracted": True,
+                        "valid_null_probes": n,
+                        "avg_similarity": avg_sim,
+                        "confirm_sim": conf_sim,
+                        "version_extracted": False,
                         "canary_verified": False,
                     },
                     reproducible=True, verified=True,
+                    verification_request_snippet=conf_resp.request_snippet,
+                    verification_response_snippet=conf_resp.response_snippet,
                 )
                 return VerificationResult(
-                    is_vulnerable=True, confidence_score=90.0,
+                    is_vulnerable=True, confidence_score=confidence,
                     detection_method="union_based", findings=[finding],
-                    evidence={"version_extracted": True},
+                    evidence={"valid_null_probes": n, "avg_similarity": avg_sim},
                     reproducible=True,
                 )
 
-            # ----------------------------------------------------------------
-            # Pass 4: Stable column-count differential.
-            # Requires >= 3 payloads in the valid window.
-            # ----------------------------------------------------------------
-            n = len(valid_null_probes)
-            if n < _UNION_MIN_SIGNIFICANT_PAYLOADS:
-                logger.debug(
-                    "UNION differential suppressed %s:%s — only %d/%d payloads in window",
-                    url, parameter, n, _UNION_MIN_SIGNIFICANT_PAYLOADS,
-                )
+            except Exception as e:
+                logger.error("UNION verification failed %s:%s: %s", url, parameter, e)
                 return VerificationResult(
                     is_vulnerable=False, confidence_score=0.0,
                     detection_method="union_based", findings=[],
-                    evidence={
-                        "suppressed": True,
-                        "reason": f"only_{n}_valid_null_probes",
-                    },
+                    evidence={"error": str(e)},
                 )
-
-            # Cross-column confirmation: pick the best NULL payload and verify
-            # that a different column count also produces a valid-window response.
-            # This rules out coincidental page changes on non-SQL parameters.
-            best_payload, best_resp, best_sim = max(
-                valid_null_probes, key=lambda x: abs(x[2] - 0.5)
-            )
-            best_col_count = best_payload.count("NULL")
-
-            # Pick a confirmation column count that is different from best.
-            confirm_col_count = best_col_count + 1 if best_col_count < 5 else best_col_count - 1
-            confirm_payload = "' UNION SELECT " + ",".join(["NULL"] * confirm_col_count) + "--"
-
-            conf_url, conf_params, conf_data = self._build_request_args(
-                url, parameter, confirm_payload, method, form_inputs
-            )
-            conf_resp = await self._send(
-                conf_url, method, conf_params, conf_data,
-                test_phase="union_cross_column_confirm", payload=confirm_payload,
-            )
-            conf_sim = _body_similarity(baseline_body, conf_resp.body or "")
-
-            # The confirmation probe must ALSO be in the valid window.
-            if not _similarity_in_union_window(conf_sim):
-                logger.debug(
-                    "UNION cross-column confirm outside window (%.2f) %s:%s — suppressed",
-                    conf_sim, url, parameter,
-                )
-                return VerificationResult(
-                    is_vulnerable=False, confidence_score=0.0,
-                    detection_method="union_based", findings=[],
-                    evidence={
-                        "suppressed": True,
-                        "reason": "cross_column_confirm_failed",
-                        "confirm_sim": conf_sim,
-                    },
-                )
-
-            avg_sim = sum(s for _, _, s in valid_null_probes) / n
-            confidence = 65.0 if avg_sim > 0.85 else 75.0
-
-            if confidence < 75.0:
-                logger.debug(
-                    "UNION differential weak (avg_sim=%.2f, confidence=%.1f) %s:%s — suppressed",
-                    avg_sim, confidence, url, parameter,
-                )
-                return VerificationResult(
-                    is_vulnerable=False, confidence_score=confidence,
-                    detection_method="union_based", findings=[],
-                    evidence={
-                        "suppressed": True,
-                        "reason": "weak_similarity_change",
-                        "avg_sim": avg_sim,
-                    },
-                )
-
-            finding = self._create_finding(
-                category=OwaspCategory.a05,
-                vuln_type="SQL Injection (UNION-Based)",
-                severity=SeverityLevel.high,
-                url=url, parameter=parameter, payload=best_payload,
-                evidence=(
-                    f"UNION NULL payloads produced consistent response changes "
-                    f"across {n} column-count variants (avg similarity: {avg_sim:.2f}). "
-                    f"Cross-column confirmation probe similarity: {conf_sim:.2f}. "
-                    f"No canary or version proof — circumstantial evidence."
-                ),
-                confidence_score=confidence, detection_method="union_based",
-                method=method,
-                detection_evidence={
-                    "valid_null_probes": n,
-                    "avg_similarity": avg_sim,
-                    "confirm_sim": conf_sim,
-                    "version_extracted": False,
-                    "canary_verified": False,
-                },
-                reproducible=True, verified=True,
-                verification_request_snippet=conf_resp.request_snippet,
-                verification_response_snippet=conf_resp.response_snippet,
-            )
-            return VerificationResult(
-                is_vulnerable=True, confidence_score=confidence,
-                detection_method="union_based", findings=[finding],
-                evidence={"valid_null_probes": n, "avg_similarity": avg_sim},
-                reproducible=True,
-            )
-
-        except Exception as e:
-            logger.error("UNION verification failed %s:%s: %s", url, parameter, e)
-            return VerificationResult(
-                is_vulnerable=False, confidence_score=0.0,
-                detection_method="union_based", findings=[],
-                evidence={"error": str(e)},
-            )
-
+            
     # ======================================================================
     # Technique 4: Time-based blind
     # ======================================================================

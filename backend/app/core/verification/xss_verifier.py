@@ -175,28 +175,48 @@ class XSSVerifier(BaseVerifier):
         form_inputs: Optional[list] = None,
         stored_display_urls: Optional[list[str]] = None,
     ) -> VerificationResult:
-        """
-        Verify XSS vulnerability.
-
-        Parameters
-        ----------
-        url                 : Target URL.
-        parameter           : Parameter (or header name) to inject.
-        method              : HTTP method.  Pass ``"HEADER:<name>"`` for
-                              header-injection candidates.
-        value               : Existing parameter value (used as baseline).
-        form_inputs         : Raw form inputs for POST candidates.
-        stored_display_urls : Extra URLs to probe for stored-XSS reflection
-                              (e.g. admin panel, profile page, feed page).
-        """
+        """Verify XSS vulnerability."""
+        
         self._begin_verification(parameter)
         findings: list[Finding] = []
 
         is_header_injection = method.upper().startswith("HEADER:")
         is_jsonp = parameter.lower() in self._JSONP_PARAM_NAMES
 
+        # ---------------------------------------------------------------- #
+        # GENERIC FIX: Pre-fetch clean baselines BEFORE mutating state
+        # ---------------------------------------------------------------- #
+        self._stored_baselines = {}
+
+        if not is_header_injection:
+            urls_to_probe = list(stored_display_urls or [])
+            bare = url.split("?")[0]
+
+            if bare not in urls_to_probe:
+                urls_to_probe.append(bare)
+
+            for probe_url in urls_to_probe:
+                try:
+                    self._stored_baselines[probe_url] = await self._send(
+                        probe_url,
+                        "GET",
+                        test_phase="stored_pre_test_baseline",
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Failed to pre-fetch clean baseline for %s: %s",
+                        probe_url,
+                        e,
+                    )
+
+        # ---------------------------------------------------------------- #
+
         pre_test_baseline = await self.fetch_pre_test_baseline(
-            url, parameter, method, value, form_inputs
+            url,
+            parameter,
+            method,
+            value,
+            form_inputs,
         )
 
         # DOM XSS — uses the clean pre-test snapshot; not for header candidates.
@@ -269,6 +289,9 @@ class XSSVerifier(BaseVerifier):
         else:
             payload_set = self.XSS_PAYLOADS
 
+        # ---------------------------------------------------------------- #
+        # Active payload testing
+        # ---------------------------------------------------------------- #
         for payload_type, payload in payload_set.items():
             result = await self._test_payload(
                 url, parameter, method, value, payload, payload_type,
@@ -278,6 +301,24 @@ class XSSVerifier(BaseVerifier):
                 findings.extend(result.findings)
 
         if findings:
+            # ------------------------------------------------------------ #
+            # GENERIC DEDUPLICATION: Upgrade/Consolidate findings.
+            # If the parameter is proven to support Stored XSS, then any
+            # concurrent "Reflected" findings on this exact parameter are 
+            # just immediate echoes of the same underlying persistent vector.
+            # ------------------------------------------------------------ #
+            has_stored = any(f.vuln_type == "Stored XSS" for f in findings)
+            
+            if has_stored:
+                for finding in findings:
+                    if finding.vuln_type == "Reflected XSS":
+                        finding.vuln_type = "Stored XSS"
+                        finding.evidence = (
+                            f"[Consolidated Reflection] Immediate echo of a confirmed "
+                            f"Stored XSS parameter. {finding.evidence}"
+                        )
+            # ------------------------------------------------------------ #
+
             findings.sort(key=lambda f: f.confidence_score, reverse=True)
             best = findings[0]
             return VerificationResult(
@@ -497,68 +538,49 @@ class XSSVerifier(BaseVerifier):
     # Stored XSS helpers
     # ------------------------------------------------------------------ #
 
-    async def _check_stored_reflection(
-        self,
-        payload: str,
-        origin_url: str,
-        stored_display_urls: Optional[list[str]],
-        *,
-        canary: str | None = None,
-    ) -> bool:
-        """Quick canary check across stored display URLs.  Returns True if any
-        of them reflect the payload."""
-        is_reflected, _, _, _, _ = await self._probe_stored(
-            payload, origin_url, stored_display_urls, canary=canary
-        )
-        return is_reflected
-
     async def _probe_stored(
-        self,
-        payload: str,
-        origin_url: str,
-        stored_display_urls: Optional[list[str]],
-        *,
-        canary: str | None = None,
-    ) -> tuple[bool, list[int], bool, Optional[object], dict]:
-        """
-        Check whether ``payload`` appears in any of the stored display URLs.
+            self,
+            payload: str,
+            origin_url: str,
+            stored_display_urls: Optional[list[str]],
+            *,
+            canary: str | None = None,
+        ) -> tuple[bool, list[int], bool, Optional[object], dict]:
+            """Check whether ``payload`` appears in any of the stored display URLs."""
+            urls_to_probe: list[str] = list(stored_display_urls or [])
+            bare = origin_url.split("?")[0]
+            if bare not in urls_to_probe:
+                urls_to_probe.append(bare)
 
-        Falls back to ``origin_url`` (query-stripped) when no display URLs are
-        provided — preserving the original behaviour.
+            for probe_url in urls_to_probe:
+                try:
+                    # GENERIC FIX: Read from the pristine pre-injection baselines if available
+                    if hasattr(self, "_stored_baselines") and probe_url in self._stored_baselines:
+                        baseline_resp = self._stored_baselines[probe_url]
+                    else:
+                        baseline_resp = await self._send(
+                            probe_url, "GET", test_phase="stored_pre_test_baseline"
+                        )
 
-        Returns (is_reflected, locations, was_encoded, response_object, evidence).
-        response_object is None when nothing was found.
-        """
-        urls_to_probe: list[str] = list(stored_display_urls or [])
-        bare = origin_url.split("?")[0]
-        if bare not in urls_to_probe:
-            urls_to_probe.append(bare)
+                    resp = await self._send(probe_url, "GET", test_phase="stored_check")
+                    is_ref, locs, was_enc = self._detect_reflection(payload, resp.body)
+                    if not is_ref:
+                        continue
 
-        display_baselines: dict[str, ResponseData] = {}
-        for probe_url in urls_to_probe:
-            try:
-                if probe_url not in display_baselines:
-                    display_baselines[probe_url] = await self._send(
-                        probe_url, "GET", test_phase="stored_pre_test_baseline"
+                    # Comparative analysis now evaluates against a genuinely clean snapshot
+                    verified, reflection_evidence = ResponseAnalyzer.verify_reflection(
+                        payload,
+                        resp.body,
+                        baseline_body=baseline_resp.body,
+                        canary=canary,
                     )
-                resp = await self._send(probe_url, "GET", test_phase="stored_check")
-                is_ref, locs, was_enc = self._detect_reflection(payload, resp.body)
-                if not is_ref:
-                    continue
+                    if verified:
+                        reflection_evidence["verification_canary"] = canary
+                        return True, locs, was_enc, resp, reflection_evidence
+                except Exception as e:
+                    logger.debug("Stored-XSS probe failed for %s: %s", probe_url, e)
 
-                verified, reflection_evidence = ResponseAnalyzer.verify_reflection(
-                    payload,
-                    resp.body,
-                    baseline_body=display_baselines[probe_url].body,
-                    canary=canary,
-                )
-                if verified:
-                    reflection_evidence["verification_canary"] = canary
-                    return True, locs, was_enc, resp, reflection_evidence
-            except Exception as e:
-                logger.debug("Stored-XSS probe failed for %s: %s", probe_url, e)
-
-        return False, [], False, None, {}
+            return False, [], False, None, {}
 
     # ------------------------------------------------------------------ #
     # Reflection detection — O(n) via re.finditer

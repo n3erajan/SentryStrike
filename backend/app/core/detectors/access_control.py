@@ -114,62 +114,74 @@ class AccessControlDetector(BaseDetector):
         semaphore = asyncio.Semaphore(4)
 
         async def verify_idor_candidate(cand) -> list[Finding]:
-            cand_url, param, method, val = cand
-            cand_findings = []
-            
-            # Manipulate ID value (increment numeric, or swap common IDs)
-            try:
-                num_val = int(val)
-                modified_val = str(num_val + 1)
-            except ValueError:
-                modified_val = "2" if val == "1" else "1"
+                    cand_url, param, method, val = cand
+                    cand_findings = []
+                    
+                    # 1. Calculate a modified ID to test horizontal privilege escalation
+                    try:
+                        num_val = int(val)
+                        modified_val = str(num_val + 1)
+                    except ValueError:
+                        modified_val = "2" if val == "1" else "1"
 
-            async with semaphore:
-                try:
-                    from app.core.verification.verification_framework import URLParameterBuilder
-                    
-                    # A. Query with authentication to check if resource exists
-                    authed_verifier.set_request_context(parameter=param)
-                    base_url, base_params, base_data = URLParameterBuilder.inject_parameter(cand_url, param, val, method)
-                    authed_resp = await authed_verifier.send_request(
-                        base_url, method, base_params, base_data, test_phase="idor_authed"
-                    )
-                    
-                    if authed_resp.status_code != 200:
-                        return []
-
-                    # B. Query unauthenticated to see if access control is broken
-                    unauth_url, unauth_params, unauth_data = URLParameterBuilder.inject_parameter(cand_url, param, val, method)
-                    unauth_resp = await unauthed_verifier.send_request(
-                        unauth_url, method, unauth_params, unauth_data, test_phase="idor_unauth"
-                    )
-                    
-                    if unauth_resp.status_code == 200:
-                        body_lower = unauth_resp.body.lower()
-                        # Make sure it's not a generic login/auth redirect returning a 200
-                        if not ("login" in body_lower and ("password" in body_lower or "username" in body_lower)):
-                            similarity = ResponseAnalyzer.calculate_similarity(authed_resp.body, unauth_resp.body)
-                            if similarity <= 0.95:
-                                return []
-                            cand_findings.append(
-                                Finding(
-                                    category=OwaspCategory.a01,
-                                    vuln_type="Insecure Direct Object Reference (IDOR)",
-                                    severity=SeverityLevel.high,
-                                    url=cand_url,
-                                    parameter=param,
-                                    method=method,
-                                    payload=val,
-                                    evidence=f"Object reference parameter '{param}' is accessible without authentication.",
-                                    verified=True,
-                                    verification_request_snippet=unauth_resp.request_snippet,
-                                    verification_response_snippet=unauth_resp.response_snippet,
-                                    reproducible=True,
-                                )
+                    async with semaphore:
+                        try:
+                            from app.core.verification.verification_framework import URLParameterBuilder
+                            
+                            # --- STEP 1: Establish Baseline (Is this just a public page?) ---
+                            unauth_url, unauth_params, unauth_data = URLParameterBuilder.inject_parameter(cand_url, param, val, method)
+                            unauth_resp = await unauthed_verifier.send_request(
+                                unauth_url, method, unauth_params, unauth_data, test_phase="idor_unauth_base"
                             )
-                except Exception as e:
-                    logger.error("IDOR verification failed for %s param %s: %s", cand_url, param, e)
-            return cand_findings
+                            
+                            unauth_mod_url, unauth_mod_params, unauth_mod_data = URLParameterBuilder.inject_parameter(cand_url, param, modified_val, method)
+                            unauth_mod_resp = await unauthed_verifier.send_request(
+                                unauth_mod_url, method, unauth_mod_params, unauth_mod_data, test_phase="idor_unauth_mod"
+                            )
+
+                            # If both unauthenticated requests return 200 OK and don't render a login page,
+                            # this is an intentionally PUBLIC endpoint (e.g., a public article), NOT an IDOR.
+                            if unauth_resp.status_code == 200 and unauth_mod_resp.status_code == 200:
+                                body_lower = unauth_resp.body.lower()
+                                if not ("login" in body_lower and ("password" in body_lower or "username" in body_lower)):
+                                    # Abort to prevent false positives.
+                                    return []
+
+                            # --- STEP 2: Test IDOR (Horizontal Escalation) ---
+                            # Now we know the endpoint is protected. Let's see if our Authed session 
+                            # can access the modified (other user's) ID.
+                            authed_verifier.set_request_context(parameter=param)
+                            auth_mod_url, auth_mod_params, auth_mod_data = URLParameterBuilder.inject_parameter(cand_url, param, modified_val, method)
+                            auth_mod_resp = await authed_verifier.send_request(
+                                auth_mod_url, method, auth_mod_params, auth_mod_data, test_phase="idor_authed_mod"
+                            )
+
+                            # If the request succeeds (200 OK) instead of being blocked (401/403/Redirect)
+                            if auth_mod_resp.status_code == 200:
+                                body_lower = auth_mod_resp.body.lower()
+                                
+                                # Ensure it didn't just quietly redirect us to a 200 OK login/dashboard page
+                                if not ("login" in body_lower and ("password" in body_lower or "username" in body_lower)):
+                                    cand_findings.append(
+                                        Finding(
+                                            category=OwaspCategory.a01,
+                                            vuln_type="Insecure Direct Object Reference (IDOR)",
+                                            severity=SeverityLevel.high,
+                                            url=cand_url,
+                                            parameter=param,
+                                            method=method,
+                                            payload=modified_val,
+                                            evidence=f"Access control bypass: Object reference '{param}'={modified_val} was accessible by the current session, despite lacking unauthenticated access.",
+                                            verified=True,
+                                            verification_request_snippet=auth_mod_resp.request_snippet,
+                                            verification_response_snippet=auth_mod_resp.response_snippet,
+                                            reproducible=True,
+                                        )
+                                    )
+                        except Exception as e:
+                            logger.error("IDOR verification failed for %s param %s: %s", cand_url, param, e)
+                            
+                    return cand_findings
 
         tasks = [verify_idor_candidate(c) for c in idor_candidates]
         results = await asyncio.gather(*tasks)
