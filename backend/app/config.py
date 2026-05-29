@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     crawl_depth: int = Field(default=3, alias="CRAWL_DEPTH")
     crawl_max_urls: int = Field(default=200, alias="CRAWL_MAX_URLS")
-    crawl_rate_limit_per_second: float = Field(default=3.0, alias="CRAWL_RATE_LIMIT_PER_SECOND")
+    crawl_rate_limit_per_second: float = Field(default=8.0, alias="CRAWL_RATE_LIMIT_PER_SECOND")
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     scanner_concurrency: int = Field(default=8, alias="SCANNER_CONCURRENCY")
 
