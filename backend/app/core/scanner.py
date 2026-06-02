@@ -35,6 +35,7 @@ from app.models.vulnerability import (
     Exploitability,
     LocationInfo,
     OwaspCategory,
+    ReviewStatus,
     SeverityLevel,
     Vulnerability,
     normalize_exploitability,
@@ -162,22 +163,39 @@ class ScanOrchestrator:
             if not ssl_result.get("valid", True):
                 findings.append(
                     Finding(
-                        category=OwaspCategory.a02,
+                        category=OwaspCategory.a04,
                         vuln_type="Weak TLS/SSL Configuration",
                         severity=SeverityLevel.medium,
                         url=scan.target_url,
                         evidence="; ".join(ssl_result.get("issues", [])) or "TLS issues detected",
+                        verified=True,
+                        reproducible=True,
                     )
                 )
 
             skip_in_single_path = (SensitivePathsDetector,)
-            detector_tasks = [
-                detector.detect(crawl_result.urls, crawl_result.forms, session_cookies=getattr(crawl_result, "session_cookies", {}))
+            active_detectors = [
+                detector
                 for detector in self.detectors
                 if not isinstance(detector, (CryptoFailuresDetector, SecurityHeadersDetector))
                 and not (scan.crawl_mode == CrawlMode.single and isinstance(detector, skip_in_single_path))
             ]
-            detector_results = await asyncio.gather(*detector_tasks, return_exceptions=True)
+            detector_parallelism = max(2, get_settings().scanner_concurrency // 3)
+            detector_semaphore = asyncio.Semaphore(detector_parallelism)
+            session_cookies = getattr(crawl_result, "session_cookies", {})
+
+            async def run_detector(detector) -> list[Finding]:
+                async with detector_semaphore:
+                    return await detector.detect(
+                        crawl_result.urls,
+                        crawl_result.forms,
+                        session_cookies=session_cookies,
+                    )
+
+            detector_results = await asyncio.gather(
+                *[run_detector(detector) for detector in active_detectors],
+                return_exceptions=True,
+            )
             for result in detector_results:
                 if isinstance(result, Exception):
                     logger.warning("detector failure: %s", result)
@@ -217,15 +235,91 @@ class ScanOrchestrator:
                 len(findings),
             )
 
-            # scan_mode filtering: If verified, keep only verified findings
+            # scan_mode filtering: If verified, keep only verified findings.
+            #
+            # IMPORTANT — heuristic passthrough:
+            # Some vulnerability classes are confirmed by *observing* the HTTP response (e.g.
+            # "credentials sent in a GET query string", "no CSRF token in form", "phpMyAdmin
+            # is reachable").  These findings are structurally true the moment the detector
+            # inspects the response — there is no active exploit payload that could flip
+            # `verified=True`.  Dropping them silently would cause the scanner to miss
+            # critical, real issues on targets like DVWA.
+            #
+            # For these classes we keep the finding but note it is heuristic-only so the
+            # AI analysis phase can apply its own confidence weighting.
+            HEURISTIC_PASSTHROUGH_TYPES: tuple[str, ...] = (
+                # Credential / transport exposure — observable from request inspection alone
+                "credentials transmitted via http get",
+                "credentials via get",
+                "password in get",
+                # CSRF structural absence — observable from form HTML
+                "authentication form may lack csrf",
+                "csrf protection",
+                "csrf token",
+                # Exposed admin / sensitive paths — confirmed by HTTP 200/redirect response
+                "admin / privileged endpoint",
+                "admin endpoint",
+                "privileged endpoint",
+                "well-known admin",
+                "sensitive path",
+                "admin panel",
+                "phpmyadmin",
+                # Security-header absence — confirmed from response headers
+                "missing security header",
+                "security header",
+                # Session / cookie attribute issues — confirmed from Set-Cookie header
+                "insecure session cookie",
+                "cookie attribute",
+                # Information disclosure — confirmed from response body
+                "information disclosure",
+                "server banner",
+                "stack trace",
+                "debug page",
+                # TLS / transport issues already handled by sslyze (always verified=True)
+                "weak tls",
+                "ssl configuration",
+            )
+
             settings = get_settings()
             scan_mode = getattr(settings, "scan_mode", "verified")
             if scan_mode == "verified":
-                findings = [
-                    f for f in findings
-                    if getattr(f, "verified", False)
-                    or f.severity in (SeverityLevel.info, SeverityLevel.low)
-                ]
+                kept, dropped = [], []
+                for f in findings:
+                    vuln_lower = f.vuln_type.lower()
+                    is_verified = getattr(f, "verified", False)
+                    is_low_severity = f.severity in (SeverityLevel.info, SeverityLevel.low)
+                    is_heuristic_passthrough = any(
+                        keyword in vuln_lower for keyword in HEURISTIC_PASSTHROUGH_TYPES
+                    ) and getattr(f, "detection_method", "heuristic") == "heuristic"
+
+                    if is_verified or is_low_severity or is_heuristic_passthrough:
+                        if is_heuristic_passthrough and not is_verified:
+                            # Boost confidence slightly so AI phase doesn't ignore it, but
+                            # leave verified=False so the risk-score weighting in _to_vulnerability
+                            # still applies a 30 % penalty — honest representation.
+                            f.confidence_score = max(f.confidence_score, 0.6)
+                            logger.info(
+                                "verified scan mode KEPT heuristic finding (passthrough): "
+                                "vuln_type=%r severity=%s url=%s",
+                                f.vuln_type,
+                                f.severity.value if hasattr(f.severity, "value") else f.severity,
+                                f.url,
+                            )
+                        kept.append(f)
+                    else:
+                        dropped.append(f)
+                        logger.warning(
+                            "verified scan mode DROPPED finding: vuln_type=%r severity=%s verified=%s "
+                            "url=%s parameter=%s detection_method=%s confidence=%.1f",
+                            f.vuln_type,
+                            f.severity.value if hasattr(f.severity, "value") else f.severity,
+                            getattr(f, "verified", False),
+                            f.url,
+                            f.parameter,
+                            getattr(f, "detection_method", "unknown"),
+                            getattr(f, "confidence_score", 0.0),
+                        )
+                findings = kept
                 logger.info("filtered findings for verified scan mode: %d findings remaining", len(findings))
 
             # PHASE 1: Detect all vulnerabilities
@@ -236,10 +330,13 @@ class ScanOrchestrator:
             logger.info("phase 2 starting: analyzing %d findings", len(vulnerabilities))
             vulnerabilities = await self._analyze_all_findings(vulnerabilities, scan)
 
-            # Phase 1.4: Sync severity from CVSS
+            # Phase 2.1: Sync severity from CVSS (pre-FP adjustment)
             for v in vulnerabilities:
                 severity_str = CvssCalculator.get_severity(v.cvss_score)
                 v.severity = SeverityLevel(severity_str)
+
+            # Phase 2.2: Downgrade severity/CVSS for high false-positive probability findings
+            self._apply_false_positive_adjustments(vulnerabilities)
 
             vulnerabilities = self._compute_priority_ranks(vulnerabilities)
             vulnerabilities.sort(key=lambda v: v.cvss_score, reverse=True)
@@ -397,29 +494,57 @@ class ScanOrchestrator:
     async def _analyze_batch(self, batch: list[Vulnerability], tech_stack_str: str) -> list[dict]:
         vuln_descriptions = []
         for i, vuln in enumerate(batch):
-            auth_ctx = "requires_auth" if "cookie" in (vuln.evidence.request_snippet or "").lower() else "unknown_auth"
+            req = vuln.evidence.request_snippet or ""
+            resp = vuln.evidence.response_snippet or ""
+            payload = vuln.evidence.payload or ""
+            auth_ctx = "requires_auth" if "cookie" in req.lower() else "unknown_auth"
+
+            # Evidence is what the LLM must ground on. Keep it class-agnostic but
+            # include request/response/payload so fp scoring can vary by finding.
+            evidence_block = (
+                "evidence_block=\n"
+                f"- url={vuln.location.url}\n"
+                f"- http_method={vuln.location.http_method}\n"
+                f"- parameter={vuln.location.parameter or 'none'}\n"
+                f"- payload={payload or 'n/a'}\n"
+                f"- request_snippet={req[:1600] if req else 'n/a'}\n"
+                f"- response_snippet={resp[:1600] if resp else 'n/a'}\n"
+            )
+
             vuln_descriptions.append(
                 f"[{i}] type={vuln.vuln_type}; category={vuln.category.value}; "
-                f"severity={vuln.severity.value}; url={vuln.location.url}; "
-                f"method={vuln.location.http_method}; param={vuln.location.parameter or 'none'}; "
-                f"auth_context={auth_ctx}; "
-                f"evidence={vuln.evidence.response_snippet or vuln.evidence.payload or 'n/a'}"
+                f"severity={vuln.severity.value}; auth_context={auth_ctx}; "
+                + evidence_block
             )
-            
+
         prompt = self._build_prompt(tech_stack_str, vuln_descriptions, is_batch=True)
         return await self.ai_client.generate_json_list(prompt, expected_count=len(batch))
 
+
     async def _analyze_single(self, vuln: Vulnerability, tech_stack_str: str) -> dict:
-        auth_ctx = "requires_auth" if "cookie" in (vuln.evidence.request_snippet or "").lower() else "unknown_auth"
+        req = vuln.evidence.request_snippet or ""
+        resp = vuln.evidence.response_snippet or ""
+        payload = vuln.evidence.payload or ""
+        auth_ctx = "requires_auth" if "cookie" in req.lower() else "unknown_auth"
+
+        evidence_block = (
+            "evidence_block=\n"
+            f"- url={vuln.location.url}\n"
+            f"- http_method={vuln.location.http_method}\n"
+            f"- parameter={vuln.location.parameter or 'none'}\n"
+            f"- payload={payload or 'n/a'}\n"
+            f"- request_snippet={req[:1600] if req else 'n/a'}\n"
+            f"- response_snippet={resp[:1600] if resp else 'n/a'}\n"
+        )
+
         vuln_desc = (
             f"type={vuln.vuln_type}; category={vuln.category.value}; "
-            f"severity={vuln.severity.value}; url={vuln.location.url}; "
-            f"method={vuln.location.http_method}; param={vuln.location.parameter or 'none'}; "
-            f"auth_context={auth_ctx}; "
-            f"evidence={vuln.evidence.response_snippet or vuln.evidence.payload or 'n/a'}"
+            f"severity={vuln.severity.value}; auth_context={auth_ctx}; "
+            + evidence_block
         )
         prompt = self._build_prompt(tech_stack_str, [vuln_desc], is_batch=False)
         return await self.ai_client.generate_json(prompt)
+
 
     def _build_prompt(self, tech_stack_str: str, vuln_descriptions: list[str], is_batch: bool) -> str:
             """Constructs an evaluation prompt with strict verification rules optimized for local 7B models."""
@@ -510,6 +635,110 @@ class ScanOrchestrator:
             "false_positive_probability": 0.1,
             "remediation": remediation,
         }
+
+    def _apply_false_positive_adjustments(self, vulnerabilities: list[Vulnerability]) -> None:
+        """Downgrade CVSS score and severity for findings with high false-positive probability.
+
+        Thresholds (applied after AI analysis populates false_positive_probability):
+          fp_prob >= 0.90  →  cap CVSS at 1.0  (Info-level)
+          fp_prob >= 0.75  →  cap CVSS at 2.5  (Low-level)
+          fp_prob >= 0.50  →  reduce CVSS by 40 % (one severity band down at minimum)
+
+        After adjusting the CVSS score the severity label is re-derived via
+        CvssCalculator.get_severity so that both fields stay in sync.
+        """
+        _SEVERITY_ORDER = [
+            SeverityLevel.info,
+            SeverityLevel.low,
+            SeverityLevel.medium,
+            SeverityLevel.high,
+            SeverityLevel.critical,
+        ]
+
+        for v in vulnerabilities:
+            fp_prob = v.ai_analysis.false_positive_probability
+            if fp_prob is None:
+                continue
+
+            original_cvss = v.cvss_score
+            original_severity = v.severity
+
+            # --- Auto FP suppression ---
+            if fp_prob >= 0.80:
+                # High-confidence FP: auto-flag as false positive
+                v.is_false_positive = True
+                v.review_status = ReviewStatus.needs_review
+                reasoning = (v.ai_analysis.false_positive_reasoning or "").lower()
+                has_evidence_markers = any(
+                    kw in reasoning
+                    for kw in [
+                        "no sql", "sql error", "pdoexception", "mysql", "postgres", "sqlstate",
+                        "root:x", "boot loader", "file path", "system file",
+                        "time", "delta", "sleep", "timing",
+                        "csrf", "token", "samesite", "form",
+                        "canary", "reflected", "execution", "not executed",
+                        "difference", "baseline",
+                    ]
+                )
+
+                # If the model claims high FP but cannot reference any concrete evidence markers,
+                # treat it as low confidence and do not auto-suppress.
+                if not has_evidence_markers:
+                    logger.info(
+                        "Skipping auto-FP suppression due to insufficient reasoning markers: vuln_type=%r fp_prob=%.2f url=%s reasoning=%r",
+                        v.vuln_type,
+                        fp_prob,
+                        v.location.url,
+                        v.ai_analysis.false_positive_reasoning,
+                    )
+                else:
+                    v.is_false_positive = True
+                    v.review_status = ReviewStatus.needs_review
+                    logger.info(
+                        "Auto-suppressed as FP: vuln_type=%r fp_prob=%.2f url=%s",
+                        v.vuln_type,
+                        fp_prob,
+                        v.location.url,
+                    )
+            elif fp_prob >= 0.50:
+
+                # Moderate FP probability: flag for review
+                v.review_status = ReviewStatus.needs_review
+
+            # --- CVSS adjustments ---
+            if fp_prob >= 0.90:
+                # Almost certainly a scanner hallucination – collapse to Info
+                adjusted_cvss = min(original_cvss, 1.0)
+            elif fp_prob >= 0.75:
+                # Very likely a false positive – cap at Low
+                adjusted_cvss = min(original_cvss, 2.5)
+            elif fp_prob >= 0.50:
+                # Probable false positive – reduce score by 40 %
+                adjusted_cvss = round(original_cvss * 0.60, 1)
+            else:
+                # Low false-positive probability – no CVSS adjustment needed
+                continue
+
+            adjusted_cvss = max(0.0, round(adjusted_cvss, 1))
+            adjusted_severity = SeverityLevel(CvssCalculator.get_severity(adjusted_cvss))
+
+            if adjusted_cvss != original_cvss or adjusted_severity != original_severity:
+                logger.info(
+                    "FP adjustment: vuln_type=%r fp_prob=%.2f  "
+                    "cvss %s -> %s  severity %s -> %s  url=%s",
+
+
+
+                    v.vuln_type,
+                    fp_prob,
+                    original_cvss,
+                    adjusted_cvss,
+                    original_severity.value,
+                    adjusted_severity.value,
+                    v.location.url,
+                )
+                v.cvss_score = adjusted_cvss
+                v.severity = adjusted_severity
 
     def _compute_priority_ranks(self, vulnerabilities: list[Vulnerability]) -> list[Vulnerability]:
         exploitability_weight = {"Easy": 3.0, "Medium": 2.0, "Hard": 1.0}

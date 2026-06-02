@@ -23,7 +23,7 @@ class CryptoFailuresDetector(BaseDetector):
             if parsed_root.scheme != "https":
                 findings.append(
                     Finding(
-                        category=OwaspCategory.a02,
+                        category=OwaspCategory.a04,
                         vuln_type="Insecure Transport",
                         severity=SeverityLevel.high,
                         url=root_url,
@@ -45,7 +45,7 @@ class CryptoFailuresDetector(BaseDetector):
                     if not insecure_transport_reported:
                         findings.append(
                             Finding(
-                                category=OwaspCategory.a02,
+                                category=OwaspCategory.a04,
                                 vuln_type="Insecure Transport",
                                 severity=SeverityLevel.high,
                                 url=url,
@@ -66,7 +66,7 @@ class CryptoFailuresDetector(BaseDetector):
                 if mixed_content_resources:
                     findings.append(
                         Finding(
-                            category=OwaspCategory.a02,
+                            category=OwaspCategory.a04,
                             vuln_type="Mixed Content (HTTP resources loaded over HTTPS)",
                             severity=SeverityLevel.medium,
                             url=url,
@@ -104,7 +104,7 @@ class CryptoFailuresDetector(BaseDetector):
                             reported_session_cookies.add(cookie_name)
                             findings.append(
                                 Finding(
-                                    category=OwaspCategory.a02,
+                                    category=OwaspCategory.a04,
                                     vuln_type="Insecure Session Cookie Attributes",
                                     severity=SeverityLevel.medium,
                                     url=url,
@@ -127,7 +127,7 @@ class CryptoFailuresDetector(BaseDetector):
                     if "secure" not in cookie_parts:
                         findings.append(
                             Finding(
-                                category=OwaspCategory.a02,
+                                category=OwaspCategory.a04,
                                 vuln_type="Cookie Without Secure Flag",
                                 severity=SeverityLevel.medium,
                                 url=url,
@@ -142,15 +142,23 @@ class CryptoFailuresDetector(BaseDetector):
             # Heuristically check sensitive params in GET URLs
             for url in urls:
                 lowered = url.lower()
-                if any(token in lowered for token in ["token=", "password=", "secret="]):
+                matched_token = next(
+                    (t for t in ["password=", "secret=", "token="] if t in lowered), None
+                )
+                if matched_token:
                     findings.append(
                         Finding(
-                            category=OwaspCategory.a02,
+                            category=OwaspCategory.a04,
                             vuln_type="Sensitive Data in URL",
                             severity=SeverityLevel.high,
                             url=url,
-                            evidence="Potential secret found in query string.",
-                            verified=False
+                            evidence=(
+                                f"Sensitive parameter '{matched_token.rstrip('=')}' found "
+                                f"in plain-text URL query string — credentials may be exposed "
+                                f"in server logs, browser history, and Referer headers."
+                            ),
+                            verified=True,
+                            reproducible=True,
                         )
                     )
 

@@ -38,6 +38,16 @@ def mock_http_verifier():
         elif data:
             payload_val = str(next(iter(data.values()))) if data else ""
 
+        if kwargs.get("test_phase") in ("idor_unauth_base", "idor_unauth_mod"):
+            return ResponseData(
+                status_code=401,
+                headers={"Content-Type": "text/plain"},
+                body="Unauthorized",
+                response_time_ms=5.0,
+                request_snippet=f"{method} {url} HTTP/1.1",
+                response_snippet="HTTP/1.1 401 Unauthorized\n\nUnauthorized"
+            )
+
         # Construct body with reflection and error patterns
         body = f"Mock Page Content. Reflection: {payload_val}. "
         # Include SQL error syntax if a quote is injected
@@ -101,12 +111,15 @@ async def test_security_headers_detector_reports_once_for_site() -> None:
 
     import app.core.detectors.security_headers as security_headers_module
 
-    original_client = security_headers_module.httpx.AsyncClient
-    security_headers_module.httpx.AsyncClient = DummyClient  # type: ignore[assignment]
+    def dummy_scan_client(**kwargs) -> DummyClient:
+        return DummyClient()
+
+    original_factory = security_headers_module.create_scan_client
+    security_headers_module.create_scan_client = dummy_scan_client  # type: ignore[assignment]
     try:
         findings = await detector.detect(urls=urls, forms=[], root_url="http://example.com/")
     finally:
-        security_headers_module.httpx.AsyncClient = original_client  # type: ignore[assignment]
+        security_headers_module.create_scan_client = original_factory  # type: ignore[assignment]
 
     header_findings = [finding for finding in findings if finding.vuln_type == "Missing Security Header"]
     assert len(header_findings) >= 4

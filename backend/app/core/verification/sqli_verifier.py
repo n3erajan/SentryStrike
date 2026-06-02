@@ -298,6 +298,21 @@ class SQLiVerifier(BaseVerifier):
         _run_differential = True
         _run_error_time   = True
 
+        # Gate 0: phpinfo/debug page exclusion — these pages echo everything
+        # and trigger false SQL error matches, false UNION reflections, etc.
+        if pre_test_baseline is not None and ResponseAnalyzer.is_phpinfo_or_debug_page(
+            pre_test_baseline.body or ""
+        ):
+            logger.debug(
+                "Skipping all SQLi techniques on phpinfo/debug page %s:%s",
+                url, parameter,
+            )
+            return VerificationResult(
+                is_vulnerable=False, confidence_score=0.0,
+                detection_method="none", findings=[],
+                evidence={"skipped": "phpinfo_or_debug_page"},
+            )
+
         # Gate 1: Content Type Check
         if pre_test_baseline is not None:
             # ... content type checks ...
@@ -1233,6 +1248,20 @@ class SQLiVerifier(BaseVerifier):
                     continue
 
                 confidence = 75.0
+
+                # Build structured timing evidence for reviewer validation
+                threshold_used = expected_ms * threshold_fraction
+                timing_evidence = {
+                    **timing,
+                    "baseline_times_ms": baseline_times,
+                    "injected_times_ms": inj_times,
+                    "baseline_mean_ms": round(baseline_mean, 1),
+                    "injected_mean_ms": round(injected_mean, 1),
+                    "delta_ms": round(diff_ms, 1),
+                    "expected_sleep_ms": expected_ms,
+                    "threshold_ms": round(threshold_used, 1),
+                }
+
                 finding = self._create_finding(
                     category=OwaspCategory.a05,
                     vuln_type="SQL Injection (Time-Based Blind)",
@@ -1240,12 +1269,14 @@ class SQLiVerifier(BaseVerifier):
                     url=url, parameter=parameter, payload=payload,
                     evidence=(
                         f"Response delayed {diff_ms:.0f}ms with sleep payload "
-                        f"(baseline mean: {baseline_mean:.0f}ms, "
-                        f"injected mean: {injected_mean:.0f}ms, "
-                        f"expected: {expected_ms}ms)."
+                        f"(baseline_mean={baseline_mean:.0f}ms, "
+                        f"injected_mean={injected_mean:.0f}ms, "
+                        f"delta={diff_ms:.0f}ms, "
+                        f"threshold={threshold_used:.0f}ms, "
+                        f"expected_sleep={expected_ms}ms)."
                     ),
                     confidence_score=confidence, detection_method="time_based",
-                    method=method, detection_evidence=timing,
+                    method=method, detection_evidence=timing_evidence,
                     reproducible=True, verified=True,
                     verification_request_snippet=last_resp.request_snippet,
                     verification_response_snippet=last_resp.response_snippet,
@@ -1253,7 +1284,7 @@ class SQLiVerifier(BaseVerifier):
                 return VerificationResult(
                     is_vulnerable=True, confidence_score=confidence,
                     detection_method="time_based", findings=[finding],
-                    evidence=timing, reproducible=True,
+                    evidence=timing_evidence, reproducible=True,
                 )
 
             return VerificationResult(

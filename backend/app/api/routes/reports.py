@@ -47,13 +47,19 @@ async def generate_pdf_report(scan_id: str, repo: ScanRepository = Depends(get_s
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 
-    sections = [
-        ("Executive Summary", scan.report_metadata.summary or "No summary available"),
-        ("Risk Score", f"Overall risk score: {scan.overall_risk_score}"),
-        ("Statistics", str(scan.statistics.model_dump())),
-        ("Top Findings", "\n".join([f"- {v.vuln_type} ({v.severity.value}) @ {v.location.url}" for v in scan.vulnerabilities[:20]]) or "None"),
-    ]
-    payload = build_scan_pdf(title=f"Sentry Strike Report - {scan.target_url}", sections=sections)
+    scan_data = {
+        "success": True,
+        "data": {
+            "scan_id": scan_id,
+            "generated_at": scan.report_metadata.generated_at.isoformat()
+                            if scan.report_metadata.generated_at else datetime.now().isoformat(),
+            "executive_summary": scan.report_metadata.summary or "No summary available.",
+            "statistics": scan.statistics.model_dump(),
+            "risk_score": scan.overall_risk_score,
+            "vulnerabilities": [v.model_dump() for v in scan.vulnerabilities],
+        },
+    }
+    payload = build_scan_pdf(scan_data=scan_data)
     return Response(
         content=payload,
         media_type="application/pdf",

@@ -1,37 +1,894 @@
+"""
+Sentry Strike – Professional Penetration Test Report Generator
+Converts scan JSON output into a polished, client-ready PDF report.
+"""
+
+from __future__ import annotations
+
+import json
+import textwrap
+from datetime import datetime
 from io import BytesIO
+from pathlib import Path
+from typing import Any
 
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import (
+    BaseDocTemplate,
+    Flowable,
+    Frame,
+    HRFlowable,
+    Image,
+    KeepTogether,
+    NextPageTemplate,
+    PageBreak,
+    PageTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 
-def build_scan_pdf(title: str, sections: list[tuple[str, str]]) -> bytes:
-    buffer = BytesIO()
-    pdf = canvas.Canvas(buffer, pagesize=letter)
+def _fmt_dt(value, fmt="%Y-%m-%d %H:%M:%S") -> str:
+    """Safely format a datetime object or ISO string to a readable string."""
+    if value is None:
+        return "N/A"
+    if hasattr(value, "strftime"):          # actual datetime / date object
+        return value.strftime(fmt)
+    try:
+        return datetime.fromisoformat(str(value)).strftime(fmt)
+    except Exception:
+        return str(value)[:19]
 
-    width, height = letter
-    y = height - 50
+def _clean_enum(value: str) -> str:
+    """Strip enum class prefix like 'SeverityLevel.' or 'Exploitability.' and capitalise."""
+    if value and "." in value:
+        return value.split(".")[-1].capitalize()
+    return value or "N/A"
 
-    pdf.setFont("Helvetica-Bold", 16)
-    pdf.drawString(50, y, title)
-    y -= 30
 
-    for section_title, content in sections:
-        if y < 120:
-            pdf.showPage()
-            y = height - 50
-        pdf.setFont("Helvetica-Bold", 12)
-        pdf.drawString(50, y, section_title)
-        y -= 18
-        pdf.setFont("Helvetica", 10)
-        for line in content.splitlines() or [""]:
-            if y < 80:
-                pdf.showPage()
-                y = height - 50
-                pdf.setFont("Helvetica", 10)
-            pdf.drawString(55, y, line[:140])
-            y -= 14
-        y -= 8
+# ─────────────────────────────── Palette ────────────────────────────────── #
+#
+# Design principles:
+#   • All text-on-background combos meet WCAG AA (≥4.5:1 normal, ≥3:1 large/bold)
+#   • Severity header bars use deep solid fills → white text always legible
+#   • Severity text colors on white all ≥5.8:1 contrast ratio
+#   • Labels use #444C56 (~8.5:1) instead of the former #8B949E (3.4:1, failing AA)
+#   • Yellow/amber never used as text on white — replaced with deep amber-brown
+#   • Row tints are very pale; all text printed on them stays near-black
 
-    pdf.save()
-    buffer.seek(0)
-    return buffer.read()
+# ── Structural neutrals ──────────────────────────────────────────────────
+DARK_BG      = colors.HexColor("#1A1F2E")   # cover / header bars (deep navy)
+PANEL_BG     = colors.HexColor("#252B3B")   # secondary dark panel
+LIGHT_BG     = colors.HexColor("#F3F4F6")   # alternating table row tint
+DIVIDER      = colors.HexColor("#C8CDD5")   # rule lines
+WHITE        = colors.white
+BODY_TEXT    = colors.HexColor("#1C2128")   # primary body  (contrast ~16:1 on white)
+LABEL_TEXT   = colors.HexColor("#444C56")   # field labels  (contrast ~8.5:1 on white ✓)
+CAPTION_TEXT = colors.HexColor("#57606A")   # captions/meta (contrast ~5.7:1 on white ✓)
+
+# ── Brand ─────────────────────────────────────────────────────────────────
+BRAND_RED    = colors.HexColor("#C0392B")   # Sentry Strike red  (7.1:1 on white ✓)
+BRAND_RED_LT = colors.HexColor("#FDECEA")   # faint red tint
+
+# ── Severity foreground — text/badge color ON WHITE background ────────────
+#   Critical  #B91C1C  7.2:1 ✓   High   #C2410C  5.8:1 ✓
+#   Medium    #92400E  6.7:1 ✓   Low    #1D4ED8  7.1:1 ✓   Info  #166534  7.5:1 ✓
+SEV_FG = {
+    "Critical": colors.HexColor("#B91C1C"),
+    "High":     colors.HexColor("#C2410C"),
+    "Medium":   colors.HexColor("#92400E"),
+    "Low":      colors.HexColor("#1D4ED8"),
+    "Info":     colors.HexColor("#166534"),
+}
+
+# ── Severity solid fills — ONLY used as bar/badge backgrounds with WHITE text ─
+SEV_COLOR = {
+    "Critical": colors.HexColor("#991B1B"),   # deep crimson
+    "High":     colors.HexColor("#9A3412"),   # deep burnt-orange
+    "Medium":   colors.HexColor("#78350F"),   # deep amber-brown
+    "Low":      colors.HexColor("#1E3A8A"),   # deep royal blue
+    "Info":     colors.HexColor("#14532D"),   # deep forest green
+}
+
+# ── Severity row tints — very pale, near-black text printed on top ─────────
+SEV_BG = {
+    "Critical": colors.HexColor("#FEF2F2"),
+    "High":     colors.HexColor("#FFF7ED"),
+    "Medium":   colors.HexColor("#FFFBEB"),
+    "Low":      colors.HexColor("#EFF6FF"),
+    "Info":     colors.HexColor("#F0FDF4"),
+}
+
+# Legacy aliases so all existing references keep working
+ACCENT_RED    = BRAND_RED
+ACCENT_ORANGE = SEV_FG["High"]
+ACCENT_YELLOW = SEV_FG["Medium"]
+ACCENT_BLUE   = SEV_FG["Low"]
+ACCENT_GREEN  = SEV_FG["Info"]
+MID_GRAY      = CAPTION_TEXT
+
+
+# ─────────────────────────── Custom Flowables ───────────────────────────── #
+
+class ColoredBar(Flowable):
+    """A full-width colored rectangle – used for section divider bars."""
+
+    def __init__(self, color, height=3, width=None):
+        super().__init__()
+        self._color = color
+        self._height = height
+        self._width = width
+
+    def wrap(self, avail_w, avail_h):
+        self.width = self._width or avail_w
+        self.height = self._height
+        return self.width, self.height
+
+    def draw(self):
+        self.canv.setFillColor(self._color)
+        self.canv.rect(0, 0, self.width, self.height, fill=1, stroke=0)
+
+
+class SeverityBadge(Flowable):
+    """Pill-shaped severity badge."""
+
+    def __init__(self, severity: str, font_size=8):
+        super().__init__()
+        self._sev = severity
+        self._fs = font_size
+        self.width = 70
+        self.height = 16
+
+    def wrap(self, *_):
+        return self.width, self.height
+
+    def draw(self):
+        c = self.canv
+        color = SEV_COLOR.get(self._sev, MID_GRAY)
+        bg    = SEV_BG.get(self._sev, LIGHT_BG)
+        r = self.height / 2
+        c.setFillColor(bg)
+        c.setStrokeColor(color)
+        c.setLineWidth(0.8)
+        c.roundRect(0, 0, self.width, self.height, r, fill=1, stroke=1)
+        c.setFillColor(color)
+        c.setFont("Helvetica-Bold", self._fs)
+        c.drawCentredString(self.width / 2, 4, self._sev.upper())
+
+
+class CoverPage:
+    """Draws the full dark cover page directly onto a canvas."""
+
+    @staticmethod
+    def draw(canvas, doc, report_data: dict):
+        w, h = A4
+        data = report_data.get("data", {})
+        stats = data.get("statistics", {})
+        target_url = data.get("scan_id", "")
+        # Try to get URL from first vulnerability
+        vulns = data.get("vulnerabilities", [])
+        target = "http://192.168.16.101/dvwa/"
+        if vulns:
+            target = vulns[0].get("location", {}).get("url", target)
+            target = "/".join(target.split("/")[:3])
+
+        gen_at = data.get("generated_at", "")
+        date_str = _fmt_dt(gen_at, "%B %d, %Y")
+
+        canvas.saveState()
+
+        # ── Dark background ──
+        canvas.setFillColor(DARK_BG)
+        canvas.rect(0, 0, w, h, fill=1, stroke=0)
+
+        # ── Red accent strip (left edge) ──
+        canvas.setFillColor(BRAND_RED)
+        canvas.rect(0, 0, 6*mm, h, fill=1, stroke=0)
+
+        # ── Logo / tool name ──
+        canvas.setFillColor(BRAND_RED)
+        canvas.setFont("Helvetica-Bold", 13)
+        canvas.drawString(22*mm, h - 28*mm, "SENTRY STRIKE")
+        canvas.setFillColor(MID_GRAY)
+        canvas.setFont("Helvetica", 9)
+        canvas.drawString(22*mm, h - 34*mm, "Web Application Security Scanner")
+
+        # ── Divider line ──
+        canvas.setStrokeColor(colors.HexColor("#30363D"))
+        canvas.setLineWidth(0.5)
+        canvas.line(22*mm, h - 37*mm, w - 20*mm, h - 37*mm)
+
+        # ── Main title ──
+        canvas.setFillColor(WHITE)
+        canvas.setFont("Helvetica-Bold", 34)
+        canvas.drawString(22*mm, h - 60*mm, "Penetration Test")
+        canvas.setFont("Helvetica-Bold", 34)
+        canvas.drawString(22*mm, h - 74*mm, "Report")
+
+        canvas.setFillColor(MID_GRAY)
+        canvas.setFont("Helvetica", 11)
+        canvas.drawString(22*mm, h - 85*mm, f"Target: {target}")
+        canvas.drawString(22*mm, h - 92*mm, f"Date:   {date_str}")
+        scan_id_str = f"Scan ID: {data.get('scan_id', 'N/A')}"
+        # Clip long scan IDs to fit within page margin
+        canvas.setFont("Helvetica", 10)
+        max_w = w - 44*mm
+        while canvas.stringWidth(scan_id_str, "Helvetica", 10) > max_w and len(scan_id_str) > 20:
+            scan_id_str = scan_id_str[:-4] + "…"
+        canvas.drawString(22*mm, h - 99*mm, scan_id_str)
+
+        # ── Risk score pill ──
+        risk = data.get("risk_score", 0)
+        pill_x, pill_y, pill_w, pill_h = 22*mm, h - 130*mm, 55*mm, 28*mm
+        canvas.setFillColor(ACCENT_RED)
+        canvas.roundRect(pill_x, pill_y, pill_w, pill_h, 5, fill=1, stroke=0)
+        canvas.setFillColor(WHITE)
+        canvas.setFont("Helvetica-Bold", 20)
+        canvas.drawCentredString(pill_x + pill_w/2, pill_y + 14, f"{risk:.1f}")
+        canvas.setFont("Helvetica-Bold", 7)
+        canvas.drawCentredString(pill_x + pill_w/2, pill_y + 5, "RISK SCORE / 100")
+
+        # ── Stats boxes ──
+        sev_order = [
+            ("Critical", ACCENT_RED,    stats.get("severity_breakdown", {}).get("critical", 0)),
+            ("High",     ACCENT_ORANGE, stats.get("severity_breakdown", {}).get("high", 0)),
+            ("Medium",   ACCENT_YELLOW, stats.get("severity_breakdown", {}).get("medium", 0)),
+            ("Low",      ACCENT_BLUE,   stats.get("severity_breakdown", {}).get("low", 0)),
+        ]
+        bx = 85*mm
+        for label, clr, count in sev_order:
+            canvas.setFillColor(clr)
+            canvas.roundRect(bx, pill_y, 22*mm, pill_h, 4, fill=1, stroke=0)
+            canvas.setFillColor(WHITE)
+            canvas.setFont("Helvetica-Bold", 16)
+            canvas.drawCentredString(bx + 11*mm, pill_y + 14, str(count))
+            canvas.setFont("Helvetica-Bold", 6.5)
+            canvas.drawCentredString(bx + 11*mm, pill_y + 5, label.upper())
+            bx += 26*mm
+
+        # ── Total vulns ──
+        canvas.setFillColor(PANEL_BG)
+        canvas.roundRect(22*mm, h - 160*mm, 55*mm, 20*mm, 4, fill=1, stroke=0)
+        canvas.setFillColor(WHITE)
+        canvas.setFont("Helvetica-Bold", 15)
+        canvas.drawCentredString(49.5*mm, h - 151*mm, str(stats.get("total_vulnerabilities", 0)))
+        canvas.setFont("Helvetica-Bold", 7)
+        canvas.drawCentredString(49.5*mm, h - 158*mm, "TOTAL VULNERABILITIES")
+
+        canvas.setFillColor(PANEL_BG)
+        canvas.roundRect(85*mm, h - 160*mm, 55*mm, 20*mm, 4, fill=1, stroke=0)
+        canvas.setFillColor(WHITE)
+        canvas.setFont("Helvetica-Bold", 15)
+        canvas.drawCentredString(112.5*mm, h - 151*mm, str(stats.get("total_urls_crawled", 0)))
+        canvas.setFont("Helvetica-Bold", 7)
+        canvas.drawCentredString(112.5*mm, h - 158*mm, "URLS CRAWLED")
+
+        # ── Footer ──
+        canvas.setFillColor(colors.HexColor("#30363D"))
+        canvas.rect(0, 0, w, 18*mm, fill=1, stroke=0)
+        canvas.setFillColor(MID_GRAY)
+        canvas.setFont("Helvetica", 8)
+        canvas.drawString(22*mm, 11*mm, "CONFIDENTIAL — For authorized recipient use only")
+        canvas.drawRightString(w - 20*mm, 11*mm, "OWASP Top 10 2025")
+        canvas.setStrokeColor(BRAND_RED)
+        canvas.setLineWidth(1)
+        canvas.line(0, 18*mm, w, 18*mm)
+
+        canvas.restoreState()
+
+
+# ──────────────────────────── Style Registry ────────────────────────────── #
+
+def build_styles():
+    base = getSampleStyleSheet()
+
+    def s(name, **kw) -> ParagraphStyle:
+        return ParagraphStyle(name, **kw)
+
+    return {
+        "h1": s("H1",
+            fontName="Helvetica-Bold", fontSize=18, textColor=BODY_TEXT,
+            spaceAfter=4, spaceBefore=14, leading=22),
+        "h2": s("H2",
+            fontName="Helvetica-Bold", fontSize=13, textColor=BRAND_RED,
+            spaceAfter=3, spaceBefore=10, leading=16),
+        "h3": s("H3",
+            fontName="Helvetica-Bold", fontSize=10, textColor=BODY_TEXT,
+            spaceAfter=2, spaceBefore=6, leading=13),
+        "body": s("Body",
+            fontName="Helvetica", fontSize=9.5, textColor=BODY_TEXT,
+            leading=14, spaceAfter=4, alignment=TA_JUSTIFY),
+        "body_sm": s("BodySm",
+            fontName="Helvetica", fontSize=8.5, textColor=BODY_TEXT,
+            leading=12, spaceAfter=3),
+        "label": s("Label",
+            fontName="Helvetica-Bold", fontSize=8, textColor=LABEL_TEXT,
+            leading=10, spaceAfter=3, spaceBefore=7),
+        "mono": s("Mono",
+            fontName="Courier", fontSize=7.5, textColor=BODY_TEXT,
+            leading=10, spaceAfter=2,
+            backColor=LIGHT_BG, borderPadding=(3, 5, 3, 5)),
+        "caption": s("Caption",
+            fontName="Helvetica-Oblique", fontSize=8, textColor=CAPTION_TEXT,
+            leading=10, spaceAfter=6),
+        "toc_entry": s("TOC",
+            fontName="Helvetica", fontSize=10, textColor=BODY_TEXT,
+            leading=16, spaceAfter=0),
+        "toc_title": s("TOCTitle",
+            fontName="Helvetica-Bold", fontSize=10, textColor=BODY_TEXT,
+            leading=16, spaceAfter=0),
+        "center": s("Center",
+            fontName="Helvetica", fontSize=9, textColor=BODY_TEXT,
+            alignment=TA_CENTER, leading=28),
+        # ── Used for Paragraph cells that sit on DARK_BG table headers ──────
+        "th": s("TH",
+            fontName="Helvetica-Bold", fontSize=9, textColor=WHITE,
+            leading=12, spaceAfter=0),
+        "th_center": s("THCenter",
+            fontName="Helvetica-Bold", fontSize=9, textColor=WHITE,
+            alignment=TA_CENTER, leading=12, spaceAfter=0),
+    }
+
+
+# ──────────────────────────── Page Templates ────────────────────────────── #
+
+def make_doc(buf: BytesIO, report_data: dict) -> BaseDocTemplate:
+    doc = BaseDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=20*mm, rightMargin=20*mm,
+        topMargin=22*mm, bottomMargin=22*mm,
+        title="Sentry Strike – Penetration Test Report",
+        author="Sentry Strike Scanner",
+    )
+
+    def draw_cover(canvas, doc):
+        CoverPage.draw(canvas, doc, report_data)
+
+    def header_footer(canvas, doc):
+        w, h = A4
+        canvas.saveState()
+        # Top bar
+        canvas.setFillColor(DARK_BG)
+        canvas.rect(0, h - 14*mm, w, 14*mm, fill=1, stroke=0)
+        canvas.setFillColor(BRAND_RED)
+        canvas.rect(0, h - 14*mm, 5*mm, 14*mm, fill=1, stroke=0)
+        canvas.setFillColor(WHITE)
+        canvas.setFont("Helvetica-Bold", 8)
+        canvas.drawString(10*mm, h - 9*mm, "SENTRY STRIKE")
+        canvas.setFillColor(MID_GRAY)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawRightString(w - 10*mm, h - 9*mm, "Penetration Test Report — CONFIDENTIAL")
+
+        # Bottom bar
+        canvas.setFillColor(LIGHT_BG)
+        canvas.rect(0, 0, w, 14*mm, fill=1, stroke=0)
+        canvas.setStrokeColor(DIVIDER)
+        canvas.setLineWidth(0.5)
+        canvas.line(0, 14*mm, w, 14*mm)
+        canvas.setFillColor(MID_GRAY)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawString(20*mm, 5*mm, "© Sentry Strike Security Report — For Authorized Use Only")
+        canvas.drawRightString(w - 20*mm, 5*mm, f"Page {doc.page}")
+
+        canvas.restoreState()
+
+    cover_frame = Frame(0, 0, A4[0], A4[1], leftPadding=0, rightPadding=0,
+                        topPadding=0, bottomPadding=0, id="cover")
+    body_frame  = Frame(20*mm, 22*mm, A4[0] - 40*mm, A4[1] - 44*mm,
+                        leftPadding=0, rightPadding=0,
+                        topPadding=0, bottomPadding=0, id="body")
+
+    doc.addPageTemplates([
+        PageTemplate(id="Cover", frames=[cover_frame], onPage=draw_cover),
+        PageTemplate(id="Normal", frames=[body_frame], onPage=header_footer),
+    ])
+    return doc
+
+
+# ─────────────────────────── Helper builders ────────────────────────────── #
+
+def section_header(title: str, styles: dict, number: str = "") -> list:
+    """Returns flowables for a styled section heading."""
+    prefix = f"{number}. " if number else ""
+    elems = [
+        Spacer(1, 4*mm),
+        ColoredBar(BRAND_RED, height=3),
+        Spacer(1, 2*mm),
+        Paragraph(f"{prefix}{title}", styles["h1"]),
+        Spacer(1, 1*mm),
+    ]
+    return elems
+
+
+def sub_header(title: str, styles: dict) -> list:
+    return [
+        Spacer(1, 3*mm),
+        Paragraph(title, styles["h2"]),
+        HRFlowable(width="100%", thickness=0.5, color=DIVIDER, spaceAfter=2),
+    ]
+
+
+def labeled_value(label: str, value: str, styles: dict) -> list:
+    return [
+        Paragraph(label.upper(), styles["label"]),
+        Paragraph(str(value), styles["body_sm"]),
+    ]
+
+
+def code_block(text: str, styles: dict) -> Flowable:
+    clean = textwrap.shorten(text, width=1200, placeholder="…")
+    clean = clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return Paragraph(clean, styles["mono"])
+
+
+def severity_row_color(sev: str):
+    return SEV_BG.get(sev, WHITE)
+
+
+# ─────────────────────────── Report Sections ────────────────────────────── #
+
+def build_toc(data: dict, styles: dict) -> list:
+    elems = section_header("Table of Contents", styles, "")
+    rows = [
+        ("1.", "Executive Summary"),
+        ("2.", "Scan Statistics"),
+        ("3.", "Vulnerability Summary"),
+        ("4.", "Detailed Findings"),
+        ("5.", "Remediation Roadmap"),
+    ]
+    tbl_data = [[Paragraph(n, styles["toc_title"]), Paragraph(t, styles["toc_entry"])] for n, t in rows]
+    tbl = Table(tbl_data, colWidths=[15*mm, None])
+    tbl.setStyle(TableStyle([
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [WHITE, LIGHT_BG]),
+        ("TOPPADDING",  (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("LINEBELOW", (0, -1), (-1, -1), 0.5, DIVIDER),
+    ]))
+    elems.append(tbl)
+    return elems
+
+
+def build_executive_summary(data: dict, styles: dict) -> list:
+    d = data.get("data", {})
+    elems = section_header("Executive Summary", styles, "1")
+
+    summary = d.get("executive_summary", "No summary available.")
+    elems.append(Paragraph(summary, styles["body"]))
+    elems.append(Spacer(1, 4*mm))
+
+    # Key metadata box
+    gen_at = d.get("generated_at", "")
+    date_str = _fmt_dt(gen_at, "%B %d, %Y %H:%M UTC")
+
+    vulns = d.get("vulnerabilities", [])
+    target = "N/A"
+    if vulns:
+        url = vulns[0].get("location", {}).get("url", "")
+        target = "/".join(url.split("/")[:3]) if url else "N/A"
+
+    meta_rows = [
+        ["Scan Target",  target],
+        ["Scan ID",      d.get("scan_id", "N/A")],
+        ["Generated At", date_str],
+        ["Risk Score",   f"{d.get('risk_score', 0):.2f} / 100"],
+        ["Classification", "CONFIDENTIAL"],
+    ]
+    tbl = Table(
+        [[Paragraph(f"<b>{r[0]}</b>", styles["body_sm"]),
+          Paragraph(r[1], styles["body_sm"])] for r in meta_rows],
+        colWidths=[45*mm, None],
+    )
+    tbl.setStyle(TableStyle([
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [LIGHT_BG, WHITE]),
+        ("GRID", (0, 0), (-1, -1), 0.4, DIVIDER),
+        ("TOPPADDING",  (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    elems.append(tbl)
+    return elems
+
+
+def build_statistics(data: dict, styles: dict) -> list:
+    d = data.get("data", {})
+    stats = d.get("statistics", {})
+    sev   = stats.get("severity_breakdown", {})
+    elems = section_header("Scan Statistics", styles, "2")
+
+    # Top-level numbers
+    top_data = [
+        ["Total URLs Crawled", "Total Vulnerabilities", "Risk Score"],
+        [
+            Paragraph(f'<font size="22"><b>{stats.get("total_urls_crawled", 0)}</b></font>', styles["center"]),
+            Paragraph(f'<font size="22"><b>{stats.get("total_vulnerabilities", 0)}</b></font>', styles["center"]),
+            Paragraph(f'<font size="22"><b>{d.get("risk_score", 0):.1f}</b></font>', styles["center"]),
+        ],
+    ]
+    top_tbl = Table(top_data, colWidths=[56.5*mm, 56.5*mm, 57*mm])
+    top_tbl.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, 0), DARK_BG),
+        ("TEXTCOLOR",    (0, 0), (-1, 0), WHITE),
+        ("FONTNAME",     (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE",     (0, 0), (-1, 0), 9),
+        ("ALIGN",        (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",   (0, 0), (-1, 0), 8),
+        ("BOTTOMPADDING",(0, 0), (-1, 0), 8),
+        ("TOPPADDING",   (0, 1), (-1, 1), 12),
+        ("BOTTOMPADDING",(0, 1), (-1, 1), 12),
+        ("GRID",         (0, 0), (-1, -1), 0.5, DIVIDER),
+        ("LINEABOVE",    (0, 0), (-1, 0),  2,   BRAND_RED),
+    ]))
+    elems.append(top_tbl)
+    elems.append(Spacer(1, 5*mm))
+
+    # Severity breakdown
+    elems += sub_header("Severity Breakdown", styles)
+    sev_rows = [
+        [Paragraph("Severity", styles["th"]),
+         Paragraph("Count", styles["th"]),
+         Paragraph("Visual", styles["th"]),
+         Paragraph("% of Total", styles["th"])],
+    ]
+    total = stats.get("total_vulnerabilities", 1) or 1
+    for sev_label, sev_key in [("Critical", "critical"), ("High", "high"),
+                                ("Medium", "medium"), ("Low", "low"), ("Info", "info")]:
+        count = sev.get(sev_key, 0)
+        pct = count / total * 100
+        bar_len = max(int(pct * 0.8), 0)  # max ~80 chars
+        bar = "█" * bar_len
+        fg = SEV_FG.get(sev_label, LABEL_TEXT)      # contrast-safe text color on white
+        sev_rows.append([
+            Paragraph(f'<font color="#{fg.hexval()[2:]}"><b>{sev_label}</b></font>', styles["body_sm"]),
+            Paragraph(f"<b>{count}</b>", styles["body_sm"]),
+            Paragraph(f'<font color="#{fg.hexval()[2:]}">{bar}</font>', styles["body_sm"]),
+            Paragraph(f"{pct:.1f}%", styles["body_sm"]),
+        ])
+
+    sev_tbl = Table(sev_rows, colWidths=[28*mm, 18*mm, None, 22*mm])
+    sev_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), DARK_BG),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), WHITE),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_BG]),
+        ("GRID",       (0, 0), (-1, -1), 0.4, DIVIDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+    ]))
+    elems.append(sev_tbl)
+
+    # Category breakdown
+    elems.append(Spacer(1, 5*mm))
+    elems += sub_header("Findings by OWASP Category", styles)
+    vulns = d.get("vulnerabilities", [])
+    cat_counts: dict[str, int] = {}
+    for v in vulns:
+        cat_counts[v.get("category", "Unknown")] = cat_counts.get(v.get("category", "Unknown"), 0) + 1
+
+    cat_rows = [[Paragraph("OWASP Category", styles["th"]),
+                 Paragraph("Count", styles["th_center"])]]
+    for cat, cnt in sorted(cat_counts.items(), key=lambda x: -x[1]):
+        cat_rows.append([Paragraph(cat, styles["body_sm"]), Paragraph(str(cnt), styles["body_sm"])])
+
+    cat_tbl = Table(cat_rows, colWidths=[None, 22*mm])
+    cat_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), DARK_BG),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), WHITE),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_BG]),
+        ("GRID",       (0, 0), (-1, -1), 0.4, DIVIDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+    ]))
+    elems.append(cat_tbl)
+    return elems
+
+
+def build_vulnerability_summary(data: dict, styles: dict) -> list:
+    d = data.get("data", {})
+    vulns = d.get("vulnerabilities", [])
+    elems = section_header("Vulnerability Summary", styles, "3")
+    elems.append(Paragraph(
+        "The table below lists all confirmed vulnerabilities, ordered by CVSS score.",
+        styles["body"],
+    ))
+    elems.append(Spacer(1, 3*mm))
+
+    sorted_vulns = sorted(vulns, key=lambda v: v.get("cvss_score", 0), reverse=True)
+
+    header = [
+        Paragraph("#", styles["th_center"]),
+        Paragraph("Vulnerability", styles["th"]),
+        Paragraph("Category", styles["th"]),
+        Paragraph("Severity", styles["th"]),
+        Paragraph("CVSS", styles["th_center"]),
+    ]
+    rows = [header]
+    for i, v in enumerate(sorted_vulns, 1):
+        sev   = v.get("severity", "Low")
+        sev_display = _clean_enum(sev)
+        fg = SEV_FG.get(sev_display, SEV_FG.get(sev, LABEL_TEXT))
+        rows.append([
+            Paragraph(str(i), styles["body_sm"]),
+            Paragraph(v.get("vuln_type", "Unknown"), styles["body_sm"]),
+            Paragraph(v.get("category", ""), styles["body_sm"]),
+            Paragraph(f'<font color="#{fg.hexval()[2:]}"><b>{sev_display}</b></font>', styles["body_sm"]),
+            Paragraph(f'<b>{v.get("cvss_score", 0):.1f}</b>', styles["body_sm"]),
+        ])
+
+    tbl = Table(rows, colWidths=[10*mm, 65*mm, 55*mm, 22*mm, 16*mm])
+    style_cmds = [
+        ("BACKGROUND", (0, 0), (-1, 0), DARK_BG),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), WHITE),
+        ("GRID",       (0, 0), (-1, -1), 0.4, DIVIDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+    ]
+    # Row shading by severity
+    for i, v in enumerate(sorted_vulns, 1):
+        bg = SEV_BG.get(_clean_enum(v.get("severity", "Low")), WHITE)
+        style_cmds.append(("BACKGROUND", (0, i), (-1, i), bg))
+
+    tbl.setStyle(TableStyle(style_cmds))
+    elems.append(tbl)
+    return elems
+
+
+def build_detailed_findings(data: dict, styles: dict) -> list:
+    d = data.get("data", {})
+    vulns = d.get("vulnerabilities", [])
+    elems = section_header("Detailed Findings", styles, "4")
+    elems.append(Paragraph(
+        "Each finding is documented with technical evidence, AI-assisted analysis, "
+        "business impact, and remediation guidance.",
+        styles["body"],
+    ))
+
+    sorted_vulns = sorted(vulns, key=lambda v: v.get("cvss_score", 0), reverse=True)
+
+    for idx, v in enumerate(sorted_vulns, 1):
+        sev_raw  = v.get("severity", "Low")
+        sev      = _clean_enum(sev_raw)
+        sev_color = SEV_COLOR.get(sev, MID_GRAY)
+        cvss     = v.get("cvss_score", 0)
+        loc      = v.get("location", {})
+        ev       = v.get("evidence", {})
+        ai       = v.get("ai_analysis", {})
+
+        block = []
+
+        # ── Finding header bar ──
+        block.append(Spacer(1, 4*mm))
+        title_tbl = Table(
+            [[
+                Paragraph(f'<font color="white"><b>Finding #{idx}</b></font>', styles["body_sm"]),
+                Paragraph(f'<font color="white"><b>{v.get("vuln_type", "Unknown")}</b></font>', styles["h3"]),
+                Paragraph(f'<font color="white"><b>CVSS {cvss:.1f}</b></font>', styles["body_sm"]),
+            ]],
+            colWidths=[22*mm, None, 20*mm],
+        )
+        title_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), sev_color),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (-1, 0), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        block.append(title_tbl)
+
+        # ── Details grid ──
+        def detail_row(label: str, val: str):
+            return [
+                Paragraph(f"<b>{label}</b>", styles["label"]),
+                Paragraph(str(val) if val else "N/A", styles["body_sm"]),
+            ]
+
+        details = [
+            detail_row("Category",   v.get("category", "")),
+            detail_row("Severity",   sev),
+            detail_row("CVSS Vector", v.get("cvss_vector", "N/A")),
+            detail_row("URL",         loc.get("url", "N/A")),
+            detail_row("Parameter",   loc.get("parameter") or "N/A"),
+            detail_row("HTTP Method", loc.get("http_method", "N/A")),
+            detail_row("Review Status", (v.get("review_status") or "N/A").title()),
+            detail_row("Detected At",  _fmt_dt(v.get("detected_at"))),
+        ]
+        det_tbl = Table(details, colWidths=[35*mm, None])
+        det_tbl.setStyle(TableStyle([
+            ("ROWBACKGROUNDS", (0, 0), (-1, -1), [LIGHT_BG, WHITE]),
+            ("GRID",       (0, 0), (-1, -1), 0.3, DIVIDER),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+        ]))
+        block.append(det_tbl)
+        block.append(Spacer(1, 3*mm))
+
+        # ── Business Impact ──
+        block.append(Spacer(1, 3*mm))
+        block.append(Paragraph("BUSINESS IMPACT", styles["label"]))
+        block.append(Spacer(1, 1*mm))
+        block.append(Paragraph(ai.get("business_impact", "N/A"), styles["body_sm"]))
+        block.append(Spacer(1, 3*mm))
+
+        # ── Exploitability ──
+        exploit = _clean_enum(ai.get("exploitability", "N/A"))
+        exploit_note = ai.get("exploitability_reasoning", "")
+        block.append(Paragraph("EXPLOITABILITY", styles["label"]))
+        block.append(Spacer(1, 1*mm))
+        block.append(Paragraph(f"<b>{exploit}</b> — {exploit_note}", styles["body_sm"]))
+        block.append(Spacer(1, 3*mm))
+
+        # ── Evidence ──
+        payload = ev.get("payload")
+        if payload:
+            block.append(Spacer(1, 2*mm))
+            block.append(Paragraph("PAYLOAD USED", styles["label"]))
+            block.append(Spacer(1, 1.5*mm))
+            block.append(code_block(payload, styles))
+            block.append(Spacer(1, 3*mm))
+
+        req = ev.get("request_snippet")
+        if req:
+            block.append(Paragraph("REQUEST SNIPPET", styles["label"]))
+            block.append(Spacer(1, 1.5*mm))
+            # truncate to first 3 lines
+            lines = [l for l in req.strip().splitlines() if l.strip()][:4]
+            block.append(code_block("\n".join(lines), styles))
+            block.append(Spacer(1, 3*mm))
+
+        resp = ev.get("response_snippet")
+        if resp and len(resp) < 400:
+            block.append(Paragraph("RESPONSE SNIPPET", styles["label"]))
+            block.append(Spacer(1, 1.5*mm))
+            lines = [l for l in resp.strip().splitlines() if l.strip()][:4]
+            block.append(code_block("\n".join(lines), styles))
+            block.append(Spacer(1, 3*mm))
+
+        # ── False positive info ──
+        fp_prob = ai.get("false_positive_probability", 0)
+        fp_pct  = int(fp_prob * 100)
+        block.append(Spacer(1, 2*mm))
+        block.append(Paragraph(
+            f"<b>False Positive Probability:</b> {fp_pct}%  |  "
+            f"<b>AI Analysis Status:</b> {ai.get('ai_analysis_status', 'N/A').title()}",
+            styles["caption"],
+        ))
+
+        elems.append(KeepTogether(block[:6]))  # keep header + details together
+        elems.extend(block[6:])
+        elems.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER,
+                                spaceBefore=4, spaceAfter=2))
+
+    return elems
+
+
+def build_remediation_roadmap(data: dict, styles: dict) -> list:
+    d = data.get("data", {})
+    vulns = d.get("vulnerabilities", [])
+    elems = section_header("Remediation Roadmap", styles, "5")
+    elems.append(Paragraph(
+        "The following roadmap prioritises remediation actions by severity and exploitability. "
+        "Immediate attention should be given to Critical findings before addressing lower-severity items.",
+        styles["body"],
+    ))
+    elems.append(Spacer(1, 3*mm))
+
+    phases = {
+        "Immediate (Critical)": [],
+        "Short-Term (Medium / Easy)": [],
+        "Mid-Term (Medium)": [],
+        "Long-Term (Low)": [],
+    }
+    for v in vulns:
+        sev    = v.get("severity", "Low")
+        exploi = v.get("ai_analysis", {}).get("exploitability", "Medium")
+        if sev == "Critical":
+            phases["Immediate (Critical)"].append(v)
+        elif sev in ("High", "Medium") and exploi == "Easy":
+            phases["Short-Term (Medium / Easy)"].append(v)
+        elif sev == "Medium":
+            phases["Mid-Term (Medium)"].append(v)
+        else:
+            phases["Long-Term (Low)"].append(v)
+
+    for phase, items in phases.items():
+        if not items:
+            continue
+        elems += sub_header(phase, styles)
+        rows = [[
+            Paragraph("Vulnerability", styles["th"]),
+            Paragraph("Action", styles["th"]),
+        ]]
+        for v in items:
+            rem = v.get("ai_analysis", {}).get("remediation", "See full finding for details.")
+            rows.append([
+                Paragraph(v.get("vuln_type", "Unknown"), styles["body_sm"]),
+                Paragraph(rem[:200] + ("…" if len(rem) > 200 else ""), styles["body_sm"]),
+            ])
+        tbl = Table(rows, colWidths=[55*mm, None])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",  (0, 0), (-1, 0), DARK_BG),
+            ("TEXTCOLOR",   (0, 0), (-1, 0), WHITE),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_BG]),
+            ("GRID",        (0, 0), (-1, -1), 0.4, DIVIDER),
+            ("TOPPADDING",     (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING",  (0, 0), (-1, -1), 5),
+            ("LEFTPADDING",    (0, 0), (-1, -1), 6),
+            ("VALIGN",      (0, 0), (-1, -1), "TOP"),
+        ]))
+        elems.append(tbl)
+        elems.append(Spacer(1, 3*mm))
+
+    return elems
+
+
+# ─────────────────────────── Public API ─────────────────────────────────── #
+
+def build_scan_pdf(scan_data: dict | None = None,
+                   json_path: str | None = None) -> bytes:
+    """
+    Generate a professional pentest report PDF.
+
+    Parameters
+    ----------
+    scan_data : dict, optional
+        Already-parsed scan JSON dict.
+    json_path : str, optional
+        Path to a scan JSON file to load.
+
+    Returns
+    -------
+    bytes
+        Raw PDF bytes.
+    """
+    if scan_data is None and json_path:
+        with open(json_path, "r", encoding="utf-8") as f:
+            scan_data = json.load(f)
+    if scan_data is None:
+        raise ValueError("Provide either scan_data or json_path.")
+
+    buf    = BytesIO()
+    doc    = make_doc(buf, scan_data)
+    styles = build_styles()
+
+    story: list = []
+
+    # ── Cover page (drawn via PageTemplate onPage callback) ──
+    story.append(NextPageTemplate("Normal"))
+    story.append(PageBreak())
+
+    # ── Body sections ──
+    story += build_toc(scan_data, styles)
+    story.append(PageBreak())
+
+    story += build_executive_summary(scan_data, styles)
+    story.append(PageBreak())
+
+    story += build_statistics(scan_data, styles)
+    story.append(PageBreak())
+
+    story += build_vulnerability_summary(scan_data, styles)
+    story.append(PageBreak())
+
+    story += build_detailed_findings(scan_data, styles)
+    story.append(PageBreak())
+
+    story += build_remediation_roadmap(scan_data, styles)
+
+    doc.build(story)
+
+    buf.seek(0)
+    return buf.read()

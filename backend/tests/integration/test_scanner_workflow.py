@@ -191,8 +191,9 @@ class MockServerRequestHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
-            if "'" in self.path:
-                self.wfile.write(b"SQL syntax error")
+            import urllib.parse
+            if "'" in urllib.parse.unquote(self.path):
+                self.wfile.write(b"you have an error in your sql syntax")
             else:
                 self.wfile.write(b"User details")
         else:

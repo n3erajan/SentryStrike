@@ -102,7 +102,7 @@ class ResponseAnalyzer:
     # Unix/Linux command output patterns
     UNIX_PATTERNS = {
         r"uid=\d+.*gid=\d+": "id output",
-        r"root|www-data|nobody|nginx|apache": "Unix username",
+        r"(?:uid|gid)=\d+\((?:root|www-data|nobody|nginx|apache)\)": "Unix username",
         r"^total \d+": "ls -la output",
         r"/bin/\w+|/usr/bin|/sbin": "Unix path",
         r"Linux.*\d+\.\d+": "uname output",
@@ -460,14 +460,69 @@ class ResponseAnalyzer:
 
         for pattern, name in ResponseAnalyzer.UNIX_PATTERNS.items():
             if re.search(pattern, response_body, re.MULTILINE | re.IGNORECASE):
-                unix_found.append(name)
+                unix_found.append(pattern)
 
         for pattern, name in ResponseAnalyzer.WINDOWS_PATTERNS.items():
             if re.search(pattern, response_body, re.MULTILINE | re.IGNORECASE):
-                windows_found.append(name)
+                windows_found.append(pattern)
 
         detected = len(unix_found) > 0 or len(windows_found) > 0
         return detected, unix_found, windows_found
+
+    # -----------------------------------------------------------------------
+    # phpinfo / Debug Page Detection
+    # -----------------------------------------------------------------------
+
+    # Markers that uniquely identify a phpinfo() output page.
+    _PHPINFO_MARKERS = (
+        "phpinfo()",
+        "php variables",
+        "php license",
+        "configuration file (php.ini) path",
+        "php credits",
+        "php version",
+    )
+
+    # Generic debug/environment dump markers — require 3+ co-occurring to flag.
+    _DEBUG_ENV_MARKERS = (
+        "environment variables",
+        "server_software",
+        "http_host",
+        "document_root",
+        "request_uri",
+        "server_name",
+        "server_addr",
+    )
+
+    @staticmethod
+    def is_phpinfo_or_debug_page(body: str) -> bool:
+        """Detect if a response body is a phpinfo() page or debug environment dump.
+
+        phpinfo pages echo every request parameter in their output, causing
+        injection detectors to see 'reflection' when it's just phpinfo
+        rendering the query string.  Verifiers should skip testing on these
+        endpoints entirely.
+
+        Returns True when:
+          - 2+ phpinfo-specific markers are found, OR
+          - 3+ generic debug/environment markers co-occur.
+        """
+        if not body:
+            return False
+
+        lowered = body.lower()
+
+        # Fast path: phpinfo-specific markers
+        phpinfo_hits = sum(1 for m in ResponseAnalyzer._PHPINFO_MARKERS if m in lowered)
+        if phpinfo_hits >= 2:
+            return True
+
+        # Slower path: generic debug/environment dump
+        debug_hits = sum(1 for m in ResponseAnalyzer._DEBUG_ENV_MARKERS if m in lowered)
+        if debug_hits >= 3:
+            return True
+
+        return False
 
     # -----------------------------------------------------------------------
     # Differential Analysis (Main Method)

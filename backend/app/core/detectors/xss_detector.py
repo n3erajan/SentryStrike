@@ -1,12 +1,10 @@
 import asyncio
 import logging
-import random
-import string
-from urllib.parse import parse_qsl, urlparse
 
+from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
-from app.core.verification.xss_verifier import XSSVerifier
-from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.core.verification.response_analyzer import ResponseData
+from app.core.verification.xss_verifier import PendingBrowserVerification, XSSVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -114,47 +112,118 @@ class XSSDetector(BaseDetector):
 
         logger.debug("XSSDetector: testing %d candidates.", len(candidates))
 
-        semaphore = asyncio.Semaphore(4)
-        verifier = XSSVerifier()
-        verifier.http_verifier.cookies = session_cookies
+        settings = get_settings()
+        worker_count = max(1, min(4, settings.scanner_concurrency // 2 or 1))
+        stored_probe_urls = XSSVerifier.select_stored_probe_urls(urls)
+        shared_baselines = await self._prefetch_stored_baselines(
+            stored_probe_urls, session_cookies,
+        )
 
-        async def verify_candidate(cand: tuple) -> list[Finding]:
-            # 5-tuple  → POST form candidate (has raw_inputs)
-            # 4-tuple  → GET/URL candidate (no form_inputs needed)
-            # 4-tuple with method == "HEADER" → header-injection candidate
+        # ── Phase 1: HTTP-only scanning ───────────────────────────────────────────
+        pending_browser_jobs: list[PendingBrowserVerification] = []
+
+        async def verify_candidate(
+            cand: tuple,
+        ) -> tuple[list[Finding], list[PendingBrowserVerification]]:
             if len(cand) == 5:
                 cand_url, param, method, val, form_inputs = cand
             else:
                 cand_url, param, method, val = cand
                 form_inputs = None
 
-            async with semaphore:
+            verifier = XSSVerifier()
+            verifier.http_verifier.cookies = session_cookies
+            try:
+                result = await verifier.verify(
+                    cand_url, param, method, val,
+                    form_inputs=form_inputs,
+                    stored_display_urls=stored_probe_urls,
+                    stored_baselines=shared_baselines,
+                )
+                pending: list[PendingBrowserVerification] = []
+                if result.evidence.get("browser_verification_pending"):
+                    job = result.evidence.get("pending_job")
+                    if job:
+                        pending.append(job)
+                    return [], pending
+                if result.is_vulnerable:
+                    return result.findings, []
+            except Exception as e:
+                logger.error("XSS verification failed for %s param %s: %s", cand_url, param, e)
+            finally:
+                await verifier.close()
+            return [], []
+
+        queue: asyncio.Queue[tuple] = asyncio.Queue()
+        for cand in candidates:
+            queue.put_nowait(cand)
+
+        async def worker() -> tuple[list[Finding], list[PendingBrowserVerification]]:
+            local_findings: list[Finding] = []
+            local_pending: list[PendingBrowserVerification] = []
+            while True:
                 try:
-                    result = await verifier.verify(
-                        cand_url,
-                        param,
-                        method,
-                        val,
-                        form_inputs=form_inputs,
-                        stored_display_urls=urls,
-                    )
-                    if result.is_vulnerable:
-                        return result.findings
-                except Exception as e:
-                    logger.error(
-                        "XSS verification failed for %s param %s: %s",
-                        cand_url, param, e,
-                    )
-                return []
+                    cand = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                cand_findings, cand_pending = await verify_candidate(cand)
+                local_findings.extend(cand_findings)
+                local_pending.extend(cand_pending)
+            return local_findings, local_pending
 
-        tasks = [verify_candidate(c) for c in candidates]
-        results = await asyncio.gather(*tasks)
-        for res in results:
-            findings.extend(res)
+        worker_results = await asyncio.gather(
+            *[worker() for _ in range(worker_count)],
+            return_exceptions=True,
+        )
+        for result in worker_results:
+            if isinstance(result, Exception):
+                logger.warning("XSS worker failed: %s", result)
+                continue
+            cand_findings, cand_pending = result
+            findings.extend(cand_findings)
+            pending_browser_jobs.extend(cand_pending)
 
-        await verifier.close()
+        # ── Phase 2: Browser verification — runs after ALL HTTP scanning is done ──
+        if pending_browser_jobs:
+            logger.debug(
+                "XSSDetector: HTTP phase complete. Running browser verification for %d candidates.",
+                len(pending_browser_jobs),
+            )
+            browser_verifier = XSSVerifier()
+            browser_verifier.http_verifier.cookies = session_cookies
+            try:
+                for job in pending_browser_jobs:
+                    browser_findings = await browser_verifier.run_browser_verification(job)
+                    findings.extend(browser_findings)
+            finally:
+                await browser_verifier.close()
+
         return findings
 
+    @staticmethod
+    async def _prefetch_stored_baselines(
+        probe_urls: list[str],
+        session_cookies: dict,
+    ) -> dict[str, ResponseData]:
+        """Fetch stored-XSS baselines once and share them across all candidates."""
+        if not probe_urls:
+            return {}
+
+        verifier = XSSVerifier()
+        verifier.http_verifier.cookies = session_cookies
+        baselines: dict[str, ResponseData] = {}
+        try:
+            for probe_url in probe_urls:
+                try:
+                    baselines[probe_url] = await verifier._send(
+                        probe_url, "GET", test_phase="stored_pre_test_baseline",
+                    )
+                except Exception as e:
+                    logger.debug("Failed to pre-fetch shared baseline for %s: %s", probe_url, e)
+        finally:
+            await verifier.close()
+        return baselines
+    
     # ---------------------------------------------------------------------- #
     # Header-injection candidate builder
     # ---------------------------------------------------------------------- #

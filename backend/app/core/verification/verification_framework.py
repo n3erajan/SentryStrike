@@ -19,12 +19,14 @@ from urllib.parse import urlencode, urlparse, parse_qs, parse_qsl, urlunparse
 from app.core.detectors.base_detector import Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
 from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.config import get_settings
 from app.utils.http_logging import (
     ScanRequestContext,
     infer_payload_from_request,
     log_http_response,
     resolve_request_context,
 )
+from app.utils.scan_throttle import get_scan_http_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +77,20 @@ class HttpVerifier:
     async def get_client(self) -> httpx.AsyncClient:
         """Get or create async HTTP client."""
         if self._client is None:
+            settings = get_settings()
+            pool_size = max(1, settings.scanner_concurrency)
+            timeout = httpx.Timeout(
+                connect=min(5.0, self.timeout_seconds),
+                read=self.timeout_seconds,
+                write=self.timeout_seconds,
+                pool=min(5.0, self.timeout_seconds),
+            )
             self._client = httpx.AsyncClient(
-                timeout=self.timeout_seconds,
+                timeout=timeout,
+                limits=httpx.Limits(
+                    max_connections=pool_size,
+                    max_keepalive_connections=pool_size,
+                ),
                 cookies=self.cookies,
                 headers=self.headers,
                 follow_redirects=self.follow_redirects,
@@ -166,7 +180,8 @@ class HttpVerifier:
             if cookies:
                 request_kwargs["cookies"] = cookies
 
-            response = await client.request(**request_kwargs)
+            async with get_scan_http_semaphore():
+                response = await client.request(**request_kwargs)
 
             end_time = time.time() if capture_timing else None
             response_time_ms = (end_time - start_time) * 1000 if capture_timing else 0
@@ -518,7 +533,12 @@ class TestPollutionFilter:
                 finding.verified = False
                 finding.reproducible = False
                 finding.confidence_score = min(finding.confidence_score, 20.0)
-                finding.severity = SeverityLevel.low
+                # Preserve original severity for medium/high findings; only downgrade low/info severity
+                if finding.severity in (SeverityLevel.low, SeverityLevel.info):
+                    finding.severity = SeverityLevel.low
+                else:
+                    # Keep original severity but mark as unverified
+                    pass
                 finding.evidence = (
                     f"[Suspected test pollution] {finding.evidence or ''}".strip()
                 )

@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from app.config import get_settings
 from app.core.crawler.url_parser import normalize_url, same_domain, normalize_for_dedupe
 from app.utils.http_logging import make_httpx_response_logger
+from app.utils.scan_http import create_scan_client
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ class WebSpider:
 
         robots = await self._load_robots(root_url)
 
-        async with httpx.AsyncClient(
+        async with create_scan_client(
             timeout=self.settings.request_timeout_seconds,
             follow_redirects=True,
             headers={"User-Agent": "SentryStrikeScanner/1.0"},
@@ -266,7 +267,7 @@ class WebSpider:
         forms: list[HtmlForm] = []
         discovered_urls: list[str] = []
 
-        async with httpx.AsyncClient(
+        async with create_scan_client(
             timeout=self.settings.request_timeout_seconds,
             follow_redirects=True,
             headers={"User-Agent": "SentryStrikeScanner/1.0"},
@@ -394,7 +395,7 @@ class WebSpider:
         robots_url = normalize_url(root_url, "/robots.txt")
         parser = robotparser.RobotFileParser()
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with create_scan_client(timeout=5.0) as client:
                 response = await client.get(robots_url)
             if response.status_code >= 400:
                 return None

@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 
 from app.config import get_settings
 from app.models.vulnerability import TechnologyComponent
+from app.utils.scan_http import create_scan_client
 
 
 class TechnologyDetector:
@@ -13,7 +14,7 @@ class TechnologyDetector:
 
     async def detect(self, url: str) -> list[TechnologyComponent]:
         components: list[TechnologyComponent] = []
-        async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
+        async with create_scan_client(timeout=self.settings.request_timeout_seconds) as client:
             response = await client.get(url)
 
         headers = response.headers

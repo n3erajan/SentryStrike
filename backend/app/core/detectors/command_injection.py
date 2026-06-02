@@ -21,18 +21,36 @@ class CommandInjectionDetector(BaseDetector):
         session_cookies = kwargs.get("session_cookies") or {}
 
         # 1. Candidate extraction
-        candidates = set()
-        
-        # URL Parameters
+        # Each candidate is a 5-tuple: (url, param, method, value, form_inputs).
+        # form_inputs is the full sibling input list for the form — required so
+        # FormPayloadBuilder includes Submit buttons and hidden CSRF tokens in every
+        # POST body. Without it, DVWA's isset($_POST['Submit']) check fails and
+        # shell_exec is never reached (all responses return in ~5ms, no output).
+        #
+        # We use a list + seen set on (url, param, method) instead of a set of tuples
+        # because FormInput dataclass objects are not hashable.
+        candidates: list[tuple] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def add_candidate(url, param, method, value, form_inputs=None):
+            key = (url, param, method)
+            if key not in seen:
+                seen.add(key)
+                candidates.append((url, param, method, value, form_inputs))
+
+        # URL parameters — no form_inputs needed (GET query string injection)
         for url in urls:
             parsed = urlparse(url)
             query_params = parse_qsl(parsed.query, keep_blank_values=True)
             for param_name, param_value in query_params:
                 param_lower = param_name.lower()
-                if param_lower in self.cmd_param_tokens or any(token in param_lower for token in ["cmd", "command", "exec"]):
-                    candidates.add((url, param_name, "GET", param_value))
+                if param_lower in self.cmd_param_tokens or any(
+                    token in param_lower for token in ["cmd", "command", "exec"]
+                ):
+                    add_candidate(url, param_name, "GET", param_value, None)
 
-        # Form Inputs
+        # Form inputs — pass the full sibling list as form_inputs so Submit
+        # buttons and hidden fields are included in every POST body.
         for form in forms:
             form_url = getattr(form, "action", getattr(form, "page_url", ""))
             form_method = getattr(form, "method", "POST").upper()
@@ -45,26 +63,30 @@ class CommandInjectionDetector(BaseDetector):
                         token in inp_name_lower
                         for token in ["cmd", "command", "exec", "run", "shell", "ping"]
                     ):
-                        candidates.add((form_url, inp_name, form_method, ""))
+                        add_candidate(form_url, inp_name, form_method, "", raw_inputs)
 
         if not candidates:
             return []
 
-        # 2. Active Verification
+        # 2. Active verification
         semaphore = asyncio.Semaphore(4)
         verifier = CommandInjectionVerifier(timeout_seconds=10.0)
-        # Apply session cookies
         verifier.http_verifier.cookies = session_cookies
 
         async def verify_candidate(cand) -> list[Finding]:
-            cand_url, param, method, val = cand
+            cand_url, param, method, val, form_inputs = cand
             async with semaphore:
                 try:
-                    result = await verifier.verify(cand_url, param, method, val)
+                    result = await verifier.verify(
+                        cand_url, param, method, val, form_inputs=form_inputs
+                    )
                     if result.is_vulnerable:
                         return result.findings
                 except Exception as e:
-                    logger.error("Command injection verification failed for %s param %s: %s", cand_url, param, e)
+                    logger.error(
+                        "Command injection verification failed for %s param %s: %s",
+                        cand_url, param, e,
+                    )
                 return []
 
         tasks = [verify_candidate(c) for c in candidates]

@@ -116,7 +116,6 @@ async def test_sqli_verifier_boolean_requires_confirmation():
 
 def test_sqli_verifier_prepends_baseline_to_payload():
     verifier = SQLiVerifier()
-    verifier._baseline_value = "1"
 
     url, _, _ = verifier._build_request_args(
         "http://example.com/sqli?id=1",
@@ -124,6 +123,7 @@ def test_sqli_verifier_prepends_baseline_to_payload():
         "' AND '1'='1",
         "GET",
         None,
+        baseline_value="1",
     )
 
     assert "id=1%27+AND+%271%27%3D%271" in url or "id=1' AND '1'='1" in url

@@ -8,6 +8,7 @@ from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
+from app.utils.scan_http import create_scan_client
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ class SensitivePathsDetector(BaseDetector):
         settings = get_settings()
         semaphore = asyncio.Semaphore(5)
 
-        async with httpx.AsyncClient(
+        async with create_scan_client(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
             verify=False,  # Similar to other detectors, allow self-signed for scanning

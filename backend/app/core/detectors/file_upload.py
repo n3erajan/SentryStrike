@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
+from app.utils.scan_http import create_scan_client
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ class FileUploadDetector(BaseDetector):
 
         # Derive the site root once so candidate upload paths can be built
         # relative to the origin rather than the form's own path.
-        async with httpx.AsyncClient(
+        async with create_scan_client(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
             headers={"User-Agent": "SentryStrikeScanner/1.0"},
@@ -134,7 +135,7 @@ class FileUploadDetector(BaseDetector):
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
             if accessible_url:
                 findings.append(Finding(
-                    category=OwaspCategory.a04,
+                    category=OwaspCategory.a05,
                     vuln_type="Unrestricted File Upload",
                     severity=SeverityLevel.critical,
                     url=form_url,
@@ -162,7 +163,7 @@ class FileUploadDetector(BaseDetector):
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
             if accessible_url:
                 findings.append(Finding(
-                    category=OwaspCategory.a04,
+                    category=OwaspCategory.a05,
                     vuln_type="Weak File Upload Validation",
                     severity=SeverityLevel.critical,
                     url=form_url,
@@ -180,7 +181,7 @@ class FileUploadDetector(BaseDetector):
                 ))
             else:
                 findings.append(Finding(
-                    category=OwaspCategory.a04,
+                    category=OwaspCategory.a05,
                     vuln_type="Weak File Upload Validation",
                     severity=SeverityLevel.high,
                     url=form_url,
@@ -205,7 +206,7 @@ class FileUploadDetector(BaseDetector):
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
             if accessible_url:
                 findings.append(Finding(
-                    category=OwaspCategory.a04,
+                    category=OwaspCategory.a05,
                     vuln_type="Double Extension Bypass",
                     severity=SeverityLevel.critical,
                     url=form_url,
@@ -223,7 +224,7 @@ class FileUploadDetector(BaseDetector):
                 ))
             else:
                 findings.append(Finding(
-                    category=OwaspCategory.a04,
+                    category=OwaspCategory.a05,
                     vuln_type="Double Extension Bypass",
                     severity=SeverityLevel.high,
                     url=form_url,
@@ -244,7 +245,7 @@ class FileUploadDetector(BaseDetector):
         )
         if accepted and not self._has_error_terms(response.text or ""):
             findings.append(Finding(
-                category=OwaspCategory.a04,
+                category=OwaspCategory.a05,
                 vuln_type="Missing File Type Validation",
                 severity=SeverityLevel.medium,
                 url=form_url,
