@@ -43,6 +43,30 @@ class FileInclusionDetector(BaseDetector):
     ]
 
     @staticmethod
+    def _is_direct_path_traversal(payload: str) -> bool:
+        lowered = payload.lower()
+        if "://" in lowered:
+            return False
+        return (
+            "../" in payload
+            or "..\\" in payload
+            or "%2f" in lowered
+            or "%5c" in lowered
+            or lowered.startswith("/etc/")
+            or re.match(r"^[a-z]:\\", lowered) is not None
+        )
+
+    @classmethod
+    def _file_read_finding_type(cls, payload: str) -> tuple[OwaspCategory, str, str]:
+        if cls._is_direct_path_traversal(payload):
+            return (
+                OwaspCategory.a01,
+                "Path Traversal / Arbitrary File Read",
+                "path_traversal_file_read",
+            )
+        return OwaspCategory.a05, "Local File Inclusion (LFI)", "file_retrieval"
+
+    @staticmethod
     def _is_valid_src_code_delivery(text_content: str) -> bool:
         indicators = [r"<?php", r"html", r"doctype", r"require_once", r"include(", r"$_GET", r"$_POST"]
         return any(re.search(ind, text_content, re.IGNORECASE) for ind in indicators)
@@ -165,17 +189,19 @@ class FileInclusionDetector(BaseDetector):
                                         continue
 
                                 cand_findings.append(
+                                    # Direct filesystem traversal is an access-control failure.
+                                    # Runtime wrappers/streams remain framework inclusion findings.
                                     Finding(
-                                        category=OwaspCategory.a05,
-                                        vuln_type="Local File Inclusion (LFI)",
+                                        category=self._file_read_finding_type(payload)[0],
+                                        vuln_type=self._file_read_finding_type(payload)[1],
                                         severity=SeverityLevel.critical,
                                         url=cand_url,
                                         parameter=param,
                                         method=method,
                                         payload=payload,
-                                        evidence=f"LFI confirmed via payload '{payload}' ({desc}). Unique system token detected.",
+                                        evidence=f"Arbitrary file read confirmed via payload '{payload}' ({desc}). Unique system token detected.",
                                         confidence_score=95.0,
-                                        detection_method="file_retrieval",
+                                        detection_method=self._file_read_finding_type(payload)[2],
                                         reproducible=True,
                                         verified=True,
                                         verification_request_snippet=injected.request_snippet,

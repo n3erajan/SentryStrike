@@ -23,6 +23,7 @@ async def get_report_data(scan_id: str, repo: ScanRepository = Depends(get_scan_
         "executive_summary": scan.report_metadata.summary,
         "statistics": scan.statistics.model_dump(),
         "risk_score": scan.overall_risk_score,
+        "technology_stack": [tech.model_dump() for tech in scan.technology_stack],
         "vulnerabilities": [v.model_dump() for v in scan.vulnerabilities],
     }
     return json_response(data)
@@ -56,6 +57,7 @@ async def generate_pdf_report(scan_id: str, repo: ScanRepository = Depends(get_s
             "executive_summary": scan.report_metadata.summary or "No summary available.",
             "statistics": scan.statistics.model_dump(),
             "risk_score": scan.overall_risk_score,
+            "technology_stack": [tech.model_dump() for tech in scan.technology_stack],
             "vulnerabilities": [v.model_dump() for v in scan.vulnerabilities],
         },
     }

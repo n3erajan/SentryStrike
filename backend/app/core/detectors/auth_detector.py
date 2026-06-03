@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import statistics
 from urllib.parse import parse_qsl, urlparse
 
 from app.config import get_settings
@@ -123,6 +124,13 @@ class AuthenticationFailuresDetector(BaseDetector):
         "cfid", "cftoken",
     }
 
+    _rate_limit_terms = {
+        "too many attempts", "too many requests", "rate limit", "rate-limit",
+        "throttle", "throttled", "temporarily locked", "account locked",
+        "lockout", "try again later", "captcha", "challenge required",
+        "429", "slow down",
+    }
+
     # ---------------------------------------------------------------------------
     # Internal helpers
     # ---------------------------------------------------------------------------
@@ -132,6 +140,37 @@ class AuthenticationFailuresDetector(BaseDetector):
 
     def _url_contains(self, lowered_url: str, token_set: set[str]) -> bool:
         return any(tok in lowered_url for tok in token_set)
+
+    def _sensitive_query_params(self, query_params: list[tuple[str, str]], lowered_url: str) -> set[str]:
+        credential_params = {"password", "passwd", "pass", "pwd", "secret", "api_key", "apikey", "private_key"}
+        contextual_params = self._sensitive_get_params - credential_params
+        auth_context = self._url_contains(
+            lowered_url,
+            self.login_tokens
+            | self.reset_tokens
+            | self.api_auth_tokens
+            | self.mfa_tokens
+            | {"oauth", "authorize", "callback", "session"},
+        )
+
+        leaked: set[str] = set()
+        for key, value in query_params:
+            key_lower = key.lower()
+            value = value or ""
+            if key_lower in credential_params and value:
+                leaked.add(key_lower)
+                continue
+            if key_lower not in contextual_params or not value:
+                continue
+            value_lower = value.lower()
+            looks_secret = (
+                len(value) >= 16
+                or value_lower.count(".") == 2
+                or any(ch.isdigit() for ch in value) and any(ch.isalpha() for ch in value) and len(value) >= 8
+            )
+            if auth_context or looks_secret:
+                leaked.add(key_lower)
+        return leaked
 
     def _finding(
         self,
@@ -163,6 +202,53 @@ class AuthenticationFailuresDetector(BaseDetector):
         if payload is not None:
             kwargs["payload"] = payload
         return Finding(**kwargs)
+
+    def _rate_limit_signals_present(self, responses: list[object]) -> bool:
+        for response in responses:
+            if getattr(response, "status_code", 0) in {401, 403, 423, 429}:
+                body_lower = (getattr(response, "body", "") or "").lower()
+                if getattr(response, "status_code", 0) in {423, 429}:
+                    return True
+                if any(term in body_lower for term in self._rate_limit_terms):
+                    return True
+            body_lower = (getattr(response, "body", "") or "").lower()
+            if any(term in body_lower for term in self._rate_limit_terms):
+                return True
+        return False
+
+    @staticmethod
+    def _response_signature(response: object) -> tuple:
+        body = getattr(response, "body", "") or ""
+        normalized = " ".join(body.lower().split())
+        return (
+            getattr(response, "status_code", 0),
+            len(body),
+            normalized[:300],
+        )
+
+    def _burst_responses_stable(self, burst_results: list[dict]) -> bool:
+        responses = [r for result in burst_results for r in result["responses"]]
+        if not responses:
+            return False
+
+        signatures = {self._response_signature(response) for response in responses}
+        if len(signatures) > 1:
+            return False
+
+        all_times = [float(getattr(response, "response_time_ms", 0.0) or 0.0) for response in responses]
+        if len(all_times) < 2:
+            return False
+
+        mean_time = statistics.mean(all_times)
+        stdev_time = statistics.pstdev(all_times)
+        if stdev_time > max(100.0, mean_time * 0.15):
+            return False
+
+        burst_means = [result["mean_ms"] for result in burst_results if result["responses"]]
+        if len(burst_means) >= 2 and burst_means[-1] > burst_means[0] + 500.0:
+            return False
+
+        return True
 
     # ---------------------------------------------------------------------------
     # Main detect method
@@ -246,37 +332,74 @@ class AuthenticationFailuresDetector(BaseDetector):
                         )
                     )
 
-            # Test 2: Active Brute-Force Testing
-            responses = []
-            for _ in range(5):
-                brute_url, brute_params, brute_data = URLParameterBuilder.inject_parameter(form_url, username_param, "test", method)
-                if method == "POST":
-                    brute_data = payload
-                else:
-                    brute_params = payload
-                
-                resp = await verifier.send_request(
-                    brute_url, method, brute_params, brute_data, test_phase="brute_force"
+            # Test 2: Sliding-scale parallel brute-force rate-limit probing.
+            burst_results = []
+            last_responses = []
+            burst_sizes = (5, 20, 50)
+            burst_semaphore = asyncio.Semaphore(10)
+
+            async def send_brute_attempt(attempt_idx: int):
+                async with burst_semaphore:
+                    brute_url, brute_params, brute_data = URLParameterBuilder.inject_parameter(
+                        form_url, username_param, "test", method
+                    )
+                    attempt_payload = payload.copy()
+                    if method == "POST":
+                        brute_data = attempt_payload
+                    else:
+                        brute_params = attempt_payload
+
+                    return await verifier.send_request(
+                        brute_url,
+                        method,
+                        brute_params,
+                        brute_data,
+                        test_phase="brute_force_burst",
+                        parameter=username_param,
+                    )
+
+            attempt_offset = 0
+            for burst_size in burst_sizes:
+                responses = await asyncio.gather(
+                    *[send_brute_attempt(attempt_offset + i) for i in range(burst_size)]
                 )
-                responses.append(resp)
-                await asyncio.sleep(0.05)
-            
-            rate_limited = any(r.status_code == 429 for r in responses)
-            locked_out = any("lock" in r.body.lower() or "too many attempts" in r.body.lower() for r in responses)
-            times = [r.response_time_ms for r in responses]
-            has_progressive_delay = len(times) >= 2 and times[-1] > times[0] + 1000
-            
-            if not (rate_limited or locked_out or has_progressive_delay):
+                attempt_offset += burst_size
+                last_responses = list(responses)
+                times = [float(r.response_time_ms or 0.0) for r in responses]
+                burst_results.append({
+                    "size": burst_size,
+                    "responses": list(responses),
+                    "mean_ms": statistics.mean(times) if times else 0.0,
+                    "stdev_ms": statistics.pstdev(times) if len(times) > 1 else 0.0,
+                })
+                if self._rate_limit_signals_present(list(responses)):
+                    break
+                await asyncio.sleep(0.1)
+
+            all_burst_responses = [r for result in burst_results for r in result["responses"]]
+            rate_limit_detected = self._rate_limit_signals_present(all_burst_responses)
+            responses_stable = self._burst_responses_stable(burst_results)
+
+            if not rate_limit_detected and responses_stable:
+                total_attempts = sum(result["size"] for result in burst_results)
+                burst_summary = ", ".join(
+                    f"{result['size']} req mean={result['mean_ms']:.0f}ms stdev={result['stdev_ms']:.0f}ms"
+                    for result in burst_results
+                )
                 findings.append(
                     self._finding(
                         vuln_type="Lack of Brute-Force Protection on Login Form",
                         url=form_url,
                         method=method,
                         severity=SeverityLevel.high,
-                        evidence=f"Sent 5 rapid authentication attempts to '{form_url}' and received no account lockout, rate-limiting (429), or progressive delays.",
+                        evidence=(
+                            f"Sent {total_attempts} authentication attempts in increasing parallel bursts "
+                            f"({burst_summary}) and observed stable response bodies/timings with no lockout, "
+                            "rate-limit status, CAPTCHA/challenge, or progressive delay signals."
+                        ),
                         verified=True,
-                        verification_request_snippet=responses[-1].request_snippet if responses else None,
-                        verification_response_snippet=responses[-1].response_snippet if responses else None,
+                        verification_request_snippet=last_responses[-1].request_snippet if last_responses else None,
+                        verification_response_snippet=last_responses[-1].response_snippet if last_responses else None,
                     )
                 )
 
@@ -333,7 +456,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                         )
 
             # Test 3: Session Cookie Attributes check
-            for r in responses:
+            for r in all_burst_responses:
                 set_cookie_headers = [v for k, v in r.headers.items() if k.lower() == "set-cookie"]
                 for header in set_cookie_headers:
                     cookie_parts = [p.strip().lower() for p in header.split(";")]
@@ -651,7 +774,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                 ))
 
             # 8. Sensitive credentials in query string (GET)
-            leaked_params = query_keys.intersection(self._sensitive_get_params)
+            leaked_params = self._sensitive_query_params(query_params, lowered)
             if leaked_params:
                 findings.append(self._finding(
                     vuln_type="Sensitive Credential / Token Exposed in URL Query String",

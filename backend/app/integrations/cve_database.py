@@ -1,6 +1,10 @@
+import logging
+
 from app.integrations.nvd_client import NvdClient
 from app.models.cve import CveRecord
 from app.models.vulnerability import TechnologyComponent
+
+logger = logging.getLogger(__name__)
 
 
 class CveDatabaseService:
@@ -10,7 +14,16 @@ class CveDatabaseService:
     async def enrich_components(self, components: list[TechnologyComponent]) -> list[TechnologyComponent]:
         enriched: list[TechnologyComponent] = []
         for component in components:
-            cves = await self.nvd_client.lookup_cves(component.name, component.version)
+            try:
+                cves = await self.nvd_client.lookup_cves(component.name, component.version)
+            except Exception as exc:
+                logger.warning(
+                    "CVE lookup failed for component %s %s: %s",
+                    component.name,
+                    component.version or "",
+                    exc,
+                )
+                cves = []
             cve_ids = [item.get("cve_id", "") for item in cves if item.get("cve_id")]
             component.cves = cve_ids
             enriched.append(component)
@@ -18,15 +31,18 @@ class CveDatabaseService:
             for c in cves:
                 if not c.get("cve_id"):
                     continue
-                exists = await CveRecord.find_one(CveRecord.cve_id == c["cve_id"])
-                if exists:
-                    continue
-                await CveRecord(
-                    cve_id=c["cve_id"],
-                    component_name=component.name,
-                    component_version=component.version,
-                    severity_score=c.get("severity_score"),
-                    summary=c.get("summary"),
-                ).insert()
+                try:
+                    exists = await CveRecord.find_one(CveRecord.cve_id == c["cve_id"])
+                    if exists:
+                        continue
+                    await CveRecord(
+                        cve_id=c["cve_id"],
+                        component_name=component.name,
+                        component_version=component.version,
+                        severity_score=c.get("severity_score"),
+                        summary=c.get("summary"),
+                    ).insert()
+                except Exception as exc:
+                    logger.warning("Failed to cache CVE %s: %s", c["cve_id"], exc)
 
         return enriched

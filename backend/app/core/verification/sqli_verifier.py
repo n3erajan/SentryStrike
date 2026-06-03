@@ -830,6 +830,18 @@ class SQLiVerifier(BaseVerifier):
                     )
                     
                     if canary_reflected:
+                        if ResponseAnalyzer.is_phpinfo_or_debug_page(inj_resp.body or ""):
+                            logger.debug(
+                                "UNION canary '%s' reflected on diagnostic/debug page. Suppressing SQLi false positive.",
+                                canary,
+                            )
+                            continue
+                        if ResponseAnalyzer.is_request_metadata_reflection(inj_resp.body or "", canary):
+                            logger.debug(
+                                "UNION canary '%s' reflected in request metadata dump. Suppressing SQLi false positive.",
+                                canary,
+                            )
+                            continue
                         # --------------------------------------------------------
                         # UNIVERSAL ANTI-XSS GUARD: Detect literal text reflection
                         # --------------------------------------------------------

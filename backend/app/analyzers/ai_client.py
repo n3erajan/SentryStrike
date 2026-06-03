@@ -7,18 +7,53 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# Ollama model families that support the `think` parameter.
+# For unsupported models the parameter is silently ignored by Ollama, but
+# we skip it entirely to keep payloads clean and avoid log noise.
+_THINKING_CAPABLE_PREFIXES = ("qwen3", "deepseek-r1", "qwq")
+
+
+def _model_supports_thinking(model_name: str) -> bool:
+    """Return True if *model_name* is known to support Ollama's ``think`` param."""
+    name_lower = (model_name or "").lower()
+    return any(name_lower.startswith(prefix) for prefix in _THINKING_CAPABLE_PREFIXES)
+
 
 class OllamaClient:
     def __init__(self) -> None:
         self.settings = get_settings()
+        self._thinking_capable = _model_supports_thinking(self.settings.ollama_model)
 
-    async def generate_json(self, prompt: str) -> dict:
-        payload = {
+    def _build_payload(self, prompt: str, *, thinking: bool) -> dict:
+        """Construct the Ollama /api/generate payload.
+
+        ``think=True``  → chain-of-thought reasoning (slower, more accurate).
+        ``think=False`` → direct answer, no <think> block (faster).
+
+        The ``think`` key is only injected for models that support it so the
+        payload stays clean for qwen2.5-coder and other non-thinking models.
+        """
+        payload: dict = {
             "model": self.settings.ollama_model,
             "prompt": prompt,
             "stream": False,
             "format": "json",
         }
+        if self._thinking_capable:
+            payload["think"] = thinking
+            logger.debug("thinking mode: %s for model %s", thinking, self.settings.ollama_model)
+        return payload
+
+    async def generate_json(self, prompt: str, *, thinking: bool = False) -> dict:
+        """Generate a single JSON dict from *prompt*.
+
+        Args:
+            prompt:   The full prompt string.
+            thinking: Whether to enable chain-of-thought reasoning.
+                      Pass ``True`` for borderline/ambiguous findings;
+                      leave ``False`` (default) for clear-cut, high-confidence ones.
+        """
+        payload = self._build_payload(prompt, thinking=thinking)
 
         for attempt in range(1, self.settings.ai_max_retries + 2):
             try:
@@ -35,18 +70,18 @@ class OllamaClient:
 
         raise RuntimeError("Ollama failed to generate JSON after retries")
 
-    async def generate_json_list(self, prompt: str, expected_count: int) -> list[dict]:
+    async def generate_json_list(self, prompt: str, expected_count: int, *, thinking: bool = False) -> list[dict]:
         """Send a single prompt expecting a JSON array response with *expected_count* items.
+
+        Args:
+            prompt:         The full prompt string.
+            expected_count: Number of result objects expected in the array.
+            thinking:       Whether to enable chain-of-thought reasoning.
 
         Raises RuntimeError if the AI response cannot be
         parsed or has the wrong length after retries.
         """
-        payload = {
-            "model": self.settings.ollama_model,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json",
-        }
+        payload = self._build_payload(prompt, thinking=thinking)
 
         for attempt in range(1, self.settings.ai_max_retries + 2):
             try:

@@ -5,6 +5,7 @@ import httpx
 
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.verification.response_analyzer import ResponseAnalyzer
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
 from app.utils.scan_http import create_scan_client
@@ -16,22 +17,56 @@ from app.utils.scan_http import create_scan_client
 _HIGH_PATTERNS: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE)
     for p in [
+        # SQL verbose errors (common across stacks)
         r"you have an error in your sql syntax",        # MySQL verbose query error
         r"syntax error at or near",                     # PostgreSQL
         r"pg::(?:syntax|unique|constraint|connection)", # PostgreSQL exception class
         r"sqlstate\[",                                  # PDO with state code
+        r"\bsqlstate\b",                                # JDBC/ODBC/PDO state code
+        r"\bsqlexception\b",                            # Java/.NET SQL exception
         r"ociexception",                                # Oracle
         r"connectionexception",                         # DB connection failure
+        r"sql error",                                   # generic DB error text
+        r"database error",                              # generic DB error text
+        r"pdoexception",                                # PHP PDO exception dump
+        r"check the manual that corresponds to your (?:mysql|mariadb) server version",
+        r"\b(?:mysql|mariadb) server version\b",
+        r"warning:\s+mysql(?:i)?_",                     # PHP mysql/mysqli warnings
+        r"sqlite(?:3)?\.(?:operationalerror|databaseerror|integrityerror)",
+
+        # Full SQL echoes / query execution lines
+        r"executing\s*:\s*select\b",                    # common Java/JSP/hibernate echoes
+        r"executing\s*:\s*insert\b",
+        r"executing\s*:\s*update\b",
+        r"executing\s*:\s*delete\b",
+        r"select\s+.+\s+from\s+.+where\b",          # query-shaped echo
+        r"insert\s+into\s+.+\bvalues\b",          # query-shaped echo
+
+        # Direct credential/config leaks in error output
         r"password\s*=",                                # credential leak in error
         r"db_password|database_password|db_pass",       # config key leak
+
+        # Internal path disclosure
         r"/var/www/",                                   # Unix web root path
         r"/home/\w+/",                                  # Unix home path
-        r"[A-Za-z]:\\\\(?:inetpub|xampp|wamp|www)",    # Windows web root path
+        r"/etc/",                                       # common sensitive folder disclosure
+        r"/boot/",                                      # boot artifacts
+        r"/[A-Za-z0-9_\-]+/www/",                      # weird nested roots sometimes echoed
+        r"[A-Za-z]:\\\\(?:inetpub|xampp|wamp|www|rails|django)",    # Windows web root path
         r"app/models/",                                 # MVC model path
         r"app/controllers/",                            # MVC controller path
         r"site-packages/",                              # Python package path
+        r"vendor/(?:laravel|symfony)/",                  # Composer vendor disclosure
+
+        # PHP stack traces / exception dumps
         r"caught exception:",                           # PHP/generic exception dump
         r"mysqli_error\(",                              # raw PHP function name leaking
+        r"mysql_(?:fetch|query|num_rows|connect)\b",    # raw legacy PHP MySQL call leaking
+        r"\b(phpinfo\(|fatal error:|parse error:)\b",  # PHP error output markers
+
+        # IP disclosure hints often appear with stack traces
+        r"\b(?:127\.0\.0\.1|localhost)\b",
+        r"\b(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[0-1])\.)\d+\.\d+\b",
     ]
 ]
 
@@ -76,6 +111,20 @@ _LOW_PATTERNS: list[re.Pattern] = [
     ]
 ]
 
+_DEBUG_METRICS_PATTERNS: list[re.Pattern] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"^#\s*HELP\s+\w+",                         # Prometheus exposition
+        r"^#\s*TYPE\s+\w+",                         # Prometheus exposition
+        r"jvm_memory_used_bytes|process_cpu_seconds_total|http_server_requests",
+        r"\"activeProfiles\"|\"propertySources\"|\"systemProperties\"",  # Spring actuator env
+        r"\"heapUsed\"|\"rss\"|\"uptime\"|\"pid\"",  # Node/process dumps
+        r"debug\s*=\s*true|app_debug|environment\s*:\s*(dev|debug|local)",
+        r"phpinfo\(\)|configuration file \(php\.ini\) path",
+        r"server-status|apache server status|scoreboard",
+    ]
+]
+
 _SENSITIVE_HEADERS = {
     "x-powered-by",
     "x-aspnet-version",
@@ -97,6 +146,21 @@ _FUZZ_PAYLOADS: list[tuple[str, str]] = [
     ("<script>", "HTML/XML metacharacter — XML parser or sanitiser errors"),
     ("../../../etc/passwd", "path traversal — file-handling errors"),
     ("%00%0d%0a", "URL-encoded null + CRLF — header injection / parser errors"),
+]
+
+_DEBUG_ENDPOINT_PATHS = [
+    "/debug",
+    "/debug/vars",
+    "/metrics",
+    "/status",
+    "/server-status",
+    "/phpinfo.php",
+    "/actuator",
+    "/actuator/env",
+    "/actuator/metrics",
+    "/actuator/health",
+    "/actuator/prometheus",
+    "/__debug__",
 ]
 
 _DEFAULT_URL_LIMIT = 20
@@ -150,7 +214,7 @@ def _build_evidence(
     sensitive_hdrs: list[str],
     trigger: str = "",
 ) -> str:
-    all_patterns = _HIGH_PATTERNS + _MEDIUM_PATTERNS + _LOW_PATTERNS
+    all_patterns = _HIGH_PATTERNS + _MEDIUM_PATTERNS + _LOW_PATTERNS + _DEBUG_METRICS_PATTERNS
     compiled = [p for p in all_patterns if p.pattern in matched_patterns]
     snippet = _extract_snippet(body, compiled) if compiled else body[:_EVIDENCE_SNIPPET_LEN]
 
@@ -163,6 +227,27 @@ def _build_evidence(
         parts.append(f"Sensitive headers: {', '.join(sensitive_hdrs)}")
     parts.append(f"Excerpt: {snippet!r}")
     return " | ".join(parts)
+
+def _observed_text_from_finding(finding: Finding) -> str:
+    evidence_parts: list[str] = []
+    for value in (
+        getattr(finding, "verification_response_snippet", None),
+        getattr(finding, "evidence", None),
+        getattr(finding, "payload", None),
+    ):
+        if value:
+            evidence_parts.append(str(value))
+
+    detection_evidence = getattr(finding, "detection_evidence", {}) or {}
+    for value in detection_evidence.values():
+        if isinstance(value, (list, tuple, set)):
+            evidence_parts.extend(str(item) for item in value if item)
+        elif isinstance(value, dict):
+            evidence_parts.extend(str(item) for item in value.values() if item)
+        elif value:
+            evidence_parts.append(str(value))
+
+    return "\n".join(evidence_parts)
 
 def _replace_param_values(url: str, replacement: str) -> str:
     if "?" not in url:
@@ -225,6 +310,17 @@ class ExceptionHandlingDetector(BaseDetector):
                 if isinstance(result, Finding):
                     _add_finding(result, findings, seen)
 
+            # Technique 1b: globally exposed debug/metrics endpoints
+            debug_tasks = [
+                self._probe_debug_endpoint(client, semaphore, root, path)
+                for root in self._target_roots(urls)
+                for path in _DEBUG_ENDPOINT_PATHS
+            ]
+            results_debug = await asyncio.gather(*debug_tasks, return_exceptions=True)
+            for result in results_debug:
+                if isinstance(result, Finding):
+                    _add_finding(result, findings, seen)
+
             # ── Technique 2: Parameter fuzzing on GET URLs ────────────────
             param_urls = [u for u in urls if "?" in u]
             fuzz_tasks = [
@@ -261,6 +357,74 @@ class ExceptionHandlingDetector(BaseDetector):
 
         return findings
 
+    def findings_from_observed_evidence(self, observed_findings: list[Finding]) -> list[Finding]:
+        findings: list[Finding] = []
+        seen: set[tuple] = set()
+
+        for source in observed_findings or []:
+            if source.category == OwaspCategory.a10 and source.vuln_type == "Verbose Error Handling":
+                continue
+
+            observed_text = _observed_text_from_finding(source)
+            severity, high_hits, med_hits = _classify_body(observed_text)
+            matched = high_hits or med_hits
+            if not matched or not severity:
+                continue
+
+            trigger = (
+                f"observed during {source.vuln_type} verification"
+                if getattr(source, "vuln_type", None)
+                else "observed during active verification"
+            )
+            evidence = _build_evidence(
+                url=source.url,
+                method=source.method,
+                status=200,
+                body=observed_text,
+                matched_patterns=matched,
+                sensitive_hdrs=[],
+                trigger=trigger,
+            )
+
+            finding = Finding(
+                category=OwaspCategory.a10,
+                vuln_type="Verbose Error Handling",
+                severity=severity,
+                url=source.url,
+                parameter=source.parameter,
+                method=source.method,
+                payload=source.payload,
+                evidence=evidence,
+                confidence_score=95.0 if severity == SeverityLevel.high else 85.0,
+                detection_method="observed_exception_evidence",
+                detection_evidence={
+                    "source_vuln_type": source.vuln_type,
+                    "source_detection_method": getattr(source, "detection_method", None),
+                    "matched_patterns": matched,
+                },
+                verified=True,
+                reproducible=getattr(source, "reproducible", False),
+                verification_request_snippet=getattr(source, "verification_request_snippet", None),
+                verification_response_snippet=ResponseAnalyzer.build_evidence_response_snippet(
+                    status_code=200,
+                    body=observed_text,
+                    payload=source.payload or trigger,
+                    extra_markers=matched,
+                ),
+            )
+            _add_finding(finding, findings, seen)
+
+        return findings
+
+    @staticmethod
+    def _target_roots(urls: list[str]) -> list[str]:
+        roots: set[str] = set()
+        for url in urls:
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme and parsed.netloc:
+                roots.add(f"{parsed.scheme}://{parsed.netloc}")
+        return sorted(roots)
+
     async def _probe_404(
         self,
         client: httpx.AsyncClient,
@@ -282,6 +446,56 @@ class ExceptionHandlingDetector(BaseDetector):
             body=response.text, headers=response.headers,
             trigger="non-existent path probe", require_body_match=True,
             parameter=None, payload=None
+        )
+
+    async def _probe_debug_endpoint(
+        self,
+        client: httpx.AsyncClient,
+        semaphore: asyncio.Semaphore,
+        root: str,
+        path: str,
+    ) -> Finding | None:
+        test_url = f"{root.rstrip('/')}/{path.lstrip('/')}"
+        async with semaphore:
+            try:
+                response = await client.get(test_url)
+            except Exception:
+                return None
+
+        if response.status_code != 200:
+            return None
+
+        matched = [p.pattern for p in _DEBUG_METRICS_PATTERNS if p.search(response.text or "")]
+        if not matched:
+            return None
+
+        evidence = _build_evidence(
+            url=test_url,
+            method="GET",
+            status=response.status_code,
+            body=response.text,
+            matched_patterns=matched,
+            sensitive_hdrs=_sensitive_headers_present(response.headers),
+            trigger="debug/metrics endpoint probe",
+        )
+
+        return Finding(
+            category=OwaspCategory.a10,
+            vuln_type="Debug / Metrics Endpoint Exposed",
+            severity=SeverityLevel.medium,
+            url=test_url,
+            method="GET",
+            evidence=evidence,
+            confidence_score=90.0,
+            verified=True,
+            reproducible=True,
+            verification_request_snippet=f"GET {test_url} HTTP/1.1\nUser-Agent: Sentry/2.0",
+            verification_response_snippet=ResponseAnalyzer.build_evidence_response_snippet(
+                status_code=response.status_code,
+                body=response.text,
+                payload="debug/metrics endpoint probe",
+                extra_markers=matched,
+            ),
         )
 
     async def _probe_get_params(
@@ -472,7 +686,12 @@ class ExceptionHandlingDetector(BaseDetector):
             verified=True,
             reproducible=True,
             verification_request_snippet=f"{method} {url} HTTP/1.1\nUser-Agent: Sentry/2.0\nPayload: {payload}",
-            verification_response_snippet=f"HTTP/1.1 {status}\n\n{body[:600]}",
+            verification_response_snippet=ResponseAnalyzer.build_evidence_response_snippet(
+                status_code=status,
+                body=body,
+                payload=payload or trigger,
+                extra_markers=[trigger, *matched],
+            ),
         )
 
 def _prioritise_urls(urls: list[str]) -> list[str]:

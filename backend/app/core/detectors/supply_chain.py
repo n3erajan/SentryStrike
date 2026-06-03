@@ -14,16 +14,10 @@ class SupplyChainDetector(BaseDetector):
             name = getattr(tech, "name", "unknown")
             version = (getattr(tech, "version", None) or "").strip()
             cves = getattr(tech, "cves", [])
+            # If version is unknown, do not emit any finding.
+            # Supply-chain findings are only meaningful when a version is
+            # available and can be mapped to linked CVEs.
             if not version:
-                findings.append(
-                    Finding(
-                        category=OwaspCategory.a03,
-                        vuln_type="Component Version Unknown",
-                        severity=SeverityLevel.low,
-                        url=root_url,
-                        evidence=f"Unable to determine version for component {name}.",
-                    )
-                )
                 continue
             if not cves:
                 continue

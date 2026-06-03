@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from uuid import uuid4
+from urllib.parse import urlparse
 
 from app.config import get_settings
 
@@ -86,6 +88,10 @@ class ScanOrchestrator:
                 "Implement object-level authorization and verify the authenticated user has "
                 "permission to access the referenced resource."
             ),
+            "Path Traversal / Arbitrary File Read": (
+                "Canonicalize requested paths, reject traversal sequences, enforce an allowlist of readable "
+                "files/directories, and ensure file access stays inside the intended document root."
+            ),
             "OS Command Injection": (
                 "Never pass user input to shell commands. Use parameterized APIs "
                 "(e.g., subprocess with shell=False) and strict allowlists."
@@ -114,8 +120,28 @@ class ScanOrchestrator:
             "Unrestricted File Upload": (
                 "Validate extension, MIME type, and content. Store uploads outside webroot and randomize names."
             ),
+            "Weak File Upload Validation": (
+                "Validate uploads server-side using extension allowlists, MIME checks, and file magic bytes; "
+                "store files outside the webroot with randomized names and disable script execution."
+            ),
+            "Double Extension Bypass": (
+                "Normalize filenames before validation, reject dangerous compound extensions, and enforce "
+                "server-side allowlists independent of client-supplied MIME types."
+            ),
+            "Missing File Type Validation": (
+                "Enforce server-side file type validation using allowlisted extensions and magic-byte inspection; "
+                "reject unexpected content types and scan uploaded files before storage."
+            ),
             "Insecure Session Cookie Attributes": (
                 "Set HttpOnly, Secure, and SameSite=Strict (or Lax) on session cookies."
+            ),
+            "Known CVE": (
+                "Upgrade the affected component to a patched version, remove unsupported versions, and verify "
+                "the component is no longer matched to the reported CVE."
+            ),
+            "Verbose Error Handling": (
+                "Disable verbose errors in production, return generic error pages, and send stack traces or "
+                "debug details only to protected server-side logs."
             ),
         }
 
@@ -202,6 +228,16 @@ class ScanOrchestrator:
                     continue
                 findings.extend(result)
 
+            exception_detector = next((detector for detector in self.detectors if isinstance(detector, ExceptionHandlingDetector)), None)
+            if exception_detector is not None:
+                observed_exception_findings = exception_detector.findings_from_observed_evidence(findings)
+                if observed_exception_findings:
+                    logger.info(
+                        "derived %d exception-handling finding(s) from observed active-verification evidence",
+                        len(observed_exception_findings),
+                    )
+                    findings.extend(observed_exception_findings)
+
             # Provide the scan root URL so site-wide detectors can avoid duplicate page-level findings.
             crypto_detector = next((detector for detector in self.detectors if isinstance(detector, CryptoFailuresDetector)), None)
             if crypto_detector is not None:
@@ -234,6 +270,30 @@ class ScanOrchestrator:
                 "test pollution filter complete: %d findings after contamination review",
                 len(findings),
             )
+
+            # CSRF finding deduplication:
+            # If token_bypass verified CSRF exists for a URL, suppress weaker heuristics
+            # like "Authentication Form Lacks CSRF Protection" to reduce duplicate noise.
+            _csrf_confirmed_urls: set[str] = set()
+            for f in findings:
+                if not f.vuln_type:
+                    continue
+                if "csrf" not in f.vuln_type.lower():
+                    continue
+                if getattr(f, "detection_method", "") == "token_bypass" or getattr(f, "verified", False):
+                    _csrf_confirmed_urls.add(f.url.split("?")[0])
+
+            if _csrf_confirmed_urls:
+                filtered: list[Finding] = []
+                for f in findings:
+                    url_key = (f.url or "").split("?")[0]
+                    vt_lower = (f.vuln_type or "").lower()
+                    if url_key in _csrf_confirmed_urls and "authentication form" in vt_lower and "lacks csrf" in vt_lower:
+                        continue
+                    if url_key in _csrf_confirmed_urls and "authentication form" in vt_lower and "may lack csrf" in vt_lower:
+                        continue
+                    filtered.append(f)
+                findings = filtered
 
             # scan_mode filtering: If verified, keep only verified findings.
             #
@@ -357,7 +417,7 @@ class ScanOrchestrator:
                 total_weighted_score = 0.0
                 total_weight = 0.0
                 for v in vulnerabilities:
-                    is_verified = v.evidence.request_snippet is not None
+                    is_verified = v.evidence.verified
                     weight = 1.0 if is_verified else 0.5
                     total_weighted_score += v.cvss_score * weight
                     total_weight += weight
@@ -448,9 +508,11 @@ class ScanOrchestrator:
                             result = result["results"][0]
                         else:
                             vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.failed
+                            req_snippet = (vuln.evidence.request_snippet or "").lower()
+                            requires_auth = "cookie" in req_snippet or "authorization" in req_snippet
                             cvss = CvssCalculator.from_vulnerability_context(
                                 vuln_type=vuln.vuln_type,
-                                requires_auth=False,
+                                requires_auth=requires_auth,
                                 confidence=0.8,
                                 impact=0.9 if vuln.severity.value in {"Critical", "High"} else 0.5,
                             )
@@ -483,7 +545,15 @@ class ScanOrchestrator:
                     vuln.ai_analysis.false_positive_probability = fp_prob
                     vuln.ai_analysis.false_positive_reasoning = result.get("false_positive_reasoning")
                     vuln.ai_analysis.exploitability_reasoning = result.get("exploitability_reasoning")
-                    vuln.ai_analysis.remediation = result.get("remediation", fallback["remediation"])
+                    remediation = result.get("remediation", fallback["remediation"])
+                    if self._remediation_is_incompatible(vuln.vuln_type, remediation):
+                        logger.info(
+                            "Replacing incompatible AI remediation with fallback: vuln_type=%r remediation=%r",
+                            vuln.vuln_type,
+                            remediation,
+                        )
+                        remediation = fallback["remediation"]
+                    vuln.ai_analysis.remediation = remediation
                     vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
                     vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.success
 
@@ -501,11 +571,17 @@ class ScanOrchestrator:
 
             # Evidence is what the LLM must ground on. Keep it class-agnostic but
             # include request/response/payload so fp scoring can vary by finding.
+            parsed = urlparse(vuln.location.url)
+            app_hint = parsed.path.split("/")[-1] or parsed.path
             evidence_block = (
                 "evidence_block=\n"
                 f"- url={vuln.location.url}\n"
                 f"- http_method={vuln.location.http_method}\n"
                 f"- parameter={vuln.location.parameter or 'none'}\n"
+                f"- detector_verified={vuln.evidence.verified}\n"
+                f"- detector_confidence_score={vuln.evidence.confidence_score:.1f}/100\n"
+                f"- detection_method={vuln.evidence.detection_method or 'unknown'}\n"
+                f"- detection_evidence={json.dumps(vuln.evidence.detection_evidence)[:1200] if vuln.evidence.detection_evidence else '{}'}\n"
                 f"- payload={payload or 'n/a'}\n"
                 f"- request_snippet={req[:1600] if req else 'n/a'}\n"
                 f"- response_snippet={resp[:1600] if resp else 'n/a'}\n"
@@ -532,6 +608,10 @@ class ScanOrchestrator:
             f"- url={vuln.location.url}\n"
             f"- http_method={vuln.location.http_method}\n"
             f"- parameter={vuln.location.parameter or 'none'}\n"
+            f"- detector_verified={vuln.evidence.verified}\n"
+            f"- detector_confidence_score={vuln.evidence.confidence_score:.1f}/100\n"
+            f"- detection_method={vuln.evidence.detection_method or 'unknown'}\n"
+            f"- detection_evidence={json.dumps(vuln.evidence.detection_evidence)[:1200] if vuln.evidence.detection_evidence else '{}'}\n"
             f"- payload={payload or 'n/a'}\n"
             f"- request_snippet={req[:1600] if req else 'n/a'}\n"
             f"- response_snippet={resp[:1600] if resp else 'n/a'}\n"
@@ -547,55 +627,118 @@ class ScanOrchestrator:
 
 
     def _build_prompt(self, tech_stack_str: str, vuln_descriptions: list[str], is_batch: bool) -> str:
-            """Constructs an evaluation prompt with strict verification rules optimized for local 7B models."""
+        """Constructs an evaluation prompt optimized for Qwen3 8B / local 8B models."""
+
+        # KEY CHANGE 1: Role framing with explicit task decomposition
+        # Small models respond better to "think step by step" with explicit phases
+        role_and_task = (
+            "You are a senior penetration tester writing a verified security report. "
+            "For each finding, perform these steps IN ORDER before writing JSON:\n"
+            "  Step 1: Read the evidence_block carefully. Identify the EXACT proof markers present.\n"
+            "  Step 2: Decide if this is real or a false positive based ONLY on what is in the evidence.\n"
+            "  Step 3: Write remediation that is specific to the vuln_type AND the tech stack below.\n"
+            "  Step 4: Describe business_impact in terms of what data/capability is concretely at risk.\n"
+            "Output ONLY the JSON. No preamble, no explanation outside the JSON.\n\n"
+        )
+
+        # KEY CHANGE 2: Provide concrete examples of good vs bad output
+        # Small models learn format from examples far better than from instructions
+        output_examples = (
+            "OUTPUT QUALITY RULES WITH EXAMPLES:\n"
             
-            # Grounding constraints designed to break the model's tendency to agree blindly
-            verification_guardrails = (
-                "CRITICAL VERIFICATION RULES TO PREVENT FALSE POSITIVES:\n"
-                "1. For SQL Injection: The 'evidence' string MUST contain an explicit database runtime error "
-                "(e.g., 'SQL syntax', 'PDOException', 'MySQL', 'PostgreSQL driver'). If the evidence merely shows "
-                "the payload reflected back dynamically in standard HTML text, you MUST mark false_positive_probability = 0.95 "
-                "and confidence = 0.05.\n"
-                "2. For Local/Remote File Inclusion (LFI/RFI): The 'evidence' MUST show contents of system files "
-                "(e.g., 'root:x:0', '[boot loader]') or file paths being evaluated. If it just reloads the base page, "
-                "mark false_positive_probability = 0.90.\n"
-                "3. Reflection does not equal Execution: If a payload is visible inside an HTTP response snippet but did "
-                "not break out of its execution context, treat it strictly as a potential False Positive.\n"
-                "4. Do not invent details: Base your reasoning solely on the verified markers present inside the 'evidence' field.\n"
+            "business_impact — Reference the parameter name, URL path, and attacker capability:\n"
+            "  BAD:  'An attacker can access sensitive information and compromise the server.'\n"
+            "  GOOD (OS Command Injection on exec/ via ip param): "
+            "'An attacker can execute arbitrary OS commands as www-data on the web server, "
+            "enabling exfiltration of /etc/passwd, lateral movement to internal services, "
+            "or installation of a reverse shell — full server compromise without credentials.'\n"
+            "  GOOD (Stored XSS on guestbook via comment param): "
+            "'Any authenticated user can inject a persistent script that steals session cookies "
+            "of every visitor, enabling account takeover across all user roles including admins.'\n\n"
+            
+            "remediation — Name the exact function/config for the detected tech stack:\n"
+            "  BAD:  'Implement input validation and use parameterized queries.'\n"
+            "  GOOD (SQLi on PHP/MySQL): "
+            "'Replace concatenated SQL with PDO prepared statements: "
+            "$stmt = $pdo->prepare(\"SELECT * FROM users WHERE id = ?\"); $stmt->execute([$id]);'\n"
+            "  GOOD (OS Command Injection on PHP): "
+            "'Remove shell execution entirely. If pinging is required, use fsockopen() or a "
+            "dedicated PHP network library. Never pass $_POST[\"ip\"] to exec(), system(), or shell_exec().'\n"
+            "  GOOD (Reflected XSS on PHP): "
+            "'Wrap all echoed user input in htmlspecialchars($value, ENT_QUOTES, \"UTF-8\") "
+            "and add Content-Security-Policy: default-src \\'self\\' to the response headers.'\n\n"
+            
+            "exploitability_reasoning — Reference the specific evidence marker that justifies the rating:\n"
+            "  BAD:  'The payload was executed successfully.'\n"
+            "  GOOD: 'Response contains uid=33(www-data) confirming shell command execution with no auth required.'\n"
+            "  GOOD: 'Time delta of 5.1s vs baseline 0.3s confirms SLEEP(5) was evaluated by the database.'\n\n"
+        )
+
+        verification_guardrails = (
+            "VERIFICATION RULES (apply before scoring false_positive_probability):\n"
+            "1. verified=true + confidence_score >= 70 → false_positive_probability MUST be <= 0.20 "
+            "unless evidence explicitly contradicts the detector (state what contradicts it).\n"
+            "2. SQLi: error strings (PDOException, You have an error in your SQL), time delta > 2x baseline, "
+            "or differential boolean responses are valid proof. Payload reflected in HTML text alone → FP = 0.85.\n"
+            "3. LFI/RFI: MUST show file contents (root:x:0, [boot loader], /bin/bash). "
+            "Page reload without file content → FP = 0.90.\n"
+            "4. XSS: canary executed in browser, context breakout (<script>alert confirmed), "
+            "or stored replay with execution = real. Payload text in HTML without execution context breakout → FP = 0.75.\n"
+            "5. OS Command Injection: uid=/gid= in response, hostname output, directory listing = real. "
+            "Payload reflected in error message without command output → FP = 0.80.\n"
+            "6. Do NOT invent evidence. If a proof marker is absent, say so in false_positive_reasoning.\n\n"
+        )
+
+        # KEY CHANGE 3: Explicit schema with value constraints + anchoring to evidence
+        schema_keys = (
+            "Return a flat JSON object with EXACTLY these keys (no extras, no nesting):\n"
+            "{\n"
+            '  "exploitability": "Easy" | "Medium" | "Hard",\n'
+            '    // Easy = unauthenticated + single HTTP request + no user interaction\n'
+            '    // Medium = requires auth session OR multi-step workflow\n'
+            '    // Hard = requires special server config, chaining, or privileged access\n'
+            '  "exploitability_reasoning": "<1 sentence citing a specific evidence marker that justifies the rating>",\n'
+            '  "business_impact": "<2 sentences: sentence 1 = what attacker gains right now; sentence 2 = worst-case escalation path>",\n'
+            '  "confidence": <float 0.0-1.0>,\n'
+            '    // 1.0 = proof of execution in response. 0.7 = strong indirect evidence. 0.4 = ambiguous.\n'
+            '  "false_positive_probability": <float 0.0-1.0>,\n'
+            '  "false_positive_reasoning": "<cite which evidence marker is present or absent>",\n'
+            '  "remediation": "<specific function call or config change for the exact tech stack; include a 1-line code example if applicable>"\n'
+            "}\n\n"
+        )
+
+        # KEY CHANGE 4: Pass application context to anchor business_impact
+        # (url path hints at app type; parameter hints at data sensitivity)
+        context_note = (
+            f"Target Technology Stack: {tech_stack_str}\n"
+            "Note: Treat the application as a real production target. "
+            "Infer application type from URL paths and parameter names when writing business_impact "
+            "(e.g. /login → credential theft risk, /exec → RCE risk, /upload → file plant risk).\n\n"
+        )
+
+        if is_batch:
+            return (
+                role_and_task
+                + output_examples
+                + context_note
+                + verification_guardrails
+                + "Return a JSON object with a top-level \"results\" array. "
+                "Retain exact index order. Each element uses the schema above.\n\n"
+                + schema_keys.replace("flat JSON object", "object in the results array")
+                + "Vulnerabilities to process:\n"
+                + "\n".join(vuln_descriptions)
             )
-
-            schema_keys = (
-                "- exploitability: 'Easy' (no auth, direct execution, public exploit), "
-                "'Medium' (requires an authenticated session/multi-step workflow), or 'Hard' (requires special config or chains).\n"
-                "- exploitability_reasoning: Short, objective 1-sentence statement justifying execution capability.\n"
-                "- business_impact: A concrete 1-2 sentence statement detailing exactly what an attacker steals or executes. "
-                "Do NOT use generic filler like 'potential security risks'.\n"
-                "- confidence: float 0.0 to 1.0 (probability this finding is legitimate based strictly on the evidence).\n"
-                "- false_positive_probability: float 0.0 to 1.0 (probability this is a scanner hallucination/reflection).\n"
-                "- false_positive_reasoning: Explain exactly why this is real or why it appears to be a false positive reflection.\n"
-                "- remediation: Framework-specific mitigation step targeting the identified Technology Stack.\n"
+        else:
+            return (
+                role_and_task
+                + output_examples
+                + context_note
+                + verification_guardrails
+                + schema_keys
+                + "Vulnerability to analyze:\n"
+                + "\n".join(vuln_descriptions)
             )
-
-            if is_batch:
-                return (
-                    "You are a critical, zero-trust application security code reviewer. Analyze each finding carefully.\n"
-                    "Return a JSON object containing a top-level \"results\" key which maps to an array of objects, "
-                    "retaining the exact same index order.\n\n"
-                    f"Target Technology Stack: {tech_stack_str}\n\n"
-                    f"{verification_guardrails}\n"
-                    f"Each object in the array MUST contain these identical keys:\n{schema_keys}\n"
-                    f"Vulnerabilities to process:\n" + "\n".join(vuln_descriptions)
-                )
-            else:
-                return (
-                    "You are a critical, zero-trust application security code reviewer. Analyze the finding below. "
-                    "Do not trust the scanner's classification blindly; look for physical proof in the evidence.\n\n"
-                    f"Target Technology Stack: {tech_stack_str}\n\n"
-                    f"{verification_guardrails}\n"
-                    f"Return a flat JSON object with exactly these keys:\n{schema_keys}\n"
-                    f"Vulnerability Data:\n" + "\n".join(vuln_descriptions)
-                )
-
+        
     def _get_fallback_for(self, vuln_type: str, tech_stack: list['TechnologyComponent'] = None) -> dict:
         remediation = "Apply defense-in-depth controls appropriate to this vulnerability class."
         for key, value in self._remediation_fallbacks.items():
@@ -636,6 +779,23 @@ class ScanOrchestrator:
             "remediation": remediation,
         }
 
+    def _remediation_is_incompatible(self, vuln_type: str, remediation: object) -> bool:
+        text = str(remediation or "").lower()
+        vt = (vuln_type or "").lower()
+        if not text:
+            return True
+
+        sql_terms = ("prepared statement", "parameterized quer", "mysqli_prepare", "pdo", "django orm", "sql")
+        if ("file inclusion" in vt or "lfi" in vt or "rfi" in vt) and any(term in text for term in sql_terms):
+            return True
+        if ("file upload" in vt or "extension bypass" in vt or "file type validation" in vt) and any(term in text for term in sql_terms):
+            return True
+        if "xss" in vt and any(term in text for term in sql_terms):
+            return True
+        if "csrf" in vt and any(term in text for term in sql_terms):
+            return True
+        return False
+
     def _apply_false_positive_adjustments(self, vulnerabilities: list[Vulnerability]) -> None:
         """Downgrade CVSS score and severity for findings with high false-positive probability.
 
@@ -659,15 +819,27 @@ class ScanOrchestrator:
             fp_prob = v.ai_analysis.false_positive_probability
             if fp_prob is None:
                 continue
+            effective_fp_prob = self._effective_false_positive_probability(v, fp_prob)
+            if effective_fp_prob != fp_prob:
+                logger.info(
+                    "AI FP probability constrained by verified detector evidence: "
+                    "vuln_type=%r fp_prob=%.2f effective_fp_prob=%.2f verified=%s "
+                    "detector_confidence=%.1f method=%s url=%s",
+                    v.vuln_type,
+                    fp_prob,
+                    effective_fp_prob,
+                    v.evidence.verified,
+                    v.evidence.confidence_score,
+                    v.evidence.detection_method,
+                    v.location.url,
+                )
+                v.ai_analysis.false_positive_probability = effective_fp_prob
 
             original_cvss = v.cvss_score
             original_severity = v.severity
 
             # --- Auto FP suppression ---
-            if fp_prob >= 0.80:
-                # High-confidence FP: auto-flag as false positive
-                v.is_false_positive = True
-                v.review_status = ReviewStatus.needs_review
+            if effective_fp_prob >= 0.80:
                 reasoning = (v.ai_analysis.false_positive_reasoning or "").lower()
                 has_evidence_markers = any(
                     kw in reasoning
@@ -684,10 +856,12 @@ class ScanOrchestrator:
                 # If the model claims high FP but cannot reference any concrete evidence markers,
                 # treat it as low confidence and do not auto-suppress.
                 if not has_evidence_markers:
+                    v.is_false_positive = False
+                    v.review_status = ReviewStatus.needs_review
                     logger.info(
                         "Skipping auto-FP suppression due to insufficient reasoning markers: vuln_type=%r fp_prob=%.2f url=%s reasoning=%r",
                         v.vuln_type,
-                        fp_prob,
+                        effective_fp_prob,
                         v.location.url,
                         v.ai_analysis.false_positive_reasoning,
                     )
@@ -697,22 +871,25 @@ class ScanOrchestrator:
                     logger.info(
                         "Auto-suppressed as FP: vuln_type=%r fp_prob=%.2f url=%s",
                         v.vuln_type,
-                        fp_prob,
+                        effective_fp_prob,
                         v.location.url,
                     )
-            elif fp_prob >= 0.50:
+            elif effective_fp_prob >= 0.50:
 
                 # Moderate FP probability: flag for review
                 v.review_status = ReviewStatus.needs_review
+            else:
+                v.is_false_positive = False
+                v.review_status = ReviewStatus.confirmed
 
             # --- CVSS adjustments ---
-            if fp_prob >= 0.90:
+            if effective_fp_prob >= 0.90:
                 # Almost certainly a scanner hallucination – collapse to Info
                 adjusted_cvss = min(original_cvss, 1.0)
-            elif fp_prob >= 0.75:
+            elif effective_fp_prob >= 0.75:
                 # Very likely a false positive – cap at Low
                 adjusted_cvss = min(original_cvss, 2.5)
-            elif fp_prob >= 0.50:
+            elif effective_fp_prob >= 0.50:
                 # Probable false positive – reduce score by 40 %
                 adjusted_cvss = round(original_cvss * 0.60, 1)
             else:
@@ -730,7 +907,7 @@ class ScanOrchestrator:
 
 
                     v.vuln_type,
-                    fp_prob,
+                    effective_fp_prob,
                     original_cvss,
                     adjusted_cvss,
                     original_severity.value,
@@ -740,13 +917,42 @@ class ScanOrchestrator:
                 v.cvss_score = adjusted_cvss
                 v.severity = adjusted_severity
 
+    def _effective_false_positive_probability(self, vuln: Vulnerability, fp_prob: float) -> float:
+        """Constrain AI FP scoring when detector-side active verification is strong."""
+        if not vuln.evidence.verified or vuln.evidence.confidence_score < 70.0:
+            return fp_prob
+
+        method = (vuln.evidence.detection_method or "").lower()
+        evidence_blob = " ".join(
+            [
+                vuln.vuln_type or "",
+                vuln.evidence.payload or "",
+                vuln.evidence.response_snippet or "",
+                json.dumps(vuln.evidence.detection_evidence) if vuln.evidence.detection_evidence else "",
+            ]
+        ).lower()
+
+        strong_markers = [
+            "time_based", "sleep", "delay", "delta", "timing",
+            "boolean_differential", "union_based", "error_based", "canary_verified",
+            "browser", "executed", "context_breakout", "token_bypass",
+            "tampered", "missing csrf", "foreign origin", "origin/referer",
+        ]
+        has_strong_marker = any(marker in method or marker in evidence_blob for marker in strong_markers)
+        if has_strong_marker or vuln.evidence.confidence_score >= 85.0:
+            return min(fp_prob, 0.20)
+
+        return min(fp_prob, 0.40)
+
     def _compute_priority_ranks(self, vulnerabilities: list[Vulnerability]) -> list[Vulnerability]:
         exploitability_weight = {"Easy": 3.0, "Medium": 2.0, "Hard": 1.0}
 
         def risk_score(vuln: Vulnerability) -> float:
             exploit_value = vuln.ai_analysis.exploitability.value if vuln.ai_analysis.exploitability else "Medium"
             exploit_w = exploitability_weight.get(exploit_value, 2.0)
-            fp_penalty = 1.0 - (vuln.ai_analysis.false_positive_probability or 0.1)
+            raw_fp_prob = vuln.ai_analysis.false_positive_probability
+            fp_prob = self._effective_false_positive_probability(vuln, raw_fp_prob) if raw_fp_prob is not None else 0.1
+            fp_penalty = 1.0 - fp_prob
             return vuln.cvss_score * exploit_w * fp_penalty
 
         vulnerabilities.sort(key=risk_score, reverse=True)
@@ -843,7 +1049,82 @@ class ScanOrchestrator:
             evidence=Evidence(
                 payload=finding.payload,
                 request_snippet=getattr(finding, "verification_request_snippet", None),
-                response_snippet=getattr(finding, "verification_response_snippet", None) or finding.evidence
+                response_snippet=self._finding_response_snippet(finding),
+                verified=getattr(finding, "verified", False),
+                confidence_score=float(getattr(finding, "confidence_score", 0.0) or 0.0),
+                detection_method=getattr(finding, "detection_method", None),
+                detection_evidence=getattr(finding, "detection_evidence", {}) or {},
             ),
             detected_at=datetime.now(timezone.utc),
         )
+
+    def _finding_response_snippet(self, finding: Finding) -> str | None:
+        evidence = self._clean_evidence_text(finding.evidence or "")
+        response_snippet = (getattr(finding, "verification_response_snippet", None) or "").strip()
+
+        if not self._should_include_response_excerpt(finding):
+            return f"VERIFICATION EVIDENCE:\n{evidence}" if evidence else None
+
+        if evidence and response_snippet:
+            return f"VERIFICATION EVIDENCE:\n{evidence}\n\nRESPONSE EXCERPT:\n{response_snippet}"
+        if evidence:
+            return f"VERIFICATION EVIDENCE:\n{evidence}"
+        return response_snippet or None
+
+    @staticmethod
+    def _clean_evidence_text(evidence: str) -> str:
+        """Collapse repeated semicolon-delimited evidence fragments."""
+        parts = re.split(r"\s*;\s*", str(evidence or "").strip())
+        clean_parts: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            normalized = " ".join(part.split())
+            key = normalized.lower()
+            if normalized and key not in seen:
+                seen.add(key)
+                clean_parts.append(normalized)
+        return "; ".join(clean_parts)
+
+    def _should_include_response_excerpt(self, finding: Finding) -> bool:
+        vt = (finding.vuln_type or "").lower()
+        method = (getattr(finding, "detection_method", "") or "").lower()
+        response_snippet = (getattr(finding, "verification_response_snippet", None) or "").strip()
+
+        header_metadata_terms = (
+            "header", "cookie", "transport", "tls", "ssl", "https", "server banner",
+            "cache-control", "hsts",
+        )
+        if "mixed content" not in vt and any(term in vt for term in header_metadata_terms):
+            return False
+
+        no_body_proof_terms = (
+            "csrf", "brute-force", "brute force", "time-based blind",
+            "boolean-based blind", "rate", "captcha bypass",
+            "credentials transmitted via http get",
+            "credential / token exposed",
+            "authentication form lacks csrf",
+            "authentication form may lack csrf",
+        )
+        if any(term in vt for term in no_body_proof_terms):
+            return False
+
+        body_proof_terms = (
+            "xss", "command injection", "file inclusion", "path traversal",
+            "arbitrary file read", "ssrf", "verbose error", "debug / metrics",
+            "sensitive path", "information disclosure", "known cve", "mixed content",
+        )
+        if any(term in vt for term in body_proof_terms):
+            return True
+
+        if method in {
+            "error_based",
+            "union_based",
+            "file_retrieval",
+            "path_traversal_file_read",
+            "stream_decoding_oracle",
+            "command_output",
+            "remote_include_error_oracle",
+        }:
+            return True
+
+        return bool(response_snippet) and len(response_snippet) <= 600

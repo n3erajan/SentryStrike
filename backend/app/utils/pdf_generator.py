@@ -6,11 +6,13 @@ Converts scan JSON output into a polished, client-ready PDF report.
 from __future__ import annotations
 
 import json
+import re
 import textwrap
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
@@ -46,11 +48,65 @@ def _fmt_dt(value, fmt="%Y-%m-%d %H:%M:%S") -> str:
     except Exception:
         return str(value)[:19]
 
-def _clean_enum(value: str) -> str:
-    """Strip enum class prefix like 'SeverityLevel.' or 'Exploitability.' and capitalise."""
-    if value and "." in value:
-        return value.split(".")[-1].capitalize()
-    return value or "N/A"
+
+def _para_escape(value: Any) -> str:
+    """Escape dynamic text before passing it to ReportLab Paragraph markup."""
+    text = "N/A" if value is None else str(value)
+    return escape(text).replace("\n", "<br/>")
+
+
+def _dedupe_semicolon_text(value: Any) -> str:
+    parts = re.split(r"\s*;\s*", str(value or "").strip())
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        normalized = " ".join(part.split())
+        key = normalized.lower()
+        if normalized and key not in seen:
+            seen.add(key)
+            cleaned.append(normalized)
+    return "; ".join(cleaned)
+
+OWASP_CATEGORY_LABELS = {
+    "a01": "A01-Broken Access Control",
+    "a02": "A02-Security Misconfiguration",
+    "a03": "A03-Supply Chain Failures",
+    "a04": "A04-Cryptographic Failures",
+    "a05": "A05-Injection",
+    "a06": "A06-Insecure Design",
+    "a07": "A07-Authentication Failures",
+    "a08": "A08-Data Integrity Failures",
+    "a09": "A09-Logging Failures",
+    "a10": "A10-Exception Handling and Information Leakage",
+}
+
+
+def _clean_enum(value: Any, *, title_case: bool = True) -> str:
+    """Return enum values without Python enum class prefixes."""
+    if value is None:
+        return "N/A"
+    if hasattr(value, "value"):
+        value = value.value
+    text = str(value)
+    if "." in text:
+        text = text.split(".")[-1]
+    if not text:
+        return "N/A"
+    return text.replace("_", " ").title() if title_case else text
+
+
+def _clean_category(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    if hasattr(value, "value"):
+        return str(value.value)
+    text = str(value)
+    key = text.split(".")[-1].lower()
+    return OWASP_CATEGORY_LABELS.get(key, text)
+
+
+def _clean_status(value: Any) -> str:
+    return _clean_enum(value).replace("Needs Review", "Needs Review")
 
 
 # ─────────────────────────────── Palette ────────────────────────────────── #
@@ -308,6 +364,9 @@ def build_styles():
         "body_sm": s("BodySm",
             fontName="Helvetica", fontSize=8.5, textColor=BODY_TEXT,
             leading=12, spaceAfter=3),
+        "body_sm_justify": s("BodySmJustify",
+            fontName="Helvetica", fontSize=8.5, textColor=BODY_TEXT,
+            leading=12, spaceAfter=3, alignment=TA_JUSTIFY),
         "label": s("Label",
             fontName="Helvetica-Bold", fontSize=8, textColor=LABEL_TEXT,
             leading=10, spaceAfter=3, spaceBefore=7),
@@ -419,18 +478,58 @@ def sub_header(title: str, styles: dict) -> list:
 def labeled_value(label: str, value: str, styles: dict) -> list:
     return [
         Paragraph(label.upper(), styles["label"]),
-        Paragraph(str(value), styles["body_sm"]),
+        Paragraph(_para_escape(value), styles["body_sm"]),
     ]
 
 
 def code_block(text: str, styles: dict) -> Flowable:
-    clean = textwrap.shorten(text, width=1200, placeholder="…")
-    clean = clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return Paragraph(clean, styles["mono"])
+    return full_code_block(text, styles)
 
 
 def severity_row_color(sev: str):
     return SEV_BG.get(sev, WHITE)
+
+
+def full_code_block(text: str, styles: dict) -> Flowable:
+    wrapped_lines: list[str] = []
+    for line in str(text).splitlines() or [""]:
+        if len(line) > 110:
+            wrapped_lines.extend(textwrap.wrap(
+                line,
+                width=110,
+                replace_whitespace=False,
+                drop_whitespace=False,
+                break_long_words=True,
+                break_on_hyphens=False,
+            ))
+        else:
+            wrapped_lines.append(line)
+    clean = "\n".join(wrapped_lines)
+    clean = clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    clean = clean.replace("\n", "<br/>")
+    return Paragraph(clean, styles["mono"])
+
+
+def _response_evidence_label_and_text(resp: str) -> tuple[str, str]:
+    text = str(resp or "").strip()
+    evidence_prefix = "VERIFICATION EVIDENCE:"
+    excerpt_prefix = "RESPONSE EXCERPT:"
+    if text.startswith(evidence_prefix) and excerpt_prefix not in text:
+        return "VERIFICATION EVIDENCE", _dedupe_semicolon_text(text[len(evidence_prefix):])
+    return "RESPONSE SNIPPET", text
+
+
+def _split_response_evidence(resp: str) -> tuple[str | None, str | None]:
+    text = str(resp or "").strip()
+    evidence_prefix = "VERIFICATION EVIDENCE:"
+    excerpt_prefix = "RESPONSE EXCERPT:"
+    if not text.startswith(evidence_prefix):
+        return None, text or None
+    remainder = text[len(evidence_prefix):].strip()
+    if excerpt_prefix not in remainder:
+        return _dedupe_semicolon_text(remainder), None
+    evidence_text, excerpt = remainder.split(excerpt_prefix, 1)
+    return _dedupe_semicolon_text(evidence_text), excerpt.strip() or None
 
 
 # ─────────────────────────── Report Sections ────────────────────────────── #
@@ -440,9 +539,10 @@ def build_toc(data: dict, styles: dict) -> list:
     rows = [
         ("1.", "Executive Summary"),
         ("2.", "Scan Statistics"),
-        ("3.", "Vulnerability Summary"),
-        ("4.", "Detailed Findings"),
-        ("5.", "Remediation Roadmap"),
+        ("3.", "Technology Detected"),
+        ("4.", "Vulnerability Summary"),
+        ("5.", "Detailed Findings"),
+        ("6.", "Remediation Roadmap"),
     ]
     tbl_data = [[Paragraph(n, styles["toc_title"]), Paragraph(t, styles["toc_entry"])] for n, t in rows]
     tbl = Table(tbl_data, colWidths=[15*mm, None])
@@ -462,7 +562,7 @@ def build_executive_summary(data: dict, styles: dict) -> list:
     elems = section_header("Executive Summary", styles, "1")
 
     summary = d.get("executive_summary", "No summary available.")
-    elems.append(Paragraph(summary, styles["body"]))
+    elems.append(Paragraph(_para_escape(summary), styles["body"]))
     elems.append(Spacer(1, 4*mm))
 
     # Key metadata box
@@ -484,7 +584,7 @@ def build_executive_summary(data: dict, styles: dict) -> list:
     ]
     tbl = Table(
         [[Paragraph(f"<b>{r[0]}</b>", styles["body_sm"]),
-          Paragraph(r[1], styles["body_sm"])] for r in meta_rows],
+          Paragraph(_para_escape(r[1]), styles["body_sm"])] for r in meta_rows],
         colWidths=[45*mm, None],
     )
     tbl.setStyle(TableStyle([
@@ -572,12 +672,13 @@ def build_statistics(data: dict, styles: dict) -> list:
     vulns = d.get("vulnerabilities", [])
     cat_counts: dict[str, int] = {}
     for v in vulns:
-        cat_counts[v.get("category", "Unknown")] = cat_counts.get(v.get("category", "Unknown"), 0) + 1
+        cat = _clean_category(v.get("category", "Unknown"))
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
     cat_rows = [[Paragraph("OWASP Category", styles["th"]),
                  Paragraph("Count", styles["th_center"])]]
     for cat, cnt in sorted(cat_counts.items(), key=lambda x: -x[1]):
-        cat_rows.append([Paragraph(cat, styles["body_sm"]), Paragraph(str(cnt), styles["body_sm"])])
+        cat_rows.append([Paragraph(_para_escape(cat), styles["body_sm"]), Paragraph(str(cnt), styles["body_sm"])])
 
     cat_tbl = Table(cat_rows, colWidths=[None, 22*mm])
     cat_tbl.setStyle(TableStyle([
@@ -593,10 +694,54 @@ def build_statistics(data: dict, styles: dict) -> list:
     return elems
 
 
+def build_technology_detected(data: dict, styles: dict) -> list:
+    d = data.get("data", {})
+    technologies = d.get("technology_stack", [])
+    elems = section_header("Technology Detected", styles, "3")
+    elems.append(Paragraph(
+        "The scanner identified the following technologies and checked each detected component for known CVEs.",
+        styles["body"],
+    ))
+    elems.append(Spacer(1, 3*mm))
+
+    if not technologies:
+        elems.append(Paragraph("No technologies were detected for this target.", styles["body_sm"]))
+        return elems
+
+    rows = [[
+        Paragraph("Component", styles["th"]),
+        Paragraph("Version", styles["th"]),
+        Paragraph("Category", styles["th"]),
+        Paragraph("Known CVEs", styles["th"]),
+    ]]
+    for tech in technologies:
+        cves = tech.get("cves", []) or []
+        rows.append([
+            Paragraph(_para_escape(tech.get("name") or "Unknown"), styles["body_sm"]),
+            Paragraph(_para_escape(tech.get("version") or "Unknown"), styles["body_sm"]),
+            Paragraph(_para_escape(tech.get("category") or "Unknown"), styles["body_sm"]),
+            Paragraph(_para_escape(", ".join(cves) if cves else "None found"), styles["body_sm"]),
+        ])
+
+    tbl = Table(rows, colWidths=[42*mm, 28*mm, 32*mm, None])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), DARK_BG),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), WHITE),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_BG]),
+        ("GRID",       (0, 0), (-1, -1), 0.4, DIVIDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ("VALIGN",      (0, 0), (-1, -1), "TOP"),
+    ]))
+    elems.append(tbl)
+    return elems
+
+
 def build_vulnerability_summary(data: dict, styles: dict) -> list:
     d = data.get("data", {})
     vulns = d.get("vulnerabilities", [])
-    elems = section_header("Vulnerability Summary", styles, "3")
+    elems = section_header("Vulnerability Summary", styles, "4")
     elems.append(Paragraph(
         "The table below lists all confirmed vulnerabilities, ordered by CVSS score.",
         styles["body"],
@@ -619,8 +764,8 @@ def build_vulnerability_summary(data: dict, styles: dict) -> list:
         fg = SEV_FG.get(sev_display, SEV_FG.get(sev, LABEL_TEXT))
         rows.append([
             Paragraph(str(i), styles["body_sm"]),
-            Paragraph(v.get("vuln_type", "Unknown"), styles["body_sm"]),
-            Paragraph(v.get("category", ""), styles["body_sm"]),
+            Paragraph(_para_escape(v.get("vuln_type", "Unknown")), styles["body_sm"]),
+            Paragraph(_para_escape(_clean_category(v.get("category", ""))), styles["body_sm"]),
             Paragraph(f'<font color="#{fg.hexval()[2:]}"><b>{sev_display}</b></font>', styles["body_sm"]),
             Paragraph(f'<b>{v.get("cvss_score", 0):.1f}</b>', styles["body_sm"]),
         ])
@@ -648,7 +793,7 @@ def build_vulnerability_summary(data: dict, styles: dict) -> list:
 def build_detailed_findings(data: dict, styles: dict) -> list:
     d = data.get("data", {})
     vulns = d.get("vulnerabilities", [])
-    elems = section_header("Detailed Findings", styles, "4")
+    elems = section_header("Detailed Findings", styles, "5")
     elems.append(Paragraph(
         "Each finding is documented with technical evidence, AI-assisted analysis, "
         "business impact, and remediation guidance.",
@@ -673,7 +818,7 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
         title_tbl = Table(
             [[
                 Paragraph(f'<font color="white"><b>Finding #{idx}</b></font>', styles["body_sm"]),
-                Paragraph(f'<font color="white"><b>{v.get("vuln_type", "Unknown")}</b></font>', styles["h3"]),
+                Paragraph(f'<font color="white"><b>{_para_escape(v.get("vuln_type", "Unknown"))}</b></font>', styles["h3"]),
                 Paragraph(f'<font color="white"><b>CVSS {cvss:.1f}</b></font>', styles["body_sm"]),
             ]],
             colWidths=[22*mm, None, 20*mm],
@@ -692,17 +837,17 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
         def detail_row(label: str, val: str):
             return [
                 Paragraph(f"<b>{label}</b>", styles["label"]),
-                Paragraph(str(val) if val else "N/A", styles["body_sm"]),
+                Paragraph(_para_escape(val) if val else "N/A", styles["body_sm"]),
             ]
 
         details = [
-            detail_row("Category",   v.get("category", "")),
+            detail_row("Category",   _clean_category(v.get("category", ""))),
             detail_row("Severity",   sev),
             detail_row("CVSS Vector", v.get("cvss_vector", "N/A")),
             detail_row("URL",         loc.get("url", "N/A")),
             detail_row("Parameter",   loc.get("parameter") or "N/A"),
             detail_row("HTTP Method", loc.get("http_method", "N/A")),
-            detail_row("Review Status", (v.get("review_status") or "N/A").title()),
+            detail_row("Review Status", _clean_status(v.get("review_status") or "N/A")),
             detail_row("Detected At",  _fmt_dt(v.get("detected_at"))),
         ]
         det_tbl = Table(details, colWidths=[35*mm, None])
@@ -720,7 +865,7 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
         block.append(Spacer(1, 3*mm))
         block.append(Paragraph("BUSINESS IMPACT", styles["label"]))
         block.append(Spacer(1, 1*mm))
-        block.append(Paragraph(ai.get("business_impact", "N/A"), styles["body_sm"]))
+        block.append(Paragraph(_para_escape(ai.get("business_impact", "N/A")), styles["body_sm"]))
         block.append(Spacer(1, 3*mm))
 
         # ── Exploitability ──
@@ -728,7 +873,7 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
         exploit_note = ai.get("exploitability_reasoning", "")
         block.append(Paragraph("EXPLOITABILITY", styles["label"]))
         block.append(Spacer(1, 1*mm))
-        block.append(Paragraph(f"<b>{exploit}</b> — {exploit_note}", styles["body_sm"]))
+        block.append(Paragraph(f"<b>{_para_escape(exploit)}</b> - {_para_escape(exploit_note)}", styles["body_sm"]))
         block.append(Spacer(1, 3*mm))
 
         # ── Evidence ──
@@ -737,25 +882,29 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
             block.append(Spacer(1, 2*mm))
             block.append(Paragraph("PAYLOAD USED", styles["label"]))
             block.append(Spacer(1, 1.5*mm))
-            block.append(code_block(payload, styles))
+            block.append(full_code_block(payload, styles))
             block.append(Spacer(1, 3*mm))
 
         req = ev.get("request_snippet")
         if req:
             block.append(Paragraph("REQUEST SNIPPET", styles["label"]))
             block.append(Spacer(1, 1.5*mm))
-            # truncate to first 3 lines
-            lines = [l for l in req.strip().splitlines() if l.strip()][:4]
-            block.append(code_block("\n".join(lines), styles))
+            block.append(full_code_block(req.strip(), styles))
             block.append(Spacer(1, 3*mm))
 
         resp = ev.get("response_snippet")
-        if resp and len(resp) < 400:
-            block.append(Paragraph("RESPONSE SNIPPET", styles["label"]))
-            block.append(Spacer(1, 1.5*mm))
-            lines = [l for l in resp.strip().splitlines() if l.strip()][:4]
-            block.append(code_block("\n".join(lines), styles))
-            block.append(Spacer(1, 3*mm))
+        if resp:
+            evidence_text, excerpt_text = _split_response_evidence(resp)
+            if evidence_text:
+                block.append(Paragraph("VERIFICATION EVIDENCE", styles["label"]))
+                block.append(Spacer(1, 1.5*mm))
+                block.append(Paragraph(_para_escape(evidence_text), styles["body_sm_justify"]))
+                block.append(Spacer(1, 3*mm))
+            if excerpt_text:
+                block.append(Paragraph("RESPONSE EXCERPT" if evidence_text else "RESPONSE SNIPPET", styles["label"]))
+                block.append(Spacer(1, 1.5*mm))
+                block.append(full_code_block(excerpt_text, styles))
+                block.append(Spacer(1, 3*mm))
 
         # ── False positive info ──
         fp_prob = ai.get("false_positive_probability", 0)
@@ -763,7 +912,7 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
         block.append(Spacer(1, 2*mm))
         block.append(Paragraph(
             f"<b>False Positive Probability:</b> {fp_pct}%  |  "
-            f"<b>AI Analysis Status:</b> {ai.get('ai_analysis_status', 'N/A').title()}",
+            f"<b>AI Analysis Status:</b> {_clean_status(ai.get('ai_analysis_status', 'N/A'))}",
             styles["caption"],
         ))
 
@@ -778,7 +927,7 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
 def build_remediation_roadmap(data: dict, styles: dict) -> list:
     d = data.get("data", {})
     vulns = d.get("vulnerabilities", [])
-    elems = section_header("Remediation Roadmap", styles, "5")
+    elems = section_header("Remediation Roadmap", styles, "6")
     elems.append(Paragraph(
         "The following roadmap prioritises remediation actions by severity and exploitability. "
         "Immediate attention should be given to Critical findings before addressing lower-severity items.",
@@ -793,8 +942,8 @@ def build_remediation_roadmap(data: dict, styles: dict) -> list:
         "Long-Term (Low)": [],
     }
     for v in vulns:
-        sev    = v.get("severity", "Low")
-        exploi = v.get("ai_analysis", {}).get("exploitability", "Medium")
+        sev    = _clean_enum(v.get("severity", "Low"))
+        exploi = _clean_enum(v.get("ai_analysis", {}).get("exploitability", "Medium"))
         if sev == "Critical":
             phases["Immediate (Critical)"].append(v)
         elif sev in ("High", "Medium") and exploi == "Easy":
@@ -814,8 +963,11 @@ def build_remediation_roadmap(data: dict, styles: dict) -> list:
         ]]
         for v in items:
             rem = v.get("ai_analysis", {}).get("remediation", "See full finding for details.")
+            rem = _para_escape(rem)
+            if len(rem) > 200:
+                rem = rem[:197] + "..."
             rows.append([
-                Paragraph(v.get("vuln_type", "Unknown"), styles["body_sm"]),
+                Paragraph(_para_escape(v.get("vuln_type", "Unknown")), styles["body_sm"]),
                 Paragraph(rem[:200] + ("…" if len(rem) > 200 else ""), styles["body_sm"]),
             ])
         tbl = Table(rows, colWidths=[55*mm, None])
@@ -878,6 +1030,9 @@ def build_scan_pdf(scan_data: dict | None = None,
     story.append(PageBreak())
 
     story += build_statistics(scan_data, styles)
+    story.append(PageBreak())
+
+    story += build_technology_detected(scan_data, styles)
     story.append(PageBreak())
 
     story += build_vulnerability_summary(scan_data, styles)

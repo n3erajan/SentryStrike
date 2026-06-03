@@ -197,9 +197,18 @@ class HttpVerifier:
                 response_time_ms=response_time_ms,
             )
 
-            response_snippet = f"HTTP/1.1 {response.status_code} {response.reason_phrase}\n" + \
-                               "\n".join([f"{k}: {v}" for k, v in response.headers.items()]) + \
-                               f"\n\n{response.text[:1000]}"
+            response_snippet = ResponseAnalyzer.build_evidence_response_snippet(
+                status_code=response.status_code,
+                reason_phrase=response.reason_phrase,
+                headers=dict(response.headers),
+                body=response.text,
+                payload=effective_payload,
+                extra_markers=[
+                    ctx.module,
+                    ctx.parameter,
+                    ctx.test_phase,
+                ],
+            )
 
             return ResponseData(
                 status_code=response.status_code,
@@ -402,6 +411,34 @@ class FindingDeduplicator:
     """Deduplicates and merges findings from multiple verifiers."""
 
     @staticmethod
+    def _canonical_url(url: str) -> str:
+        parsed_url = urlparse(url)
+        path = parsed_url.path or "/"
+        lowered = path.lower()
+        for suffix in ("/index.php", "/index.html", "/index.htm", "/default.aspx"):
+            if lowered.endswith(suffix):
+                path = path[: -len(suffix)] or "/"
+                break
+        return f"{parsed_url.scheme}://{parsed_url.netloc}{path}".rstrip("/")
+
+    @staticmethod
+    def _dedupe_family(vuln_type: str) -> str:
+        vt = (vuln_type or "").lower()
+        if "admin" in vt or "privileged endpoint" in vt or "sensitive path discovered" in vt:
+            return "admin_or_sensitive_endpoint"
+        if "csrf" in vt and "auth" in vt:
+            return "authentication_csrf"
+        if "csrf" in vt:
+            return "csrf"
+        if "insecure transport" in vt or "weak tls" in vt or "ssl configuration" in vt:
+            return "transport_security"
+        if "credential" in vt and ("get" in vt or "url" in vt):
+            return "credentials_in_url"
+        if "sensitive data in url" in vt:
+            return "credentials_in_url"
+        return vt
+
+    @staticmethod
     def deduplicate(findings: list[Finding]) -> list[Finding]:
         """
         Merge duplicate findings (same url+parameter+vuln_type).
@@ -417,12 +454,15 @@ class FindingDeduplicator:
         if not findings:
             return []
 
-        # Group by (canonical_url, parameter, vuln_type)
+        # Group by canonical URL, parameter, and normalized vulnerability family.
         groups: dict[tuple, list[Finding]] = {}
         for finding in findings:
-            parsed_url = urlparse(finding.url)
-            canonical_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-            key = (canonical_url, finding.parameter, finding.vuln_type)
+            canonical_url = FindingDeduplicator._canonical_url(finding.url)
+            family = FindingDeduplicator._dedupe_family(finding.vuln_type)
+            parameter = finding.parameter
+            if family in {"csrf", "authentication_csrf", "admin_or_sensitive_endpoint", "transport_security"}:
+                parameter = None
+            key = (canonical_url, parameter, family)
             if key not in groups:
                 groups[key] = []
             groups[key].append(finding)
@@ -445,7 +485,15 @@ class FindingDeduplicator:
                             all_evidence[key].append(val)
 
             best.detection_evidence = all_evidence
-            best.evidence = "; ".join([f.evidence or "" for f in sorted_group if f.evidence])
+            evidence_parts = []
+            seen_evidence = set()
+            for f in sorted_group:
+                evidence = (f.evidence or "").strip()
+                evidence_key = " ".join(evidence.lower().split())
+                if evidence and evidence_key not in seen_evidence:
+                    seen_evidence.add(evidence_key)
+                    evidence_parts.append(evidence)
+            best.evidence = "; ".join(evidence_parts)
             best.reproducible = any(f.reproducible for f in sorted_group)
 
             deduplicated.append(best)

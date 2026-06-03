@@ -15,6 +15,8 @@ class CvssCalculator:
     VULN_CVSS_PROFILES: dict[str, dict[str, str]] = {
         "Command Injection": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "H"},
         "SQL Injection": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "N"},
+        "Path Traversal": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N", "pr": "L"},
+        "Arbitrary File Read": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N", "pr": "L"},
         "File Inclusion": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "H"},
         "File Upload": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "H"},
         "XSS": {"ac": "L", "ui": "R", "s": "C", "c": "L", "i": "L", "a": "N"},

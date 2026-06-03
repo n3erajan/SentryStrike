@@ -1,5 +1,5 @@
 import logging
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 import re
 
 from app.core.detectors.base_detector import BaseDetector, Finding
@@ -11,6 +11,26 @@ logger = logging.getLogger(__name__)
 
 class CryptoFailuresDetector(BaseDetector):
     name = "crypto_failures"
+
+    _high_confidence_sensitive_params = {"password", "passwd", "pass", "pwd", "secret", "api_key", "apikey"}
+    _contextual_sensitive_params = {"token", "access_token", "auth_token", "session_token"}
+
+    def _sensitive_query_params(self, url: str) -> set[str]:
+        parsed = urlparse(url)
+        lowered_url = url.lower()
+        auth_context = any(tok in lowered_url for tok in ["login", "auth", "session", "oauth", "token", "reset"])
+        leaked: set[str] = set()
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            key_lower = key.lower()
+            if key_lower in self._high_confidence_sensitive_params and value:
+                leaked.add(key_lower)
+                continue
+            if key_lower not in self._contextual_sensitive_params or not value:
+                continue
+            looks_secret = len(value) >= 16 or value.count(".") == 2
+            if auth_context or looks_secret:
+                leaked.add(key_lower)
+        return leaked
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []

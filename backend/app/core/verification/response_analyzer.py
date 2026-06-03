@@ -95,6 +95,31 @@ class ResponseAnalyzer:
         re.IGNORECASE
     )
 
+    STRONG_EVIDENCE_MARKERS = [
+        # SQL/database proof
+        MYSQL_ERRORS,
+        MSSQL_ERRORS,
+        POSTGRES_ERRORS,
+        ORACLE_ERRORS,
+        SQLITE_ERRORS,
+        GENERIC_SQL_ERRORS,
+        # File inclusion proof
+        re.compile(r"(root:x:0:0:|daemon:x:|bin:x:|\[boot loader\]|\[fonts\]|/etc/passwd|win\.ini)", re.I),
+        # PHP filter / encoded source disclosure proof
+        re.compile(r"(PD9waH|aW5jbHVkZ|cmVxdWlyZ|ZnVuY3Rpb24)", re.I),
+        # Per-request canaries are much stronger than generic HTML tags.
+        re.compile(r"(sentryprobe_[a-f0-9]{8})", re.I),
+        # Command injection proof
+        re.compile(r"(uid=\d+.*gid=\d+|nt authority|active connections|/bin/\w+|/usr/bin|c:\\windows)", re.I | re.M),
+        # SSRF/internal service proof
+        re.compile(r"(localhost|127\.0\.0\.1|169\.254\.169\.254|metadata service|internal host)", re.I),
+        # CSRF/auth workflow proof
+        re.compile(r"(updated|saved|success|changed|csrf|token|forbidden|unauthorized|access denied)", re.I),
+    ]
+    GENERIC_EVIDENCE_MARKERS = [
+        re.compile(r"(<script|onerror\s*=|onload\s*=|javascript:)", re.I),
+    ]
+
     # -----------------------------------------------------------------------
     # Command Output Patterns
     # -----------------------------------------------------------------------
@@ -448,6 +473,92 @@ class ResponseAnalyzer:
         return errors
 
     @staticmethod
+    def build_evidence_response_snippet(
+        *,
+        status_code: int,
+        reason_phrase: str = "",
+        headers: dict[str, str] | None = None,
+        body: str = "",
+        payload: str = "",
+        extra_markers: list[str] | None = None,
+        max_body_chars: int = 1200,
+        context_chars: int = 450,
+        include_headers: bool = False,
+    ) -> str:
+        """Build a response snippet centered around proof, not byte zero.
+
+        The report should show the evidence that made the verifier believe the
+        finding is real. For long HTML pages, that means selecting an excerpt
+        around SQL errors, canaries, command output, file contents, CSRF status
+        text, or the injected payload instead of taking the first N chars.
+        """
+        headers = headers or {}
+        body = body or ""
+        header_text = f"HTTP/1.1 {status_code} {reason_phrase}".rstrip() if include_headers else ""
+        if header_text and headers:
+            safe_headers = []
+            for key, value in headers.items():
+                if key.lower() in {"set-cookie", "cookie", "authorization"}:
+                    value = "[redacted]"
+                safe_headers.append(f"{key}: {value}")
+            header_text += "\n" + "\n".join(safe_headers)
+
+        prefix_text = f"{header_text}\n\n" if header_text else ""
+
+        if not body:
+            return header_text
+
+        fallback_positions: list[int] = []
+        for marker in [payload, *(extra_markers or [])]:
+            if marker:
+                pos = body.lower().find(str(marker).lower())
+                if pos >= 0:
+                    fallback_positions.append(pos)
+
+        proof_positions: list[int] = []
+        proof_positions.extend(ResponseAnalyzer._encoded_source_positions(body))
+        for pattern in ResponseAnalyzer.STRONG_EVIDENCE_MARKERS:
+            match = pattern.search(body)
+            if match:
+                proof_positions.append(match.start())
+
+        generic_positions: list[int] = []
+        for pattern in ResponseAnalyzer.GENERIC_EVIDENCE_MARKERS:
+            match = pattern.search(body)
+            if match:
+                generic_positions.append(match.start())
+
+        focus_positions = fallback_positions or proof_positions or generic_positions
+        if focus_positions:
+            focus = min(focus_positions)
+            start = max(0, focus - context_chars)
+            end = min(len(body), start + max_body_chars)
+            if end - focus < min(context_chars, max_body_chars // 3):
+                start = max(0, end - max_body_chars)
+            excerpt = body[start:end]
+            prefix = "[...snip before proof...]\n" if start > 0 else ""
+            suffix = "\n[...snip after proof...]" if end < len(body) else ""
+            return f"{prefix_text}{prefix}{excerpt}{suffix}"
+
+        excerpt = body[:max_body_chars]
+        suffix = "\n[...snip after excerpt...]" if len(body) > max_body_chars else ""
+        return f"{prefix_text}{excerpt}{suffix}"
+
+    @staticmethod
+    def _encoded_source_positions(body: str) -> list[int]:
+        positions: list[int] = []
+        source_markers = ("pd9wah", "aw5jbhvkz", "cmvxdwlyz", "znvuy3rpb24")
+        for match in re.finditer(r"[A-Za-z0-9+/]{40,}={0,2}", body or ""):
+            candidate = match.group(0)
+            lowered = candidate.lower()
+            marker_offsets = [lowered.find(marker) for marker in source_markers if marker in lowered]
+            if marker_offsets:
+                positions.append(match.start() + min(marker_offsets))
+            elif len(set(candidate)) >= 12:
+                positions.append(match.start())
+        return positions
+
+    @staticmethod
     def detect_command_output(response_body: str) -> tuple[bool, list[str], list[str]]:
         """
         Detect Unix/Windows command output patterns.
@@ -523,6 +634,39 @@ class ResponseAnalyzer:
             return True
 
         return False
+
+    @staticmethod
+    def is_request_metadata_reflection(body: str, marker: str) -> bool:
+        """Detect reflection inside request/environment dump sections.
+
+        Debug pages, diagnostics pages, and server environment dumps often echo
+        every query parameter. A canary appearing there is not proof of SQL data
+        extraction, XSS execution, or file access.
+        """
+        if not body or not marker:
+            return False
+        lowered = body.lower()
+        marker_lower = marker.lower()
+        pos = lowered.find(marker_lower)
+        if pos < 0:
+            return False
+        window = lowered[max(0, pos - 500): pos + len(marker_lower) + 500]
+        request_dump_markers = (
+            "query_string",
+            "request_uri",
+            "script_name",
+            "php_self",
+            "http_get_vars",
+            "$_get",
+            "_get",
+            "request parameters",
+            "request parameter",
+            "environment variables",
+            "server variables",
+            "variable",
+            "value",
+        )
+        return sum(1 for marker_text in request_dump_markers if marker_text in window) >= 2
 
     # -----------------------------------------------------------------------
     # Differential Analysis (Main Method)

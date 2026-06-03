@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 from app.core.detectors.access_control import AccessControlDetector
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
 from app.core.detectors.crypto_failures import CryptoFailuresDetector
+from app.core.detectors.file_inclusion import FileInclusionDetector
 from app.core.detectors.security_headers import SecurityHeadersDetector
 from app.core.detectors.sql_injection import SQLInjectionDetector
 from app.core.detectors.xss_detector import XSSDetector
@@ -164,3 +165,21 @@ async def test_auth_detector_flags_login_and_reset_forms() -> None:
         assert any("CSRF" in f.vuln_type for f in findings)
     finally:
         settings.scan_mode = original_mode
+
+
+def test_file_inclusion_classifies_direct_traversal_as_a01() -> None:
+    category, vuln_type, method = FileInclusionDetector._file_read_finding_type("../../../../etc/passwd")
+
+    assert category == OwaspCategory.a01
+    assert vuln_type == "Path Traversal / Arbitrary File Read"
+    assert method == "path_traversal_file_read"
+
+
+def test_file_inclusion_keeps_wrappers_as_lfi() -> None:
+    category, vuln_type, method = FileInclusionDetector._file_read_finding_type(
+        "php://filter/convert.base64-encode/resource=index.php"
+    )
+
+    assert category == OwaspCategory.a05
+    assert vuln_type == "Local File Inclusion (LFI)"
+    assert method == "file_retrieval"
