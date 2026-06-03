@@ -66,13 +66,18 @@ def test_verified_time_based_sqli_is_not_auto_suppressed_by_high_ai_fp_probabili
         ),
     )
 
-    _orchestrator()._apply_false_positive_adjustments([vulnerability])
+    orchestrator = _orchestrator()
+    grade = orchestrator.evidence_grader.grade(vulnerability)
+    vulnerability.ai_analysis.evidence_grade = grade.grade
+    vulnerability.ai_analysis.false_positive_probability = min(vulnerability.ai_analysis.false_positive_probability, grade.fp_ceiling)
+    
+    orchestrator._apply_false_positive_adjustments([vulnerability])
 
     assert vulnerability.is_false_positive is False
     assert vulnerability.review_status == ReviewStatus.confirmed
     assert vulnerability.cvss_score == 9.1
     assert vulnerability.severity == SeverityLevel.critical
-    assert vulnerability.ai_analysis.false_positive_probability == 0.2
+    assert vulnerability.ai_analysis.false_positive_probability == 0.05
 
 
 def test_unverified_high_fp_finding_is_still_suppressed() -> None:
@@ -96,7 +101,12 @@ def test_unverified_high_fp_finding_is_still_suppressed() -> None:
         ),
     )
 
-    _orchestrator()._apply_false_positive_adjustments([vulnerability])
+    orchestrator = _orchestrator()
+    grade = orchestrator.evidence_grader.grade(vulnerability)
+    vulnerability.ai_analysis.evidence_grade = grade.grade
+    vulnerability.ai_analysis.false_positive_probability = min(vulnerability.ai_analysis.false_positive_probability, grade.fp_ceiling)
+    
+    orchestrator._apply_false_positive_adjustments([vulnerability])
 
     assert vulnerability.is_false_positive is True
     assert vulnerability.review_status == ReviewStatus.needs_review

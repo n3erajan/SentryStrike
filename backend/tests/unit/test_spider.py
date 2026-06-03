@@ -3,8 +3,9 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+import httpx
 
-from app.core.crawler.spider import WebSpider
+from app.core.crawler.spider import AuthReplayState, WebSpider
 
 
 class MultiPageHandler(BaseHTTPRequestHandler):
@@ -78,6 +79,55 @@ def test_parse_html_self_closing_form_includes_file_input():
     assert input_types["uploaded"] == "file"
     assert input_types["MAX_FILE_SIZE"] == "hidden"
     assert input_types["Upload"] == "submit"
+
+
+class FakeSessionClient:
+    def __init__(self) -> None:
+        self.request_count = 0
+        self.replayed = False
+        self.cookies = httpx.Cookies()
+
+    async def request(self, method: str, url: str, **kwargs):
+        self.request_count += 1
+        if self.request_count == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text="<html><form><input name='username'><input type='password' name='password'>Session expired</form></html>",
+                request=httpx.Request(method, "http://example.test/login"),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text="<html>private area</html>",
+            request=httpx.Request(method, url),
+        )
+
+    async def get(self, url: str, **kwargs):
+        return httpx.Response(200, text="<html>login</html>", request=httpx.Request("GET", url))
+
+    async def post(self, url: str, data=None, **kwargs):
+        self.replayed = True
+        self.cookies.set("sessionid", "fresh")
+        return httpx.Response(200, text="<html>ok</html>", request=httpx.Request("POST", url))
+
+
+@pytest.mark.asyncio
+async def test_session_keeper_reauthenticates_and_retries_login_bounce():
+    spider = WebSpider()
+    spider._auth_replay_state = AuthReplayState(
+        login_url="http://example.test/login",
+        action="http://example.test/login",
+        method="POST",
+        payload={"username": "user", "password": "pass"},
+    )
+    client = FakeSessionClient()
+
+    response = await spider._request_with_session_keeper(client, "GET", "http://example.test/private")
+
+    assert response.text == "<html>private area</html>"
+    assert client.replayed is True
+    assert client.request_count == 2
 
 
 @pytest.mark.asyncio

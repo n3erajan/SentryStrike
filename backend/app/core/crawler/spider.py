@@ -55,10 +55,20 @@ class CrawlResult:
     session_cookies: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class AuthReplayState:
+    login_url: str
+    action: str
+    method: str
+    payload: dict[str, str]
+
+
 class WebSpider:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.session_cookies = {}
+        self._auth_replay_state: AuthReplayState | None = None
+        self._configured_auth_cookies: dict[str, str] = {}
 
     def _snapshot_cookies(self, cookies: httpx.Cookies) -> dict[str, str]:
         snapshot: dict[str, str] = {}
@@ -196,7 +206,7 @@ class WebSpider:
                     await rate_limit_sleep()
 
                     try:
-                        response = await client.get(url)
+                        response = await self._request_with_session_keeper(client, "GET", url)
                     except Exception as exc:
                         logger.warning("crawl failed for %s: %s", url, exc)
                         queue.task_done()
@@ -276,7 +286,7 @@ class WebSpider:
             await self._authenticate_session(client, target_url)
 
             try:
-                response = await client.get(target_url)
+                response = await self._request_with_session_keeper(client, "GET", target_url)
             except Exception as exc:
                 logger.warning("fetch_single failed for %s: %s", target_url, exc)
                 return CrawlResult(urls=[], forms=[], session_cookies=self.session_cookies)
@@ -291,20 +301,91 @@ class WebSpider:
 
         return CrawlResult(urls=discovered_urls, forms=forms, session_cookies=self.session_cookies)
 
-    async def _authenticate_session(self, client: httpx.AsyncClient, root_url: str):
+    async def _request_with_session_keeper(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        *,
+        retry_on_login: bool = True,
+        **kwargs,
+    ) -> httpx.Response:
+        response = await client.request(method, url, **kwargs)
+        if not retry_on_login:
+            return response
+
+        if not self._session_keeper_enabled():
+            return response
+
+        if not self._looks_like_session_loss(response, url):
+            return response
+
+        logger.info("crawler session appears expired at %s; refreshing auth state and retrying once", url)
+        await self._authenticate_session(client, url, force=True)
+        return await client.request(method, url, **kwargs)
+
+    def _session_keeper_enabled(self) -> bool:
+        return bool(
+            self.settings.authentication_cookie
+            or (self.settings.authentication_username and self.settings.authentication_password)
+            or self._auth_replay_state
+        )
+
+    def _looks_like_session_loss(self, response: httpx.Response, requested_url: str = "") -> bool:
+        final_path = response.url.path.lower()
+        requested_path = urlparse(requested_url).path.lower()
+        if response.status_code in {401, 403, 419, 440}:
+            return True
+        if final_path != requested_path and any(token in final_path for token in ("/login", "/signin", "/auth", "/session")):
+            return True
+        content_type = response.headers.get("content-type", "").lower()
+        if "text/html" not in content_type:
+            return False
+        body = response.text.lower()
+        has_login_form = "<form" in body and any(token in body for token in ("password", "username", "login", "signin"))
+        has_session_message = any(
+            token in body
+            for token in (
+                "session expired",
+                "please log in",
+                "please login",
+                "you must log in",
+                "authentication required",
+            )
+        )
+        return has_login_form and has_session_message
+
+    async def _authenticate_session(self, client: httpx.AsyncClient, root_url: str, force: bool = False):
         """Authenticate session using cookies or credentials."""
         # 1. Parse cookie string if provided
         if self.settings.authentication_cookie:
-            cookies = {}
-            for cookie in self.settings.authentication_cookie.split(";"):
-                cookie = cookie.strip()
-                if "=" in cookie:
-                    k, v = cookie.split("=", 1)
-                    cookies[k] = v
+            if not self._configured_auth_cookies or force:
+                cookies = {}
+                for cookie in self.settings.authentication_cookie.split(";"):
+                    cookie = cookie.strip()
+                    if "=" in cookie:
+                        k, v = cookie.split("=", 1)
+                        cookies[k] = v
+                self._configured_auth_cookies = cookies
+            cookies = self._configured_auth_cookies
             client.cookies.update(cookies)
             self.session_cookies.update(cookies)
             logger.info("Session authenticated via provided cookie string")
             return
+
+        if force and self._auth_replay_state is not None:
+            try:
+                state = self._auth_replay_state
+                await client.get(state.login_url)
+                if state.method == "POST":
+                    await client.post(state.action, data=state.payload)
+                else:
+                    await client.get(state.action, params=state.payload)
+                self.session_cookies.update(self._snapshot_cookies(client.cookies))
+                logger.info("Session refreshed via stored login replay state")
+                return
+            except Exception as e:
+                logger.warning("Stored login replay failed, attempting fresh authentication: %s", e)
 
         # 2. Check if username and password are provided
         username = self.settings.authentication_username
@@ -384,6 +465,12 @@ class WebSpider:
                 
                 # Check for successful authentication
                 if resp.status_code in [200, 302]:
+                    self._auth_replay_state = AuthReplayState(
+                        login_url=login_url,
+                        action=action,
+                        method=method,
+                        payload=dict(payload),
+                    )
                     logger.info("Authentication request sent. Session cookies: %s", self._snapshot_cookies(client.cookies))
                 
             except Exception as e:

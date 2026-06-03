@@ -528,7 +528,10 @@ class ResponseAnalyzer:
             if match:
                 generic_positions.append(match.start())
 
-        focus_positions = fallback_positions or proof_positions or generic_positions
+        if ResponseAnalyzer._is_xss_like_payload(payload):
+            focus_positions = fallback_positions or generic_positions or proof_positions
+        else:
+            focus_positions = proof_positions or fallback_positions or generic_positions
         if focus_positions:
             focus = min(focus_positions)
             start = max(0, focus - context_chars)
@@ -543,6 +546,11 @@ class ResponseAnalyzer:
         excerpt = body[:max_body_chars]
         suffix = "\n[...snip after excerpt...]" if len(body) > max_body_chars else ""
         return f"{prefix_text}{excerpt}{suffix}"
+
+    @staticmethod
+    def _is_xss_like_payload(payload: str) -> bool:
+        lowered = (payload or "").lower()
+        return any(token in lowered for token in ("<script", "<svg", "<img", "onerror", "onload", "javascript:"))
 
     @staticmethod
     def _encoded_source_positions(body: str) -> list[int]:

@@ -5,6 +5,7 @@ import re
 from urllib.parse import parse_qsl, urlparse
 
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.payload_profile import PayloadProfile, build_payload_profile
 from app.core.verification.response_analyzer import ResponseAnalyzer
 from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder, FormPayloadBuilder
 from app.models.vulnerability import OwaspCategory, SeverityLevel
@@ -42,6 +43,47 @@ class FileInclusionDetector(BaseDetector):
         ("https://0.0.0.0:0/sentry_rfi_test", "Remote HTTPS include attempt"),
     ]
 
+    @classmethod
+    def _payload_family(cls, payload: str) -> str:
+        lowered = payload.lower()
+        if lowered.startswith("php://") or lowered.startswith("data://") or lowered.startswith("expect://"):
+            return "php_wrapper"
+        if "windows" in lowered or re.match(r"^[a-z]:\\", lowered):
+            return "windows_file"
+        if "/etc/passwd" in lowered:
+            return "unix_file"
+        return "generic"
+
+    @classmethod
+    def _select_lfi_payloads(cls, profile: PayloadProfile) -> list[tuple[str, str, str]]:
+        if profile.confidence == "unknown":
+            return cls.LFI_PAYLOADS
+
+        selected: list[tuple[str, str, str]] = []
+        for payload, verify_rule, desc in cls.LFI_PAYLOADS:
+            family = cls._payload_family(payload)
+            if family == "php_wrapper":
+                if profile.supports_php_wrappers:
+                    selected.append((payload, verify_rule, desc))
+                continue
+            if family == "windows_file":
+                if profile.is_windows:
+                    selected.append((payload, verify_rule, desc))
+                continue
+            if family == "unix_file":
+                if profile.is_unix_like or not profile.is_windows:
+                    selected.append((payload, verify_rule, desc))
+                continue
+            selected.append((payload, verify_rule, desc))
+
+        return selected or cls.LFI_PAYLOADS
+
+    @classmethod
+    def _select_rfi_payloads(cls, profile: PayloadProfile) -> list[tuple[str, str]]:
+        if profile.confidence == "unknown" or profile.supports_remote_include:
+            return cls.RFI_PAYLOADS
+        return []
+
     @staticmethod
     def _is_direct_path_traversal(payload: str) -> bool:
         lowered = payload.lower()
@@ -74,6 +116,9 @@ class FileInclusionDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        payload_profile = build_payload_profile(kwargs.get("technology_stack"))
+        lfi_payloads = self._select_lfi_payloads(payload_profile)
+        rfi_payloads = self._select_rfi_payloads(payload_profile)
 
         from app.core.crawler.param_discovery import ParamDiscovery
         
@@ -147,7 +192,7 @@ class FileInclusionDetector(BaseDetector):
                     )
                     
                     # --- Execute LFI Testing Suite ---
-                    for payload, verify_rule, desc in self.LFI_PAYLOADS:
+                    for payload, verify_rule, desc in lfi_payloads:
                         if verify_rule and verify_rule not in ["DYNAMIC_B64_CHECK", "DYNAMIC_STREAM_CHECK"]:
                             if re.search(verify_rule, baseline.body, re.I):
                                 continue
@@ -269,7 +314,7 @@ class FileInclusionDetector(BaseDetector):
                                     )
 
                     # --- Execute Advanced RFI Suite ---
-                    for payload, desc in self.RFI_PAYLOADS:
+                    for payload, desc in rfi_payloads:
                         injected_url, injected_params, injected_data = _build_request_args(payload)
                         injected = await verifier.send_request(
                             injected_url, method, injected_params, injected_data,

@@ -27,6 +27,7 @@ from app.core.detectors.csrf_detector import CSRFDetector
 from app.core.detectors.ssrf_detector import SSRFDetector
 from app.core.detectors.sensitive_paths import SensitivePathsDetector
 from app.core.verification.verification_framework import FindingDeduplicator, TestPollutionFilter
+from app.core.evidence_grader import EvidenceGrader
 from app.database.repositories.scan_repository import ScanRepository
 from app.integrations.cve_database import CveDatabaseService
 from app.integrations.sslyze_wrapper import SslAnalyzer
@@ -58,6 +59,7 @@ class ScanOrchestrator:
 
         self.ai_client = OllamaClient()
         self.ai_report = AiReportGenerator()
+        self.evidence_grader = EvidenceGrader()
 
         self.detectors = [
             AccessControlDetector(),
@@ -216,6 +218,7 @@ class ScanOrchestrator:
                         crawl_result.urls,
                         crawl_result.forms,
                         session_cookies=session_cookies,
+                        technology_stack=scan.technology_stack,
                     )
 
             detector_results = await asyncio.gather(
@@ -230,7 +233,7 @@ class ScanOrchestrator:
 
             exception_detector = next((detector for detector in self.detectors if isinstance(detector, ExceptionHandlingDetector)), None)
             if exception_detector is not None:
-                observed_exception_findings = exception_detector.findings_from_observed_evidence(findings)
+                observed_exception_findings = exception_detector.findings_from_observed_evidence(findings, target_url=scan.target_url)
                 if observed_exception_findings:
                     logger.info(
                         "derived %d exception-handling finding(s) from observed active-verification evidence",
@@ -502,6 +505,13 @@ class ScanOrchestrator:
 
                 # Apply AI results back to each vulnerability
                 for idx, (vuln, result) in enumerate(zip(batch, results), start=batch_start + 1):
+                    # Pre-grade the finding deterministically BEFORE applying AI output
+                    grade = self.evidence_grader.grade(vuln)
+                    logger.info(
+                        "Evidence grade: vuln_type=%r grade=%s fp_ceiling=%.2f reason=%r url=%s",
+                        vuln.vuln_type, grade.grade, grade.fp_ceiling, grade.reason, vuln.location.url,
+                    )
+
                     if result.get("ai_analysis_status") == "failed" or "results" in result:
                         # Guard against malformed nested batch JSON structures
                         if "results" in result and isinstance(result["results"], list) and len(result["results"]) > 0:
@@ -519,15 +529,29 @@ class ScanOrchestrator:
                             vuln.cvss_score = cvss.score
                             vuln.cvss_vector = cvss.vector
                             vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
+                            # Even on AI failure, apply the grader ceiling
+                            vuln.ai_analysis.false_positive_probability = grade.fp_ceiling
+                            vuln.ai_analysis.evidence_grade = grade.grade
+                            vuln.ai_analysis.evidence_grade_reason = grade.reason
                             analyzed.append(vuln)
                             continue
 
                     fallback = self._get_fallback_for(vuln.vuln_type, scan.technology_stack)
                     confidence = float(result.get("confidence", fallback["confidence"]))
-                    
-                    # Check for explicit AI override on false positives
-                    fp_prob = float(result.get("false_positive_probability", fallback["false_positive_probability"]))
-                    
+
+                    # AI FP output is advisory: clamp to grader ceiling.
+                    # AI can LOWER the FP probability (confirm a finding) but
+                    # never RAISE it above what the evidence grade allows.
+                    raw_ai_fp = float(result.get("false_positive_probability", fallback["false_positive_probability"]))
+                    fp_prob = min(raw_ai_fp, grade.fp_ceiling)
+                    if raw_ai_fp > grade.fp_ceiling:
+                        logger.info(
+                            "Clamped AI FP probability: vuln_type=%r ai_fp=%.2f -> ceiling=%.2f "
+                            "grade=%s reason=%r url=%s",
+                            vuln.vuln_type, raw_ai_fp, grade.fp_ceiling,
+                            grade.grade, grade.reason, vuln.location.url,
+                        )
+
                     impact = 0.9 if vuln.severity.value in {"Critical", "High"} else 0.5
                     cvss = CvssCalculator.from_vulnerability_context(
                         vuln_type=vuln.vuln_type,
@@ -545,6 +569,8 @@ class ScanOrchestrator:
                     vuln.ai_analysis.false_positive_probability = fp_prob
                     vuln.ai_analysis.false_positive_reasoning = result.get("false_positive_reasoning")
                     vuln.ai_analysis.exploitability_reasoning = result.get("exploitability_reasoning")
+                    vuln.ai_analysis.evidence_grade = grade.grade
+                    vuln.ai_analysis.evidence_grade_reason = grade.reason
                     remediation = result.get("remediation", fallback["remediation"])
                     if self._remediation_is_incompatible(vuln.vuln_type, remediation):
                         logger.info(
@@ -675,18 +701,16 @@ class ScanOrchestrator:
         )
 
         verification_guardrails = (
-            "VERIFICATION RULES (apply before scoring false_positive_probability):\n"
-            "1. verified=true + confidence_score >= 70 → false_positive_probability MUST be <= 0.20 "
-            "unless evidence explicitly contradicts the detector (state what contradicts it).\n"
-            "2. SQLi: error strings (PDOException, You have an error in your SQL), time delta > 2x baseline, "
-            "or differential boolean responses are valid proof. Payload reflected in HTML text alone → FP = 0.85.\n"
-            "3. LFI/RFI: MUST show file contents (root:x:0, [boot loader], /bin/bash). "
-            "Page reload without file content → FP = 0.90.\n"
-            "4. XSS: canary executed in browser, context breakout (<script>alert confirmed), "
-            "or stored replay with execution = real. Payload text in HTML without execution context breakout → FP = 0.75.\n"
-            "5. OS Command Injection: uid=/gid= in response, hostname output, directory listing = real. "
-            "Payload reflected in error message without command output → FP = 0.80.\n"
-            "6. Do NOT invent evidence. If a proof marker is absent, say so in false_positive_reasoning.\n\n"
+            "FALSE POSITIVE SCORING RULES:\n"
+            "The detection engine has already pre-scored false_positive_probability based on "
+            "objective evidence markers. Your FP score is ADVISORY ONLY:\n"
+            "- You may LOWER false_positive_probability if you see additional confirming evidence.\n"
+            "- You may NOT raise it above the pre-scored value. The system will clamp it.\n"
+            "- For structural findings (missing headers, GET credentials, TLS issues, admin paths), "
+            "the finding itself IS the proof — do NOT mark these as false positives.\n"
+            "- Focus your analysis on remediation specificity, business_impact depth, and "
+            "exploitability_reasoning quality.\n"
+            "- Do NOT invent evidence. If a proof marker is absent, say so in false_positive_reasoning.\n\n"
         )
 
         # KEY CHANGE 3: Explicit schema with value constraints + anchoring to evidence
@@ -799,47 +823,44 @@ class ScanOrchestrator:
     def _apply_false_positive_adjustments(self, vulnerabilities: list[Vulnerability]) -> None:
         """Downgrade CVSS score and severity for findings with high false-positive probability.
 
-        Thresholds (applied after AI analysis populates false_positive_probability):
+        Now grader-aware: the FP probability has already been clamped to the
+        evidence-grade ceiling during ``_analyze_all_findings``.  This method
+        only applies CVSS/severity adjustments for findings that *still* have
+        elevated FP probability after clamping (i.e., Grade C/D findings where
+        the AI legitimately flagged weak evidence).
+
+        Thresholds:
           fp_prob >= 0.90  →  cap CVSS at 1.0  (Info-level)
           fp_prob >= 0.75  →  cap CVSS at 2.5  (Low-level)
-          fp_prob >= 0.50  →  reduce CVSS by 40 % (one severity band down at minimum)
+          fp_prob >= 0.50  →  reduce CVSS by 40 %
 
-        After adjusting the CVSS score the severity label is re-derived via
-        CvssCalculator.get_severity so that both fields stay in sync.
+        Grade A/B findings will never reach these thresholds because their
+        ceiling is 0.05–0.15.
         """
-        _SEVERITY_ORDER = [
-            SeverityLevel.info,
-            SeverityLevel.low,
-            SeverityLevel.medium,
-            SeverityLevel.high,
-            SeverityLevel.critical,
-        ]
-
         for v in vulnerabilities:
             fp_prob = v.ai_analysis.false_positive_probability
             if fp_prob is None:
                 continue
-            effective_fp_prob = self._effective_false_positive_probability(v, fp_prob)
-            if effective_fp_prob != fp_prob:
-                logger.info(
-                    "AI FP probability constrained by verified detector evidence: "
-                    "vuln_type=%r fp_prob=%.2f effective_fp_prob=%.2f verified=%s "
-                    "detector_confidence=%.1f method=%s url=%s",
-                    v.vuln_type,
-                    fp_prob,
-                    effective_fp_prob,
-                    v.evidence.verified,
-                    v.evidence.confidence_score,
-                    v.evidence.detection_method,
-                    v.location.url,
-                )
-                v.ai_analysis.false_positive_probability = effective_fp_prob
 
             original_cvss = v.cvss_score
             original_severity = v.severity
 
-            # --- Auto FP suppression ---
-            if effective_fp_prob >= 0.80:
+            # --- Review status assignment ---
+            if fp_prob >= 0.80:
+                # Only auto-suppress if the grader grade allows it (D-grade).
+                # Grade A/B findings can never reach this threshold.
+                evidence_grade = getattr(v.ai_analysis, "evidence_grade", None)
+                if evidence_grade in ("A", "B", "B+"):
+                    # Should not happen after clamping, but guard against it
+                    v.is_false_positive = False
+                    v.review_status = ReviewStatus.confirmed
+                    logger.warning(
+                        "Grade %s finding had fp_prob=%.2f >= 0.80 — this should not happen "
+                        "after clamping. Forcing confirmed. vuln_type=%r url=%s",
+                        evidence_grade, fp_prob, v.vuln_type, v.location.url,
+                    )
+                    continue
+
                 reasoning = (v.ai_analysis.false_positive_reasoning or "").lower()
                 has_evidence_markers = any(
                     kw in reasoning
@@ -853,44 +874,34 @@ class ScanOrchestrator:
                     ]
                 )
 
-                # If the model claims high FP but cannot reference any concrete evidence markers,
-                # treat it as low confidence and do not auto-suppress.
                 if not has_evidence_markers:
                     v.is_false_positive = False
                     v.review_status = ReviewStatus.needs_review
                     logger.info(
-                        "Skipping auto-FP suppression due to insufficient reasoning markers: vuln_type=%r fp_prob=%.2f url=%s reasoning=%r",
-                        v.vuln_type,
-                        effective_fp_prob,
-                        v.location.url,
+                        "Skipping auto-FP suppression due to insufficient reasoning markers: "
+                        "vuln_type=%r fp_prob=%.2f grade=%s url=%s reasoning=%r",
+                        v.vuln_type, fp_prob, evidence_grade, v.location.url,
                         v.ai_analysis.false_positive_reasoning,
                     )
                 else:
                     v.is_false_positive = True
                     v.review_status = ReviewStatus.needs_review
                     logger.info(
-                        "Auto-suppressed as FP: vuln_type=%r fp_prob=%.2f url=%s",
-                        v.vuln_type,
-                        effective_fp_prob,
-                        v.location.url,
+                        "Auto-suppressed as FP: vuln_type=%r fp_prob=%.2f grade=%s url=%s",
+                        v.vuln_type, fp_prob, evidence_grade, v.location.url,
                     )
-            elif effective_fp_prob >= 0.50:
-
-                # Moderate FP probability: flag for review
+            elif fp_prob >= 0.50:
                 v.review_status = ReviewStatus.needs_review
             else:
                 v.is_false_positive = False
                 v.review_status = ReviewStatus.confirmed
 
             # --- CVSS adjustments ---
-            if effective_fp_prob >= 0.90:
-                # Almost certainly a scanner hallucination – collapse to Info
+            if fp_prob >= 0.90:
                 adjusted_cvss = min(original_cvss, 1.0)
-            elif effective_fp_prob >= 0.75:
-                # Very likely a false positive – cap at Low
+            elif fp_prob >= 0.75:
                 adjusted_cvss = min(original_cvss, 2.5)
-            elif effective_fp_prob >= 0.50:
-                # Probable false positive – reduce score by 40 %
+            elif fp_prob >= 0.50:
                 adjusted_cvss = round(original_cvss * 0.60, 1)
             else:
                 # Low false-positive probability – no CVSS adjustment needed
@@ -901,13 +912,11 @@ class ScanOrchestrator:
 
             if adjusted_cvss != original_cvss or adjusted_severity != original_severity:
                 logger.info(
-                    "FP adjustment: vuln_type=%r fp_prob=%.2f  "
+                    "FP adjustment: vuln_type=%r fp_prob=%.2f grade=%s  "
                     "cvss %s -> %s  severity %s -> %s  url=%s",
-
-
-
                     v.vuln_type,
-                    effective_fp_prob,
+                    fp_prob,
+                    getattr(v.ai_analysis, 'evidence_grade', '?'),
                     original_cvss,
                     adjusted_cvss,
                     original_severity.value,
@@ -918,31 +927,14 @@ class ScanOrchestrator:
                 v.severity = adjusted_severity
 
     def _effective_false_positive_probability(self, vuln: Vulnerability, fp_prob: float) -> float:
-        """Constrain AI FP scoring when detector-side active verification is strong."""
-        if not vuln.evidence.verified or vuln.evidence.confidence_score < 70.0:
-            return fp_prob
+        """Constrain AI FP scoring using the evidence grader ceiling.
 
-        method = (vuln.evidence.detection_method or "").lower()
-        evidence_blob = " ".join(
-            [
-                vuln.vuln_type or "",
-                vuln.evidence.payload or "",
-                vuln.evidence.response_snippet or "",
-                json.dumps(vuln.evidence.detection_evidence) if vuln.evidence.detection_evidence else "",
-            ]
-        ).lower()
-
-        strong_markers = [
-            "time_based", "sleep", "delay", "delta", "timing",
-            "boolean_differential", "union_based", "error_based", "canary_verified",
-            "browser", "executed", "context_breakout", "token_bypass",
-            "tampered", "missing csrf", "foreign origin", "origin/referer",
-        ]
-        has_strong_marker = any(marker in method or marker in evidence_blob for marker in strong_markers)
-        if has_strong_marker or vuln.evidence.confidence_score >= 85.0:
-            return min(fp_prob, 0.20)
-
-        return min(fp_prob, 0.40)
+        This is now a lightweight wrapper: the grader does the heavy lifting.
+        Kept for backward compatibility with ``_compute_priority_ranks`` which
+        calls this method directly.
+        """
+        grade = self.evidence_grader.grade(vuln)
+        return min(fp_prob, grade.fp_ceiling)
 
     def _compute_priority_ranks(self, vulnerabilities: list[Vulnerability]) -> list[Vulnerability]:
         exploitability_weight = {"Easy": 3.0, "Medium": 2.0, "Hard": 1.0}

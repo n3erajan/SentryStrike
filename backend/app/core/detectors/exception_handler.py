@@ -172,12 +172,65 @@ _GATEWAY_CODES = {501, 502, 503, 504}
 # Helper utilities
 # ---------------------------------------------------------------------------
 
-def _classify_body(body: str) -> tuple[SeverityLevel | None, list[str], list[str]]:
-    high_hits = [p.pattern for p in _HIGH_PATTERNS if p.search(body)]
+def _get_target_host(target_url: str | None) -> str | None:
+    if not target_url:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(target_url)
+        host = parsed.hostname or parsed.netloc
+        if host and ":" in host:
+            host = host.split(":")[0]
+        return host
+    except Exception:
+        return None
+
+def _is_self_reference(matched_str: str, target_host: str | None) -> bool:
+    if not target_host:
+        return False
+    matched_lower = matched_str.lower().strip()
+    target_lower = target_host.lower().strip()
+    
+    if matched_lower == target_lower:
+        return True
+        
+    localhost_ips = {"127.0.0.1", "localhost"}
+    if matched_lower in localhost_ips and target_lower in localhost_ips:
+        return True
+        
+    return False
+
+def _classify_body(body: str, target_host: str | None = None) -> tuple[SeverityLevel | None, list[str], list[str]]:
+    high_hits = []
+    for p in _HIGH_PATTERNS:
+        matches = list(p.finditer(body))
+        if not matches:
+            continue
+        is_ip_pattern = p.pattern in (
+            r"\b(?:127\.0\.0\.1|localhost)\b",
+            r"\b(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[0-1])\.)\d+\.\d+\b"
+        )
+        if is_ip_pattern and target_host:
+            if all(_is_self_reference(m.group(0), target_host) for m in matches):
+                continue
+        high_hits.append(p.pattern)
+
     if high_hits:
         return SeverityLevel.high, high_hits, []
 
-    med_hits = [p.pattern for p in _MEDIUM_PATTERNS if p.search(body)]
+    med_hits = []
+    for p in _MEDIUM_PATTERNS:
+        matches = list(p.finditer(body))
+        if not matches:
+            continue
+        is_ip_pattern = p.pattern in (
+            r"\b(?:127\.0\.0\.1|localhost)\b",
+            r"\b(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[0-1])\.)\d+\.\d+\b"
+        )
+        if is_ip_pattern and target_host:
+            if all(_is_self_reference(m.group(0), target_host) for m in matches):
+                continue
+        med_hits.append(p.pattern)
+
     if med_hits:
         return SeverityLevel.medium, [], med_hits
 
@@ -205,6 +258,14 @@ def _finding_key(url: str, vuln_type: str, severity: SeverityLevel) -> tuple:
     path = url.split("?")[0]
     return (path, vuln_type, severity)
 
+def _evidence_endpoint_key(finding: Finding) -> tuple[str, str | None, str]:
+    parsed = urllib.parse.urlparse(finding.url or "")
+    return (
+        f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/"),
+        finding.parameter,
+        finding.vuln_type,
+    )
+
 def _build_evidence(
     url: str,
     method: str,
@@ -229,25 +290,8 @@ def _build_evidence(
     return " | ".join(parts)
 
 def _observed_text_from_finding(finding: Finding) -> str:
-    evidence_parts: list[str] = []
-    for value in (
-        getattr(finding, "verification_response_snippet", None),
-        getattr(finding, "evidence", None),
-        getattr(finding, "payload", None),
-    ):
-        if value:
-            evidence_parts.append(str(value))
-
-    detection_evidence = getattr(finding, "detection_evidence", {}) or {}
-    for value in detection_evidence.values():
-        if isinstance(value, (list, tuple, set)):
-            evidence_parts.extend(str(item) for item in value if item)
-        elif isinstance(value, dict):
-            evidence_parts.extend(str(item) for item in value.values() if item)
-        elif value:
-            evidence_parts.append(str(value))
-
-    return "\n".join(evidence_parts)
+    # Only evaluate the actual HTTP response body snippet returned by the server
+    return finding.verification_response_snippet or ""
 
 def _replace_param_values(url: str, replacement: str) -> str:
     if "?" not in url:
@@ -357,16 +401,40 @@ class ExceptionHandlingDetector(BaseDetector):
 
         return findings
 
-    def findings_from_observed_evidence(self, observed_findings: list[Finding]) -> list[Finding]:
+    def findings_from_observed_evidence(
+        self,
+        observed_findings: list[Finding],
+        target_url: str | None = None,
+    ) -> list[Finding]:
         findings: list[Finding] = []
         seen: set[tuple] = set()
+        target_host = _get_target_host(target_url)
+        existing_verbose_error_keys = {
+            (endpoint, parameter)
+            for endpoint, parameter, vuln_type in (
+                _evidence_endpoint_key(finding) for finding in (observed_findings or [])
+            )
+            if vuln_type == "Verbose Error Handling"
+        }
+        existing_verbose_error_endpoints = {
+            endpoint
+            for endpoint, _, vuln_type in (
+                _evidence_endpoint_key(finding) for finding in (observed_findings or [])
+            )
+            if vuln_type == "Verbose Error Handling"
+        }
 
         for source in observed_findings or []:
             if source.category == OwaspCategory.a10 and source.vuln_type == "Verbose Error Handling":
                 continue
+            endpoint, parameter, _ = _evidence_endpoint_key(source)
+            if (endpoint, parameter) in existing_verbose_error_keys:
+                continue
+            if endpoint in existing_verbose_error_endpoints:
+                continue
 
             observed_text = _observed_text_from_finding(source)
-            severity, high_hits, med_hits = _classify_body(observed_text)
+            severity, high_hits, med_hits = _classify_body(observed_text, target_host=target_host)
             matched = high_hits or med_hits
             if not matched or not severity:
                 continue
@@ -650,7 +718,7 @@ class ExceptionHandlingDetector(BaseDetector):
         if status in _GATEWAY_CODES:
             return None
 
-        severity, high_hits, med_hits = _classify_body(body)
+        severity, high_hits, med_hits = _classify_body(body, target_host=_get_target_host(url))
         matched = high_hits or med_hits
 
         sensitive_hdrs = _sensitive_headers_present(headers)

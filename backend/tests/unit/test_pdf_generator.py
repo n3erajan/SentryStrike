@@ -1,9 +1,14 @@
 from app.utils.pdf_generator import (
     _clean_category,
     _clean_enum,
+    _dedupe_semicolon_text,
     _response_evidence_label_and_text,
     _split_response_evidence,
+    build_detailed_findings,
+    build_remediation_roadmap,
     build_scan_pdf,
+    build_styles,
+    full_code_block,
 )
 
 
@@ -31,6 +36,107 @@ def test_pdf_splits_and_deduplicates_verification_evidence() -> None:
 
     assert evidence == "Header not found: x-frame-options"
     assert excerpt == "<body>proof</body>"
+
+
+def test_pdf_evidence_dedupe_preserves_semicolons_inside_sql_excerpt() -> None:
+    text = (
+        "GET http://target.test/sqli?id=%27 -> HTTP 200 | "
+        "Excerpt: \"<pre>You have an error in your SQL syntax; check the manual "
+        "that corresponds to your MySQL server version for the right syntax</pre>\""
+    )
+
+    deduped = _dedupe_semicolon_text(text)
+
+    assert "SQL syntax; check the manual" in deduped
+
+
+def test_pdf_evidence_dedupe_drops_repeated_verbose_error_records() -> None:
+    text = (
+        "GET http://target.test/sqli?id=%27 -> HTTP 200 | Trigger: form fuzz | "
+        "Excerpt: \"<pre>You have an error in your SQL syntax; check the manual "
+        "that corresponds to your MySQL server version for the right syntax to use near ''''' at line 1</pre>\"; "
+        "GET http://target.test/sqli -> HTTP 200 | Trigger: observed during SQLi | "
+        "Excerpt: \"<pre>You have an error in your SQL syntax; check the manual "
+        "that corresponds to your MySQL server version for the right syntax to use near ''' at line 1</pre>\""
+    )
+
+    deduped = _dedupe_semicolon_text(text)
+
+    assert deduped.count("You have an error in your SQL syntax") == 1
+
+
+def test_pdf_remediation_roadmap_keeps_full_remediation_text() -> None:
+    long_remediation = (
+        "Replace concatenated SQL with prepared statements. "
+        "Use PDO::prepare(), bind parameters with explicit types, centralize query helpers, "
+        "add regression tests for quote, boolean, and time-based payloads, and disable verbose "
+        "database exceptions in production responses."
+    )
+    scan_data = {
+        "data": {
+            "vulnerabilities": [
+                {
+                    "vuln_type": "SQL Injection",
+                    "severity": "SeverityLevel.critical",
+                    "ai_analysis": {
+                        "exploitability": "Exploitability.easy",
+                        "remediation": long_remediation,
+                    },
+                }
+            ]
+        }
+    }
+
+    elems = build_remediation_roadmap(scan_data, build_styles())
+    table = next(elem for elem in elems if hasattr(elem, "_cellvalues"))
+    action_cell = table._cellvalues[1][1]
+
+    assert "disable verbose database exceptions" in action_cell.getPlainText()
+    assert "..." not in action_cell.getPlainText()
+
+
+def test_pdf_detailed_findings_do_not_repeat_remediation_section() -> None:
+    scan_data = {
+        "data": {
+            "vulnerabilities": [
+                {
+                    "vuln_type": "SQL Injection",
+                    "category": "OwaspCategory.a05",
+                    "severity": "SeverityLevel.critical",
+                    "cvss_score": 9.0,
+                    "location": {"url": "http://target.test/sqli", "parameter": "id", "http_method": "GET"},
+                    "evidence": {},
+                    "ai_analysis": {
+                        "business_impact": "Database disclosure.",
+                        "exploitability": "Exploitability.easy",
+                        "exploitability_reasoning": "Payload triggers SQL errors.",
+                        "remediation": "Use prepared statements.",
+                    },
+                }
+            ]
+        }
+    }
+
+    flowables = build_detailed_findings(scan_data, build_styles())
+    labels = [getattr(flowable, "getPlainText", lambda: "")() for flowable in flowables]
+
+    assert "REMEDIATION" not in labels
+
+
+def test_pdf_code_block_wraps_long_encoded_get_request_inside_available_width() -> None:
+    styles = build_styles()
+    request = (
+        "GET /dvwa/vulnerabilities/sqli/?id=1%27+AND+extractvalue%281%2Cconcat%280x7e%2C%28SELECT+"
+        "%40%40version%29%29%29--&Submit=Submit HTTP/1.1"
+    )
+    block = full_code_block(request, styles)
+    available_width = 170 * 2.83465
+
+    block.wrap(available_width, 800)
+
+    max_text_width = available_width - (block.pad_x * 2)
+    assert len(block.lines) > 1
+    assert all(block._string_width(line) <= max_text_width + 0.01 for line in block.lines)
 
 
 def test_pdf_builds_with_full_long_response_snippet() -> None:

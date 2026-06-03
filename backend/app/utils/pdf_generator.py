@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import re
-import textwrap
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -56,16 +55,72 @@ def _para_escape(value: Any) -> str:
 
 
 def _dedupe_semicolon_text(value: Any) -> str:
-    parts = re.split(r"\s*;\s*", str(value or "").strip())
+    text = str(value or "").strip()
+    parts = re.split(
+        r";\s+(?=(?:"
+        r"(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+https?://|"
+        r"Header not found:|Supporting finding:|Payload |Form |"
+        r"Authentication |SQL-engine |Response |Missing |Sensitive |Insecure "
+        r"))",
+        text,
+    )
     cleaned: list[str] = []
     seen: set[str] = set()
+    seen_excerpts: set[str] = set()
     for part in parts:
         normalized = " ".join(part.split())
+        normalized = _collapse_repeated_evidence_excerpt(normalized)
+        excerpt_key = _evidence_excerpt_key(normalized)
+        if excerpt_key and any(excerpt_key in existing or existing in excerpt_key for existing in seen_excerpts):
+            continue
+        if excerpt_key:
+            seen_excerpts.add(excerpt_key)
         key = normalized.lower()
         if normalized and key not in seen:
             seen.add(key)
             cleaned.append(normalized)
     return "; ".join(cleaned)
+
+
+def _evidence_excerpt_key(text: str) -> str | None:
+    excerpt_match = re.search(r'Excerpt:\s*([\'"])(?P<excerpt>.*?)(?:\1|$)', text, re.I)
+    if not excerpt_match:
+        return None
+    excerpt = re.sub(r"\s+", " ", excerpt_match.group("excerpt")).strip().lower()
+    if "you have an error in your sql syntax" in excerpt and (
+        "mysql server version" in excerpt or "mariadb server version" in excerpt
+    ):
+        return "mysql_sql_syntax_verbose_error"
+    if "sqlstate" in excerpt:
+        return "sqlstate_verbose_error"
+    if len(excerpt) < 40:
+        return None
+    return excerpt
+
+
+def _collapse_repeated_evidence_excerpt(text: str) -> str:
+    excerpt_match = re.search(r'Excerpt:\s*([\'"])(?P<excerpt>.*?)(?:\1|$)', text, re.I)
+    if not excerpt_match:
+        return text
+    excerpt = " ".join(excerpt_match.group("excerpt").split()).lower()
+    if not excerpt:
+        return text
+    # When merged evidence contains the same proof excerpt twice, keep the
+    # highest-signal first record and drop later near-duplicates.
+    records = re.split(r";\s+(?=(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+https?://)", text)
+    if len(records) <= 1:
+        return text
+    kept: list[str] = []
+    seen_excerpts: set[str] = set()
+    for record in records:
+        match = re.search(r'Excerpt:\s*([\'"])(?P<excerpt>.*?)(?:\1|$)', record, re.I)
+        if match:
+            key = " ".join(match.group("excerpt").split()).lower()
+            if any(key in existing or existing in key for existing in seen_excerpts):
+                continue
+            seen_excerpts.add(key)
+        kept.append(record)
+    return "; ".join(kept)
 
 OWASP_CATEGORY_LABELS = {
     "a01": "A01-Broken Access Control",
@@ -217,6 +272,101 @@ class SeverityBadge(Flowable):
         c.setFillColor(color)
         c.setFont("Helvetica-Bold", self._fs)
         c.drawCentredString(self.width / 2, 4, self._sev.upper())
+
+
+class CodeBlock(Flowable):
+    """Width-aware monospace block that wraps long tokens inside its bounds."""
+
+    def __init__(self, text: str, *, font_name="Courier", font_size=7.2, leading=9.4):
+        super().__init__()
+        self.text = self._normalize_text(text)
+        self.font_name = font_name
+        self.font_size = font_size
+        self.leading = leading
+        self.pad_x = 5
+        self.pad_y = 4
+        self.lines: list[str] = []
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        cleaned = str(text or "").replace("\t", "    ")
+        cleaned = re.sub(r"</?pre[^>]*>", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"</?code[^>]*>", "", cleaned, flags=re.I)
+        return cleaned
+
+    def _string_width(self, text: str) -> float:
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+
+        return stringWidth(text, self.font_name, self.font_size)
+
+    def _wrap_line(self, line: str, max_width: float) -> list[str]:
+        if not line:
+            return [""]
+
+        wrapped: list[str] = []
+        remaining = line.replace("\t", "    ")
+        while remaining:
+            if self._string_width(remaining) <= max_width:
+                wrapped.append(remaining)
+                break
+
+            lo, hi = 1, len(remaining)
+            best = 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if self._string_width(remaining[:mid]) <= max_width:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+
+            break_at = best
+            space_at = remaining.rfind(" ", 0, best + 1)
+            if space_at > max(12, int(best * 0.55)):
+                break_at = space_at
+
+            chunk = remaining[:break_at].rstrip()
+            wrapped.append(chunk or remaining[:best])
+            remaining = remaining[break_at:].lstrip() if break_at == space_at else remaining[break_at:]
+
+        return wrapped
+
+    def _wrap_text(self, avail_w: float) -> list[str]:
+        max_text_width = max(20, avail_w - (self.pad_x * 2))
+        lines: list[str] = []
+        for raw_line in self.text.splitlines() or [""]:
+            lines.extend(self._wrap_line(raw_line, max_text_width))
+        return lines
+
+    def wrap(self, avail_w, avail_h):
+        self.width = avail_w
+        self.lines = self._wrap_text(avail_w)
+        self.height = (self.pad_y * 2) + max(1, len(self.lines)) * self.leading
+        return self.width, self.height
+
+    def split(self, avail_w, avail_h):
+        lines = self._wrap_text(avail_w)
+        max_lines = int(max(0, avail_h - (self.pad_y * 2)) // self.leading)
+        if max_lines <= 1 or len(lines) <= max_lines:
+            return []
+
+        first = CodeBlock("\n".join(lines[:max_lines]), font_name=self.font_name, font_size=self.font_size, leading=self.leading)
+        rest = CodeBlock("\n".join(lines[max_lines:]), font_name=self.font_name, font_size=self.font_size, leading=self.leading)
+        return [first, rest]
+
+    def draw(self):
+        c = self.canv
+        c.saveState()
+        c.setFillColor(LIGHT_BG)
+        c.roundRect(0, 0, self.width, self.height, 2, fill=1, stroke=0)
+        c.setFillColor(BODY_TEXT)
+        c.setFont(self.font_name, self.font_size)
+
+        y = self.height - self.pad_y - self.font_size
+        for line in self.lines:
+            c.drawString(self.pad_x, y, line)
+            y -= self.leading
+        c.restoreState()
 
 
 class CoverPage:
@@ -372,7 +522,8 @@ def build_styles():
             leading=10, spaceAfter=3, spaceBefore=7),
         "mono": s("Mono",
             fontName="Courier", fontSize=7.5, textColor=BODY_TEXT,
-            leading=10, spaceAfter=2,
+            leading=10, spaceAfter=2, alignment=TA_LEFT,
+            wordWrap="CJK", splitLongWords=1,
             backColor=LIGHT_BG, borderPadding=(3, 5, 3, 5)),
         "caption": s("Caption",
             fontName="Helvetica-Oblique", fontSize=8, textColor=CAPTION_TEXT,
@@ -491,23 +642,7 @@ def severity_row_color(sev: str):
 
 
 def full_code_block(text: str, styles: dict) -> Flowable:
-    wrapped_lines: list[str] = []
-    for line in str(text).splitlines() or [""]:
-        if len(line) > 110:
-            wrapped_lines.extend(textwrap.wrap(
-                line,
-                width=110,
-                replace_whitespace=False,
-                drop_whitespace=False,
-                break_long_words=True,
-                break_on_hyphens=False,
-            ))
-        else:
-            wrapped_lines.append(line)
-    clean = "\n".join(wrapped_lines)
-    clean = clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    clean = clean.replace("\n", "<br/>")
-    return Paragraph(clean, styles["mono"])
+    return CodeBlock(text)
 
 
 def _response_evidence_label_and_text(resp: str) -> tuple[str, str]:
@@ -796,7 +931,7 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
     elems = section_header("Detailed Findings", styles, "5")
     elems.append(Paragraph(
         "Each finding is documented with technical evidence, AI-assisted analysis, "
-        "business impact, and remediation guidance.",
+        "business impact, and exploitability context.",
         styles["body"],
     ))
 
@@ -898,7 +1033,7 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
             if evidence_text:
                 block.append(Paragraph("VERIFICATION EVIDENCE", styles["label"]))
                 block.append(Spacer(1, 1.5*mm))
-                block.append(Paragraph(_para_escape(evidence_text), styles["body_sm_justify"]))
+                block.append(Paragraph(_para_escape(evidence_text), styles["body_sm"]))
                 block.append(Spacer(1, 3*mm))
             if excerpt_text:
                 block.append(Paragraph("RESPONSE EXCERPT" if evidence_text else "RESPONSE SNIPPET", styles["label"]))
@@ -963,12 +1098,9 @@ def build_remediation_roadmap(data: dict, styles: dict) -> list:
         ]]
         for v in items:
             rem = v.get("ai_analysis", {}).get("remediation", "See full finding for details.")
-            rem = _para_escape(rem)
-            if len(rem) > 200:
-                rem = rem[:197] + "..."
             rows.append([
                 Paragraph(_para_escape(v.get("vuln_type", "Unknown")), styles["body_sm"]),
-                Paragraph(rem[:200] + ("…" if len(rem) > 200 else ""), styles["body_sm"]),
+                Paragraph(_para_escape(rem), styles["body_sm"]),
             ])
         tbl = Table(rows, colWidths=[55*mm, None])
         tbl.setStyle(TableStyle([

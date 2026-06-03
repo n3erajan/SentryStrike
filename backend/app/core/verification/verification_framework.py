@@ -10,6 +10,7 @@ Provides:
 
 import asyncio
 import logging
+import re
 import httpx
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -424,10 +425,18 @@ class FindingDeduplicator:
     @staticmethod
     def _dedupe_family(vuln_type: str) -> str:
         vt = (vuln_type or "").lower()
+        if "verbose error" in vt or "exception handling" in vt or "debug / metrics" in vt:
+            return "exception_disclosure"
+        if (
+            "local file inclusion" in vt
+            or "remote file inclusion" in vt
+            or "path traversal" in vt
+            or "arbitrary file read" in vt
+            or "file read" in vt
+        ):
+            return "file_read_or_inclusion"
         if "admin" in vt or "privileged endpoint" in vt or "sensitive path discovered" in vt:
             return "admin_or_sensitive_endpoint"
-        if "csrf" in vt and "auth" in vt:
-            return "authentication_csrf"
         if "csrf" in vt:
             return "csrf"
         if "insecure transport" in vt or "weak tls" in vt or "ssl configuration" in vt:
@@ -460,7 +469,7 @@ class FindingDeduplicator:
             canonical_url = FindingDeduplicator._canonical_url(finding.url)
             family = FindingDeduplicator._dedupe_family(finding.vuln_type)
             parameter = finding.parameter
-            if family in {"csrf", "authentication_csrf", "admin_or_sensitive_endpoint", "transport_security"}:
+            if family in {"csrf", "admin_or_sensitive_endpoint", "transport_security", "exception_disclosure"}:
                 parameter = None
             key = (canonical_url, parameter, family)
             if key not in groups:
@@ -485,10 +494,23 @@ class FindingDeduplicator:
                             all_evidence[key].append(val)
 
             best.detection_evidence = all_evidence
+            best.verified = any(f.verified for f in sorted_group)
             evidence_parts = []
             seen_evidence = set()
+            seen_proofs = set()
             for f in sorted_group:
+                if f.vuln_type != best.vuln_type:
+                    profile_part = f"Supporting finding: {f.vuln_type}"
+                    profile_key = profile_part.lower()
+                    if profile_key not in seen_evidence:
+                        seen_evidence.add(profile_key)
+                        evidence_parts.append(profile_part)
                 evidence = (f.evidence or "").strip()
+                proof_key = FindingDeduplicator._evidence_proof_key(evidence)
+                if proof_key and proof_key in seen_proofs:
+                    continue
+                if proof_key:
+                    seen_proofs.add(proof_key)
                 evidence_key = " ".join(evidence.lower().split())
                 if evidence and evidence_key not in seen_evidence:
                     seen_evidence.add(evidence_key)
@@ -499,6 +521,21 @@ class FindingDeduplicator:
             deduplicated.append(best)
 
         return deduplicated
+
+    @staticmethod
+    def _evidence_proof_key(evidence: str) -> str | None:
+        text = " ".join(re.sub(r"<[^>]+>", " ", str(evidence or "")).lower().split())
+        if not text:
+            return None
+        if "you have an error in your sql syntax" in text and (
+            "mysql server version" in text or "mariadb server version" in text
+        ):
+            return "mysql_sql_syntax_verbose_error"
+        if "sqlstate" in text:
+            return "sqlstate_verbose_error"
+        if "stack trace:" in text or "traceback (most recent call last)" in text:
+            return "stack_trace_verbose_error"
+        return None
 
     @staticmethod
     def filter_by_confidence(findings: list[Finding], min_confidence: float = 50.0) -> list[Finding]:

@@ -11,7 +11,8 @@ from app.core.detectors.sql_injection import SQLInjectionDetector
 from app.core.detectors.xss_detector import XSSDetector
 from app.core.verification.response_analyzer import ResponseData
 from app.core.verification.verification_framework import HttpVerifier
-from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.core.payload_profile import build_payload_profile
+from app.models.vulnerability import OwaspCategory, SeverityLevel, TechnologyComponent
 
 
 class DummyInput:
@@ -183,3 +184,30 @@ def test_file_inclusion_keeps_wrappers_as_lfi() -> None:
     assert category == OwaspCategory.a05
     assert vuln_type == "Local File Inclusion (LFI)"
     assert method == "file_retrieval"
+
+
+def test_file_inclusion_payloads_are_tuned_for_windows_iis() -> None:
+    profile = build_payload_profile([
+        TechnologyComponent(name="Microsoft-IIS", version="10.0", category="server"),
+        TechnologyComponent(name="ASP.NET", version=None, category="framework"),
+    ])
+
+    payloads = FileInclusionDetector._select_lfi_payloads(profile)
+    payload_values = [payload for payload, _, _ in payloads]
+
+    assert any("windows" in payload.lower() for payload in payload_values)
+    assert not any("/etc/passwd" in payload.lower() for payload in payload_values)
+    assert not any(payload.lower().startswith("php://") for payload in payload_values)
+
+
+def test_file_inclusion_payloads_keep_php_wrappers_for_php_stack() -> None:
+    profile = build_payload_profile([
+        TechnologyComponent(name="PHP", version="8.2", category="framework"),
+        TechnologyComponent(name="Apache", version="2.4", category="server"),
+    ])
+
+    payloads = FileInclusionDetector._select_lfi_payloads(profile)
+    payload_values = [payload for payload, _, _ in payloads]
+
+    assert any("/etc/passwd" in payload.lower() for payload in payload_values)
+    assert any(payload.lower().startswith("php://") for payload in payload_values)

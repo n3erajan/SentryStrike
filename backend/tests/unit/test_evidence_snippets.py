@@ -75,6 +75,26 @@ def test_response_snippet_prefers_payload_canary_over_page_scripts() -> None:
     assert "/static/app.js" not in snippet
 
 
+def test_response_snippet_prefers_xss_payload_over_unrelated_sql_error() -> None:
+    payload = "<img src=x onerror=window.sentry_hook('sentryprobe_b3a44e58')>"
+    body = (
+        "<pre>You have an error in your SQL syntax near old noise</pre>"
+        + ("A" * 1800)
+        + payload
+        + ("B" * 600)
+    )
+
+    snippet = ResponseAnalyzer.build_evidence_response_snippet(
+        status_code=200,
+        reason_phrase="OK",
+        body=body,
+        payload=payload,
+    )
+
+    assert payload in snippet
+    assert "old noise" not in snippet
+
+
 def test_response_snippet_centers_php_filter_base64_output() -> None:
     encoded_php = "PD9waHAKJHBhZ2UgPSAkX0dFVFsncGFnZSddOwppbmNsdWRlKCRwYWdlKTsKPz4="
     body = (
