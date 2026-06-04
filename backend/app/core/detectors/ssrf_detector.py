@@ -88,7 +88,7 @@ class SSRFDetector(BaseDetector):
                         if injected.status_code == 200 and re.search(regex_pattern, injected.body, re.I):
                             cand_findings.append(
                                 Finding(
-                                    category=OwaspCategory.a05,
+                                    category=OwaspCategory.a01,
                                     vuln_type="Server-Side Request Forgery (SSRF)",
                                     severity=SeverityLevel.high,
                                     url=cand_url,

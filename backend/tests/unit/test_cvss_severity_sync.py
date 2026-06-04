@@ -16,9 +16,11 @@ def test_csrf_severity_sync():
     assert severity in ["Low", "Medium"]
 
 
-def test_path_traversal_cvss_requires_low_privileges():
+def test_path_traversal_cvss_reflects_high_severity():
+    """Path Traversal should score ~7.5 (High) per CVSS v3.1 — no privilege required."""
     result = CvssCalculator.from_vulnerability_context("Path Traversal / Arbitrary File Read")
 
-    assert "/PR:L/" in result.vector
+    assert "/PR:N/" in result.vector
     assert "/C:H/" in result.vector
-    assert result.score > 0
+    severity = CvssCalculator.get_severity(result.score)
+    assert severity == "High", f"expected High, got {severity} (score={result.score})"

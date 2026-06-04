@@ -111,6 +111,18 @@ _LOW_PATTERNS: list[re.Pattern] = [
     ]
 ]
 
+# Patterns that indicate direct credential/config disclosure (not error handling)
+_CREDENTIAL_PATTERN_STRINGS: frozenset = frozenset({
+    r"password\s*=",
+    r"db_password|database_password|db_pass",
+})
+
+
+def _is_credential_disclosure(matched: list[str]) -> bool:
+    """Return True if matched patterns indicate credential disclosure, not error handling."""
+    return any(p in matched for p in _CREDENTIAL_PATTERN_STRINGS)
+
+
 _DEBUG_METRICS_PATTERNS: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE)
     for p in [
@@ -266,6 +278,18 @@ def _evidence_endpoint_key(finding: Finding) -> tuple[str, str | None, str]:
         finding.vuln_type,
     )
 
+def _matched_texts(body: str, matched_patterns: list[str]) -> list[str]:
+    """Return the literal text that matched each pattern, for snippet centering."""
+    all_patterns = _HIGH_PATTERNS + _MEDIUM_PATTERNS + _LOW_PATTERNS + _DEBUG_METRICS_PATTERNS
+    results: list[str] = []
+    for pattern in all_patterns:
+        if pattern.pattern in matched_patterns:
+            m = pattern.search(body)
+            if m:
+                results.append(m.group(0))
+    return results
+
+
 def _build_evidence(
     url: str,
     method: str,
@@ -275,10 +299,6 @@ def _build_evidence(
     sensitive_hdrs: list[str],
     trigger: str = "",
 ) -> str:
-    all_patterns = _HIGH_PATTERNS + _MEDIUM_PATTERNS + _LOW_PATTERNS + _DEBUG_METRICS_PATTERNS
-    compiled = [p for p in all_patterns if p.pattern in matched_patterns]
-    snippet = _extract_snippet(body, compiled) if compiled else body[:_EVIDENCE_SNIPPET_LEN]
-
     parts = [f"{method} {url} → HTTP {status}"]
     if trigger:
         parts.append(f"Trigger: {trigger}")
@@ -286,7 +306,6 @@ def _build_evidence(
         parts.append(f"Matched: {', '.join(matched_patterns[:3])}")
     if sensitive_hdrs:
         parts.append(f"Sensitive headers: {', '.join(sensitive_hdrs)}")
-    parts.append(f"Excerpt: {snippet!r}")
     return " | ".join(parts)
 
 def _observed_text_from_finding(finding: Finding) -> str:
@@ -454,9 +473,16 @@ class ExceptionHandlingDetector(BaseDetector):
                 trigger=trigger,
             )
 
+            if _is_credential_disclosure(matched):
+                derived_vuln_type = "Default Credentials Disclosure"
+                derived_category = OwaspCategory.a07
+            else:
+                derived_vuln_type = "Verbose Error Handling"
+                derived_category = OwaspCategory.a10
+
             finding = Finding(
-                category=OwaspCategory.a10,
-                vuln_type="Verbose Error Handling",
+                category=derived_category,
+                vuln_type=derived_vuln_type,
                 severity=severity,
                 url=source.url,
                 parameter=source.parameter,
@@ -477,7 +503,7 @@ class ExceptionHandlingDetector(BaseDetector):
                     status_code=200,
                     body=observed_text,
                     payload=source.payload or trigger,
-                    extra_markers=matched,
+                    extra_markers=[trigger, *_matched_texts(observed_text, matched)],
                 ),
             )
             _add_finding(finding, findings, seen)
@@ -562,7 +588,7 @@ class ExceptionHandlingDetector(BaseDetector):
                 status_code=response.status_code,
                 body=response.text,
                 payload="debug/metrics endpoint probe",
-                extra_markers=matched,
+                extra_markers=_matched_texts(response.text, matched),
             ),
         )
 
@@ -741,9 +767,16 @@ class ExceptionHandlingDetector(BaseDetector):
             matched_patterns=matched, sensitive_hdrs=sensitive_hdrs, trigger=trigger,
         )
 
+        if _is_credential_disclosure(matched):
+            vuln_type = "Default Credentials Disclosure"
+            category = OwaspCategory.a07
+        else:
+            vuln_type = "Verbose Error Handling"
+            category = OwaspCategory.a10
+
         return Finding(
-            category=OwaspCategory.a10,
-            vuln_type="Verbose Error Handling",
+            category=category,
+            vuln_type=vuln_type,
             severity=severity,
             url=url,
             parameter=parameter,
@@ -758,7 +791,7 @@ class ExceptionHandlingDetector(BaseDetector):
                 status_code=status,
                 body=body,
                 payload=payload or trigger,
-                extra_markers=[trigger, *matched],
+                extra_markers=[trigger, *_matched_texts(body, matched)],
             ),
         )
 

@@ -23,7 +23,7 @@ class SupplyChainDetector(BaseDetector):
                 continue
 
             for cve_id in cves:
-                cve_score = 7.5
+                cve_score = getattr(tech, "cve_scores", {}).get(cve_id, 7.5)
                 if cve_score >= 9.0:
                     severity = SeverityLevel.critical
                 elif cve_score >= 7.0:

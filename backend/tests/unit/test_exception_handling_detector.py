@@ -69,7 +69,7 @@ def test_exception_detector_derives_a10_from_observed_database_error_evidence() 
     assert findings[0].vuln_type == "Verbose Error Handling"
     assert findings[0].severity == SeverityLevel.high
     assert findings[0].detection_method == "observed_exception_evidence"
-    assert "mariadb server version" in findings[0].evidence.lower()
+    assert "mariadb server version" in findings[0].verification_response_snippet.lower()
 
 
 def test_exception_detector_does_not_derive_duplicate_when_endpoint_already_has_verbose_error() -> None:

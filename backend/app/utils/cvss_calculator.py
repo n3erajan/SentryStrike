@@ -13,20 +13,47 @@ class CvssCalculator:
     """Standard CVSS v3.1 calculation for scanner output normalization."""
 
     VULN_CVSS_PROFILES: dict[str, dict[str, str]] = {
+        # --- Critical (9.0+) ---
         "Command Injection": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "H"},
         "SQL Injection": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "N"},
-        "Path Traversal": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N", "pr": "L"},
-        "Arbitrary File Read": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N", "pr": "L"},
         "File Inclusion": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "H"},
         "File Upload": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "H"},
-        "XSS": {"ac": "L", "ui": "R", "s": "C", "c": "L", "i": "L", "a": "N"},
-        "CSRF": {"ac": "L", "ui": "R", "s": "U", "c": "N", "i": "L", "a": "N", "pr": "L"},  # CSRF requires auth
+        "Default Credentials": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "H"},
+
+        # --- High (7.0–8.9) ---
+        "Path Traversal": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Arbitrary File Read": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "IDOR": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Forced Browsing": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Sensitive File": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Brute-Force": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Credentials": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Token Exposed": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Insecure Transport": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Stored XSS": {"ac": "L", "ui": "R", "s": "C", "c": "L", "i": "H", "a": "N"},
         "SSRF": {"ac": "L", "ui": "N", "s": "C", "c": "H", "i": "N", "a": "N"},
-        "IDOR": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N", "pr": "L"},
-        "Missing Security": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
-        "Insecure Transport": {"ac": "H", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+
+        # --- Medium (4.0–6.9) ---
+        "XSS": {"ac": "L", "ui": "R", "s": "C", "c": "L", "i": "L", "a": "N"},
+        "CSRF": {"ac": "L", "ui": "R", "s": "U", "c": "N", "i": "L", "a": "N", "pr": "L"},
         "Cookie": {"ac": "L", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
-        "Information Disclosure": {"ac": "L", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
+        "Mixed Content": {"ac": "L", "ui": "R", "s": "U", "c": "L", "i": "N", "a": "N"},
+        "Open Redirect": {"ac": "L", "ui": "R", "s": "U", "c": "N", "i": "L", "a": "N"},
+        "OAuth": {"ac": "L", "ui": "R", "s": "U", "c": "L", "i": "L", "a": "N"},
+        "TLS": {"ac": "H", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "SSL": {"ac": "H", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Known CVE": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "N"},
+
+        # --- Low (0.1–3.9) ---
+        "Missing Security": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
+        "Information Disclosure": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
+        "CSP": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
+        "Cache Control": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
+        "CAPTCHA": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
+        "Captcha": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
+        "Debug": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
+        "Metrics": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
+        "Autocomplete": {"ac": "H", "ui": "R", "s": "U", "c": "L", "i": "N", "a": "N"},
     }
 
     @staticmethod

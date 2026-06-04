@@ -26,6 +26,11 @@ class CveDatabaseService:
                 cves = []
             cve_ids = [item.get("cve_id", "") for item in cves if item.get("cve_id")]
             component.cves = cve_ids
+            component.cve_scores = {
+                item["cve_id"]: item["severity_score"]
+                for item in cves
+                if item.get("cve_id") and item.get("severity_score") is not None
+            }
             enriched.append(component)
 
             for c in cves:

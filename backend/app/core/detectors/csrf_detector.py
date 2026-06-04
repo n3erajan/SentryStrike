@@ -170,7 +170,7 @@ class CSRFDetector(BaseDetector):
 
                             cand_findings.append(
                                 Finding(
-                                    category=OwaspCategory.a07,
+                                    category=OwaspCategory.a01,
                                     vuln_type="Cross-Site Request Forgery (CSRF)",
                                     severity=severity,
                                     url=form_url,

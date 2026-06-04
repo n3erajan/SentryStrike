@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     mongodb_db_name: str = Field(default="sentry_strike", alias="MONGODB_DB_NAME")
 
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
-    ollama_model: str = Field(default="qwen3:8b", alias="OLLAMA_MODEL")
+    ollama_model: str = Field(default="qwen3.5:9b", alias="OLLAMA_MODEL")
     ollama_timeout_seconds: float = Field(default=120.0, alias="OLLAMA_TIMEOUT_SECONDS")
     ai_max_retries: int = Field(default=2, alias="AI_MAX_RETRIES")
 

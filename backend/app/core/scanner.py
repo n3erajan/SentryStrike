@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import re
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -416,16 +417,24 @@ class ScanOrchestrator:
             scan.statistics.severity_breakdown.low = len([v for v in vulnerabilities if v.severity.value == "Low"])
             scan.statistics.severity_breakdown.info = len([v for v in vulnerabilities if v.severity.value == "Info"])
 
-            if vulnerabilities:
+            active = [v for v in vulnerabilities if not v.is_false_positive]
+
+            if active:
                 total_weighted_score = 0.0
                 total_weight = 0.0
-                for v in vulnerabilities:
-                    is_verified = v.evidence.verified
-                    weight = 1.0 if is_verified else 0.5
-                    total_weighted_score += v.cvss_score * weight
-                    total_weight += weight
-                
-                scan.overall_risk_score = min(100.0, round((total_weighted_score / total_weight) * 10, 2)) if total_weight > 0 else 0.0
+                for v in active:
+                    w = 1.0 if v.evidence.verified else 0.7
+                    total_weighted_score += v.cvss_score * w
+                    total_weight += w
+
+                avg_cvss = total_weighted_score / total_weight if total_weight > 0 else 0.0
+
+                # Volume amplification with logarithmic diminishing returns.
+                # More findings → higher risk, but each additional finding adds less.
+                n = len(active)
+                volume_mult = 1.0 + (0.15 * math.log(n) if n > 1 else 0.0)
+
+                scan.overall_risk_score = min(100.0, round(avg_cvss * 10 * volume_mult, 2))
             else:
                 scan.overall_risk_score = 0.0
 
@@ -883,6 +892,9 @@ class ScanOrchestrator:
                         v.vuln_type, fp_prob, evidence_grade, v.location.url,
                         v.ai_analysis.false_positive_reasoning,
                     )
+                    # Also skip CVSS adjustment — insufficient evidence to suppress
+                    # means insufficient evidence to reduce the score.
+                    continue
                 else:
                     v.is_false_positive = True
                     v.review_status = ReviewStatus.needs_review
