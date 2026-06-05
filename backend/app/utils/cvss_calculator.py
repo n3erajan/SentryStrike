@@ -20,7 +20,7 @@ class CvssCalculator:
         "File Upload": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "H"},
         "Default Credentials": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "H"},
 
-        # --- High (7.0–8.9) ---
+        # --- High (7.0-8.9) ---
         "Path Traversal": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
         "Arbitrary File Read": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
         "IDOR": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
@@ -33,7 +33,7 @@ class CvssCalculator:
         "Stored XSS": {"ac": "L", "ui": "R", "s": "C", "c": "L", "i": "H", "a": "N"},
         "SSRF": {"ac": "L", "ui": "N", "s": "C", "c": "H", "i": "N", "a": "N"},
 
-        # --- Medium (4.0–6.9) ---
+        # --- Medium (4.0-6.9) ---
         "XSS": {"ac": "L", "ui": "R", "s": "C", "c": "L", "i": "L", "a": "N"},
         "CSRF": {"ac": "L", "ui": "R", "s": "U", "c": "N", "i": "L", "a": "N", "pr": "L"},
         "Cookie": {"ac": "L", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
@@ -44,7 +44,7 @@ class CvssCalculator:
         "SSL": {"ac": "H", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
         "Known CVE": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "N"},
 
-        # --- Low (0.1–3.9) ---
+        # --- Low (0.1-3.9) ---
         "Missing Security": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
         "Information Disclosure": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},
         "CSP": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},

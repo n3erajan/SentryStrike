@@ -1,17 +1,17 @@
 """Deterministic Evidence Grader for false-positive classification.
 
 Replaces AI-based FP adjudication with rule-based grading.  The grader
-assigns each finding a grade (A–D) with a corresponding FP *ceiling*.
+assigns each finding a grade (A-D) with a corresponding FP *ceiling*.
 The AI may still output a ``false_positive_probability`` but it can only
 *lower* the ceiling, never raise it.
 
 Grades
 ------
-A – Active verification with strong proof markers  → ceiling 0.05
-B – Structural / observable (the finding IS the proof) → ceiling 0.10
-B+ – Verified by detector with decent confidence   → ceiling 0.15
-C – Heuristic with partial evidence                 → ceiling 0.40
-D – Weak / ambiguous evidence                       → ceiling 0.75
+A - Active verification with strong proof markers  → ceiling 0.05
+B - Structural / observable (the finding IS the proof) → ceiling 0.10
+B+ - Verified by detector with decent confidence   → ceiling 0.15
+C - Heuristic with partial evidence                 → ceiling 0.40
+D - Weak / ambiguous evidence                       → ceiling 0.75
 """
 
 from __future__ import annotations
@@ -148,11 +148,11 @@ class EvidenceGrader:
         """Assign an evidence grade to *vuln*.
 
         Evaluation order (first match wins):
-        1. Grade A – verified + high confidence + strong active marker
-        2. Grade B – structural/observable vuln type
-        3. Grade B+ – verified + moderate confidence
-        4. Grade C – heuristic with partial evidence
-        5. Grade D – everything else
+        1. Grade A - verified + high confidence + strong active marker
+        2. Grade B - structural/observable vuln type
+        3. Grade B+ - verified + moderate confidence
+        4. Grade C - heuristic with partial evidence
+        5. Grade D - everything else
         """
         vuln_lower = (vuln.vuln_type or "").lower()
         method = (vuln.evidence.detection_method or "").lower()

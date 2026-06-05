@@ -509,7 +509,7 @@ class ScanOrchestrator:
             for batch_start in range(0, len(vulnerabilities), BATCH_SIZE):
                 batch = vulnerabilities[batch_start : batch_start + BATCH_SIZE]
                 logger.info(
-                    "Analyzing batch %d–%d of %d vulnerabilities with local LLM",
+                    "Analyzing batch %d-%d of %d vulnerabilities with local LLM",
                     batch_start + 1,
                     batch_start + len(batch),
                     len(vulnerabilities),
@@ -872,7 +872,7 @@ class ScanOrchestrator:
           fp_prob >= 0.50  →  reduce CVSS by 40 %
 
         Grade A/B findings will never reach these thresholds because their
-        ceiling is 0.05–0.15.
+        ceiling is 0.05-0.15.
         """
         for v in vulnerabilities:
             fp_prob = v.ai_analysis.false_positive_probability
@@ -944,7 +944,7 @@ class ScanOrchestrator:
             elif fp_prob >= 0.50:
                 adjusted_cvss = round(original_cvss * 0.60, 1)
             else:
-                # Low false-positive probability – no CVSS adjustment needed
+                # Low false-positive probability - no CVSS adjustment needed
                 continue
 
             adjusted_cvss = max(0.0, round(adjusted_cvss, 1))

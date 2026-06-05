@@ -1,5 +1,5 @@
 """
-Sentry Strike – Professional Penetration Test Report Generator
+Sentry Strike - Professional Penetration Test Report Generator
 Converts scan JSON output into a polished, client-ready PDF report.
 """
 
@@ -229,7 +229,7 @@ MID_GRAY      = CAPTION_TEXT
 # ─────────────────────────── Custom Flowables ───────────────────────────── #
 
 class ColoredBar(Flowable):
-    """A full-width colored rectangle – used for section divider bars."""
+    """A full-width colored rectangle - used for section divider bars."""
 
     def __init__(self, color, height=3, width=None):
         super().__init__()
@@ -555,7 +555,7 @@ def make_doc(buf: BytesIO, report_data: dict) -> BaseDocTemplate:
         pagesize=A4,
         leftMargin=20*mm, rightMargin=20*mm,
         topMargin=22*mm, bottomMargin=22*mm,
-        title="Sentry Strike – Penetration Test Report",
+        title="Sentry Strike - Penetration Test Report",
         author="Sentry Strike Scanner",
     )
 
