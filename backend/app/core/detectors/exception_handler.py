@@ -42,21 +42,10 @@ _HIGH_PATTERNS: list[re.Pattern] = [
         r"select\s+.+\s+from\s+.+where\b",          # query-shaped echo
         r"insert\s+into\s+.+\bvalues\b",          # query-shaped echo
 
-        # Direct credential/config leaks in error output
-        r"password\s*=",                                # credential leak in error
-        r"db_password|database_password|db_pass",       # config key leak
-
-        # Internal path disclosure
-        r"/var/www/",                                   # Unix web root path
-        r"/home/\w+/",                                  # Unix home path
-        r"/etc/",                                       # common sensitive folder disclosure
-        r"/boot/",                                      # boot artifacts
-        r"/[A-Za-z0-9_\-]+/www/",                      # weird nested roots sometimes echoed
-        r"[A-Za-z]:\\\\(?:inetpub|xampp|wamp|www|rails|django)",    # Windows web root path
-        r"app/models/",                                 # MVC model path
-        r"app/controllers/",                            # MVC controller path
-        r"site-packages/",                              # Python package path
-        r"vendor/(?:laravel|symfony)/",                  # Composer vendor disclosure
+        # Path disclosure in error context (e.g. stack traces revealing server paths)
+        r"/var/www/",                                   # Unix web root path in trace
+        r"/home/\w+/",                                  # Unix home path in trace
+        r"[A-Za-z]:\\\\(?:inetpub|xampp|wamp|www|rails|django)",    # Windows web root path in trace
 
         # PHP stack traces / exception dumps
         r"caught exception:",                           # PHP/generic exception dump
@@ -111,31 +100,7 @@ _LOW_PATTERNS: list[re.Pattern] = [
     ]
 ]
 
-# Patterns that indicate direct credential/config disclosure (not error handling)
-_CREDENTIAL_PATTERN_STRINGS: frozenset = frozenset({
-    r"password\s*=",
-    r"db_password|database_password|db_pass",
-})
 
-
-def _is_credential_disclosure(matched: list[str]) -> bool:
-    """Return True if matched patterns indicate credential disclosure, not error handling."""
-    return any(p in matched for p in _CREDENTIAL_PATTERN_STRINGS)
-
-
-_DEBUG_METRICS_PATTERNS: list[re.Pattern] = [
-    re.compile(p, re.IGNORECASE)
-    for p in [
-        r"^#\s*HELP\s+\w+",                         # Prometheus exposition
-        r"^#\s*TYPE\s+\w+",                         # Prometheus exposition
-        r"jvm_memory_used_bytes|process_cpu_seconds_total|http_server_requests",
-        r"\"activeProfiles\"|\"propertySources\"|\"systemProperties\"",  # Spring actuator env
-        r"\"heapUsed\"|\"rss\"|\"uptime\"|\"pid\"",  # Node/process dumps
-        r"debug\s*=\s*true|app_debug|environment\s*:\s*(dev|debug|local)",
-        r"phpinfo\(\)|configuration file \(php\.ini\) path",
-        r"server-status|apache server status|scoreboard",
-    ]
-]
 
 _SENSITIVE_HEADERS = {
     "x-powered-by",
@@ -156,23 +121,7 @@ _FUZZ_PAYLOADS: list[tuple[str, str]] = [
     ("9999999999999999999", "integer overflow probe"),
     ("{{7*7}}", "template expression — SSTI errors in unprotected renderers"),
     ("<script>", "HTML/XML metacharacter — XML parser or sanitiser errors"),
-    ("../../../etc/passwd", "path traversal — file-handling errors"),
     ("%00%0d%0a", "URL-encoded null + CRLF — header injection / parser errors"),
-]
-
-_DEBUG_ENDPOINT_PATHS = [
-    "/debug",
-    "/debug/vars",
-    "/metrics",
-    "/status",
-    "/server-status",
-    "/phpinfo.php",
-    "/actuator",
-    "/actuator/env",
-    "/actuator/metrics",
-    "/actuator/health",
-    "/actuator/prometheus",
-    "/__debug__",
 ]
 
 _DEFAULT_URL_LIMIT = 20
@@ -280,7 +229,7 @@ def _evidence_endpoint_key(finding: Finding) -> tuple[str, str | None, str]:
 
 def _matched_texts(body: str, matched_patterns: list[str]) -> list[str]:
     """Return the literal text that matched each pattern, for snippet centering."""
-    all_patterns = _HIGH_PATTERNS + _MEDIUM_PATTERNS + _LOW_PATTERNS + _DEBUG_METRICS_PATTERNS
+    all_patterns = _HIGH_PATTERNS + _MEDIUM_PATTERNS + _LOW_PATTERNS
     results: list[str] = []
     for pattern in all_patterns:
         if pattern.pattern in matched_patterns:
@@ -328,6 +277,46 @@ def _replace_param_values(url: str, replacement: str) -> str:
             pairs.append(part)
     return f"{base}?{'&'.join(pairs)}"
 
+def _reflection_guard(
+    body: str,
+    payload: str | None,
+    matched_patterns: list[str],
+) -> list[str]:
+    """Filter matched patterns that only match because the payload is reflected in the body.
+
+    If *payload* appears literally in *body*, any pattern that matches only inside the
+    reflected payload text is a false positive — the application is echoing input, not
+    disclosing an error path.  This guard strips the payload from the body and re-checks
+    each pattern.
+    """
+    if not payload or not matched_patterns or payload not in body:
+        return matched_patterns
+
+    stripped_body = body.replace(payload, "")
+    surviving: list[str] = []
+    for pattern_str in matched_patterns:
+        try:
+            pattern = re.compile(pattern_str, re.IGNORECASE)
+            if pattern.search(stripped_body):
+                surviving.append(pattern_str)
+        except re.error:
+            surviving.append(pattern_str)
+    return surviving
+
+
+def _reclassify_severity(matched: list[str]) -> SeverityLevel | None:
+    """Re-derive the highest severity from surviving matched pattern strings."""
+    if not matched:
+        return None
+    high_set = {p.pattern for p in _HIGH_PATTERNS}
+    med_set = {p.pattern for p in _MEDIUM_PATTERNS}
+    if any(p in high_set for p in matched):
+        return SeverityLevel.high
+    if any(p in med_set for p in matched):
+        return SeverityLevel.medium
+    return SeverityLevel.low
+
+
 # ---------------------------------------------------------------------------
 # Detector Engine
 # ---------------------------------------------------------------------------
@@ -370,17 +359,6 @@ class ExceptionHandlingDetector(BaseDetector):
             tasks_404 = [self._probe_404(client, semaphore, url) for url in probe_urls]
             results_404 = await asyncio.gather(*tasks_404, return_exceptions=True)
             for result in results_404:
-                if isinstance(result, Finding):
-                    _add_finding(result, findings, seen)
-
-            # Technique 1b: globally exposed debug/metrics endpoints
-            debug_tasks = [
-                self._probe_debug_endpoint(client, semaphore, root, path)
-                for root in self._target_roots(urls)
-                for path in _DEBUG_ENDPOINT_PATHS
-            ]
-            results_debug = await asyncio.gather(*debug_tasks, return_exceptions=True)
-            for result in results_debug:
                 if isinstance(result, Finding):
                     _add_finding(result, findings, seen)
 
@@ -458,6 +436,13 @@ class ExceptionHandlingDetector(BaseDetector):
             if not matched or not severity:
                 continue
 
+            # Apply reflection guard: the source finding's payload might be echoed
+            # in the observed text, causing a pattern match that is not a real error.
+            matched = _reflection_guard(observed_text, source.payload, matched)
+            severity = _reclassify_severity(matched)
+            if not matched or not severity:
+                continue
+
             trigger = (
                 f"observed during {source.vuln_type} verification"
                 if getattr(source, "vuln_type", None)
@@ -473,16 +458,9 @@ class ExceptionHandlingDetector(BaseDetector):
                 trigger=trigger,
             )
 
-            if _is_credential_disclosure(matched):
-                derived_vuln_type = "Default Credentials Disclosure"
-                derived_category = OwaspCategory.a07
-            else:
-                derived_vuln_type = "Verbose Error Handling"
-                derived_category = OwaspCategory.a10
-
             finding = Finding(
-                category=derived_category,
-                vuln_type=derived_vuln_type,
+                category=OwaspCategory.a10,
+                vuln_type="Verbose Error Handling",
                 severity=severity,
                 url=source.url,
                 parameter=source.parameter,
@@ -540,56 +518,6 @@ class ExceptionHandlingDetector(BaseDetector):
             body=response.text, headers=response.headers,
             trigger="non-existent path probe", require_body_match=True,
             parameter=None, payload=None
-        )
-
-    async def _probe_debug_endpoint(
-        self,
-        client: httpx.AsyncClient,
-        semaphore: asyncio.Semaphore,
-        root: str,
-        path: str,
-    ) -> Finding | None:
-        test_url = f"{root.rstrip('/')}/{path.lstrip('/')}"
-        async with semaphore:
-            try:
-                response = await client.get(test_url)
-            except Exception:
-                return None
-
-        if response.status_code != 200:
-            return None
-
-        matched = [p.pattern for p in _DEBUG_METRICS_PATTERNS if p.search(response.text or "")]
-        if not matched:
-            return None
-
-        evidence = _build_evidence(
-            url=test_url,
-            method="GET",
-            status=response.status_code,
-            body=response.text,
-            matched_patterns=matched,
-            sensitive_hdrs=_sensitive_headers_present(response.headers),
-            trigger="debug/metrics endpoint probe",
-        )
-
-        return Finding(
-            category=OwaspCategory.a10,
-            vuln_type="Debug / Metrics Endpoint Exposed",
-            severity=SeverityLevel.medium,
-            url=test_url,
-            method="GET",
-            evidence=evidence,
-            confidence_score=90.0,
-            verified=True,
-            reproducible=True,
-            verification_request_snippet=f"GET {test_url} HTTP/1.1\nUser-Agent: Sentry/2.0",
-            verification_response_snippet=ResponseAnalyzer.build_evidence_response_snippet(
-                status_code=response.status_code,
-                body=response.text,
-                payload="debug/metrics endpoint probe",
-                extra_markers=_matched_texts(response.text, matched),
-            ),
         )
 
     async def _probe_get_params(
@@ -747,6 +675,11 @@ class ExceptionHandlingDetector(BaseDetector):
         severity, high_hits, med_hits = _classify_body(body, target_host=_get_target_host(url))
         matched = high_hits or med_hits
 
+        # Apply reflection guard: if the matched pattern only appears because the
+        # fuzz payload is echoed back in the response body, discard the match.
+        matched = _reflection_guard(body, payload, matched)
+        severity = _reclassify_severity(matched)
+
         sensitive_hdrs = _sensitive_headers_present(headers)
         is_bare_500 = status == 500 and not matched
 
@@ -767,16 +700,9 @@ class ExceptionHandlingDetector(BaseDetector):
             matched_patterns=matched, sensitive_hdrs=sensitive_hdrs, trigger=trigger,
         )
 
-        if _is_credential_disclosure(matched):
-            vuln_type = "Default Credentials Disclosure"
-            category = OwaspCategory.a07
-        else:
-            vuln_type = "Verbose Error Handling"
-            category = OwaspCategory.a10
-
         return Finding(
-            category=category,
-            vuln_type=vuln_type,
+            category=OwaspCategory.a10,
+            vuln_type="Verbose Error Handling",
             severity=severity,
             url=url,
             parameter=parameter,

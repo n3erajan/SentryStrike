@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import statistics
 from urllib.parse import parse_qsl, urlparse
 
@@ -1175,5 +1176,73 @@ class AuthenticationFailuresDetector(BaseDetector):
                         "Verify that responses are identical for existing and non-existing accounts."
                     ),
                 ))
+
+        return findings
+
+    # ---------------------------------------------------------------------------
+    # Credential / Config Disclosure — derived from observed evidence
+    # ---------------------------------------------------------------------------
+
+    _CREDENTIAL_DISCLOSURE_PATTERNS: list[re.Pattern] = [
+        re.compile(p, re.IGNORECASE)
+        for p in [
+            r"password\s*=",
+            r"db_password|database_password|db_pass",
+        ]
+    ]
+
+    def findings_from_observed_evidence(
+        self,
+        observed_findings: list[Finding],
+    ) -> list[Finding]:
+        """Derive credential/config disclosure findings from other detectors' evidence snippets.
+
+        When the response body of another detector's confirmed finding (e.g. SQLi, LFI)
+        contains database credential or configuration keys leaked in error output, this
+        method independently reports it under A07 / Authentication Failures.
+        """
+        findings: list[Finding] = []
+        seen: set[tuple] = set()
+
+        for source in observed_findings or []:
+            observed_text = source.verification_response_snippet or ""
+            if not observed_text:
+                continue
+
+            matched_patterns = [
+                p.pattern for p in self._CREDENTIAL_DISCLOSURE_PATTERNS
+                if p.search(observed_text)
+            ]
+            if not matched_patterns:
+                continue
+
+            dedup_key = (source.url or "", "Credential / Config Disclosure in Response Body")
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
+            findings.append(
+                Finding(
+                    category=OwaspCategory.a07,
+                    vuln_type="Credential / Config Disclosure in Response Body",
+                    severity=SeverityLevel.high,
+                    url=source.url or "",
+                    parameter=source.parameter,
+                    method=source.method,
+                    evidence=(
+                        f"Credential or configuration key disclosed in response body: "
+                        f"{', '.join(matched_patterns[:2])}. "
+                        f"Observed during {source.vuln_type} verification."
+                    ),
+                    confidence_score=85.0,
+                    detection_method="observed_credential_disclosure",
+                    detection_evidence={
+                        "source_vuln_type": source.vuln_type,
+                        "matched_patterns": matched_patterns,
+                    },
+                    verified=True,
+                    reproducible=getattr(source, "reproducible", False),
+                )
+            )
 
         return findings

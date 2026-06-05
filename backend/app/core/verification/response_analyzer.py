@@ -508,12 +508,22 @@ class ResponseAnalyzer:
         if not body:
             return header_text
 
-        fallback_positions: list[int] = []
-        for marker in [payload, *(extra_markers or [])]:
+        # Primary: find the actual payload in the response body
+        payload_positions: list[int] = []
+        if payload:
+            pos = body.lower().find(str(payload).lower())
+            if pos >= 0:
+                payload_positions.append(pos)
+
+        # Module/parameter/phase markers are contextual labels that may
+        # accidentally match generic page text (e.g. parameter "name" matching
+        # an HTML attribute). Only use them as a last resort.
+        extra_positions: list[int] = []
+        for marker in (extra_markers or []):
             if marker:
                 pos = body.lower().find(str(marker).lower())
                 if pos >= 0:
-                    fallback_positions.append(pos)
+                    extra_positions.append(pos)
 
         proof_positions: list[int] = []
         proof_positions.extend(ResponseAnalyzer._encoded_source_positions(body))
@@ -529,9 +539,9 @@ class ResponseAnalyzer:
                 generic_positions.append(match.start())
 
         if ResponseAnalyzer._is_xss_like_payload(payload):
-            focus_positions = fallback_positions or generic_positions or proof_positions
+            focus_positions = payload_positions or generic_positions or proof_positions or extra_positions
         else:
-            focus_positions = proof_positions or fallback_positions or generic_positions
+            focus_positions = proof_positions or payload_positions or generic_positions or extra_positions
         if focus_positions:
             focus = min(focus_positions)
             start = max(0, focus - context_chars)

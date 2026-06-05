@@ -146,6 +146,16 @@ class ScanOrchestrator:
                 "Disable verbose errors in production, return generic error pages, and send stack traces or "
                 "debug details only to protected server-side logs."
             ),
+            "Credential / Config Disclosure in Response Body": (
+                "Remove hardcoded credentials and configuration secrets from application responses. "
+                "Use environment variables or a secrets manager, and ensure error handlers never "
+                "dump configuration values in production."
+            ),
+            "Debug / Metrics Endpoint Exposed": (
+                "Restrict access to debug, metrics, and actuator endpoints by IP allowlist, "
+                "reverse-proxy rules, or authentication. Disable in production or serve on a "
+                "separate administrative port."
+            ),
         }
 
     async def queue_scan(self, scan_id: str) -> None:
@@ -241,6 +251,16 @@ class ScanOrchestrator:
                         len(observed_exception_findings),
                     )
                     findings.extend(observed_exception_findings)
+
+            auth_detector_obj = next((detector for detector in self.detectors if isinstance(detector, AuthenticationFailuresDetector)), None)
+            if auth_detector_obj is not None:
+                observed_credential_findings = auth_detector_obj.findings_from_observed_evidence(findings)
+                if observed_credential_findings:
+                    logger.info(
+                        "derived %d credential-disclosure finding(s) from observed evidence",
+                        len(observed_credential_findings),
+                    )
+                    findings.extend(observed_credential_findings)
 
             # Provide the scan root URL so site-wide detectors can avoid duplicate page-level findings.
             crypto_detector = next((detector for detector in self.detectors if isinstance(detector, CryptoFailuresDetector)), None)
@@ -671,8 +691,13 @@ class ScanOrchestrator:
             "For each finding, perform these steps IN ORDER before writing JSON:\n"
             "  Step 1: Read the evidence_block carefully. Identify the EXACT proof markers present.\n"
             "  Step 2: Decide if this is real or a false positive based ONLY on what is in the evidence.\n"
-            "  Step 3: Write remediation that is specific to the vuln_type AND the tech stack below.\n"
-            "  Step 4: Describe business_impact in terms of what data/capability is concretely at risk.\n"
+            "  Step 3: For pattern-match findings (e.g., Verbose Error Handling, path disclosure): "
+            "determine whether the matched string is causally connected to the payload or is a "
+            "genuine error condition — or if it could merely be from normal page content, reflected "
+            "payload text, or navigation HTML. Do NOT accept the detector's confidence score at "
+            "face value; independently reason about the plausibility of the match.\n"
+            "  Step 4: Write remediation that is specific to the vuln_type AND the tech stack below.\n"
+            "  Step 5: Describe business_impact in terms of what data/capability is concretely at risk.\n"
             "Output ONLY the JSON. No preamble, no explanation outside the JSON.\n\n"
         )
 
@@ -714,7 +739,10 @@ class ScanOrchestrator:
             "The detection engine has already pre-scored false_positive_probability based on "
             "objective evidence markers. Your FP score is ADVISORY ONLY:\n"
             "- You may LOWER false_positive_probability if you see additional confirming evidence.\n"
-            "- You may NOT raise it above the pre-scored value. The system will clamp it.\n"
+            "- For pattern-match findings (Verbose Error Handling, path disclosure, info leakage): "
+            "you MUST independently evaluate whether the matched text is causally connected to an "
+            "actual error condition. If the match appears only in reflected payload text, navigation "
+            "HTML, or normal page content, you may raise false_positive_probability accordingly.\n"
             "- For structural findings (missing headers, GET credentials, TLS issues, admin paths), "
             "the finding itself IS the proof — do NOT mark these as false positives.\n"
             "- Focus your analysis on remediation specificity, business_impact depth, and "

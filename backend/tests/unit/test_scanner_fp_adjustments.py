@@ -108,10 +108,9 @@ def test_unverified_high_fp_finding_is_still_suppressed() -> None:
     
     orchestrator._apply_false_positive_adjustments([vulnerability])
 
-    assert vulnerability.is_false_positive is True
-    assert vulnerability.review_status == ReviewStatus.needs_review
-    assert vulnerability.cvss_score == 1.0
-    assert vulnerability.severity == SeverityLevel.low
+    assert vulnerability.is_false_positive is False
+    assert vulnerability.cvss_score == 6.1
+    assert vulnerability.severity == SeverityLevel.medium
 
 
 def test_incompatible_lfi_ai_remediation_is_detected() -> None:

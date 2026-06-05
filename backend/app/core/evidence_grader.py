@@ -104,6 +104,16 @@ _STRONG_ACTIVE_METHODS: frozenset[str] = frozenset({
     "remote_include_error_oracle",
 })
 
+# Detection methods that are purely passive pattern matching — no active probe,
+# no causal validation.  Findings from these methods should receive a lower
+# evidence grade because the match could be from normal page content or
+# reflected payload text rather than a genuine error disclosure.
+_WEAK_PATTERN_METHODS: frozenset[str] = frozenset({
+    "heuristic",
+    "observed_exception_evidence",
+    "path_bruteforce",
+})
+
 # Evidence-blob keywords that signal strong active proof.
 _STRONG_EVIDENCE_KEYWORDS: tuple[str, ...] = (
     "root:x:0",
@@ -171,6 +181,22 @@ class EvidenceGrader:
                 reason=(
                     f"Structural/observable finding: '{vuln.vuln_type}' — "
                     f"the observation itself is the proof"
+                ),
+            )
+
+        # --- Grade C (early): weak pattern-match method ---
+        # Pattern-match findings (observed_exception_evidence, heuristic) are
+        # inherently weaker because the match could be from normal page content
+        # or reflected payload text rather than a genuine error disclosure.
+        # Grade them C regardless of confidence so the AI has room to evaluate.
+        if method in _WEAK_PATTERN_METHODS:
+            return EvidenceGrade(
+                grade="C",
+                fp_ceiling=0.40,
+                reason=(
+                    f"Weak pattern-match method: '{method}' — "
+                    f"matched content may be from normal page content or "
+                    f"reflected payload rather than a genuine error disclosure"
                 ),
             )
 

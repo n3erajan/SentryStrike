@@ -1,38 +1,8 @@
-import asyncio
-
-import pytest
 import httpx
 
 from app.core.detectors.base_detector import Finding
 from app.core.detectors.exception_handler import ExceptionHandlingDetector
 from app.models.vulnerability import OwaspCategory, SeverityLevel
-
-
-class FakeMetricsResponse:
-    status_code = 200
-    text = "# HELP http_requests_total Total requests\n# TYPE http_requests_total counter\nhttp_requests_total 42\n"
-    headers = httpx.Headers({"content-type": "text/plain"})
-
-
-class FakeMetricsClient:
-    async def get(self, url: str):
-        return FakeMetricsResponse()
-
-
-@pytest.mark.asyncio
-async def test_exception_detector_reports_exposed_metrics_endpoint() -> None:
-    detector = ExceptionHandlingDetector()
-    finding = await detector._probe_debug_endpoint(
-        FakeMetricsClient(),
-        asyncio.Semaphore(1),
-        "https://example.test",
-        "/metrics",
-    )
-
-    assert finding is not None
-    assert finding.vuln_type == "Debug / Metrics Endpoint Exposed"
-    assert "metrics endpoint" in finding.evidence.lower()
-    assert "http_requests_total" in finding.verification_response_snippet
 
 
 def test_exception_detector_derives_a10_from_observed_database_error_evidence() -> None:

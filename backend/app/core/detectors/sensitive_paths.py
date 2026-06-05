@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -37,6 +38,30 @@ class SensitivePathsDetector(BaseDetector):
         "/WEB-INF/web.xml",
         "/Dockerfile",
         "/docker-compose.yml",
+        # Debug / Metrics / Actuator endpoints
+        "/debug",
+        "/debug/vars",
+        "/metrics",
+        "/actuator",
+        "/actuator/env",
+        "/actuator/metrics",
+        "/actuator/health",
+        "/actuator/prometheus",
+        "/__debug__",
+    ]
+
+    _DEBUG_METRICS_PATTERNS: list[re.Pattern] = [
+        re.compile(p, re.IGNORECASE)
+        for p in [
+            r"^#\s*HELP\s+\w+",
+            r"^#\s*TYPE\s+\w+",
+            r"jvm_memory_used_bytes|process_cpu_seconds_total|http_server_requests",
+            r"\"activeProfiles\"|\"propertySources\"|\"systemProperties\"",
+            r"\"heapUsed\"|\"rss\"|\"uptime\"|\"pid\"",
+            r"debug\s*=\s*true|app_debug|environment\s*:\s*(dev|debug|local)",
+            r"phpinfo\(\)|configuration file \(php\.ini\) path",
+            r"server-status|apache server status|scoreboard",
+        ]
     ]
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
@@ -115,6 +140,9 @@ class SensitivePathsDetector(BaseDetector):
                         elif "web.xml" in path and "<web-app" in body_lower:
                             is_sensitive = True
                             evidence = "Java web.xml configuration file exposed."
+                        elif any(p.search(response.text) for p in self._DEBUG_METRICS_PATTERNS):
+                            is_sensitive = True
+                            evidence = "Debug / metrics / actuator endpoint exposed."
                         else:
                             # If it's a 200 OK and not HTML, it's highly suspicious
                             if "<html" not in body_lower and len(response.text.strip()) > 0:
@@ -122,6 +150,16 @@ class SensitivePathsDetector(BaseDetector):
                                 evidence = f"Sensitive file {path} is accessible."
                         
                         if is_sensitive:
+                            # Determine vuln_type based on path category
+                            is_debug_or_metrics = any(
+                                p.search(response.text) for p in self._DEBUG_METRICS_PATTERNS
+                            )
+                            vuln_type = (
+                                "Debug / Metrics Endpoint Exposed"
+                                if is_debug_or_metrics
+                                else "Sensitive File Exposure"
+                            )
+
                             # Phase 3: Scope Context
                             clean_target_path = "/" + clean_path
                             severity = SeverityLevel.high if ".env" in path or ".sql" in path else SeverityLevel.medium
@@ -136,7 +174,7 @@ class SensitivePathsDetector(BaseDetector):
 
                             return Finding(
                                 category=OwaspCategory.a02, # Security Misconfiguration / Info Disclosure
-                                vuln_type="Sensitive File Exposure",
+                                vuln_type=vuln_type,
                                 severity=severity,
                                 url=target_url,
                                 evidence=f"Accessible sensitive path: {evidence} Snippet: {response.text[:100]}...",
