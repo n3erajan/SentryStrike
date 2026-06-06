@@ -135,7 +135,7 @@ class FileUploadDetector(BaseDetector):
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
             if accessible_url:
                 findings.append(Finding(
-                    category=OwaspCategory.a05,
+                    category=OwaspCategory.a01,
                     vuln_type="Unrestricted File Upload",
                     severity=SeverityLevel.critical,
                     url=form_url,
@@ -163,7 +163,7 @@ class FileUploadDetector(BaseDetector):
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
             if accessible_url:
                 findings.append(Finding(
-                    category=OwaspCategory.a05,
+                    category=OwaspCategory.a01,
                     vuln_type="Weak File Upload Validation",
                     severity=SeverityLevel.critical,
                     url=form_url,
@@ -181,7 +181,7 @@ class FileUploadDetector(BaseDetector):
                 ))
             else:
                 findings.append(Finding(
-                    category=OwaspCategory.a05,
+                    category=OwaspCategory.a01,
                     vuln_type="Weak File Upload Validation",
                     severity=SeverityLevel.high,
                     url=form_url,
@@ -206,7 +206,7 @@ class FileUploadDetector(BaseDetector):
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
             if accessible_url:
                 findings.append(Finding(
-                    category=OwaspCategory.a05,
+                    category=OwaspCategory.a01,
                     vuln_type="Double Extension Bypass",
                     severity=SeverityLevel.critical,
                     url=form_url,
@@ -224,7 +224,7 @@ class FileUploadDetector(BaseDetector):
                 ))
             else:
                 findings.append(Finding(
-                    category=OwaspCategory.a05,
+                    category=OwaspCategory.a01,
                     vuln_type="Double Extension Bypass",
                     severity=SeverityLevel.high,
                     url=form_url,
@@ -245,7 +245,7 @@ class FileUploadDetector(BaseDetector):
         )
         if accepted and not self._has_error_terms(response.text or ""):
             findings.append(Finding(
-                category=OwaspCategory.a05,
+                category=OwaspCategory.a01,
                 vuln_type="Missing File Type Validation",
                 severity=SeverityLevel.medium,
                 url=form_url,

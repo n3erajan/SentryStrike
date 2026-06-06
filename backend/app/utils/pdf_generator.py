@@ -125,14 +125,14 @@ def _collapse_repeated_evidence_excerpt(text: str) -> str:
 OWASP_CATEGORY_LABELS = {
     "a01": "A01-Broken Access Control",
     "a02": "A02-Security Misconfiguration",
-    "a03": "A03-Supply Chain Failures",
+    "a03": "A03-Software Supply Chain Failures",
     "a04": "A04-Cryptographic Failures",
     "a05": "A05-Injection",
     "a06": "A06-Insecure Design",
     "a07": "A07-Authentication Failures",
-    "a08": "A08-Data Integrity Failures",
-    "a09": "A09-Logging Failures",
-    "a10": "A10-Exception Handling and Information Leakage",
+    "a08": "A08-Software and Data Integrity Failures",
+    "a09": "A09-Security Logging and Monitoring Failures",
+    "a10": "A10-Mishandling of Exceptional Conditions",
 }
 
 

@@ -513,12 +513,17 @@ class ExceptionHandlingDetector(BaseDetector):
         if response.status_code in {301, 302, 303, 307, 308}:
             return None
 
-        return self._analyse_response(
+        finding = self._analyse_response(
             url=test_url, method="GET", status=response.status_code,
             body=response.text, headers=response.headers,
             trigger="non-existent path probe", require_body_match=True,
             parameter=None, payload=None
         )
+        # A 404 response to a non-existent path is expected behaviour.
+        # Only report if the body reveals real error internals (Medium+).
+        if finding is not None and response.status_code == 404 and finding.severity == SeverityLevel.low:
+            return None
+        return finding
 
     async def _probe_get_params(
         self,

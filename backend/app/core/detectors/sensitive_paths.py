@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import httpx
 
@@ -74,18 +74,18 @@ class SensitivePathsDetector(BaseDetector):
         elif not root_url:
             return []
             
-        # Phase 3: Extract the app base path for scoping checks
-        app_base_path = "/"
-        if urls:
-            app_base_path = urlparse(urls[0]).path
-            if not app_base_path.endswith("/"):
-                app_base_path = app_base_path[:app_base_path.rfind("/") + 1]
-            if not app_base_path:
-                app_base_path = "/"
-            
-        # Ensure root url ends with a slash
         if not root_url.endswith("/"):
             root_url += "/"
+
+        # Collect unique directory prefixes from all crawled URLs so we probe
+        # sensitive paths under subdirectories (e.g. /dvwa/phpinfo.php), not
+        # only at the domain root.
+        dirs_to_check = {"/"}
+        for u in urls:
+            p = urlparse(u).path
+            last_slash = p.rfind("/")
+            if last_slash > 0:
+                dirs_to_check.add(p[:last_slash + 1])
 
         settings = get_settings()
         semaphore = asyncio.Semaphore(5)
@@ -97,11 +97,20 @@ class SensitivePathsDetector(BaseDetector):
             event_hooks={"response": [make_httpx_response_logger("sensitive_paths", "path_probe")]},
         ) as client:
             
-            # Helper to check a specific path
-            async def check_path(path: str) -> Finding | None:
-                # Remove leading slash from path to work correctly with urljoin
+            already_checked: set[str] = set()
+
+            # Helper to check a specific path under a given directory prefix
+            async def check_path(base_dir: str, path: str) -> Finding | None:
                 clean_path = path.lstrip('/')
-                target_url = urljoin(root_url, clean_path)
+                # Join base_dir (e.g. /dvwa/) with the relative path
+                if base_dir == "/":
+                    target_url = root_url + clean_path
+                else:
+                    target_url = root_url.rstrip("/") + base_dir.rstrip("/") + "/" + clean_path
+
+                if target_url in already_checked:
+                    return None
+                already_checked.add(target_url)
                 
                 async with semaphore:
                     try:
@@ -160,20 +169,10 @@ class SensitivePathsDetector(BaseDetector):
                                 else "Sensitive File Exposure"
                             )
 
-                            # Phase 3: Scope Context
-                            clean_target_path = "/" + clean_path
                             severity = SeverityLevel.high if ".env" in path or ".sql" in path else SeverityLevel.medium
-                            
-                            if app_base_path != "/" and not clean_target_path.startswith(app_base_path):
-                                evidence += f" (Note: File '{clean_target_path}' is located outside the observed application base path '{app_base_path}'.)"
-                                # Optional severity reduction
-                                if severity == SeverityLevel.high:
-                                    severity = SeverityLevel.medium
-                                elif severity == SeverityLevel.medium:
-                                    severity = SeverityLevel.low
 
                             return Finding(
-                                category=OwaspCategory.a02, # Security Misconfiguration / Info Disclosure
+                                category=OwaspCategory.a02,
                                 vuln_type=vuln_type,
                                 severity=severity,
                                 url=target_url,
@@ -186,7 +185,7 @@ class SensitivePathsDetector(BaseDetector):
                         logger.debug("Error checking path %s: %s", target_url, e)
                 return None
 
-            tasks = [check_path(path) for path in self._common_sensitive_paths]
+            tasks = [check_path(dir, path) for dir in dirs_to_check for path in self._common_sensitive_paths]
             results = await asyncio.gather(*tasks)
             
             for res in results:

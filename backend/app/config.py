@@ -13,12 +13,13 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, alias="APP_PORT")
 
     mongodb_uri: str = Field(default="mongodb://localhost:27017", alias="MONGODB_URI")
-    mongodb_db_name: str = Field(default="sentry_strike", alias="MONGODB_DB_NAME")
+    mongodb_db_name: str = Field(default="sentrystrike", alias="MONGODB_DB_NAME")
 
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
     ollama_model: str = Field(default="qwen3.5:9b", alias="OLLAMA_MODEL")
     ollama_timeout_seconds: float = Field(default=120.0, alias="OLLAMA_TIMEOUT_SECONDS")
     ai_max_retries: int = Field(default=2, alias="AI_MAX_RETRIES")
+    ai_batch_size: int = Field(default=2, alias="AI_BATCH_SIZE")
 
     crawl_depth: int = Field(default=3, alias="CRAWL_DEPTH")
     crawl_max_urls: int = Field(default=200, alias="CRAWL_MAX_URLS")

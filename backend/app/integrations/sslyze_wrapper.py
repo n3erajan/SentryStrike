@@ -9,18 +9,22 @@ class SslAnalyzer:
         hostname = parsed.hostname
         if not hostname:
             return {"valid": False, "issues": ["Invalid hostname"]}
-        if parsed.scheme != "https":
-            return {"valid": False, "issues": ["Target is not HTTPS"]}
 
+        port = 443
         context = ssl.create_default_context()
         issues: list[str] = []
 
         try:
-            reader, writer = await asyncio.open_connection(hostname, 443, ssl=context, server_hostname=hostname)
+            reader, writer = await asyncio.open_connection(
+                hostname, port, ssl=context, server_hostname=hostname
+            )
             writer.close()
             await writer.wait_closed()
         except Exception:
-            issues.append("Unable to validate TLS handshake in lightweight analyzer")
+            if parsed.scheme == "https":
+                issues.append("Unable to validate TLS handshake in lightweight analyzer")
+            else:
+                issues.append("Target does not support HTTPS (no TLS response on port 443)")
 
         return {
             "valid": len(issues) == 0,

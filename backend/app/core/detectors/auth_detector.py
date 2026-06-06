@@ -587,7 +587,6 @@ class AuthenticationFailuresDetector(BaseDetector):
                                         "rate-limit status code, or CAPTCHA challenge observed. "
                                         "The endpoint does not defend against credential-stuffing "
                                         "or password-spray attacks. "
-                                        "OWASP 2025 A07 / CWE-307."
                                     ),
                                     verified=True,
                                     detection_method="credential_stuffing_probe",
@@ -645,7 +644,6 @@ class AuthenticationFailuresDetector(BaseDetector):
                                                 f"(mean={burst_mean:.0f}ms, stdev={burst_stdev:.0f}ms) "
                                                 "with no rate-limit or lockout signal, confirming the "
                                                 "endpoint does not throttle parallel authentication attempts. "
-                                                "OWASP 2025 A07 / CWE-307."
                                             ),
                                             verified=True,
                                             detection_method="active_bruteforce_probe",
@@ -774,12 +772,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                                 or "password" in input_types)
             has_username = bool(input_names.intersection({"username", "user", "email", "mail", "login",
                                                            "uname", "phone", "mobile", "account"}))
-            has_mfa      = bool(input_names.intersection(self.mfa_tokens))
             has_hidden   = "hidden" in input_types
-            has_remember = bool(input_names.intersection({"remember", "remember_me", "rememberme",
-                                                           "keep_logged_in", "stay_signed_in"}))
-            has_captcha  = bool(input_names.intersection({"captcha", "recaptcha", "g-recaptcha-response",
-                                                           "h-captcha-response", "captcha_token", "cf-turnstile-response"}))
 
             # 1. Login form discovered → run active auth tests.
             # The passive "Login Form Discovered" finding has been removed: it
@@ -792,61 +785,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                 active_findings = await self._test_active_auth(form_url, form_method, raw_inputs, session_cookies)
                 findings.extend(active_findings)
 
-            # 2. Password field without username → partial auth form (password-only SSO, PIN, etc.)
-            if has_password and not has_username:
-                findings.append(self._finding(
-                    vuln_type="Password-Only Authentication Form Detected",
-                    url=form_url,
-                    method=form_method,
-                    severity=SeverityLevel.medium,
-                    evidence=(
-                        "Form contains a password/secret field without a standard username field. "
-                        "Verify this is not a PIN or secondary-auth bypass point."
-                    ),
-                ))
-
-            # 3. MFA / OTP form
-            if has_mfa:
-                findings.append(self._finding(
-                    vuln_type="MFA / OTP Verification Form Detected",
-                    url=form_url,
-                    method=form_method,
-                    severity=SeverityLevel.medium,
-                    evidence=(
-                        "MFA-related input fields detected. Verify: OTP is single-use, "
-                        "short-lived (≤60s), rate-limited, and that step-up cannot be skipped."
-                    ),
-                ))
-
-            # 4. Remember-me / persistent session checkbox
-            if has_remember:
-                findings.append(self._finding(
-                    vuln_type="Persistent Session ('Remember Me') Detected",
-                    url=form_url,
-                    method=form_method,
-                    severity=SeverityLevel.low,
-                    evidence=(
-                        "A 'remember me' or 'keep logged in' control was found. "
-                        "Verify that persistent tokens are cryptographically random, "
-                        "stored hashed server-side, and have a reasonable expiry."
-                    ),
-                ))
-
-            # 5. No CAPTCHA on login form — brute-force risk
-            if has_username and has_password and not has_captcha:
-                findings.append(self._finding(
-                    vuln_type="Login Form Lacks Visible CAPTCHA",
-                    url=form_url,
-                    method=form_method,
-                    severity=SeverityLevel.low,
-                    evidence=(
-                        "Login form has no CAPTCHA input detected. "
-                        "Automated credential stuffing/brute-force is easier without it; "
-                        "confirm server-side rate limiting or invisible CAPTCHA is in place."
-                    ),
-                ))
-
-            # 6. Login form submitted over GET
+            # 2. Login form submitted over GET
             if has_password and form_method == "GET":
                 findings.append(self._finding(
                     vuln_type="Credentials Transmitted via HTTP GET",
@@ -890,39 +829,6 @@ class AuthenticationFailuresDetector(BaseDetector):
                     ),
                 ))
 
-            # 9. Registration form — weak default checks
-            reg_hits = input_names.intersection({"username", "email", "password", "confirm_password"})
-            if len(reg_hits) >= 2 and "register" in form_url.lower() or "signup" in form_url.lower():
-                findings.append(self._finding(
-                    vuln_type="Registration Endpoint Discovered",
-                    url=form_url,
-                    method=form_method,
-                    severity=SeverityLevel.low,
-                    evidence=(
-                        "User-registration form detected. Verify: password complexity policy, "
-                        "email verification, rate limiting to prevent account enumeration, "
-                        "and CAPTCHA to block bulk account creation."
-                    ),
-                ))
-
-            # 10. Credential inputs with autocomplete not disabled (evidence hint)
-            autocomplete_off = any(
-                getattr(i, "autocomplete", "").lower() == "off"
-                for i in raw_inputs
-                if i.name.lower() in {"password", "passwd", "pass", "pwd", "otp", "pin"}
-            )
-            if has_password and not autocomplete_off:
-                findings.append(self._finding(
-                    vuln_type="Password Field May Allow Browser Autocomplete",
-                    url=form_url,
-                    method=form_method,
-                    severity=SeverityLevel.low,
-                    evidence=(
-                        "Password input does not appear to have autocomplete='off'. "
-                        "On shared/public devices this can expose credentials via browser autofill."
-                    ),
-                ))
-
         # -----------------------------------------------------------------------
         # URL analysis
         # -----------------------------------------------------------------------
@@ -940,7 +846,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                 findings.append(self._finding(
                     vuln_type="Authentication Endpoint Discovered",
                     url=url,
-                    severity=SeverityLevel.low,
+                    severity=SeverityLevel.info,
                     evidence=(
                         "Authentication-related path detected. Verify: account lockout policy, "
                         "brute-force rate limiting, MFA enforcement, and secure session issuance."
@@ -961,17 +867,6 @@ class AuthenticationFailuresDetector(BaseDetector):
                             "and bound to the requesting user."
                         ),
                     ))
-                else:
-                    findings.append(self._finding(
-                        vuln_type="Password Reset Endpoint Discovered",
-                        url=url,
-                        severity=SeverityLevel.low,
-                        evidence=(
-                            "Password-reset endpoint with a token parameter found. "
-                            "Verify token entropy, single-use enforcement, expiry, and binding."
-                        ),
-                    ))
-
             # 3. Admin / privileged endpoint discovered
             if self._path_hits(path_tokens, self.admin_tokens) or self._url_contains(lowered, self.admin_tokens):
                 findings.append(self._finding(
@@ -986,60 +881,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                     ),
                 ))
 
-            # 4. Registration endpoint discovered
-            if self._path_hits(path_tokens, self.register_tokens) or self._url_contains(lowered, self.register_tokens):
-                findings.append(self._finding(
-                    vuln_type="User Registration Endpoint Discovered",
-                    url=url,
-                    severity=SeverityLevel.low,
-                    evidence=(
-                        "User registration path detected. Verify: email verification is required, "
-                        "rate limiting prevents mass account creation, and password policy is enforced."
-                    ),
-                ))
-
-            # 5. Logout endpoint — check for CSRF / token requirement
-            if self._path_hits(path_tokens, self.logout_tokens) or self._url_contains(lowered, self.logout_tokens):
-                if not query_keys.intersection(self._security_control_tokens):
-                    findings.append(self._finding(
-                        vuln_type="Logout Endpoint May Lack CSRF Protection",
-                        url=url,
-                        severity=SeverityLevel.medium,
-                        category=OwaspCategory.a01,
-                        evidence=(
-                            "Logout endpoint found without a CSRF token or nonce in the URL. "
-                            "A CSRF logout attack can forcibly terminate a victim's session."
-                        ),
-                    ))
-
-            # 6. API authentication / token-issuance endpoints
-            for api_tok in self.api_auth_tokens:
-                if api_tok in lowered:
-                    findings.append(self._finding(
-                        vuln_type="API Authentication / Token Endpoint Discovered",
-                        url=url,
-                        severity=SeverityLevel.medium,
-                        evidence=(
-                            f"API auth endpoint pattern '{api_tok}' detected. Verify: "
-                            "token lifetime is short, refresh tokens are rotated on use, "
-                            "revocation endpoint exists, and tokens are bound to client."
-                        ),
-                    ))
-                    break
-
-            # 7. MFA endpoint discovered
-            if self._path_hits(path_tokens, self.mfa_tokens) or self._url_contains(lowered, self.mfa_tokens):
-                findings.append(self._finding(
-                    vuln_type="MFA / OTP Verification Endpoint Discovered",
-                    url=url,
-                    severity=SeverityLevel.low,
-                    evidence=(
-                        "MFA/OTP-related path detected. Verify: codes are rate-limited, "
-                        "single-use, short-lived, and MFA step cannot be skipped by direct navigation."
-                    ),
-                ))
-
-            # 8. Sensitive credentials in query string (GET)
+            # 5. Sensitive credentials in query string (GET)
             leaked_params = self._sensitive_query_params(query_params, lowered)
             if leaked_params:
                 findings.append(self._finding(
@@ -1140,18 +982,6 @@ class AuthenticationFailuresDetector(BaseDetector):
                             ),
                         ))
 
-                if "response_type=token" in lowered or "response_type=id_token" in lowered:
-                    findings.append(self._finding(
-                        vuln_type="OAuth Implicit Flow Detected (Deprecated / Insecure)",
-                        url=url,
-                        severity=SeverityLevel.high,
-                        evidence=(
-                            "OAuth implicit flow (response_type=token or id_token) detected. "
-                            "Tokens are returned in the URL fragment and are accessible to JS. "
-                            "Use authorization code flow with PKCE instead."
-                        ),
-                    ))
-
                 if "state" not in query_keys and any(tok in lowered for tok in ("oauth", "authorize", "callback")):
                     findings.append(self._finding(
                         vuln_type="OAuth Request Missing 'state' Parameter (CSRF Risk)",
@@ -1163,19 +993,6 @@ class AuthenticationFailuresDetector(BaseDetector):
                             "or initiate unintended OAuth flows on behalf of the victim."
                         ),
                     ))
-
-            # 13. Credential enumeration hints (password-reset / registration responses)
-            if self._url_contains(lowered, self.reset_tokens) or self._url_contains(lowered, self.register_tokens):
-                findings.append(self._finding(
-                    vuln_type="Potential Account Enumeration via Auth Endpoint",
-                    url=url,
-                    severity=SeverityLevel.medium,
-                    evidence=(
-                        "Password reset and registration endpoints commonly leak whether an "
-                        "account exists via different response messages or timing. "
-                        "Verify that responses are identical for existing and non-existing accounts."
-                    ),
-                ))
 
         return findings
 

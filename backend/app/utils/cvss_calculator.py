@@ -42,7 +42,7 @@ class CvssCalculator:
         "OAuth": {"ac": "L", "ui": "R", "s": "U", "c": "L", "i": "L", "a": "N"},
         "TLS": {"ac": "H", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
         "SSL": {"ac": "H", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
-        "Known CVE": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "N"},
+        "Vulnerable Component": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "H", "a": "N"},
 
         # --- Low (0.1-3.9) ---
         "Missing Security": {"ac": "H", "ui": "N", "s": "U", "c": "L", "i": "N", "a": "N"},

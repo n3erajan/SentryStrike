@@ -36,7 +36,7 @@ class SupplyChainDetector(BaseDetector):
                 findings.append(
                     Finding(
                         category=OwaspCategory.a03,
-                        vuln_type=f"Known CVE in {name}",
+                        vuln_type=f"Vulnerable Component: {name}",
                         severity=severity,
                         url=root_url,
                         evidence=(

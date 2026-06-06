@@ -15,13 +15,13 @@ async def list_owasp_categories() -> dict:
     categories = [
         "A01-Broken Access Control",
         "A02-Security Misconfiguration",
-        "A03-Supply Chain Failures",
-        "A04-Insecure Design",
+        "A03-Software Supply Chain Failures",
+        "A04-Cryptographic Failures",
         "A05-Injection",
-        "A06-Vulnerable and Outdated Components",
+        "A06-Insecure Design",
         "A07-Authentication Failures",
         "A08-Software and Data Integrity Failures",
         "A09-Security Logging and Monitoring Failures",
-        "A10-Exception Handling and Information Leakage",
+        "A10-Mishandling of Exceptional Conditions",
     ]
     return json_response(categories)

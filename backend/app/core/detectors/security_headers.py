@@ -108,18 +108,6 @@ class SecurityHeadersDetector(BaseDetector):
                         is_sensitive = True
                         break
                         
-            if is_sensitive and self._cache_controls_sensitive(cc, pragma, expires):
-                findings.append(
-                    Finding(
-                        category=OwaspCategory.a02,
-                        vuln_type="Missing Cache-Control Hardening",
-                        severity=SeverityLevel.low,
-                        url=root_url,
-                        evidence=f"Sensitive endpoint is missing strong cache controls: Cache-Control: {response.headers.get('Cache-Control', 'None')}",
-                        verified=True
-                    )
-                )
-
             # Server header version leak
             server_hdr = response.headers.get("server", "")
             if server_hdr and any(c.isdigit() for c in server_hdr):
