@@ -55,13 +55,13 @@ class FileUploadDetector(BaseDetector):
             if raw_action:
                 form_url = urljoin(page_url, raw_action)
             else:
-                # No action attribute — browser submits back to the same page.
+                # No action attribute - browser submits back to the same page.
                 form_url = page_url
 
             form_method = (getattr(form, "method", "POST") or "POST").upper()
             raw_inputs = list(getattr(form, "inputs", []))
 
-            # Accept both "file" and "FILE" — normalise to lower-case.
+            # Accept both "file" and "FILE" - normalise to lower-case.
             file_inputs = [
                 inp for inp in raw_inputs
                 if getattr(inp, "input_type", "").lower() == "file"
@@ -71,7 +71,7 @@ class FileUploadDetector(BaseDetector):
 
         if not candidates:
             logger.info(
-                "file_upload: no forms with file inputs found in %d form(s) — skipping",
+                "file_upload: no forms with file inputs found in %d form(s) - skipping",
                 len(forms),
             )
             return []
@@ -151,7 +151,7 @@ class FileUploadDetector(BaseDetector):
                     reproducible=True,
                     verified=True,
                 ))
-                return  # Most severe finding recorded — stop here.
+                return  # Most severe finding recorded - stop here.
 
         # --- Test 2: .php upload with spoofed image/jpeg content-type ---
         accepted, response = await self._send_upload(
@@ -238,7 +238,7 @@ class FileUploadDetector(BaseDetector):
                     verified=True,
                 ))
 
-        # --- Test 4: unrestricted type — accepts plain .txt ---
+        # --- Test 4: unrestricted type - accepts plain .txt ---
         accepted, response = await self._send_upload(
             client, form_url, method, raw_inputs, file_field,
             txt_name, txt_content, "text/plain",
@@ -276,7 +276,7 @@ class FileUploadDetector(BaseDetector):
         # BUG FIX: original code had inverted ternary:
         #   method="POST" if method != "POST" else method
         # which always resolves to "POST" but was clearly intended to
-        # normalise the value — just pass method directly.
+        # normalise the value - just pass method directly.
         response = await client.request(
             method=method,
             url=form_url,
@@ -293,7 +293,7 @@ class FileUploadDetector(BaseDetector):
     def _build_form_payload(self, raw_inputs: list, file_field: str) -> dict:
         # FormPayloadBuilder.build() requires (form_inputs, target_param, target_value)
         # and is designed for injection-style tests.  For file upload we don't have a
-        # payload to inject — we just need sibling fields filled with benign defaults so
+        # payload to inject - we just need sibling fields filled with benign defaults so
         # the server doesn't reject the submission for missing required fields.
         # We build that ourselves here rather than misusing FormPayloadBuilder.
         payload: dict[str, str] = {}
@@ -303,7 +303,7 @@ class FileUploadDetector(BaseDetector):
                 continue
             inp_type = getattr(inp, "input_type", "text").lower()
             if inp_type == "file":
-                # Exclude all file fields — they are passed via the `files=` kwarg.
+                # Exclude all file fields - they are passed via the `files=` kwarg.
                 continue
             elif inp_type == "password":
                 payload[name] = "sentry_password123"
@@ -376,7 +376,7 @@ class FileUploadDetector(BaseDetector):
             if filename in match:
                 urls.append(urljoin(site_root, match))
 
-        # 5. Common upload directory guesses — anchored to site root, not form path.
+        # 5. Common upload directory guesses - anchored to site root, not form path.
         #    Using form_url with urljoin for paths like "uploads/" would resolve to
         #    e.g. http://host/dvwa/vulnerabilities/uploads/ (wrong).
         #    urljoin(site_root, "uploads/sentry_test.php") → http://host/uploads/sentry_test.php

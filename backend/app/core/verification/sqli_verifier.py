@@ -2,10 +2,10 @@
 SQL Injection Verifier: Active verification for SQL injection vulnerabilities.
 
 Implements four techniques ordered by reliability:
-  1. Boolean-based differential  — sqlmap-style directional check with double confirmation
-  2. Error-based detection       — SQL-engine-specific markers only, absent from baseline
-  3. UNION-based detection       — canary-first; differential paths require 3+ column hits
-  4. Time-based blind            — relative floor, not hardcoded; skipped if server is slow
+  1. Boolean-based differential  - sqlmap-style directional check with double confirmation
+  2. Error-based detection       - SQL-engine-specific markers only, absent from baseline
+  3. UNION-based detection       - canary-first; differential paths require 3+ column hits
+  4. Time-based blind            - relative floor, not hardcoded; skipped if server is slow
 
 False-positive philosophy
 --------------------------
@@ -14,39 +14,39 @@ No single-payload, single-check result is ever reported as vulnerable.
 
 Key fixes vs. the previous version
 ------------------------------------
-Problem 1  — UNION similarity 0.01 being treated as a hit.
-  Fix       — Hard gate: similarity < 0.10 is a page-transition/error-page, SKIP.
+Problem 1  - UNION similarity 0.01 being treated as a hit.
+  Fix       - Hard gate: similarity < 0.10 is a page-transition/error-page, SKIP.
               This replaces the broken _UNION_SIM_MIN = 0.05 floor which was
               undercut by ResponseAnalyzer.is_significant_change returning True.
 
-Problem 2  — Version extraction firing on page-transition responses.
-  Fix       — Version extraction is only attempted when the NULL-differential
+Problem 2  - Version extraction firing on page-transition responses.
+  Fix       - Version extraction is only attempted when the NULL-differential
               response has similarity IN [0.10, 0.97]. If the NULL probe itself
               would be skipped, so is the version probe that follows it.
 
-Problem 3  — Stable column-count differential (75 confidence, reproducible=True)
+Problem 3  - Stable column-count differential (75 confidence, reproducible=True)
               firing on non-SQL pages (captcha, exec).
-  Fix       — Minimum 3 payloads in the valid window required (was 2), AND an
+  Fix       - Minimum 3 payloads in the valid window required (was 2), AND an
               additional cross-column confirmation probe must pass before
               is_vulnerable is set True. Single-payload and dual-payload hits
               are always suppressed.
 
-Problem 4  — login.php username (similarity 0.03) being reported.
-  Fix       — Covered by the 0.10 hard floor above.
+Problem 4  - login.php username (similarity 0.03) being reported.
+  Fix       - Covered by the 0.10 hard floor above.
 
-Problem 5  — xss_s/txtName sqlite_version() false positive.
-  Fix       — The canary path is now the ONLY path that can set is_vulnerable=True
+Problem 5  - xss_s/txtName sqlite_version() false positive.
+  Fix       - The canary path is now the ONLY path that can set is_vulnerable=True
               on a page-transition response. Version extraction requires the
               corresponding NULL probe to have passed the similarity gate first.
 
 Design: canary-first, everything else is circumstantial
 --------------------------------------------------------
 UNION detection hierarchy (confidence order):
-  90 — Canary reflected in response, absent from baseline       (proof of extraction)
-  90 — Version indicator in response, absent from baseline,
+  90 - Canary reflected in response, absent from baseline       (proof of extraction)
+  90 - Version indicator in response, absent from baseline,
        AND parent NULL probe passed similarity gate             (strong proof)
-  75 — 3+ NULL payloads in valid window, cross-column confirm   (circumstantial but reproducible)
-  suppressed — anything below 3 NULL payloads, or unconfirmed   (not reported)
+  75 - 3+ NULL payloads in valid window, cross-column confirm   (circumstantial but reproducible)
+  suppressed - anything below 3 NULL payloads, or unconfirmed   (not reported)
 """
 
 import asyncio
@@ -90,7 +90,7 @@ _BOOL_FALSE_MATCH_MAX = 0.60
 # If natural variance between two identical requests exceeds this threshold
 # (i.e., similarity drops below _STABILITY_FLOOR), boolean + UNION are
 # disabled for that parameter.
-_STABILITY_FLOOR = 0.70   # raised from 0.60 — tighter gate
+_STABILITY_FLOOR = 0.70   # raised from 0.60 - tighter gate
 
 # ---------------------------------------------------------------------------
 # UNION similarity window
@@ -99,7 +99,7 @@ _STABILITY_FLOOR = 0.70   # raised from 0.60 — tighter gate
 # Hard floor: below this, the response is a completely different page
 # (error page, redirect-within-200, broken query). This is the primary
 # fix for the 0.01-similarity false positives.
-_UNION_SIM_MIN = 0.10     # raised from 0.05 — the critical fix
+_UNION_SIM_MIN = 0.10     # raised from 0.05 - the critical fix
 
 # Hard ceiling: above this, the UNION was silently ignored or wrong column count.
 _UNION_SIM_MAX = 0.97
@@ -137,7 +137,7 @@ _SQL_SPECIFIC_MARKERS = frozenset({
     "sqlstate",
     "sqlexception",
     "division by zero in",
-    # FIX: was "extractvalue(" and "updatexml(" — these are function NAMES that
+    # FIX: was "extractvalue(" and "updatexml(" - these are function NAMES that
     # get reflected verbatim by XSS endpoints. Replace with the actual MySQL
     # XPATH error messages that only appear on real injection.
     "xpath syntax error",                        # MySQL extractvalue/updatexml error
@@ -161,7 +161,7 @@ _VERSION_INDICATORS = frozenset({
     "microsoft sql server",
 })
 
-# Boolean injection contexts — (true_payload, false_payload)
+# Boolean injection contexts - (true_payload, false_payload)
 _BOOL_PAYLOAD_PAIRS = [
     ("' AND '1'='1",     "' AND '1'='2"),
     ("' AND 1=1--",      "' AND 1=2--"),
@@ -245,7 +245,7 @@ def _new_sql_errors(
 def _new_version_indicators(baseline_body: str, injected_body: str) -> list[str]:
     """
     Return version indicators present in injected_body but absent from
-    baseline_body. The baseline exclusion is critical — "mysql" commonly
+    baseline_body. The baseline exclusion is critical - "mysql" commonly
     appears in page footers, framework error messages, and help text.
     """
     bl = baseline_body.lower()
@@ -298,7 +298,7 @@ class SQLiVerifier(BaseVerifier):
         _run_differential = True
         _run_error_time   = True
 
-        # Gate 0: phpinfo/debug page exclusion — these pages echo everything
+        # Gate 0: phpinfo/debug page exclusion - these pages echo everything
         # and trigger false SQL error matches, false UNION reflections, etc.
         if pre_test_baseline is not None and ResponseAnalyzer.is_phpinfo_or_debug_page(
             pre_test_baseline.body or ""
@@ -333,7 +333,7 @@ class SQLiVerifier(BaseVerifier):
             )
             if not char["reflective"]:
                 logger.debug(
-                    "Parameter %s:%s characterised as non-reflective (sim≥0.90) — "
+                    "Parameter %s:%s characterised as non-reflective (sim≥0.90) - "
                     "skipping boolean and UNION, going straight to time-based",
                     url, parameter,
                 )
@@ -765,7 +765,7 @@ class SQLiVerifier(BaseVerifier):
                 detection_method="error_based", findings=[],
                 evidence={
                     "first_hit": first_hit_payload,
-                    "note": "single error hit — not reported without confirmation",
+                    "note": "single error hit - not reported without confirmation",
                 } if first_hit_payload else {},
             )
 
@@ -808,7 +808,7 @@ class SQLiVerifier(BaseVerifier):
                 baseline_body_low = baseline_body.lower()
 
                 # ----------------------------------------------------------------
-                # Pass 1: Canary probes (strongest signal — no similarity gate needed)
+                # Pass 1: Canary probes (strongest signal - no similarity gate needed)
                 # ----------------------------------------------------------------
                 for null_count in range(1, 6):
                     canary = ResponseAnalyzer.generate_probe_canary()
@@ -873,7 +873,7 @@ class SQLiVerifier(BaseVerifier):
                             url=url, parameter=parameter, payload=canary_payload,
                             evidence=(
                                 f"UNION canary '{canary}' reflected in response body. "
-                                f"Value absent from baseline — confirms data extraction."
+                                f"Value absent from baseline - confirms data extraction."
                             ),
                             confidence_score=90.0, detection_method="union_based",
                             method=method,
@@ -893,7 +893,7 @@ class SQLiVerifier(BaseVerifier):
                         )
 
                 # ----------------------------------------------------------------
-                # Pass 2: NULL differential — collect payloads in the valid window.
+                # Pass 2: NULL differential - collect payloads in the valid window.
                 # This is also the gate for Pass 3 version extraction.
                 # ----------------------------------------------------------------
                 valid_null_probes: list[tuple[str, ResponseData, float]] = []
@@ -920,7 +920,7 @@ class SQLiVerifier(BaseVerifier):
 
                     if inj_resp.status_code != 200:
                         logger.debug(
-                            "UNION NULL '%s' non-200 status (%s) %s:%s — skip",
+                            "UNION NULL '%s' non-200 status (%s) %s:%s - skip",
                             payload, inj_resp.status_code, url, parameter,
                         )
                         continue
@@ -929,14 +929,14 @@ class SQLiVerifier(BaseVerifier):
 
                     if sim < _UNION_SIM_MIN:
                         logger.debug(
-                            "UNION NULL '%s' similarity %.2f < %.2f (page transition) %s:%s — skip",
+                            "UNION NULL '%s' similarity %.2f < %.2f (page transition) %s:%s - skip",
                             payload, sim, _UNION_SIM_MIN, url, parameter,
                         )
                         continue
 
                     if sim > _UNION_SIM_MAX:
                         logger.debug(
-                            "UNION NULL '%s' similarity %.2f > %.2f (no change) %s:%s — skip",
+                            "UNION NULL '%s' similarity %.2f > %.2f (no change) %s:%s - skip",
                             payload, sim, _UNION_SIM_MAX, url, parameter,
                         )
                         continue
@@ -993,7 +993,7 @@ class SQLiVerifier(BaseVerifier):
                             ver_sim = _body_similarity(baseline_body, ver_resp.body or "")
                             if not _similarity_in_union_window(ver_sim):
                                 logger.debug(
-                                    "Version extract '%s' similarity %.2f outside window %s:%s — skip",
+                                    "Version extract '%s' similarity %.2f outside window %s:%s - skip",
                                     ver_payload, ver_sim, url, parameter,
                                 )
                                 continue
@@ -1003,7 +1003,7 @@ class SQLiVerifier(BaseVerifier):
                                 version_extracted_body = ver_resp.body
                                 version_payload_used   = ver_payload
                                 logger.debug(
-                                    "Version extracted %s:%s via '%s' — new: %s",
+                                    "Version extracted %s:%s via '%s' - new: %s",
                                     url, parameter, ver_payload, new_inds,
                                 )
                                 break
@@ -1045,7 +1045,7 @@ class SQLiVerifier(BaseVerifier):
                 n = len(valid_null_probes)
                 if n < _UNION_MIN_SIGNIFICANT_PAYLOADS:
                     logger.debug(
-                        "UNION differential suppressed %s:%s — only %d/%d payloads in window",
+                        "UNION differential suppressed %s:%s - only %d/%d payloads in window",
                         url, parameter, n, _UNION_MIN_SIGNIFICANT_PAYLOADS,
                     )
                     return VerificationResult(
@@ -1076,7 +1076,7 @@ class SQLiVerifier(BaseVerifier):
 
                 if not _similarity_in_union_window(conf_sim):
                     logger.debug(
-                        "UNION cross-column confirm outside window (%.2f) %s:%s — suppressed",
+                        "UNION cross-column confirm outside window (%.2f) %s:%s - suppressed",
                         conf_sim, url, parameter,
                     )
                     return VerificationResult(
@@ -1094,7 +1094,7 @@ class SQLiVerifier(BaseVerifier):
 
                 if confidence < 75.0:
                     logger.debug(
-                        "UNION differential weak (avg_sim=%.2f, confidence=%.1f) %s:%s — suppressed",
+                        "UNION differential weak (avg_sim=%.2f, confidence=%.1f) %s:%s - suppressed",
                         avg_sim, confidence, url, parameter,
                     )
                     return VerificationResult(
@@ -1166,15 +1166,15 @@ class SQLiVerifier(BaseVerifier):
         2. Relative floor: observed delay must be >= 60% of the intended sleep.
            A hardcoded threshold breaks on high-latency targets; 60% of expected
            is correct for both fast and slow networks.
-        3. Injected mean must itself be >= 50% of sleep duration — rules out a
+        3. Injected mean must itself be >= 50% of sleep duration - rules out a
            coincidentally fast baseline sample making a normal response look delayed.
         """
         sleep_payloads = [
-            # Standard — needs baseline_value prefix (now fixed by Fix 1)
+            # Standard - needs baseline_value prefix (now fixed by Fix 1)
             ("' AND SLEEP(3)--",                     3000),
             ("' AND SLEEP(3)#",                      3000),
             (" AND SLEEP(3)--",                      3000),
-            # Conditional — more reliable across DVWA security levels
+            # Conditional - more reliable across DVWA security levels
             ("' AND IF(1=1,SLEEP(3),0)--",           3000),
             ("' AND IF(1=1,SLEEP(3),0)#",            3000),
             # Numeric context (no quotes needed)
@@ -1207,7 +1207,7 @@ class SQLiVerifier(BaseVerifier):
 
             if baseline_mean > 2000:
                 logger.debug(
-                    "Time-based skipped %s:%s — baseline too slow (%.0fms)",
+                    "Time-based skipped %s:%s - baseline too slow (%.0fms)",
                     url, parameter, baseline_mean,
                 )
                 return VerificationResult(
@@ -1247,7 +1247,7 @@ class SQLiVerifier(BaseVerifier):
 
                 if diff_ms < expected_ms * 0.60:
                     logger.debug(
-                        "Time diff %.0fms < 60%% of expected %.0fms %s:%s — jitter",
+                        "Time diff %.0fms < 60%% of expected %.0fms %s:%s - jitter",
                         diff_ms, expected_ms, url, parameter,
                     )
                     continue

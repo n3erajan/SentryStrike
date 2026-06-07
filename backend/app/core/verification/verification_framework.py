@@ -332,7 +332,7 @@ class BaseVerifier(ABC):
         """
         Fetch a clean snapshot immediately before the first malicious payload.
 
-        Uses benign parameter values only — no injection content.
+        Uses benign parameter values only - no injection content.
         """
         if method.upper().startswith("HEADER:"):
             return await self._send(url, "GET", None, None, test_phase="pre_test_baseline")
@@ -427,9 +427,10 @@ class FindingDeduplicator:
         vt = (vuln_type or "").lower()
         if "verbose error" in vt or "exception handling" in vt or "debug / metrics" in vt:
             return "exception_disclosure"
+        if "remote file inclusion" in vt:
+            return "remote_file_inclusion"
         if (
             "local file inclusion" in vt
-            or "remote file inclusion" in vt
             or "path traversal" in vt
             or "arbitrary file read" in vt
             or "file read" in vt
@@ -515,7 +516,7 @@ class FindingDeduplicator:
                 if evidence and evidence_key not in seen_evidence:
                     seen_evidence.add(evidence_key)
                     evidence_parts.append(evidence)
-            best.evidence = "; ".join(evidence_parts)
+            best.evidence = "\n".join(evidence_parts)
             best.reproducible = any(f.reproducible for f in sorted_group)
 
             deduplicated.append(best)
@@ -619,7 +620,7 @@ class TestPollutionFilter:
                 finding.reproducible = False
                 finding.confidence_score = min(finding.confidence_score, 20.0)
                 # Preserve original severity for medium/high findings; only downgrade low/info severity
-                if finding.severity in (SeverityLevel.low, SeverityLevel.info):
+                if finding.severity == SeverityLevel.low:
                     finding.severity = SeverityLevel.low
                 else:
                     # Keep original severity but mark as unverified

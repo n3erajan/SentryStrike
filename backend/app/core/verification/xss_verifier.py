@@ -49,7 +49,7 @@ class PendingBrowserVerification:
     stored_display_urls: Optional[list[str]]
     is_header_injection: bool
     context_analysis: dict
-    # The partial finding built from HTTP evidence — browser will confirm or discard it
+    # The partial finding built from HTTP evidence - browser will confirm or discard it
     partial_finding: Finding
 
 

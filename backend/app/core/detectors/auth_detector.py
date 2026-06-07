@@ -130,7 +130,7 @@ class AuthenticationFailuresDetector(BaseDetector):
         "throttle", "throttled", "temporarily locked", "account locked",
         "lockout", "try again later", "challenge required",
         "429", "slow down",
-        # CAPTCHA challenge indicators (not bare "captcha" — too many false positives from nav menus)
+        # CAPTCHA challenge indicators (not bare "captcha" - too many false positives from nav menus)
         "g-recaptcha", "h-captcha", "cf-turnstile",
         "captcha required", "captcha verification", "captcha code",
         "captcha challenge", "captcha input",
@@ -240,9 +240,9 @@ class AuthenticationFailuresDetector(BaseDetector):
         Stability is assessed on two axes that actually indicate a control is
         present:
 
-        1. **Status-code diversity** — any non-2xx code (401, 403, 423, 429,
+        1. **Status-code diversity** - any non-2xx code (401, 403, 423, 429,
            302 to a lockout page, etc.) in *any* burst means the server reacted.
-        2. **Body-length divergence** — a consistent shift in response size
+        2. **Body-length divergence** - a consistent shift in response size
            (e.g. an error page replacing the login form) is a real signal.
 
         Timing alone is intentionally *not* used as a stability gate.  A server
@@ -375,8 +375,8 @@ class AuthenticationFailuresDetector(BaseDetector):
             # -------------------------------------------------------------------
             # Tests 2 + 3: Combined credential sequence
             #
-            # All three auth-volume checks — brute-force protection, credential
-            # stuffing, and default credentials — share the same mechanism: send
+            # All three auth-volume checks - brute-force protection, credential
+            # stuffing, and default credentials - share the same mechanism: send
             # repeated login attempts and observe whether the server blocks.
             # Running them as separate passes was wasteful (105+ requests) because
             # every pass re-proved the same thing with different payloads.
@@ -384,11 +384,11 @@ class AuthenticationFailuresDetector(BaseDetector):
             # The redesign uses ONE sequential request list that serves all three
             # purposes simultaneously:
             #
-            #   Phase A — default pairs (varied username + password)
+            #   Phase A - default pairs (varied username + password)
             #             → detects Default Credentials Accepted (critical)
             #             → each failed attempt contributes to the lockout counter
             #
-            #   Phase B — stuffing passwords (fixed bogus username, varied password)
+            #   Phase B - stuffing passwords (fixed bogus username, varied password)
             #             → detects No Lockout / Credential-Stuffing weakness (high)
             #             → extends the attempt count for the brute-force check
             #
@@ -398,7 +398,7 @@ class AuthenticationFailuresDetector(BaseDetector):
             # vs the previous ~105.
             #
             # The first request (known-bad credentials) doubles as the baseline
-            # for default-creds success detection — no extra baseline request.
+            # for default-creds success detection - no extra baseline request.
             #
             # OWASP 2025 mappings:
             #   Brute-force / stuffing → A07 / CWE-307
@@ -421,7 +421,7 @@ class AuthenticationFailuresDetector(BaseDetector):
             # The very first pair uses the known-bogus username so its response
             # becomes the baseline body length / status for success detection.
             _default_pairs: list[tuple[str, str]] = [
-                # bogus first — establishes the failure baseline
+                # bogus first - establishes the failure baseline
                 (payload[username_param], payload[password_param]),
                 # real default pairs ordered by real-world frequency
                 ("admin",         "admin"),
@@ -570,7 +570,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                         last_seq = all_seq_responses[-1]
 
                         # Finding B: no lockout against credential stuffing (high)
-                        # Only emit if default creds weren't accepted — if they were,
+                        # Only emit if default creds weren't accepted - if they were,
                         # the critical finding already captures the lack of protection.
                         if default_cred_hit is None:
                             stuffing_count = total_seq - _stuffing_start
@@ -696,7 +696,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                         if not any(term in body_lower for term in captcha_error_terms):
                             findings.append(
                                 self._finding(
-                                    vuln_type="CAPTCHA Bypass — Form Accepts Submission Without CAPTCHA",
+                                    vuln_type="CAPTCHA Bypass - Form Accepts Submission Without CAPTCHA",
                                     url=form_url,
                                     method=method,
                                     severity=SeverityLevel.high,
@@ -795,7 +795,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                     evidence=(
                         "Password field found in a form that submits via GET. "
                         "Credentials will appear in the URL, server logs, browser history, "
-                        "and Referer headers — a critical confidentiality failure."
+                        "and Referer headers - a critical confidentiality failure."
                     ),
                 ))
 
@@ -813,7 +813,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                     ),
                 ))
 
-            # 8. Password-change form — requires old password check
+            # 8. Password-change form - requires old password check
             change_hits = input_names.intersection({"current_password", "old_password", "existing_password"})
             new_hits    = input_names.intersection({"new_password", "confirm_password", "password_confirm"})
             if new_hits and not change_hits:
@@ -841,19 +841,7 @@ class AuthenticationFailuresDetector(BaseDetector):
             query_values = {v.lower() for _, v in query_params}
             scheme       = parsed.scheme.lower()
 
-            # 1. Login endpoint discovered
-            if self._path_hits(path_tokens, self.login_tokens) or self._url_contains(lowered, self.login_tokens):
-                findings.append(self._finding(
-                    vuln_type="Authentication Endpoint Discovered",
-                    url=url,
-                    severity=SeverityLevel.info,
-                    evidence=(
-                        "Authentication-related path detected. Verify: account lockout policy, "
-                        "brute-force rate limiting, MFA enforcement, and secure session issuance."
-                    ),
-                ))
-
-            # 2. Password reset endpoint — missing token indicator
+            # 1. Password reset endpoint - missing token indicator
             if self._path_hits(path_tokens, self.reset_tokens) or self._url_contains(lowered, self.reset_tokens):
                 has_token = bool(query_keys.intersection(self._security_control_tokens))
                 if not has_token:
@@ -923,7 +911,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                         severity=SeverityLevel.critical,
                         evidence=(
                             "A query parameter value resembles a JWT or long-form session token. "
-                            "Tokens in URLs are logged by proxies, servers, and browsers — "
+                            "Tokens in URLs are logged by proxies, servers, and browsers - "
                             "use Authorization headers or HttpOnly cookies instead."
                         ),
                     ))
@@ -997,7 +985,7 @@ class AuthenticationFailuresDetector(BaseDetector):
         return findings
 
     # ---------------------------------------------------------------------------
-    # Credential / Config Disclosure — derived from observed evidence
+    # Credential / Config Disclosure - derived from observed evidence
     # ---------------------------------------------------------------------------
 
     _CREDENTIAL_DISCLOSURE_PATTERNS: list[re.Pattern] = [

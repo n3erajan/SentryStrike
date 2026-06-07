@@ -82,7 +82,7 @@ class CommandInjectionVerifier(BaseVerifier):
             form_inputs: Full list of form input objects from the crawler. Required for
                 POST forms with non-injectable required fields (e.g. Submit buttons,
                 hidden CSRF tokens). Without this, forms gated on isset($_POST['Submit'])
-                will silently skip execution — all responses return in ~3ms because
+                will silently skip execution - all responses return in ~3ms because
                 nothing runs.
         """
         self._begin_verification(parameter)
@@ -186,7 +186,7 @@ class CommandInjectionVerifier(BaseVerifier):
                     # context window around that specific match and check whether that exact
                     # context window exists in the baseline. This means a pattern is only
                     # suppressed when the same text in the same surroundings was already present
-                    # before injection — not just because the pattern regex matches somewhere
+                    # before injection - not just because the pattern regex matches somewhere
                     # else in the page.
                     def is_pattern_new(pattern: str, injected: str, baseline: str) -> bool:
                         """Return True if *pattern* produces at least one match in *injected*
@@ -209,7 +209,7 @@ class CommandInjectionVerifier(BaseVerifier):
                     cmd_detected = bool(unix_patterns or windows_patterns)
 
                     # Check for explicit uid= matches that are absent from baseline.
-                    # Always run the context-window diff — never skip based on whether
+                    # Always run the context-window diff - never skip based on whether
                     # uid= appears in the baseline. The context window is what
                     # distinguishes a pre-existing stored match from a new one caused
                     # by this payload. Skipping when uid_in_baseline=True caused the
@@ -251,16 +251,16 @@ class CommandInjectionVerifier(BaseVerifier):
                     else:
                         active_patterns = unix_patterns + windows_patterns
                         for pattern in active_patterns:
-                            # 1. Try literal match — verify it's a delta occurrence
+                            # 1. Try literal match - verify it's a delta occurrence
                             idx = injected_body.find(pattern)
                             if idx != -1:
                                 ctx = injected_body[max(0, idx - 30):idx + len(pattern) + 30]
                                 if ctx not in baseline_body:
                                     focus_index = idx
                                     break
-                                # Context exists in baseline — keep searching for a delta hit
+                                # Context exists in baseline - keep searching for a delta hit
                             
-                            # 2. Try regex match — use finditer to find the delta occurrence
+                            # 2. Try regex match - use finditer to find the delta occurrence
                             try:
                                 for rmatch in re.finditer(pattern, injected_body, re.IGNORECASE):
                                     ctx_s = max(0, rmatch.start() - 30)
@@ -333,7 +333,7 @@ class CommandInjectionVerifier(BaseVerifier):
 
                             if mismatch_idx == min_len and len(injected_body) > min_len:
                                 # Pages are identical up to min_len; injected response has extra
-                                # content appended after the baseline ends — capture that tail.
+                                # content appended after the baseline ends - capture that tail.
                                 snippet_start = min_len
                             else:
                                 snippet_start = max(0, mismatch_idx - 20)

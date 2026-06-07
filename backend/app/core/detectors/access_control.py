@@ -19,15 +19,99 @@ _UUID_RE = re.compile(
 )
 _SHORT_ALNUM_RE = re.compile(r"^[a-zA-Z0-9]{1,8}$")
 
-# Slightly wider than before: allows IDs up to 32 chars (hashes, base64 slugs, etc.)
-IDOR_VALUE_PATTERN = re.compile(
-    r"^(\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-zA-Z0-9_\-]{1,32})$",
-    re.IGNORECASE,
-)
+# ---------------------------------------------------------------------------
+# IDOR value classification
+#
+# A genuine object-reference ID is one of:
+#   1. A pure integer  (e.g. 42, 1000)
+#   2. A UUID          (e.g. 550e8400-e29b-41d4-a716-446655440000)
+#   3. A short opaque token that contains at least one digit AND is not a
+#      common English word / semantic slug.  This prevents "changelog",
+#      "about", "home", "admin" etc. from being treated as IDs.
+#
+# The old IDOR_VALUE_PATTERN matched any [a-zA-Z0-9_-]{1,32}, which was far
+# too broad and was the primary root cause of semantic-slug false positives.
+# ---------------------------------------------------------------------------
+
+# Pattern 3: opaque token — must have digits mixed in (e.g. "abc123", "user_42")
+# Pure alpha strings like "changelog" do NOT match.
+_OPAQUE_TOKEN_RE = re.compile(r"^(?=.*\d)[a-zA-Z0-9_\-]{2,32}$")
+
+# Well-known semantic slug words that should never be treated as IDs even if
+# they happen to pass a regex.  This list is intentionally generic — it covers
+# routing / navigation tokens that appear across many frameworks and apps.
+_SEMANTIC_SLUGS: frozenset[str] = frozenset({
+    # Navigation / document-type words
+    "home", "about", "index", "main", "default", "start", "welcome",
+    "help", "faq", "docs", "documentation", "manual", "guide", "tutorial",
+    "changelog", "changes", "history", "readme", "license", "terms", "privacy",
+    "contact", "support", "feedback", "blog", "news", "events", "updates",
+    # Status / action words
+    "new", "edit", "create", "delete", "update", "view", "show", "list",
+    "search", "filter", "sort", "export", "import", "upload", "download",
+    "login", "logout", "register", "signup", "signin", "signout", "reset",
+    # Common CMS / framework page names
+    "page", "post", "article", "category", "tag", "section", "chapter",
+    "dashboard", "overview", "summary", "report", "analytics", "stats",
+    # Misc tokens that appear as param values in real apps
+    "all", "any", "none", "latest", "recent", "popular", "featured",
+    "active", "inactive", "enabled", "disabled", "pending", "done", "open",
+    "public", "private", "draft", "published", "archived",
+})
+
+
+def _is_valid_id_value(val: str) -> bool:
+    """
+    Return True only when *val* looks like a genuine object-reference
+    identifier — not a semantic slug or human-readable keyword.
+
+    Accepts:
+      - Pure integers: "1", "42", "10000"
+      - UUIDs: "550e8400-e29b-41d4-a716-446655440000"
+      - Opaque tokens that contain at least one digit mixed with letters
+        (e.g. "abc123", "user_42", "t9k3m") and are NOT in the semantic
+        slug blocklist.
+
+    Rejects:
+      - Empty strings
+      - Boolean/null literals ("true", "false", "null", …)
+      - Pure alphabetic strings of any length ("changelog", "home", …)
+      - Values in the semantic slug blocklist
+    """
+    if not val:
+        return False
+    lower = val.lower()
+    # Hard blocklist first — quick exit
+    if lower in _NON_ID_VALUES or lower in _SEMANTIC_SLUGS:
+        return False
+    # Pure integers are always valid IDs
+    if _NUMERIC_RE.match(val):
+        return True
+    # UUIDs are always valid IDs
+    if _UUID_RE.match(val):
+        return True
+    # Opaque token: must contain at least one digit
+    if _OPAQUE_TOKEN_RE.match(val):
+        return True
+    # Everything else (pure alpha strings, etc.) is rejected
+    return False
+
 
 # Tokens that signal "this looks like a login page body"
 _LOGIN_SIGNALS = frozenset(["login", "sign in", "signin"])
 _LOGIN_CREDENTIAL_SIGNALS = frozenset(["password", "username", "email"])
+
+# Signals inside a soft-200 body that indicate "resource not found"
+_SOFT_NOTFOUND_SIGNALS: tuple[str, ...] = (
+    "not found", "no such", "does not exist", "invalid id",
+    "no record", "resource not found", "page not found",
+    "404", "error", "invalid", "unknown",
+)
+
+# Non-ID literal values that should never be treated as object references
+_NON_ID_VALUES: frozenset[str] = frozenset({
+    "on", "off", "true", "false", "yes", "no", "null", "none", "undefined",
+})
 
 
 def _looks_like_login_page(body: str) -> bool:
@@ -36,6 +120,15 @@ def _looks_like_login_page(body: str) -> bool:
     has_login_word = any(s in b for s in _LOGIN_SIGNALS)
     has_credential_field = any(s in b for s in _LOGIN_CREDENTIAL_SIGNALS)
     return has_login_word and has_credential_field
+
+
+def _looks_like_error_page(body: str) -> bool:
+    """
+    Return True when the body looks like a generic error / not-found page
+    rather than a real resource.  Used to filter soft-200 responses.
+    """
+    b = body.lower()
+    return any(s in b for s in _SOFT_NOTFOUND_SIGNALS)
 
 
 def _mutate_id(val: str) -> list[str]:
@@ -59,13 +152,25 @@ def _mutate_id(val: str) -> list[str]:
     if _UUID_RE.match(val):
         parts = val.split("-")
         last = parts[-1]
-        # XOR last char to get a different but valid-looking UUID
         flipped = last[:-1] + ("0" if last[-1] != "0" else "1")
         candidates.append("-".join(parts[:-1] + [flipped]))
         return candidates
 
-    # Opaque short token: try "2" when val is "1", else "1"
-    candidates.append("2" if val == "1" else "1")
+    # Opaque short token: swap last digit(s) to produce a different-looking ID
+    # E.g. "user42" → "user43"; "abc123" → "abc124"
+    m = re.search(r"(\d+)$", val)
+    if m:
+        prefix = val[: m.start()]
+        n = int(m.group(1))
+        candidates.append(prefix + str(n + 1))
+        if n > 1:
+            candidates.append(prefix + str(n - 1))
+        return candidates
+
+    # Fallback for fully opaque tokens without trailing digits:
+    # try appending "1" / "2" to generate distinct candidates
+    candidates.append(val + "1")
+    candidates.append(val + "2")
     return candidates
 
 
@@ -76,13 +181,89 @@ def _strip_query(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Burp-Suite-inspired differential analysis helpers
+#
+# Burp Suite's IDOR detection (Collaborator + active scanning) works by:
+#   1. Making a baseline request with the authenticated session.
+#   2. Making the same request *without* credentials → if it already returns
+#      200, the resource is public and IDOR is not applicable.
+#   3. Mutating the ID and requesting with credentials.
+#   4. Comparing the mutated response against:
+#      a. The unauthenticated mutated response  — if unauth also gets 200,
+#         the mutated resource is public, not an access-control bypass.
+#      b. The authenticated own-resource response — the content should be
+#         *meaningfully different* (a different object was returned) but not
+#         so different that it looks like a generic error page.
+#   5. Only flagging when the authenticated mutated response is clearly a
+#      real resource that differs from the authenticated session's own data.
+#
+# We implement the same multi-signal differential below.
+# ---------------------------------------------------------------------------
+
+def _differential_idor_verdict(
+    *,
+    own_body: str,
+    mutated_authed_body: str,
+    mutated_unauthed_body: str | None,
+) -> tuple[bool, float, str]:
+    """
+    Apply Burp-Suite-style differential analysis to decide whether a response
+    to a mutated ID represents a genuine IDOR or a false positive.
+
+    Returns (is_idor, similarity_own_vs_mutated, reason).
+
+    Rules (applied in order):
+      R1. If the mutated+authed body looks like an error / not-found page →
+          not IDOR (the app rejected the mutated ID gracefully).
+      R2. If the mutated+unauthed body is provided and is nearly identical to
+          the mutated+authed body → the resource is publicly accessible,
+          so this is not a meaningful access-control bypass.
+      R3. similarity(own, mutated_authed) > 0.98 → both requests returned the
+          same generic template; not a real different object.
+      R4. similarity(own, mutated_authed) < 0.10 → the response is so
+          different that it is probably a generic error page that slipped
+          through the keyword filter.
+      R5. Passed all guards → genuine IDOR signal; report with similarity score.
+
+    The similarity thresholds are intentionally conservative to minimise
+    false positives at the cost of a slightly higher miss rate.
+    """
+    # R1: error-page guard
+    if _looks_like_error_page(mutated_authed_body):
+        return False, 0.0, "mutated response resembles an error/not-found page"
+
+    # R2: public-resource guard
+    if mutated_unauthed_body is not None:
+        unauth_sim = _body_similarity(mutated_authed_body, mutated_unauthed_body)
+        if unauth_sim > 0.85:
+            return (
+                False,
+                0.0,
+                f"mutated resource is publicly accessible (authed vs unauthed similarity: {unauth_sim:.0%})",
+            )
+
+    # R3 / R4: own-vs-mutated similarity band
+    own_sim = _body_similarity(own_body, mutated_authed_body)
+    if own_sim > 0.95:
+        return False, own_sim, "mutated response is virtually identical to own resource (generic template)"
+    if own_sim < 0.10:
+        return (
+            False,
+            own_sim,
+            "mutated response is too dissimilar from own resource — likely an error page",
+        )
+
+    # Passed all guards
+    return True, own_sim, "differential analysis passed"
+
+
+# ---------------------------------------------------------------------------
 # Main detector
 # ---------------------------------------------------------------------------
 
 class AccessControlDetector(BaseDetector):
     name = "access_control"
 
-    # FIX 1: Expanded sensitive path token set to cover common real-world paths
     sensitive_path_tokens: frozenset[str] = frozenset({
         "admin", "manage", "management", "manager",
         "internal", "debug", "private", "config", "configuration", "settings",
@@ -97,7 +278,6 @@ class AccessControlDetector(BaseDetector):
         "cpanel", "whm",                     # Hosting panels
     })
 
-    # FIX 2: Expanded IDOR param token set
     idor_param_tokens: frozenset[str] = frozenset({
         "id", "user", "user_id", "userid",
         "account", "account_id", "accountid",
@@ -113,10 +293,6 @@ class AccessControlDetector(BaseDetector):
         "ref", "reference",
     })
 
-    NON_ID_VALUES: frozenset[str] = frozenset({
-        "on", "off", "true", "false", "yes", "no", "null", "none", "undefined",
-    })
-
     # Max parallel HTTP requests to avoid hammering the target
     _CONCURRENCY = 5
 
@@ -129,8 +305,6 @@ class AccessControlDetector(BaseDetector):
     ) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies: dict[str, str] = kwargs.get("session_cookies") or {}
-        # FIX 3: Support an optional second authenticated session for vertical
-        # privilege escalation checks (e.g. normal-user vs admin).
         privileged_cookies: dict[str, str] = kwargs.get("privileged_cookies") or {}
 
         authed_verifier = HttpVerifier(cookies=session_cookies)
@@ -139,14 +313,12 @@ class AccessControlDetector(BaseDetector):
         unauthed_verifier = HttpVerifier()
         unauthed_verifier.set_request_context(module="access_control")
 
-        # Optional high-priv verifier for vertical escalation tests
         privileged_verifier: HttpVerifier | None = None
         if privileged_cookies:
             privileged_verifier = HttpVerifier(cookies=privileged_cookies)
             privileged_verifier.set_request_context(module="access_control")
 
         try:
-            # Run checks concurrently at the top level
             forced_browsing_task = self._check_forced_browsing(
                 urls, unauthed_verifier, authed_verifier
             )
@@ -178,14 +350,6 @@ class AccessControlDetector(BaseDetector):
     ) -> list[Finding]:
         """
         Detect sensitive paths that are accessible without authentication.
-
-        FIX 4: Also runs the same URL with the authed session and compares
-        status codes.  If the authed session returns 200 but unauthed returns
-        4xx, that is the correct baseline — nothing to report.  We only flag
-        when the *unauthenticated* request itself succeeds.
-
-        FIX 5: Non-200 check is broadened: 206 (partial content), 301/302
-        redirects to non-login pages, and 304s are now captured.
         """
         findings: list[Finding] = []
         semaphore = asyncio.Semaphore(self._CONCURRENCY)
@@ -194,9 +358,7 @@ class AccessControlDetector(BaseDetector):
         for url in urls:
             parsed = urlparse(url)
             path_lower = parsed.path.lower()
-            # Match whole-segment tokens
             segments = {seg for seg in path_lower.split("/") if seg}
-            # Also check assembled sub-paths (e.g. "api/internal")
             assembled = "/".join(s for s in parsed.path.split("/") if s)
             if segments.intersection(self.sensitive_path_tokens) or any(
                 tok in assembled.lower() for tok in self.sensitive_path_tokens
@@ -211,29 +373,19 @@ class AccessControlDetector(BaseDetector):
                         test_url, "GET", test_phase="forced_browsing"
                     )
 
-                    # FIX 5: Treat any 2xx as potentially exposed (not just 200)
                     if not (200 <= resp.status_code < 300):
                         return []
 
                     if _looks_like_login_page(resp.body):
                         return []
 
-                    # FIX 6: Perform an authenticated request to verify the endpoint
-                    # actually *exists* for a real user (avoids flagging custom 404
-                    # pages that return 200).
                     authed_resp = await authed_verifier.send_request(
                         test_url, "GET", test_phase="forced_browsing_authed_baseline"
                     )
                     if authed_resp.status_code not in (200, 201, 206):
-                        # If even authenticated users can't reach it, it's not a real
-                        # endpoint — skip to prevent false positives.
                         return []
 
-                    # FIX 7: Content-similarity guard.  If both bodies are nearly
-                    # identical they might both be a "soft 200" error page.
                     if _body_similarity(resp.body, authed_resp.body) > 0.95:
-                        # Same content unauthenticated as authenticated is suspicious
-                        # but could just be a public page — flag at Medium instead.
                         severity = SeverityLevel.medium
                     else:
                         severity = SeverityLevel.high
@@ -284,19 +436,17 @@ class AccessControlDetector(BaseDetector):
         for url in urls:
             parsed = urlparse(url)
             for param_name, param_value in parse_qsl(parsed.query, keep_blank_values=True):
-                if self._is_idor_param(param_name) and self._is_valid_id_value(param_value):
+                if self._is_idor_param(param_name) and _is_valid_id_value(param_value):
                     idor_candidates.add((url, param_name, "GET", param_value))
 
         # --- Path segment IDs (e.g. /users/42/profile) ---
-        # FIX 8: Also extract numeric/UUID segments from URL paths, not just
-        # query-string params, since REST APIs routinely embed IDs in paths.
+        # Only consider path segments that are purely numeric or UUIDs — not
+        # opaque tokens, which are too ambiguous when embedded in paths.
         for url in urls:
             parsed = urlparse(url)
             segments = [s for s in parsed.path.split("/") if s]
             for i, segment in enumerate(segments):
-                if self._is_valid_id_value(segment):
-                    # Synthesise a virtual "path_id" param so the rest of the
-                    # pipeline can use the same mutation logic.
+                if _NUMERIC_RE.match(segment) or _UUID_RE.match(segment):
                     idor_candidates.add((url, f"__path_seg_{i}__:{segment}", "GET", segment))
 
         # --- Form inputs ---
@@ -305,10 +455,8 @@ class AccessControlDetector(BaseDetector):
             form_method: str = getattr(form, "method", "POST").upper()
             for inp in getattr(form, "inputs", []):
                 inp_name: str = getattr(inp, "name", "") or ""
-                inp_value: str = str(getattr(inp, "value", "") or "1")
-                if self._is_idor_param(inp_name):
-                    if not self._is_valid_id_value(inp_value):
-                        inp_value = "1"
+                inp_value: str = str(getattr(inp, "value", "") or "")
+                if self._is_idor_param(inp_name) and _is_valid_id_value(inp_value):
                     idor_candidates.add((form_url, inp_name, form_method, inp_value))
 
         if not idor_candidates:
@@ -318,30 +466,40 @@ class AccessControlDetector(BaseDetector):
             cand_url, param, method, val = cand
             cand_findings: list[Finding] = []
 
-            # FIX 9: Try all mutated IDs, not just +1
             mutated_vals = _mutate_id(val)
 
             async with semaphore:
                 try:
-                    # --- Baseline: is this endpoint protected at all? ---
-                    unauth_url, unauth_params, unauth_data = URLParameterBuilder.inject_parameter(
+                    # -------------------------------------------------------
+                    # Step 1 (Burp-style): unauthenticated baseline for the
+                    # ORIGINAL value.  If the original resource is already
+                    # publicly accessible, IDOR is not applicable — any user
+                    # can already reach it without credentials.
+                    # -------------------------------------------------------
+                    unauth_own_url, unauth_own_params, unauth_own_data = URLParameterBuilder.inject_parameter(
                         cand_url, param, val, method
                     )
-                    unauth_resp = await unauthed_verifier.send_request(
-                        unauth_url, method, unauth_params, unauth_data,
-                        test_phase="idor_unauth_base"
+                    unauth_own_resp = await unauthed_verifier.send_request(
+                        unauth_own_url, method, unauth_own_params, unauth_own_data,
+                        test_phase="idor_unauth_own"
                     )
 
-                    # FIX 10: Check one mutated value at unauth level, but do NOT
-                    # short-circuit if statuses differ — the original logic aborted
-                    # when unauth returned 200 for both original+mutated.  The
-                    # correct check is: if the *original* value itself is publicly
-                    # accessible, the endpoint is public and IDOR is not applicable.
-                    if unauth_resp.status_code == 200 and not _looks_like_login_page(unauth_resp.body):
-                        # Endpoint is public → IDOR test is not meaningful
+                    if (
+                        unauth_own_resp.status_code == 200
+                        and not _looks_like_login_page(unauth_own_resp.body)
+                        and not _looks_like_error_page(unauth_own_resp.body)
+                    ):
+                        # The original resource is publicly accessible → skip
+                        logger.debug(
+                            "IDOR skip: original resource is public at %s param=%s val=%s",
+                            cand_url, param, val,
+                        )
                         return []
 
-                    # --- Authenticated request for *original* value (owned resource) ---
+                    # -------------------------------------------------------
+                    # Step 2: Authenticated request for the ORIGINAL value
+                    # (the "own resource" baseline).
+                    # -------------------------------------------------------
                     auth_own_url, auth_own_params, auth_own_data = URLParameterBuilder.inject_parameter(
                         cand_url, param, val, method
                     )
@@ -349,17 +507,32 @@ class AccessControlDetector(BaseDetector):
                         auth_own_url, method, auth_own_params, auth_own_data,
                         test_phase="idor_authed_own"
                     )
-                    # FIX 11: If even the authenticated user can't reach the
-                    # original resource, the session cookie is invalid / expired.
+
+                    # If authenticated session cannot reach its own resource,
+                    # the session cookie is invalid / expired — skip entirely.
                     if auth_own_resp.status_code not in (200, 201):
                         logger.debug(
-                            "Authed session cannot access own resource %s param=%s — skipping IDOR test",
+                            "IDOR skip: authed session cannot access own resource %s param=%s",
                             cand_url, param,
                         )
                         return []
 
-                    # --- Test horizontal privilege escalation with each mutation ---
+                    # If the own resource response itself looks like an error
+                    # page, we have no meaningful baseline to compare against.
+                    if _looks_like_error_page(auth_own_resp.body):
+                        logger.debug(
+                            "IDOR skip: own resource response looks like an error page %s param=%s",
+                            cand_url, param,
+                        )
+                        return []
+
+                    # -------------------------------------------------------
+                    # Step 3 (Burp-style differential): for each mutated ID,
+                    # fetch with authenticated session AND unauthenticated
+                    # session, then apply the differential verdict.
+                    # -------------------------------------------------------
                     for mutated_val in mutated_vals:
+                        # Authenticated request for mutated ID
                         auth_mod_url, auth_mod_params, auth_mod_data = URLParameterBuilder.inject_parameter(
                             cand_url, param, mutated_val, method
                         )
@@ -373,18 +546,35 @@ class AccessControlDetector(BaseDetector):
                         if _looks_like_login_page(auth_mod_resp.body):
                             continue
 
-                        # FIX 12: Content-diff guard — if the mutated response body
-                        # is virtually identical to the original owned resource, the
-                        # app may just echo a generic success page; lower the confidence.
-                        similarity = _body_similarity(auth_own_resp.body, auth_mod_resp.body)
-                        if similarity > 0.98:
-                            # Indistinguishable responses → likely a static/generic page
-                            continue
+                        # Unauthenticated request for the MUTATED value
+                        # (Burp-style: check if the mutated resource is itself public)
+                        unauth_mod_url, unauth_mod_params, unauth_mod_data = URLParameterBuilder.inject_parameter(
+                            cand_url, param, mutated_val, method
+                        )
+                        unauth_mod_resp = await unauthed_verifier.send_request(
+                            unauth_mod_url, method, unauth_mod_params, unauth_mod_data,
+                            test_phase="idor_unauth_mod"
+                        )
+                        mutated_unauthed_body: str | None = (
+                            unauth_mod_resp.body
+                            if unauth_mod_resp.status_code == 200
+                            and not _looks_like_login_page(unauth_mod_resp.body)
+                            and not _looks_like_error_page(unauth_mod_resp.body)
+                            else None
+                        )
 
-                        # FIX 13: Also check for "not found" language inside soft-200s
-                        soft_notfound_signals = ["not found", "no such", "does not exist", "invalid id"]
-                        mod_body_lower = auth_mod_resp.body.lower()
-                        if any(s in mod_body_lower for s in soft_notfound_signals):
+                        # Apply Burp-style differential verdict
+                        is_idor, similarity, reason = _differential_idor_verdict(
+                            own_body=auth_own_resp.body,
+                            mutated_authed_body=auth_mod_resp.body,
+                            mutated_unauthed_body=mutated_unauthed_body,
+                        )
+
+                        if not is_idor:
+                            logger.debug(
+                                "IDOR false-positive suppressed at %s param=%s mutated=%s: %s",
+                                cand_url, param, mutated_val, reason,
+                            )
                             continue
 
                         cand_findings.append(
@@ -399,8 +589,12 @@ class AccessControlDetector(BaseDetector):
                                 evidence=(
                                     f"Horizontal privilege escalation: authenticated session accessed "
                                     f"'{param}'={mutated_val} (modified from owned value '{val}'). "
-                                    f"Unauthenticated baseline returned HTTP {unauth_resp.status_code}. "
-                                    f"Body similarity to own resource: {similarity:.0%}."
+                                    f"Unauthenticated baseline for original value returned HTTP "
+                                    f"{unauth_own_resp.status_code}. "
+                                    f"Unauthenticated access to mutated value: "
+                                    f"{'blocked' if mutated_unauthed_body is None else 'public (skipped)'}. "
+                                    f"Body similarity (own vs mutated): {similarity:.0%}. "
+                                    f"Differential verdict: {reason}."
                                 ),
                                 verified=True,
                                 verification_request_snippet=auth_mod_resp.request_snippet,
@@ -411,9 +605,10 @@ class AccessControlDetector(BaseDetector):
                         # One confirmed finding per param is enough; stop mutating.
                         break
 
-                    # FIX 14: Vertical privilege escalation — if a privileged
-                    # verifier was provided, check that a low-priv user cannot
-                    # access high-privilege resources.
+                    # -------------------------------------------------------
+                    # Step 4: Vertical privilege escalation (if a high-priv
+                    # session was supplied).
+                    # -------------------------------------------------------
                     if privileged_verifier and not cand_findings:
                         for mutated_val in mutated_vals:
                             priv_url, priv_params, priv_data = URLParameterBuilder.inject_parameter(
@@ -423,13 +618,6 @@ class AccessControlDetector(BaseDetector):
                                 priv_url, method, priv_params, priv_data,
                                 test_phase="vertical_priv_check"
                             )
-                            # If the privileged user gets 200 but authed (low-priv)
-                            # user also gets 200, that is the horizontal IDOR path above.
-                            # Here we specifically look for: priv=200, authed=403/404,
-                            # which by itself is *not* a vulnerability.  The interesting
-                            # case is the reverse: authed gets 200 on a resource that
-                            # should require higher privileges (detected via priv baseline).
-                            # We flag it as a separate vuln type.
                             auth_check_url, auth_check_params, auth_check_data = URLParameterBuilder.inject_parameter(
                                 cand_url, param, mutated_val, method
                             )
@@ -441,9 +629,10 @@ class AccessControlDetector(BaseDetector):
                                 priv_resp.status_code in (200, 201)
                                 and auth_check_resp.status_code in (200, 201)
                                 and not _looks_like_login_page(auth_check_resp.body)
+                                and not _looks_like_error_page(auth_check_resp.body)
                             ):
                                 similarity = _body_similarity(priv_resp.body, auth_check_resp.body)
-                                if similarity > 0.7:  # Similar content ⇒ same resource returned
+                                if similarity > 0.7:
                                     cand_findings.append(
                                         Finding(
                                             category=OwaspCategory.a01,
@@ -491,14 +680,6 @@ class AccessControlDetector(BaseDetector):
         # Substring check: catch camelCase variants like userId, orderId, etc.
         return any(tok in lower for tok in ("id", "user", "account", "order", "record", "uuid"))
 
-    def _is_valid_id_value(self, val: str) -> bool:
-        """Return True if *val* looks like a plausible object identifier."""
-        if not val:
-            return False
-        if val.lower() in self.NON_ID_VALUES:
-            return False
-        return bool(IDOR_VALUE_PATTERN.match(val))
-
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -506,18 +687,22 @@ class AccessControlDetector(BaseDetector):
 
 def _body_similarity(a: str, b: str) -> float:
     """
-    Rough Jaccard similarity between two response bodies based on word sets.
+    Rough Jaccard similarity between two response bodies using character
+    4-grams.  Returns a float in [0, 1].  1 = identical content.
 
-    Used to detect "soft-200" pages where the body is identical or near-
-    identical regardless of the parameter value.
-
-    Returns a float in [0, 1].  1 = identical word sets.
+    Used in two places:
+      - "too similar" guard: if own and mutated responses are >95% similar
+        they are probably the same generic template.
+      - "too different" guard: if own and mutated are <10% similar the
+        mutated response is probably a generic error page.
+      - Public-resource guard: if authed and unauthed mutated responses are
+        >85% similar, the mutated resource is publicly accessible.
     """
     if not a and not b:
         return 1.0
     if not a or not b:
         return 0.0
-    # Use a character n-gram window to be more sensitive than word-level Jaccard
+
     def ngrams(text: str, n: int = 4) -> set[str]:
         t = text.lower()
         return {t[i : i + n] for i in range(len(t) - n + 1)}

@@ -41,7 +41,7 @@ def test_param_discovery_href_extraction():
     
     params = [c[1] for c in candidates]
     assert "file" in params
-    # URL already has a query param — no wordlist guessing
+    # URL already has a query param - no wordlist guessing
     assert "user_id" not in params
     assert "search" not in params
 

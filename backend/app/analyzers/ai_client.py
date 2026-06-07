@@ -24,6 +24,11 @@ class OllamaClient:
         self.settings = get_settings()
         self._thinking_capable = _model_supports_thinking(self.settings.ollama_model)
 
+    @property
+    def thinking_capable(self) -> bool:
+        """True if the configured model supports Ollama's ``think`` parameter."""
+        return self._thinking_capable
+
     def _build_payload(self, prompt: str, *, thinking: bool) -> dict:
         """Construct the Ollama /api/generate payload.
 
@@ -151,7 +156,7 @@ class OllamaClient:
                     parsed = val
                     break
             else:
-                # Single-item batch — wrap
+                # Single-item batch - wrap
                 return [parsed] if expected_count == 1 else None
 
         if not isinstance(parsed, list):

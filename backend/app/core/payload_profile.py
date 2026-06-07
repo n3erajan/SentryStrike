@@ -48,7 +48,7 @@ def build_payload_profile(technology_stack: list[TechnologyComponent] | None) ->
         is_windows=is_windows,
         is_unix_like=is_unix_like,
         supports_php_wrappers=explicit_php,
-        supports_remote_include=explicit_php or is_java,
+        supports_remote_include=supports_php or is_java,
         is_dotnet=is_dotnet,
         is_java=is_java,
         confidence="medium",

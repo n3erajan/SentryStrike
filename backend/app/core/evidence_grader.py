@@ -44,7 +44,7 @@ class EvidenceGrade:
 # ---------------------------------------------------------------------------
 
 # Vulnerability types whose *existence* is confirmed by observation alone.
-# These never require an exploit payload — the absence of a header, the use
+# These never require an exploit payload - the absence of a header, the use
 # of HTTP GET for credentials, or the reachability of an admin panel IS the
 # vulnerability.  Matching is case-insensitive substring.
 _STRUCTURAL_VULN_KEYWORDS: tuple[str, ...] = (
@@ -104,7 +104,7 @@ _STRONG_ACTIVE_METHODS: frozenset[str] = frozenset({
     "remote_include_error_oracle",
 })
 
-# Detection methods that are purely passive pattern matching — no active probe,
+# Detection methods that are purely passive pattern matching - no active probe,
 # no causal validation.  Findings from these methods should receive a lower
 # evidence grade because the match could be from normal page content or
 # reflected payload text rather than a genuine error disclosure.
@@ -179,7 +179,7 @@ class EvidenceGrader:
                 grade="B",
                 fp_ceiling=0.10,
                 reason=(
-                    f"Structural/observable finding: '{vuln.vuln_type}' — "
+                    f"Structural/observable finding: '{vuln.vuln_type}' - "
                     f"the observation itself is the proof"
                 ),
             )
@@ -194,7 +194,7 @@ class EvidenceGrader:
                 grade="C",
                 fp_ceiling=0.40,
                 reason=(
-                    f"Weak pattern-match method: '{method}' — "
+                    f"Weak pattern-match method: '{method}' - "
                     f"matched content may be from normal page content or "
                     f"reflected payload rather than a genuine error disclosure"
                 ),

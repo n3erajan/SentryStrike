@@ -21,7 +21,7 @@ class SecurityHeadersDetector(BaseDetector):
         if "no-store" in cc_lower:
             return False
         if "no-cache" in cc_lower and "must-revalidate" in cc_lower:
-            return False  # partial protection — skip or Info only
+            return False  # partial protection - skip or Info only
         if "private" in cc_lower:
             return False
         return True  # flag missing cache hardening

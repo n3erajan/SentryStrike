@@ -66,7 +66,7 @@ class XSSDetector(BaseDetector):
         "X-Original-URL",
     )
 
-    # Parameters that indicate a JSONP endpoint — use a dedicated payload.
+    # Parameters that indicate a JSONP endpoint - use a dedicated payload.
     _jsonp_param_names = {"callback", "jsonp", "cb", "json_callback", "jsoncallback"}
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
@@ -183,7 +183,7 @@ class XSSDetector(BaseDetector):
             findings.extend(cand_findings)
             pending_browser_jobs.extend(cand_pending)
 
-        # ── Phase 2: Browser verification — runs after ALL HTTP scanning is done ──
+        # ── Phase 2: Browser verification - runs after ALL HTTP scanning is done ──
         if pending_browser_jobs:
             logger.debug(
                 "XSSDetector: HTTP phase complete. Running browser verification for %d candidates.",

@@ -103,10 +103,16 @@ class ResponseAnalyzer:
         ORACLE_ERRORS,
         SQLITE_ERRORS,
         GENERIC_SQL_ERRORS,
-        # File inclusion proof
+        # File inclusion proof (local)
         re.compile(r"(root:x:0:0:|daemon:x:|bin:x:|\[boot loader\]|\[fonts\]|/etc/passwd|win\.ini)", re.I),
         # PHP filter / encoded source disclosure proof
         re.compile(r"(PD9waH|aW5jbHVkZ|cmVxdWlyZ|ZnVuY3Rpb24)", re.I),
+        # Remote file inclusion proof (example.com content fingerprints)
+        re.compile(
+            r"(Example Domain|without needing permission|in documentation examples|"
+            r"illustrative examples in documents|without prior coordination)",
+            re.I,
+        ),
         # Per-request canaries are much stronger than generic HTML tags.
         re.compile(r"(sentryprobe_[a-f0-9]{8})", re.I),
         # Command injection proof
@@ -165,7 +171,7 @@ class ResponseAnalyzer:
 
         Rejects matches that already existed in the pre-test baseline body.
         For XSS payloads, requires a meaningful unencoded substring of the
-        injected content — not merely a generic tag left by an earlier test.
+        injected content - not merely a generic tag left by an earlier test.
         """
         evidence: dict = {
             "canary": canary,
@@ -612,7 +618,7 @@ class ResponseAnalyzer:
         "php version",
     )
 
-    # Generic debug/environment dump markers — require 3+ co-occurring to flag.
+    # Generic debug/environment dump markers - require 3+ co-occurring to flag.
     _DEBUG_ENV_MARKERS = (
         "environment variables",
         "server_software",

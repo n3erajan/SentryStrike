@@ -174,7 +174,7 @@ class CryptoFailuresDetector(BaseDetector):
                             url=url,
                             evidence=(
                                 f"Sensitive parameter '{matched_token.rstrip('=')}' found "
-                                f"in plain-text URL query string — credentials may be exposed "
+                                f"in plain-text URL query string - credentials may be exposed "
                                 f"in server logs, browser history, and Referer headers."
                             ),
                             verified=True,

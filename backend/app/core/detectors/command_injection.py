@@ -22,7 +22,7 @@ class CommandInjectionDetector(BaseDetector):
 
         # 1. Candidate extraction
         # Each candidate is a 5-tuple: (url, param, method, value, form_inputs).
-        # form_inputs is the full sibling input list for the form — required so
+        # form_inputs is the full sibling input list for the form - required so
         # FormPayloadBuilder includes Submit buttons and hidden CSRF tokens in every
         # POST body. Without it, DVWA's isset($_POST['Submit']) check fails and
         # shell_exec is never reached (all responses return in ~5ms, no output).
@@ -38,7 +38,7 @@ class CommandInjectionDetector(BaseDetector):
                 seen.add(key)
                 candidates.append((url, param, method, value, form_inputs))
 
-        # URL parameters — no form_inputs needed (GET query string injection)
+        # URL parameters - no form_inputs needed (GET query string injection)
         for url in urls:
             parsed = urlparse(url)
             query_params = parse_qsl(parsed.query, keep_blank_values=True)
@@ -49,7 +49,7 @@ class CommandInjectionDetector(BaseDetector):
                 ):
                     add_candidate(url, param_name, "GET", param_value, None)
 
-        # Form inputs — pass the full sibling list as form_inputs so Submit
+        # Form inputs - pass the full sibling list as form_inputs so Submit
         # buttons and hidden fields are included in every POST body.
         for form in forms:
             form_url = getattr(form, "action", getattr(form, "page_url", ""))

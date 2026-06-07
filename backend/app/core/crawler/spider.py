@@ -273,7 +273,7 @@ class WebSpider:
         return CrawlResult(urls=discovered_urls, forms=forms, session_cookies=self.session_cookies)
 
     async def fetch_single(self, target_url: str) -> CrawlResult:
-        """Fetch one URL only — no link discovery, sitemaps, or path brute-force."""
+        """Fetch one URL only - no link discovery, sitemaps, or path brute-force."""
         forms: list[HtmlForm] = []
         discovered_urls: list[str] = []
 

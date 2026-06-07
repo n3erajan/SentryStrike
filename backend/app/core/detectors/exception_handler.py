@@ -2,6 +2,7 @@ import re
 import asyncio
 import urllib.parse
 import httpx
+import ipaddress
 
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
@@ -112,16 +113,44 @@ _SENSITIVE_HEADERS = {
     "x-request-id",
 }
 
+_PATTERNS_REQUIRING_ERROR_STATUS = frozenset({
+    r"\b(?:127\.0\.0\.1|localhost)\b",
+    r"\b(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[0-1])\.)\d+\.\d+\b",
+    r"/var/www/",
+    r"/home/\w+/",
+})
+
+_STACK_TRACE_CORROBORATORS: list[re.Pattern] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"caught exception:",
+        r"traceback \(most recent call last\)",
+        r"at \w[\w\.]+\([\w\.]+\.(?:java|kt):\d+\)",
+        r"fatal error:",
+        r"warning:\s+mysql(?:i)?_",
+        r"pdoexception",
+        r"sqlstate\[",
+        r"stack trace:",
+    ]
+]
+
+_WEAK_STANDALONE = frozenset({
+    r"\b(?:127\.0\.0\.1|localhost)\b",
+    r"\b(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[0-1])\.)\d+\.\d+\b",
+    r"/var/www/",
+    r"/home/\w+/",
+})
+
 _FUZZ_PAYLOADS: list[tuple[str, str]] = [
-    ("'", "single quote — SQL metacharacter / template error trigger"),
-    ("\x00", "null byte — triggers path/string handling errors"),
-    ("A" * 8192, "8 KB oversize string — buffer / ORM field-length exception"),
-    ("[]", "array notation — type mismatch where scalar expected"),
-    ("-1", "negative integer — constraint violations / unsigned cast errors"),
+    ("'", "single quote - SQL metacharacter / template error trigger"),
+    ("\x00", "null byte - triggers path/string handling errors"),
+    ("A" * 8192, "8 KB oversize string - buffer / ORM field-length exception"),
+    ("[]", "array notation - type mismatch where scalar expected"),
+    ("-1", "negative integer - constraint violations / unsigned cast errors"),
     ("9999999999999999999", "integer overflow probe"),
-    ("{{7*7}}", "template expression — SSTI errors in unprotected renderers"),
-    ("<script>", "HTML/XML metacharacter — XML parser or sanitiser errors"),
-    ("%00%0d%0a", "URL-encoded null + CRLF — header injection / parser errors"),
+    ("{{7*7}}", "template expression - SSTI errors in unprotected renderers"),
+    ("<script>", "HTML/XML metacharacter - XML parser or sanitiser errors"),
+    ("%00%0d%0a", "URL-encoded null + CRLF - header injection / parser errors"),
 ]
 
 _DEFAULT_URL_LIMIT = 20
@@ -150,17 +179,31 @@ def _is_self_reference(matched_str: str, target_host: str | None) -> bool:
         return False
     matched_lower = matched_str.lower().strip()
     target_lower = target_host.lower().strip()
-    
+
     if matched_lower == target_lower:
         return True
-        
-    localhost_ips = {"127.0.0.1", "localhost"}
-    if matched_lower in localhost_ips and target_lower in localhost_ips:
-        return True
-        
+
+    localhost_aliases = {"127.0.0.1", "localhost", "::1"}
+
+    if matched_lower in localhost_aliases:
+        try:
+            target_addr = ipaddress.ip_address(target_lower)
+            if target_addr.is_private or target_addr.is_loopback:
+                return True
+        except ValueError:
+            pass
+
+    if target_lower in localhost_aliases:
+        try:
+            matched_addr = ipaddress.ip_address(matched_lower)
+            if matched_addr.is_loopback:
+                return True
+        except ValueError:
+            pass
+
     return False
 
-def _classify_body(body: str, target_host: str | None = None) -> tuple[SeverityLevel | None, list[str], list[str]]:
+def _classify_body(body: str, target_host: str | None = None, http_status: int | None = None) -> tuple[SeverityLevel | None, list[str], list[str]]:
     high_hits = []
     for p in _HIGH_PATTERNS:
         matches = list(p.finditer(body))
@@ -173,7 +216,15 @@ def _classify_body(body: str, target_host: str | None = None) -> tuple[SeverityL
         if is_ip_pattern and target_host:
             if all(_is_self_reference(m.group(0), target_host) for m in matches):
                 continue
+        if p.pattern in _PATTERNS_REQUIRING_ERROR_STATUS:
+            if http_status is not None and (http_status < 400 or http_status >= 600):
+                continue
         high_hits.append(p.pattern)
+
+    if http_status is not None and high_hits and all(h in _WEAK_STANDALONE for h in high_hits):
+        has_corroboration = any(pat.search(body) for pat in _STACK_TRACE_CORROBORATORS)
+        if not has_corroboration:
+            high_hits = []
 
     if high_hits:
         return SeverityLevel.high, high_hits, []
@@ -212,7 +263,9 @@ def _extract_snippet(body: str, patterns: list[re.Pattern]) -> str:
             return snippet[:_EVIDENCE_SNIPPET_LEN]
     return body[:_EVIDENCE_SNIPPET_LEN]
 
-def _sensitive_headers_present(headers: httpx.Headers) -> list[str]:
+def _sensitive_headers_present(headers: httpx.Headers, http_status: int | None = None) -> list[str]:
+    if http_status is not None and http_status < 400:
+        return []
     return [h for h in _SENSITIVE_HEADERS if h in headers]
 
 def _finding_key(url: str, vuln_type: str, severity: SeverityLevel) -> tuple:
@@ -285,7 +338,7 @@ def _reflection_guard(
     """Filter matched patterns that only match because the payload is reflected in the body.
 
     If *payload* appears literally in *body*, any pattern that matches only inside the
-    reflected payload text is a false positive — the application is echoing input, not
+    reflected payload text is a false positive - the application is echoing input, not
     disclosing an error path.  This guard strips the payload from the body and re-checks
     each pattern.
     """
@@ -504,24 +557,51 @@ class ExceptionHandlingDetector(BaseDetector):
         url: str,
     ) -> Finding | None:
         test_url = f"{url.rstrip('/')}/non-existent-sentry-strike-endpoint-xyzzy"
+        baseline_url = url.rstrip('/')
+
+        if test_url == baseline_url:
+            return None
+
         async with semaphore:
             try:
-                response = await client.get(test_url)
+                baseline_response = await client.get(baseline_url)
+                probe_response = await client.get(test_url)
             except Exception:
                 return None
 
-        if response.status_code in {301, 302, 303, 307, 308}:
+        if probe_response.status_code in {301, 302, 303, 307, 308}:
             return None
 
         finding = self._analyse_response(
-            url=test_url, method="GET", status=response.status_code,
-            body=response.text, headers=response.headers,
+            url=test_url, method="GET", status=probe_response.status_code,
+            body=probe_response.text, headers=probe_response.headers,
             trigger="non-existent path probe", require_body_match=True,
             parameter=None, payload=None
         )
+
+        # Baseline diffing: if both baseline and probe returned 200, suppress
+        # patterns already present in normal page content (catch-all templates).
+        if (
+            finding is not None
+            and probe_response.status_code == 200
+            and baseline_response.status_code == 200
+        ):
+            _, baseline_high, baseline_med = _classify_body(
+                baseline_response.text,
+                target_host=_get_target_host(baseline_url),
+            )
+            _, probe_high, probe_med = _classify_body(
+                probe_response.text,
+                target_host=_get_target_host(test_url),
+            )
+            baseline_set = set(baseline_high + baseline_med)
+            probe_set = set(probe_high + probe_med)
+            if not (probe_set - baseline_set):
+                return None
+
         # A 404 response to a non-existent path is expected behaviour.
         # Only report if the body reveals real error internals (Medium+).
-        if finding is not None and response.status_code == 404 and finding.severity == SeverityLevel.low:
+        if finding is not None and probe_response.status_code == 404 and finding.severity == SeverityLevel.low:
             return None
         return finding
 
@@ -602,7 +682,7 @@ class ExceptionHandlingDetector(BaseDetector):
 
         return self._analyse_response(
             url=full_uri, method=method, status=response.status_code,
-            body=response.text, headers=response.headers, trigger=f"form fuzz — {payload_desc}",
+            body=response.text, headers=response.headers, trigger=f"form fuzz - {payload_desc}",
             parameter=fuzzed_param, payload=payload
         )
 
@@ -654,7 +734,7 @@ class ExceptionHandlingDetector(BaseDetector):
             finding = self._analyse_response(
                 url=fuzzed_url, method="GET", status=response.status_code,
                 body=response.text, headers=response.headers,
-                trigger=f"single-param fuzz on '{target_key}' — {payload_desc}",
+                trigger=f"single-param fuzz on '{target_key}' - {payload_desc}",
                 parameter=target_key, payload=payload
             )
             if finding:
@@ -677,7 +757,7 @@ class ExceptionHandlingDetector(BaseDetector):
         if status in _GATEWAY_CODES:
             return None
 
-        severity, high_hits, med_hits = _classify_body(body, target_host=_get_target_host(url))
+        severity, high_hits, med_hits = _classify_body(body, target_host=_get_target_host(url), http_status=status)
         matched = high_hits or med_hits
 
         # Apply reflection guard: if the matched pattern only appears because the
@@ -685,7 +765,7 @@ class ExceptionHandlingDetector(BaseDetector):
         matched = _reflection_guard(body, payload, matched)
         severity = _reclassify_severity(matched)
 
-        sensitive_hdrs = _sensitive_headers_present(headers)
+        sensitive_hdrs = _sensitive_headers_present(headers, http_status=status)
         is_bare_500 = status == 500 and not matched
 
         if require_body_match and not matched:

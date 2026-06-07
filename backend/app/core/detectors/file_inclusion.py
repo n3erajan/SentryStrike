@@ -2,7 +2,9 @@ import asyncio
 import base64
 import logging
 import re
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode, quote
+
+import httpx
 
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.payload_profile import PayloadProfile, build_payload_profile
@@ -39,9 +41,18 @@ class FileInclusionDetector(BaseDetector):
     ]
 
     RFI_PAYLOADS = [
-        ("http://0.0.0.0:0/sentry_rfi_test", "Remote HTTP include attempt"),
-        ("https://0.0.0.0:0/sentry_rfi_test", "Remote HTTPS include attempt"),
+        ("http://example.com/", "Remote include of example.com - content fingerprint"),
+        # Un-routable IPs: if allow_url_include is ON the server will try and fail
+        # with a network error.  We only treat *network* errors as indicators (see
+        # rfi_network_error_terms below); config-level refusals are a separate set
+        # (rfi_blocked_terms) that proves the server is NOT vulnerable.
+        ("http://0.0.0.0:0/sentry_rfi_test", "Remote HTTP include attempt - error oracle"),
+        ("https://0.0.0.0:0/sentry_rfi_test", "Remote HTTPS include attempt - error oracle"),
     ]
+
+    # The example.com payload is used both as the primary fingerprint check and as
+    # the content-confirmation step after an error-oracle hit on an unreachable URL.
+    _RFI_CONFIRM_PAYLOAD = "http://example.com/"
 
     @classmethod
     def _payload_family(cls, payload: str) -> str:
@@ -80,9 +91,13 @@ class FileInclusionDetector(BaseDetector):
 
     @classmethod
     def _select_rfi_payloads(cls, profile: PayloadProfile) -> list[tuple[str, str]]:
-        if profile.confidence == "unknown" or profile.supports_remote_include:
+        if profile.confidence == "unknown":
             return cls.RFI_PAYLOADS
-        return []
+        if profile.supports_remote_include:
+            return cls.RFI_PAYLOADS
+        if profile.confidence in ("high", "confirmed"):
+            return []
+        return cls.RFI_PAYLOADS
 
     @staticmethod
     def _is_direct_path_traversal(payload: str) -> bool:
@@ -110,8 +125,53 @@ class FileInclusionDetector(BaseDetector):
 
     @staticmethod
     def _is_valid_src_code_delivery(text_content: str) -> bool:
-        indicators = [r"<?php", r"html", r"doctype", r"require_once", r"include(", r"$_GET", r"$_POST"]
-        return any(re.search(ind, text_content, re.IGNORECASE) for ind in indicators)
+        # FIX: Switched from unstable regex searching to reliable, fast substring checks
+        text_lower = text_content.lower()
+        indicators = ["<?php", "html", "doctype", "require_once", "include(", "$_get", "$_post"]
+        return any(ind in text_lower for ind in indicators)
+
+    _RFI_FALLBACK_FINGERPRINTS: dict[str, list[str]] = {
+        "http://example.com/": [
+            "This domain is for use in documentation examples without needing permission",
+            "This domain is for use in illustrative examples in documents",
+            "Example Domain",
+        ],
+    }
+
+    @staticmethod
+    def _rfi_fingerprint(body: str) -> list[str]:
+        clean_html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", body, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", clean_html)).strip()
+        long_chunks: list[str] = []
+        short_chunks: list[str] = []
+        for sentence in re.split(r"(?<=[.!?])\s+", text):
+            sentence = sentence.strip()
+            if len(sentence) > 40:
+                long_chunks.append(sentence)
+            elif len(sentence) >= 12:
+                short_chunks.append(sentence)
+        combined = long_chunks[:5] + short_chunks[:1]
+        return combined[:6]
+
+    async def _fetch_rfi_fingerprints(self) -> dict[str, list[str]]:
+        fingerprints: dict[str, list[str]] = {}
+        targets = ["http://example.com/"]
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            for url in targets:
+                try:
+                    resp = await client.get(url)
+                    if resp.status_code == 200:
+                        fingerprints[url] = self._rfi_fingerprint(resp.text)
+                except Exception:
+                    logger.debug("Failed to fetch RFI fingerprint URL: %s", url)
+
+        for url, chunks in self._RFI_FALLBACK_FINGERPRINTS.items():
+            if url not in fingerprints:
+                fingerprints[url] = chunks
+            else:
+                fingerprints[url] = list(set(fingerprints[url] + chunks))
+
+        return fingerprints
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
@@ -135,6 +195,8 @@ class FileInclusionDetector(BaseDetector):
         verifier = HttpVerifier(cookies=session_cookies)
         verifier.set_request_context(module="lfi")
 
+        rfi_fingerprints = await self._fetch_rfi_fingerprints() if rfi_payloads else {}
+
         async def verify_candidate(cand) -> list[Finding]:
             if len(cand) == 5:
                 cand_url, param, method, val, form_inputs = cand
@@ -153,36 +215,45 @@ class FileInclusionDetector(BaseDetector):
             async with semaphore:
                 verifier.set_request_context(parameter=param)
                 try:
-                    # 1. Establish the working baseline response
                     baseline_url, baseline_params, baseline_data = _build_request_args(val)
                     baseline = await verifier.send_request(
                         baseline_url, method, baseline_params, baseline_data, test_phase="baseline"
                     )
                     baseline_len = len(baseline.body)
 
-                    # Gate: phpinfo/debug page exclusion — these pages echo everything
                     if ResponseAnalyzer.is_phpinfo_or_debug_page(baseline.body or ""):
-                        logger.debug(
-                            "Skipping LFI testing on phpinfo/debug page %s:%s",
-                            cand_url, param,
-                        )
                         return cand_findings
 
-                    # 2. Establish a "Missing Content" control baseline using a benign invalid local path
                     control_url, control_params, control_data = _build_request_args("sentry_non_existent_file_control_marker")
                     control_res = await verifier.send_request(
                         control_url, method, control_params, control_data, test_phase="lfi_control"
                     )
                     control_len = len(control_res.body)
-                    
-                    # Determine if the template's content block is structurally dynamic
-                    is_structural_dynamic = abs(baseline_len - control_len) > 15
 
-                    rfi_error_terms = re.compile(
+                    # Terms that prove the server *attempted* a remote HTTP fetch and
+                    # hit a network-level failure.  allow_url_include must therefore be
+                    # ON — this is a genuine RFI indicator (still needs canary
+                    # confirmation before we report it, see below).
+                    rfi_network_error_terms = re.compile(
                         r"(failed to open stream: HTTP request failed|"
-                        r"php_network_getaddresses: getaddrinfo failed|"
-                        r"allow_url_include is disabled|"
-                        r"java.net.MalformedURLException|java.io.FileNotFoundException)",
+                        r"php_network_getaddresses: getaddrinfo(?: for host)? failed|"
+                        r"java\.net\.MalformedURLException|"
+                        r"java\.io\.FileNotFoundException|"
+                        r"failed to open stream: Connection (?:refused|timed out)|"
+                        r"Unable to find the socket transport|"
+                        r"getaddrinfo.*: Name or service not known)",
+                        re.IGNORECASE,
+                    )
+
+                    # Terms that prove the server *refused* to make a remote request
+                    # because allow_url_include is DISABLED.  Their presence means the
+                    # server is NOT vulnerable — treat as a suppressor, never a trigger.
+                    rfi_blocked_terms = re.compile(
+                        r"(allow_url_include|"
+                        r"wrapper is disabled in the server configuration|"
+                        r"URL file-access is disabled|"
+                        r"not allowed to be included|"
+                        r"include_path.*does not allow)",
                         re.IGNORECASE,
                     )
                     
@@ -208,34 +279,24 @@ class FileInclusionDetector(BaseDetector):
 
                         if verify_rule and verify_rule not in ["DYNAMIC_B64_CHECK", "DYNAMIC_STREAM_CHECK"]:
                             if re.search(verify_rule, injected.body, re.I):
-                                # REFLECTION GUARD: Ensure the matched content isn't
-                                # solely inside the reflected payload text.
                                 if payload in injected.body:
                                     stripped_body = injected.body.replace(payload, "")
                                     if not re.search(verify_rule, stripped_body, re.I):
-                                        logger.debug(
-                                            "LFI verify_rule match for '%s' was inside reflected payload — "
-                                            "suppressing as reflection %s:%s",
-                                            payload, cand_url, param,
-                                        )
                                         continue
 
-                                # LENGTH DELTA GUARD: For traversal payloads (../),
-                                # require ≥50 chars of new content vs control baseline
+                                # FIX: Lowered threshold from 50 to 10 to protect slim system/docker responses
                                 if "../" in payload or "..\\" in payload:
                                     injected_len = len(injected.body)
                                     delta = abs(injected_len - control_len)
-                                    if delta < 50:
+                                    if delta < 10:
                                         logger.debug(
-                                            "LFI traversal payload '%s' response too similar to control "
-                                            "(delta=%d < 50) %s:%s — suppressing",
+                                            "LFI traversal payload '%s' response too identical to control "
+                                            "(delta=%d < 10) %s:%s - suppressing",
                                             payload, delta, cand_url, param,
                                         )
                                         continue
 
                                 cand_findings.append(
-                                    # Direct filesystem traversal is an access-control failure.
-                                    # Runtime wrappers/streams remain framework inclusion findings.
                                     Finding(
                                         category=self._file_read_finding_type(payload)[0],
                                         vuln_type=self._file_read_finding_type(payload)[1],
@@ -290,8 +351,6 @@ class FileInclusionDetector(BaseDetector):
                                 )
 
                         elif verify_rule == "DYNAMIC_STREAM_CHECK":
-                            # FIX: Compare wrapper errors explicitly against control layout behaviors 
-                            # to ensure this error isn't triggered by standard "file not found" failures.
                             if wrapper_error_terms.search(injected.body):
                                 if not wrapper_error_terms.search(baseline.body) and not wrapper_error_terms.search(control_res.body):
                                     cand_findings.append(
@@ -314,18 +373,89 @@ class FileInclusionDetector(BaseDetector):
                                     )
 
                     # --- Execute Advanced RFI Suite ---
+                    # RFI payloads are full URLs (e.g. "http://example.com/").
+                    # URLParameterBuilder encodes the value into a params dict which
+                    # httpx then percent-encodes, turning "http://example.com/" into
+                    # "http%3A%2F%2Fexample.com%2F".  PHP's include() receives that
+                    # literal string and tries to open a *local* file by that name
+                    # instead of making an HTTP request — so RFI silently fails.
+                    #
+                    # Fix: build the injection URL manually, substituting the param
+                    # value with the raw RFI URL using safe=':/?#[]@!$&\'()*+,;=%'
+                    # so the scheme and slashes are preserved verbatim in the query
+                    # string while any genuinely unsafe chars are still encoded.
+                    def _build_rfi_request_url(rfi_payload: str) -> str:
+                        parsed = urlparse(cand_url)
+                        existing_params = parse_qsl(parsed.query, keep_blank_values=True)
+                        # Replace or append the target parameter with the raw URL value.
+                        new_params = [
+                            (k, rfi_payload if k == param else v)
+                            for k, v in existing_params
+                        ]
+                        if not any(k == param for k, _ in existing_params):
+                            new_params.append((param, rfi_payload))
+                        # urlencode with safe='' would encode '://', so we build the
+                        # query string ourselves, encoding only the non-RFI params
+                        # normally and splicing the RFI URL in raw.
+                        parts = []
+                        for k, v in new_params:
+                            if k == param:
+                                # Keep the RFI URL intact; only quote the key itself.
+                                parts.append(f"{quote(k, safe='')}={v}")
+                            else:
+                                parts.append(urlencode([(k, v)]))
+                        raw_query = "&".join(parts)
+                        return urlunparse(parsed._replace(query=raw_query))
+
+                    # --- Execute Advanced RFI Suite ---
+                    verifier.set_request_context(module="rfi")
                     for payload, desc in rfi_payloads:
-                        injected_url, injected_params, injected_data = _build_request_args(payload)
+                        if method.upper() == "POST" and form_inputs is not None:
+                            injected_url, injected_params, injected_data = _build_request_args(payload)
+                        else:
+                            injected_url = _build_rfi_request_url(payload)
+                            injected_params = None
+                            injected_data = None
+                        
                         injected = await verifier.send_request(
                             injected_url, method, injected_params, injected_data,
                             test_phase="rfi_injection", payload=payload,
                         )
                         
-                        if injected.status_code != 200:
+                        if injected.status_code not in (200, 500):
                             continue
 
-                        # Evaluation Track A: Verbose Error Signatures Exist (Highly Reliable)
-                        if rfi_error_terms.search(injected.body) and not rfi_error_terms.search(baseline.body):
+                        # Strip out style and script layout data to avoid template pollution
+                        clean_injected = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", injected.body, flags=re.DOTALL | re.IGNORECASE)
+                        clean_baseline = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", baseline.body, flags=re.DOTALL | re.IGNORECASE)
+                        injected_text_lower = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", clean_injected)).strip().lower()
+                        baseline_text_lower = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", clean_baseline)).strip().lower()
+
+                        # Strict RFI signatures specific to example.com contents
+                        rfi_signatures = [
+                            "illustrative examples in documents",
+                            "iana.org/domains/example",
+                            "without prior coordination",
+                            "without needing permission"
+                        ]
+
+                        # Verify that the signature is explicitly loaded into the injected view
+                        match_results = {
+                            sig: (
+                                sig in injected_text_lower,
+                                sig in baseline_text_lower,
+                                injected_text_lower.count(sig),
+                                baseline_text_lower.count(sig)
+                            )
+                            for sig in rfi_signatures
+                        }
+
+                        fp_match = any(
+                            sig in injected_text_lower and (sig not in baseline_text_lower or injected_text_lower.count(sig) > baseline_text_lower.count(sig))
+                            for sig in rfi_signatures
+                        )
+
+                        if fp_match:
                             cand_findings.append(
                                 Finding(
                                     category=OwaspCategory.a05,
@@ -335,9 +465,9 @@ class FileInclusionDetector(BaseDetector):
                                     parameter=param,
                                     method=method,
                                     payload=payload,
-                                    evidence=f"RFI confirmed via explicit system error mapping ({desc}).",
-                                    confidence_score=95.0,
-                                    detection_method="remote_include_error_oracle",
+                                    evidence=f"RFI vulnerability confirmed via content fingerprint validation ({desc}).",
+                                    confidence_score=98.0,
+                                    detection_method="remote_include_content_fingerprint",
                                     reproducible=True,
                                     verified=True,
                                     verification_request_snippet=injected.request_snippet,
@@ -345,6 +475,90 @@ class FileInclusionDetector(BaseDetector):
                                 )
                             )
                             break
+
+                        # --- Error-oracle path (two-step) ---
+                        # The un-routable payloads (0.0.0.0) are designed to reveal
+                        # whether allow_url_include is ON: if the server *attempts* the
+                        # fetch it will emit a network-level error.  That is only an
+                        # *indicator* — not proof — because display_errors=Off silently
+                        # swallows those errors, and display_errors=On on a non-vulnerable
+                        # app can surface them for unrelated reasons.
+                        #
+                        # Confirmation must be content-based: after an error-oracle hit
+                        # we send example.com and check whether its known page text is
+                        # actually reflected in the response.  Only that proves the server
+                        # executed include($attacker_url) and returned the remote body.
+                        network_hit_in_injected = rfi_network_error_terms.search(injected.body)
+                        blocked_in_injected = rfi_blocked_terms.search(injected.body)
+                        network_hit_in_baseline = rfi_network_error_terms.search(baseline.body)
+                        blocked_in_baseline = rfi_blocked_terms.search(baseline.body)
+                        network_hit_in_control = rfi_network_error_terms.search(control_res.body)
+
+                        if (
+                            network_hit_in_injected
+                            and not blocked_in_injected
+                            and not network_hit_in_baseline
+                            and not blocked_in_baseline
+                            and not network_hit_in_control
+                        ):
+                            # Step 2: send example.com and require its known content to
+                            # appear in the response.  A network error alone is never
+                            # enough to report — we need the actual remote body reflected.
+                            if method.upper() == "POST" and form_inputs is not None:
+                                confirm_url, confirm_params, confirm_data = _build_request_args(
+                                    self._RFI_CONFIRM_PAYLOAD
+                                )
+                            else:
+                                confirm_url = _build_rfi_request_url(self._RFI_CONFIRM_PAYLOAD)
+                                confirm_params = None
+                                confirm_data = None
+
+                            confirm_res = await verifier.send_request(
+                                confirm_url, method, confirm_params, confirm_data,
+                                test_phase="rfi_content_confirm", payload=self._RFI_CONFIRM_PAYLOAD,
+                            )
+
+                            clean_confirm = re.sub(
+                                r"<(script|style)[^>]*>.*?</\1>", " ", confirm_res.body,
+                                flags=re.DOTALL | re.IGNORECASE,
+                            )
+                            confirm_text_lower = re.sub(
+                                r"\s+", " ", re.sub(r"<[^>]+>", " ", clean_confirm)
+                            ).strip().lower()
+
+                            confirm_fp_match = any(
+                                sig in confirm_text_lower and sig not in baseline_text_lower
+                                for sig in rfi_signatures
+                            )
+
+                            if confirm_fp_match:
+                                logger.info(
+                                    "RFI error-oracle confirmed by example.com content fingerprint "
+                                    "for %s param=%s", cand_url, param,
+                                )
+                                cand_findings.append(
+                                    Finding(
+                                        category=OwaspCategory.a05,
+                                        vuln_type="Remote File Inclusion (RFI)",
+                                        severity=SeverityLevel.high,
+                                        url=cand_url,
+                                        parameter=param,
+                                        method=method,
+                                        payload=self._RFI_CONFIRM_PAYLOAD,
+                                        evidence=(
+                                            f"RFI confirmed: error oracle ({desc}) indicated "
+                                            f"allow_url_include=On; example.com content fingerprint "
+                                            f"verified actual remote body inclusion."
+                                        ),
+                                        confidence_score=97.0,
+                                        detection_method="remote_include_error_oracle_content_confirmed",
+                                        reproducible=True,
+                                        verified=True,
+                                        verification_request_snippet=confirm_res.request_snippet,
+                                        verification_response_snippet=confirm_res.response_snippet,
+                                    )
+                                )
+                                break
 
                 except Exception as e:
                     logger.error("File inclusion verification failed for %s param %s: %s", cand_url, param, e)

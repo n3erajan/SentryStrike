@@ -57,7 +57,7 @@ def _para_escape(value: Any) -> str:
 def _dedupe_semicolon_text(value: Any) -> str:
     text = str(value or "").strip()
     parts = re.split(
-        r";\s+(?=(?:"
+        r"(?:;\s*|\n)(?=(?:"
         r"(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+https?://|"
         r"Header not found:|Supporting finding:|Payload |Form |"
         r"Authentication |SQL-engine |Response |Missing |Sensitive |Insecure "
@@ -79,7 +79,7 @@ def _dedupe_semicolon_text(value: Any) -> str:
         if normalized and key not in seen:
             seen.add(key)
             cleaned.append(normalized)
-    return "; ".join(cleaned)
+    return "\n".join(cleaned)
 
 
 def _evidence_excerpt_key(text: str) -> str | None:
@@ -171,7 +171,7 @@ def _clean_status(value: Any) -> str:
 #   • Severity header bars use deep solid fills → white text always legible
 #   • Severity text colors on white all ≥5.8:1 contrast ratio
 #   • Labels use #444C56 (~8.5:1) instead of the former #8B949E (3.4:1, failing AA)
-#   • Yellow/amber never used as text on white — replaced with deep amber-brown
+#   • Yellow/amber never used as text on white - replaced with deep amber-brown
 #   • Row tints are very pale; all text printed on them stays near-black
 
 # ── Structural neutrals ──────────────────────────────────────────────────
@@ -188,33 +188,30 @@ CAPTION_TEXT = colors.HexColor("#57606A")   # captions/meta (contrast ~5.7:1 on 
 BRAND_RED    = colors.HexColor("#C0392B")   # Sentry Strike red  (7.1:1 on white ✓)
 BRAND_RED_LT = colors.HexColor("#FDECEA")   # faint red tint
 
-# ── Severity foreground — text/badge color ON WHITE background ────────────
+# ── Severity foreground - text/badge color ON WHITE background ────────────
 #   Critical  #B91C1C  7.2:1 ✓   High   #C2410C  5.8:1 ✓
-#   Medium    #92400E  6.7:1 ✓   Low    #1D4ED8  7.1:1 ✓   Info  #166534  7.5:1 ✓
+#   Medium    #92400E  6.7:1 ✓   Low    #1D4ED8  7.1:1 ✓  
 SEV_FG = {
     "Critical": colors.HexColor("#B91C1C"),
     "High":     colors.HexColor("#C2410C"),
     "Medium":   colors.HexColor("#92400E"),
     "Low":      colors.HexColor("#1D4ED8"),
-    "Info":     colors.HexColor("#166534"),
 }
 
-# ── Severity solid fills — ONLY used as bar/badge backgrounds with WHITE text ─
+# ── Severity solid fills - ONLY used as bar/badge backgrounds with WHITE text ─
 SEV_COLOR = {
     "Critical": colors.HexColor("#991B1B"),   # deep crimson
     "High":     colors.HexColor("#9A3412"),   # deep burnt-orange
     "Medium":   colors.HexColor("#78350F"),   # deep amber-brown
     "Low":      colors.HexColor("#1E3A8A"),   # deep royal blue
-    "Info":     colors.HexColor("#14532D"),   # deep forest green
 }
 
-# ── Severity row tints — very pale, near-black text printed on top ─────────
+# ── Severity row tints - very pale, near-black text printed on top ─────────
 SEV_BG = {
     "Critical": colors.HexColor("#FEF2F2"),
     "High":     colors.HexColor("#FFF7ED"),
     "Medium":   colors.HexColor("#FFFBEB"),
     "Low":      colors.HexColor("#EFF6FF"),
-    "Info":     colors.HexColor("#F0FDF4"),
 }
 
 # Legacy aliases so all existing references keep working
@@ -222,7 +219,6 @@ ACCENT_RED    = BRAND_RED
 ACCENT_ORANGE = SEV_FG["High"]
 ACCENT_YELLOW = SEV_FG["Medium"]
 ACCENT_BLUE   = SEV_FG["Low"]
-ACCENT_GREEN  = SEV_FG["Info"]
 MID_GRAY      = CAPTION_TEXT
 
 
@@ -481,7 +477,7 @@ class CoverPage:
         canvas.rect(0, 0, w, 18*mm, fill=1, stroke=0)
         canvas.setFillColor(MID_GRAY)
         canvas.setFont("Helvetica", 8)
-        canvas.drawString(22*mm, 11*mm, "CONFIDENTIAL — For authorized recipient use only")
+        canvas.drawString(22*mm, 11*mm, "CONFIDENTIAL - For authorized recipient use only")
         canvas.drawRightString(w - 20*mm, 11*mm, "OWASP Top 10 2025")
         canvas.setStrokeColor(BRAND_RED)
         canvas.setLineWidth(1)
@@ -575,7 +571,7 @@ def make_doc(buf: BytesIO, report_data: dict) -> BaseDocTemplate:
         canvas.drawString(10*mm, h - 9*mm, "SENTRY STRIKE")
         canvas.setFillColor(MID_GRAY)
         canvas.setFont("Helvetica", 7.5)
-        canvas.drawRightString(w - 10*mm, h - 9*mm, "Penetration Test Report — CONFIDENTIAL")
+        canvas.drawRightString(w - 10*mm, h - 9*mm, "Penetration Test Report - CONFIDENTIAL")
 
         # Bottom bar
         canvas.setFillColor(LIGHT_BG)
@@ -585,7 +581,7 @@ def make_doc(buf: BytesIO, report_data: dict) -> BaseDocTemplate:
         canvas.line(0, 14*mm, w, 14*mm)
         canvas.setFillColor(MID_GRAY)
         canvas.setFont("Helvetica", 7.5)
-        canvas.drawString(20*mm, 5*mm, "© Sentry Strike Security Report — For Authorized Use Only")
+        canvas.drawString(20*mm, 5*mm, "© Sentry Strike Security Report - For Authorized Use Only")
         canvas.drawRightString(w - 20*mm, 5*mm, f"Page {doc.page}")
 
         canvas.restoreState()
@@ -776,7 +772,7 @@ def build_statistics(data: dict, styles: dict) -> list:
     ]
     total = stats.get("total_vulnerabilities", 1) or 1
     for sev_label, sev_key in [("Critical", "critical"), ("High", "high"),
-                                ("Medium", "medium"), ("Low", "low"), ("Info", "info")]:
+                                ("Medium", "medium"), ("Low", "low")]:
         count = sev.get(sev_key, 0)
         pct = count / total * 100
         bar_len = max(int(pct * 0.8), 0)  # max ~80 chars

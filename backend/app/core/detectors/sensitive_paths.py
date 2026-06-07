@@ -176,7 +176,7 @@ class SensitivePathsDetector(BaseDetector):
                                 vuln_type=vuln_type,
                                 severity=severity,
                                 url=target_url,
-                                evidence=f"Accessible sensitive path: {evidence} Snippet: {response.text[:100]}...",
+                                evidence=f"Accessible sensitive path: {evidence} Snippet: {response.text[:200]}...",
                                 confidence_score=95.0,
                                 detection_method="path_bruteforce",
                                 verified=True,

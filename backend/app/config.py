@@ -18,8 +18,8 @@ class Settings(BaseSettings):
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
     ollama_model: str = Field(default="qwen3.5:9b", alias="OLLAMA_MODEL")
     ollama_timeout_seconds: float = Field(default=120.0, alias="OLLAMA_TIMEOUT_SECONDS")
-    ai_max_retries: int = Field(default=2, alias="AI_MAX_RETRIES")
-    ai_batch_size: int = Field(default=2, alias="AI_BATCH_SIZE")
+    ai_max_retries: int = Field(default=3, alias="AI_MAX_RETRIES")
+    ai_batch_size: int = Field(default=1, alias="AI_BATCH_SIZE")
 
     crawl_depth: int = Field(default=3, alias="CRAWL_DEPTH")
     crawl_max_urls: int = Field(default=200, alias="CRAWL_MAX_URLS")
