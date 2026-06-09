@@ -10,6 +10,12 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.config import get_settings
+from app.core.crawler.auth_manager import ModernAuthManager
+from app.core.crawler.api_extractor import ApiExtractor
+from app.core.crawler.browser_engine import BrowserDiscoveryEngine
+from app.core.crawler.models import ApiEndpoint, CrawlState, ParameterCandidate, RouteCandidate, RouteSource
+from app.core.crawler.param_discovery import ParamDiscovery
+from app.core.crawler.spa import SpaFallbackDetector
 from app.core.crawler.url_parser import normalize_url, same_domain, normalize_for_dedupe
 from app.utils.http_logging import make_httpx_response_logger
 from app.utils.scan_http import create_scan_client
@@ -53,6 +59,12 @@ class CrawlResult:
     urls: list[str] = field(default_factory=list)
     forms: list[HtmlForm] = field(default_factory=list)
     session_cookies: dict[str, str] = field(default_factory=dict)
+    routes: list[RouteCandidate] = field(default_factory=list)
+    api_endpoints: list[ApiEndpoint] = field(default_factory=list)
+    parameters: list[ParameterCandidate] = field(default_factory=list)
+    requests: list[object] = field(default_factory=list)
+    assets: list[str] = field(default_factory=list)
+    dead_routes: list[RouteCandidate] = field(default_factory=list)
 
 
 @dataclass
@@ -71,10 +83,7 @@ class WebSpider:
         self._configured_auth_cookies: dict[str, str] = {}
 
     def _snapshot_cookies(self, cookies: httpx.Cookies) -> dict[str, str]:
-        snapshot: dict[str, str] = {}
-        for cookie in cookies.jar:
-            snapshot[cookie.name] = cookie.value
-        return snapshot
+        return ModernAuthManager.snapshot_cookies(cookies)
 
     async def crawl(self, root_url: str, max_depth: int | None = None) -> CrawlResult:
         max_depth = max_depth if max_depth is not None else self.settings.crawl_depth
@@ -83,6 +92,9 @@ class WebSpider:
         forms: list[HtmlForm] = []
         discovered_urls: list[str] = []
         discovered_set: set[str] = set()
+        crawl_state = CrawlState()
+        dead_routes: list[RouteCandidate] = []
+        spa_detector = SpaFallbackDetector()
         lock = asyncio.Lock()
 
         def should_enqueue(url_candidate: str, depth: int) -> bool:
@@ -102,12 +114,13 @@ class WebSpider:
             return False
 
         # Helper to safely call should_enqueue and put to queue
-        async def safe_enqueue(url_candidate: str, depth: int):
+        async def safe_enqueue(url_candidate: str, depth: int, source: RouteSource = RouteSource.html, priority: int = 50):
             async with lock:
                 if should_enqueue(url_candidate, depth):
-                    await queue.put((url_candidate, depth))
+                    crawl_state.add_route(RouteCandidate(url=url_candidate, source=source, priority=priority, depth=depth))
+                    await queue.put((url_candidate, depth, source))
 
-        await safe_enqueue(root_url, 0)
+        await safe_enqueue(root_url, 0, RouteSource.html, 100)
 
         robots = await self._load_robots(root_url)
 
@@ -119,6 +132,12 @@ class WebSpider:
         ) as client:
             # Perform authentication if configured
             await self._authenticate_session(client, root_url)
+            try:
+                root_response = await client.get(root_url)
+                if "text/html" in root_response.headers.get("content-type", ""):
+                    spa_detector.configure_root(root_url, root_response.text)
+            except Exception as exc:
+                logger.debug("failed to prefetch root shell for SPA fallback detection: %s", exc)
 
             # 1. Parse Sitemap directives from robots.txt if possible
             sitemap_urls = []
@@ -142,7 +161,7 @@ class WebSpider:
                         for loc in locs:
                             loc_clean = loc.strip()
                             if loc_clean and same_domain(root_url, loc_clean):
-                                await safe_enqueue(loc_clean, 0)
+                                await safe_enqueue(loc_clean, 0, RouteSource.sitemap, 80)
                 except Exception as e:
                     logger.warning("Failed to fetch sitemap %s: %s", sitemap_url, e)
 
@@ -155,7 +174,7 @@ class WebSpider:
             ]
             for path in common_paths:
                 brute_url = normalize_url(root_url, path)
-                await safe_enqueue(brute_url, 0)
+                await safe_enqueue(brute_url, 0, RouteSource.brute_force, 20)
 
             # 3. Main crawling loop with concurrency
             import time
@@ -194,7 +213,7 @@ class WebSpider:
                         if item is None:
                             queue.task_done()
                             break
-                        url, depth = item
+                        url, depth, source = item
                     except asyncio.CancelledError:
                         break
 
@@ -216,6 +235,29 @@ class WebSpider:
                         if len(discovered_urls) >= self.settings.crawl_max_urls:
                             queue.task_done()
                             break
+
+                        fallback_signal = spa_detector.detect(
+                            url,
+                            response.status_code,
+                            response.headers.get("content-type", ""),
+                            response.text if "text/html" in response.headers.get("content-type", "") else "",
+                        )
+                        if url == root_url and "text/html" in response.headers.get("content-type", ""):
+                            spa_detector.configure_root(root_url, response.text)
+
+                        if fallback_signal.is_fallback and url != root_url and source == RouteSource.brute_force:
+                            route = RouteCandidate(
+                                url=url,
+                                source=source,
+                                priority=0,
+                                depth=depth,
+                                evidence=fallback_signal.reason,
+                                is_spa_fallback=True,
+                                is_dead=True,
+                            )
+                            dead_routes.append(route)
+                            queue.task_done()
+                            continue
 
                         # Add to discovered_urls if request was successful/interesting
                         if response.status_code in [200, 301, 302, 403]:
@@ -243,7 +285,12 @@ class WebSpider:
                     for link in links:
                         normalized = normalize_url(url, link)
                         if same_domain(root_url, normalized):
-                            await safe_enqueue(normalized, depth + 1)
+                            parsed_link = urlparse(normalized)
+                            ext = pathlib.PurePosixPath(parsed_link.path).suffix.lower()
+                            if ext == ".js":
+                                await self._inspect_javascript_asset(client, normalized, root_url, crawl_state, safe_enqueue, depth + 1)
+                            else:
+                                await safe_enqueue(normalized, depth + 1, RouteSource.html, 50)
 
                     queue.task_done()
 
@@ -270,7 +317,31 @@ class WebSpider:
                     w.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
 
-        return CrawlResult(urls=discovered_urls, forms=forms, session_cookies=self.session_cookies)
+            if self.settings.crawl_browser_enabled:
+                browser_state = await BrowserDiscoveryEngine(
+                    max_interactions=self.settings.crawl_browser_max_interactions
+                ).crawl(root_url)
+                self._merge_crawl_state(crawl_state, browser_state)
+
+        for endpoint in crawl_state.api_endpoints:
+            for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
+                crawl_state.add_parameter(parameter)
+        for parameter in ParamDiscovery.build_parameter_inventory(discovered_urls, forms, api_endpoints=crawl_state.api_endpoints):
+            crawl_state.add_parameter(parameter)
+
+        result = CrawlResult(
+            urls=discovered_urls,
+            forms=forms,
+            session_cookies=self.session_cookies,
+            routes=crawl_state.routes,
+            api_endpoints=crawl_state.api_endpoints,
+            parameters=crawl_state.parameters,
+            requests=crawl_state.requests,
+            assets=sorted(crawl_state.assets),
+            dead_routes=dead_routes,
+        )
+        self._log_crawl_inventory(root_url, result)
+        return result
 
     async def fetch_single(self, target_url: str) -> CrawlResult:
         """Fetch one URL only - no link discovery, sitemaps, or path brute-force."""
@@ -299,7 +370,121 @@ class WebSpider:
                 page_forms, _ = self._parse_html(target_url, response.text)
                 forms.extend(page_forms)
 
-        return CrawlResult(urls=discovered_urls, forms=forms, session_cookies=self.session_cookies)
+        parameters = ParamDiscovery.build_parameter_inventory(discovered_urls, forms)
+        result = CrawlResult(urls=discovered_urls, forms=forms, session_cookies=self.session_cookies, parameters=parameters)
+        self._log_crawl_inventory(target_url, result)
+        return result
+
+    async def _inspect_javascript_asset(self, client, script_url: str, root_url: str, crawl_state: CrawlState, enqueue_fn, depth: int) -> None:
+        if script_url in crawl_state.assets:
+            return
+        crawl_state.assets.add(script_url)
+        try:
+            response = await self._request_with_session_keeper(client, "GET", script_url)
+        except Exception as exc:
+            logger.debug("failed to inspect javascript asset %s: %s", script_url, exc)
+            return
+        if response.status_code >= 400:
+            return
+        routes, endpoints = ApiExtractor.extract_from_javascript(script_url, response.text)
+        for route in routes:
+            if same_domain(root_url, route):
+                await enqueue_fn(route, depth, RouteSource.javascript, 70)
+        for endpoint in endpoints:
+            if same_domain(root_url, endpoint.url):
+                crawl_state.add_api_endpoint(endpoint)
+
+    @staticmethod
+    def _merge_crawl_state(target: CrawlState, source: CrawlState) -> None:
+        for route in source.routes:
+            target.add_route(route)
+        for endpoint in source.api_endpoints:
+            target.add_api_endpoint(endpoint)
+        for parameter in source.parameters:
+            target.add_parameter(parameter)
+        target.requests.extend(source.requests)
+        target.assets.update(source.assets)
+
+    def _log_crawl_inventory(self, root_url: str, result: CrawlResult) -> None:
+        if not logger.isEnabledFor(logging.INFO):
+            return
+
+        parameters_by_url: dict[str, list[ParameterCandidate]] = {}
+        for parameter in result.parameters:
+            parameters_by_url.setdefault(parameter.url, []).append(parameter)
+
+        route_urls: list[str] = []
+        seen_urls: set[str] = set()
+        for route in sorted(result.routes, key=lambda r: (-r.priority, r.depth, r.url)):
+            if route.url not in seen_urls:
+                route_urls.append(route.url)
+                seen_urls.add(route.url)
+        for url in result.urls:
+            if url not in seen_urls:
+                route_urls.append(url)
+                seen_urls.add(url)
+        for endpoint in result.api_endpoints:
+            if endpoint.url not in seen_urls:
+                route_urls.append(endpoint.url)
+                seen_urls.add(endpoint.url)
+
+        logger.info(
+            "crawler finished for %s: urls=%d routes=%d api_endpoints=%d parameters=%d forms=%d dead_routes=%d assets=%d",
+            root_url,
+            len(result.urls),
+            len(result.routes),
+            len(result.api_endpoints),
+            len(result.parameters),
+            len(result.forms),
+            len(result.dead_routes),
+            len(result.assets),
+        )
+
+        for url in route_urls:
+            route = next((candidate for candidate in result.routes if candidate.url == url), None)
+            params = parameters_by_url.get(url, [])
+            logger.info(
+                "crawler route: url=%s source=%s depth=%s priority=%s params=%s",
+                url,
+                route.source.value if route else "observed",
+                route.depth if route else "-",
+                route.priority if route else "-",
+                self._format_parameter_log(params),
+            )
+
+        for endpoint in sorted(result.api_endpoints, key=lambda ep: (ep.url, ep.method, ep.operation or "")):
+            params = parameters_by_url.get(endpoint.url, [])
+            logger.info(
+                "crawler api_endpoint: method=%s url=%s source=%s operation=%s params=%s",
+                endpoint.method,
+                endpoint.url,
+                endpoint.source.value,
+                endpoint.operation or "-",
+                self._format_parameter_log(params),
+            )
+
+        for dead_route in sorted(result.dead_routes, key=lambda route: route.url):
+            logger.info(
+                "crawler dead_route: url=%s source=%s reason=%s spa_fallback=%s",
+                dead_route.url,
+                dead_route.source.value,
+                dead_route.evidence or "-",
+                dead_route.is_spa_fallback,
+            )
+
+    @staticmethod
+    def _format_parameter_log(parameters: list[ParameterCandidate]) -> str:
+        if not parameters:
+            return "[]"
+        formatted: list[str] = []
+        for parameter in sorted(parameters, key=lambda p: (p.location.value, p.method, p.name, p.parent_path or "")):
+            relevance = ",".join(sorted(parameter.security_relevance)) or "-"
+            path_suffix = f" path={parameter.parent_path}" if parameter.parent_path else ""
+            formatted.append(
+                f"{parameter.method}:{parameter.location.value}:{parameter.name}"
+                f"{path_suffix}:source={parameter.source}:relevance={relevance}"
+            )
+        return "[" + "; ".join(formatted) + "]"
 
     async def _request_with_session_keeper(
         self,

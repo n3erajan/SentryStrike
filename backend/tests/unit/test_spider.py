@@ -1,5 +1,6 @@
 import threading
 import time
+import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -31,8 +32,42 @@ class MultiPageHandler(BaseHTTPRequestHandler):
         pass
 
 
+class SpaHandler(BaseHTTPRequestHandler):
+    shell = b"""<html><head><title>SPA</title><script src="/assets/app.js"></script></head><body><div id="root"></div></body></html>"""
+
+    def do_GET(self):
+        if self.path == "/assets/app.js":
+            self.send_response(200)
+            self.send_header("Content-type", "application/javascript")
+            self.end_headers()
+            self.wfile.write(
+                b"const routes=[{path:'/dashboard'},{path:'/users/:id'}];"
+                b"fetch('/api/users', {method:'POST', body: JSON.stringify({name:'a'})});"
+                b"const gql='/graphql'; query CurrentUser($id: ID!) { user(id:$id){name} }"
+            )
+        elif self.path.startswith("/assets/"):
+            self.send_response(404)
+            self.end_headers()
+        else:
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(self.shell)
+
+    def log_message(self, format, *args):
+        pass
+
+
 def _start_server(port: int) -> tuple[HTTPServer, threading.Thread]:
     httpd = HTTPServer(("127.0.0.1", port), MultiPageHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.3)
+    return httpd, thread
+
+
+def _start_spa_server(port: int) -> tuple[HTTPServer, threading.Thread]:
+    httpd = HTTPServer(("127.0.0.1", port), SpaHandler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     time.sleep(0.3)
@@ -144,6 +179,77 @@ async def test_crawl_discovers_linked_paths(monkeypatch):
 
         discovered_paths = {url.split("8092", 1)[-1] for url in result.urls}
         assert "/xss/" in discovered_paths or "/xss" in discovered_paths
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=1)
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_crawl_logs_finished_inventory(monkeypatch, caplog):
+    monkeypatch.setenv("CRAWL_DEPTH", "2")
+    monkeypatch.setenv("CRAWL_MAX_URLS", "50")
+    get_settings = __import__("app.config", fromlist=["get_settings"]).get_settings
+    get_settings.cache_clear()
+
+    httpd, thread = _start_server(8095)
+    try:
+        spider = WebSpider()
+        with caplog.at_level(logging.INFO, logger="app.core.crawler.spider"):
+            await spider.crawl("http://127.0.0.1:8095/")
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("crawler finished for http://127.0.0.1:8095/" in message for message in messages)
+        assert any("crawler route: url=http://127.0.0.1:8095/xss/submit" in message and "GET:form:name" in message for message in messages)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=1)
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_crawl_extracts_spa_js_routes_and_api_inventory(monkeypatch):
+    monkeypatch.setenv("CRAWL_DEPTH", "2")
+    monkeypatch.setenv("CRAWL_MAX_URLS", "50")
+    get_settings = __import__("app.config", fromlist=["get_settings"]).get_settings
+    get_settings.cache_clear()
+
+    httpd, thread = _start_spa_server(8093)
+    try:
+        spider = WebSpider()
+        result = await spider.crawl("http://127.0.0.1:8093/")
+
+        route_urls = {route.url for route in result.routes}
+        api_urls = {endpoint.url for endpoint in result.api_endpoints}
+        assert "http://127.0.0.1:8093/dashboard" in route_urls
+        assert "http://127.0.0.1:8093/api/users" in api_urls
+        assert "http://127.0.0.1:8093/graphql" in api_urls
+        assert any(asset.endswith("/assets/app.js") for asset in result.assets)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=1)
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_crawl_marks_spa_fallback_common_paths_dead(monkeypatch):
+    monkeypatch.setenv("CRAWL_DEPTH", "1")
+    monkeypatch.setenv("CRAWL_MAX_URLS", "50")
+    get_settings = __import__("app.config", fromlist=["get_settings"]).get_settings
+    get_settings.cache_clear()
+
+    httpd, thread = _start_spa_server(8094)
+    try:
+        spider = WebSpider()
+        result = await spider.crawl("http://127.0.0.1:8094/")
+
+        dead_urls = {route.url for route in result.dead_routes}
+        discovered_paths = {url.split("8094", 1)[-1] for url in result.urls}
+        assert "http://127.0.0.1:8094/admin" in dead_urls
+        assert "/admin" not in discovered_paths
     finally:
         httpd.shutdown()
         httpd.server_close()

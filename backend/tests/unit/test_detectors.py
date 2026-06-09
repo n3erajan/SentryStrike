@@ -40,7 +40,7 @@ def mock_http_verifier():
         elif data:
             payload_val = str(next(iter(data.values()))) if data else ""
 
-        if kwargs.get("test_phase") in ("idor_unauth_base", "idor_unauth_mod"):
+        if kwargs.get("test_phase") in ("idor_unauth_base", "idor_unauth_own", "idor_unauth_mod"):
             return ResponseData(
                 status_code=401,
                 headers={"Content-Type": "text/plain"},
@@ -48,6 +48,28 @@ def mock_http_verifier():
                 response_time_ms=5.0,
                 request_snippet=f"{method} {url} HTTP/1.1",
                 response_snippet="HTTP/1.1 401 Unauthorized\n\nUnauthorized"
+            )
+
+        if kwargs.get("test_phase") == "idor_authed_own":
+            body = "Account portal for Alice Smith. Balance 100. Internal account id 1."
+            return ResponseData(
+                status_code=200,
+                headers={"Content-Type": "text/html", "Server": "Apache/2.4.0"},
+                body=body,
+                response_time_ms=5.0,
+                request_snippet=f"{method} {url} HTTP/1.1",
+                response_snippet="HTTP/1.1 200 OK\nServer: Apache/2.4.0\n\n" + body
+            )
+
+        if kwargs.get("test_phase") == "idor_authed_mod":
+            body = "Account portal for Bob Jones. Balance 900. Internal account id 2."
+            return ResponseData(
+                status_code=200,
+                headers={"Content-Type": "text/html", "Server": "Apache/2.4.0"},
+                body=body,
+                response_time_ms=5.0,
+                request_snippet=f"{method} {url} HTTP/1.1",
+                response_snippet="HTTP/1.1 200 OK\nServer: Apache/2.4.0\n\n" + body
             )
 
         # Construct body with reflection and error patterns

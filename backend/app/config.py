@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     mongodb_db_name: str = Field(default="sentrystrike", alias="MONGODB_DB_NAME")
 
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
-    ollama_model: str = Field(default="qwen3.5:9b", alias="OLLAMA_MODEL")
+    ollama_model: str = Field(default="gemma4-e4b-8k", alias="OLLAMA_MODEL")
     ollama_timeout_seconds: float = Field(default=120.0, alias="OLLAMA_TIMEOUT_SECONDS")
     ai_max_retries: int = Field(default=3, alias="AI_MAX_RETRIES")
     ai_batch_size: int = Field(default=1, alias="AI_BATCH_SIZE")
@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     crawl_depth: int = Field(default=3, alias="CRAWL_DEPTH")
     crawl_max_urls: int = Field(default=200, alias="CRAWL_MAX_URLS")
     crawl_rate_limit_per_second: float = Field(default=8.0, alias="CRAWL_RATE_LIMIT_PER_SECOND")
+    crawl_browser_enabled: bool = Field(default=False, alias="CRAWL_BROWSER_ENABLED")
+    crawl_browser_max_interactions: int = Field(default=25, alias="CRAWL_BROWSER_MAX_INTERACTIONS")
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     scanner_concurrency: int = Field(default=8, alias="SCANNER_CONCURRENCY")
 

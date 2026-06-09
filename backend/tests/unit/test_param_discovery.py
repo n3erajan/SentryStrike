@@ -1,5 +1,6 @@
 import pytest
 
+from app.core.crawler.models import ApiEndpoint, ParameterLocation
 from app.core.crawler.param_discovery import ParamDiscovery
 
 def test_param_discovery_path_only_url_uses_contextual_hints():
@@ -83,3 +84,19 @@ def test_param_discovery_form_empty_value_defaults():
     assert len(id_candidates) == 1
     assert id_candidates[0][3] == "1"
     assert "user_id" not in [c[1] for c in candidates]
+
+
+def test_parameter_inventory_preserves_json_body_context():
+    endpoint = ApiEndpoint(
+        url="http://example.com/api/users",
+        method="POST",
+        request_body={"user": {"id": 7, "name": "alice"}, "redirectUrl": "/home"},
+    )
+
+    inventory = ParamDiscovery.build_parameter_inventory([], [], api_endpoints=[endpoint])
+
+    by_name = {candidate.name: candidate for candidate in inventory}
+    assert by_name["id"].location == ParameterLocation.json_body
+    assert by_name["id"].parent_path == "user.id"
+    assert "access_control" in by_name["id"].security_relevance
+    assert "redirect_ssrf" in by_name["redirectUrl"].security_relevance
