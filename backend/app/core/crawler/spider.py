@@ -10,7 +10,13 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.config import get_settings
-from app.core.crawler.auth_manager import ModernAuthManager
+from app.core.crawler.auth_manager import (
+    ModernAuthManager,
+    SmartAuthenticator,
+    AuthReplayState,
+    AuthStrategy,
+    AuthResult,
+)
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.browser_engine import BrowserDiscoveryEngine
 from app.core.crawler.models import ApiEndpoint, CrawlState, ParameterCandidate, RouteCandidate, RouteSource
@@ -67,20 +73,13 @@ class CrawlResult:
     dead_routes: list[RouteCandidate] = field(default_factory=list)
 
 
-@dataclass
-class AuthReplayState:
-    login_url: str
-    action: str
-    method: str
-    payload: dict[str, str]
-
-
 class WebSpider:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.session_cookies = {}
         self._auth_replay_state: AuthReplayState | None = None
         self._configured_auth_cookies: dict[str, str] = {}
+        self._auth_headers: dict[str, str] = {}
 
     def _snapshot_cookies(self, cookies: httpx.Cookies) -> dict[str, str]:
         return ModernAuthManager.snapshot_cookies(cookies)
@@ -320,7 +319,7 @@ class WebSpider:
             if self.settings.crawl_browser_enabled:
                 browser_state = await BrowserDiscoveryEngine(
                     max_interactions=self.settings.crawl_browser_max_interactions
-                ).crawl(root_url)
+                ).crawl(root_url, auth_cookies=self.session_cookies, auth_headers=self._auth_headers)
                 self._merge_crawl_state(crawl_state, browser_state)
 
         for endpoint in crawl_state.api_endpoints:
@@ -495,6 +494,10 @@ class WebSpider:
         retry_on_login: bool = True,
         **kwargs,
     ) -> httpx.Response:
+        if self._auth_headers:
+            kwargs.setdefault("headers", {})
+            kwargs["headers"].update(self._auth_headers)
+
         response = await client.request(method, url, **kwargs)
         if not retry_on_login:
             return response
@@ -507,6 +510,11 @@ class WebSpider:
 
         logger.info("crawler session appears expired at %s; refreshing auth state and retrying once", url)
         await self._authenticate_session(client, url, force=True)
+
+        if self._auth_headers:
+            kwargs.setdefault("headers", {})
+            kwargs["headers"].update(self._auth_headers)
+
         return await client.request(method, url, **kwargs)
 
     def _session_keeper_enabled(self) -> bool:
@@ -514,6 +522,7 @@ class WebSpider:
             self.settings.authentication_cookie
             or (self.settings.authentication_username and self.settings.authentication_password)
             or self._auth_replay_state
+            or self._auth_headers
         )
 
     def _looks_like_session_loss(self, response: httpx.Response, requested_url: str = "") -> bool:
@@ -536,9 +545,12 @@ class WebSpider:
                 "please login",
                 "you must log in",
                 "authentication required",
+                "unauthorized",
+                "token expired",
+                "invalid token",
             )
         )
-        return has_login_form and has_session_message
+        return has_session_message or (has_login_form and has_session_message)
 
     async def _authenticate_session(self, client: httpx.AsyncClient, root_url: str, force: bool = False):
         """Authenticate session using cookies or credentials."""
@@ -562,11 +574,21 @@ class WebSpider:
             try:
                 state = self._auth_replay_state
                 await client.get(state.login_url)
+                if state.headers:
+                    client.headers.update(state.headers)
+                
                 if state.method == "POST":
-                    await client.post(state.action, data=state.payload)
+                    if state.is_json:
+                        await client.post(state.action, json=state.payload)
+                    else:
+                        await client.post(state.action, data=state.payload)
                 else:
                     await client.get(state.action, params=state.payload)
+                
                 self.session_cookies.update(self._snapshot_cookies(client.cookies))
+                auth_header = client.headers.get("Authorization")
+                if auth_header:
+                    self._auth_headers["Authorization"] = auth_header
                 logger.info("Session refreshed via stored login replay state")
                 return
             except Exception as e:
@@ -577,89 +599,20 @@ class WebSpider:
         password = self.settings.authentication_password
         if username and password:
             try:
-                # First, request login page to extract CSRF tokens and baseline cookies
-                login_urls = [
-                    normalize_url(root_url, "/login.php"),
-                    normalize_url(root_url, "/login"),
-                    root_url
-                ]
-                
-                login_response = None
-                login_url = root_url
-                for l_url in login_urls:
-                    try:
-                        resp = await client.get(l_url)
-                        if resp.status_code == 200 and ("login" in resp.text.lower() or "username" in resp.text.lower()):
-                            login_response = resp
-                            login_url = l_url
-                            break
-                    except Exception:
-                        continue
-                
-                if not login_response:
-                    # Fallback to root url
-                    login_url = root_url
-                    login_response = await client.get(login_url)
-
-                # Parse HTML for login form and input fields
-                soup = BeautifulSoup(login_response.text, "html.parser")
-                form = soup.find("form")
-                
-                # Build payload
-                payload = {}
-                action = login_url
-                method = "POST"
-                
-                if form:
-                    action = normalize_url(login_url, form.get("action", ""))
-                    method = form.get("method", "POST").upper()
-                    
-                    # Fill inputs
-                    for inp in form.find_all(["input", "select", "textarea"]):
-                        name = inp.get("name")
-                        if not name:
-                            continue
-                        val = inp.get("value", "")
-                        inp_type = inp.get("type", "text").lower()
-                        autocomplete = inp.get("autocomplete", "").lower()
-                        
-                        # Identify fields
-                        name_lower = name.lower()
-                        if inp_type == "email" or autocomplete in ("username", "email"):
-                            payload[name] = username
-                        elif inp_type == "password" or autocomplete in ("current-password", "password"):
-                            payload[name] = password
-                        elif "user" in name_lower or "email" in name_lower or "login" in name_lower:
-                            payload[name] = username
-                        elif "pass" in name_lower:
-                            payload[name] = password
-                        elif inp_type == "hidden":
-                            payload[name] = val
-                        elif inp_type in ["submit", "button"] and "submit" in name_lower:
-                            payload[name] = val or "Submit"
-
-                    submit_btn = form.find("input", attrs={"type": "submit"})
-                    if submit_btn and submit_btn.get("name"):
-                        payload[submit_btn["name"]] = submit_btn.get("value", "Submit")
-
-                # Send POST request
-                if method == "POST":
-                    resp = await client.post(action, data=payload)
+                authenticator = SmartAuthenticator(self.settings)
+                result = await authenticator.authenticate(client, root_url, username, password)
+                if result.authenticated:
+                    self.session_cookies.update(result.cookies)
+                    if result.bearer_token:
+                        self._auth_headers["Authorization"] = f"Bearer {result.bearer_token}"
+                        client.headers["Authorization"] = f"Bearer {result.bearer_token}"
+                    if result.replay_state:
+                        self._auth_replay_state = result.replay_state
+                    logger.info("Session authenticated successfully. Cookies: %s, Headers: %s", self.session_cookies, self._auth_headers)
                 else:
-                    resp = await client.get(action, params=payload)
-                
-                # Check for successful authentication
-                if resp.status_code in [200, 302]:
-                    self._auth_replay_state = AuthReplayState(
-                        login_url=login_url,
-                        action=action,
-                        method=method,
-                        payload=dict(payload),
-                    )
-                    logger.info("Authentication request sent. Session cookies: %s", self._snapshot_cookies(client.cookies))
-                
+                    logger.warning("Authentication failed using all strategies")
             except Exception as e:
-                logger.error("Authentication failed: %s", e)
+                logger.error("Smart authentication cascade error: %s", e)
 
         self.session_cookies.update(self._snapshot_cookies(client.cookies))
 

@@ -19,7 +19,12 @@ class BrowserDiscoveryEngine:
     def __init__(self, max_interactions: int = 25) -> None:
         self.max_interactions = max_interactions
 
-    async def crawl(self, root_url: str) -> CrawlState:
+    async def crawl(
+        self,
+        root_url: str,
+        auth_cookies: dict[str, str] | None = None,
+        auth_headers: dict[str, str] | None = None,
+    ) -> CrawlState:
         try:
             from playwright.async_api import async_playwright
         except Exception as exc:
@@ -30,6 +35,25 @@ class BrowserDiscoveryEngine:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
             context = await browser.new_context()
+
+            if auth_cookies:
+                from urllib.parse import urlparse
+                parsed = urlparse(root_url)
+                domain = parsed.netloc.split(":")[0]
+                path = parsed.path or "/"
+                cookies_list = []
+                for name, value in auth_cookies.items():
+                    cookies_list.append({
+                        "name": name,
+                        "value": value,
+                        "domain": domain,
+                        "path": path,
+                    })
+                await context.add_cookies(cookies_list)
+
+            if auth_headers:
+                await context.set_extra_http_headers(auth_headers)
+
             page = await context.new_page()
 
             async def on_request(request):
