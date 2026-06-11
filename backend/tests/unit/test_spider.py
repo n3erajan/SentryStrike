@@ -7,6 +7,7 @@ import pytest
 import httpx
 
 from app.core.crawler.spider import AuthReplayState, WebSpider
+from app.core.detectors.sensitive_paths import SensitivePathsDetector
 
 
 class MultiPageHandler(BaseHTTPRequestHandler):
@@ -58,6 +59,28 @@ class SpaHandler(BaseHTTPRequestHandler):
         pass
 
 
+class SpaSensitivePathsHandler(BaseHTTPRequestHandler):
+    shell = (
+        b"""<html><head><title>SPA</title><script src="/assets/app.js"></script></head>"""
+        b"""<body><div id="root"></div><script>window.debug=true</script></body></html>"""
+    )
+
+    def do_GET(self):
+        if self.path == "/.env":
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"DB_PASSWORD=secret\nAPP_KEY=base64:test")
+        else:
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(self.shell)
+
+    def log_message(self, format, *args):
+        pass
+
+
 def _start_server(port: int) -> tuple[HTTPServer, threading.Thread]:
     httpd = HTTPServer(("127.0.0.1", port), MultiPageHandler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -68,6 +91,14 @@ def _start_server(port: int) -> tuple[HTTPServer, threading.Thread]:
 
 def _start_spa_server(port: int) -> tuple[HTTPServer, threading.Thread]:
     httpd = HTTPServer(("127.0.0.1", port), SpaHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.3)
+    return httpd, thread
+
+
+def _start_spa_sensitive_paths_server(port: int) -> tuple[HTTPServer, threading.Thread]:
+    httpd = HTTPServer(("127.0.0.1", port), SpaSensitivePathsHandler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     time.sleep(0.3)
@@ -250,6 +281,35 @@ async def test_crawl_marks_spa_fallback_common_paths_dead(monkeypatch):
         discovered_paths = {url.split("8094", 1)[-1] for url in result.urls}
         assert "http://127.0.0.1:8094/admin" in dead_urls
         assert "/admin" not in discovered_paths
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=1)
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_sensitive_paths_ignores_spa_shell_fallbacks_but_keeps_real_files(monkeypatch):
+    monkeypatch.setenv("REQUEST_TIMEOUT_SECONDS", "5")
+    get_settings = __import__("app.config", fromlist=["get_settings"]).get_settings
+    get_settings.cache_clear()
+
+    httpd, thread = _start_spa_sensitive_paths_server(8096)
+    root_url = "http://127.0.0.1:8096/"
+    try:
+        detector = SensitivePathsDetector()
+        findings = await detector.detect(
+            [root_url],
+            [],
+            root_url=root_url,
+            is_spa=True,
+            spa_root_html=SpaSensitivePathsHandler.shell.decode(),
+        )
+
+        finding_urls = {finding.url for finding in findings}
+        assert f"{root_url}.env" in finding_urls
+        assert f"{root_url}debug" not in finding_urls
+        assert all("window.debug=true" not in (finding.evidence or "") for finding in findings)
     finally:
         httpd.shutdown()
         httpd.server_close()

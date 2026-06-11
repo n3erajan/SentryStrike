@@ -235,13 +235,19 @@ class ScanOrchestrator:
             detector_parallelism = max(2, get_settings().scanner_concurrency // 3)
             detector_semaphore = asyncio.Semaphore(detector_parallelism)
             session_cookies = getattr(crawl_result, "session_cookies", {})
+            crawl_context = {
+                "root_url": scan.target_url,
+                "session_cookies": session_cookies,
+                "is_spa": getattr(crawl_result, "is_spa", False),
+                "spa_root_html": getattr(crawl_result, "spa_root_html", ""),
+            }
 
             async def run_detector(detector) -> list[Finding]:
                 async with detector_semaphore:
                     return await detector.detect(
                         crawl_result.urls,
                         crawl_result.forms,
-                        session_cookies=session_cookies,
+                        **crawl_context,
                         technology_stack=scan.technology_stack,
                     )
 
@@ -278,18 +284,17 @@ class ScanOrchestrator:
             # Provide the scan root URL so site-wide detectors can avoid duplicate page-level findings.
             crypto_detector = next((detector for detector in self.detectors if isinstance(detector, CryptoFailuresDetector)), None)
             if crypto_detector is not None:
-                findings.extend(await crypto_detector.detect(crawl_result.urls, crawl_result.forms, root_url=scan.target_url, session_cookies=getattr(crawl_result, "session_cookies", {})))
+                findings.extend(await crypto_detector.detect(crawl_result.urls, crawl_result.forms, **crawl_context))
 
             header_detector = next((detector for detector in self.detectors if isinstance(detector, SecurityHeadersDetector)), None)
             if header_detector is not None:
-                findings.extend(await header_detector.detect(crawl_result.urls, crawl_result.forms, root_url=scan.target_url, session_cookies=getattr(crawl_result, "session_cookies", {})))
+                findings.extend(await header_detector.detect(crawl_result.urls, crawl_result.forms, **crawl_context))
 
             supply_chain_findings = await self.supply_chain_detector.detect(
                 crawl_result.urls,
                 crawl_result.forms,
                 technologies=scan.technology_stack,
-                root_url=scan.target_url,
-                session_cookies=getattr(crawl_result, "session_cookies", {}),
+                **crawl_context,
             )
             findings.extend(supply_chain_findings)
 

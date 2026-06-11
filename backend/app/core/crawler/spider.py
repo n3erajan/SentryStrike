@@ -65,6 +65,8 @@ class CrawlResult:
     urls: list[str] = field(default_factory=list)
     forms: list[HtmlForm] = field(default_factory=list)
     session_cookies: dict[str, str] = field(default_factory=dict)
+    is_spa: bool = False
+    spa_root_html: str = ""
     routes: list[RouteCandidate] = field(default_factory=list)
     api_endpoints: list[ApiEndpoint] = field(default_factory=list)
     parameters: list[ParameterCandidate] = field(default_factory=list)
@@ -80,11 +82,13 @@ class WebSpider:
         self._auth_replay_state: AuthReplayState | None = None
         self._configured_auth_cookies: dict[str, str] = {}
         self._auth_headers: dict[str, str] = {}
+        self._is_spa: bool = False
 
     def _snapshot_cookies(self, cookies: httpx.Cookies) -> dict[str, str]:
         return ModernAuthManager.snapshot_cookies(cookies)
 
     async def crawl(self, root_url: str, max_depth: int | None = None) -> CrawlResult:
+        self._is_spa = False
         max_depth = max_depth if max_depth is not None else self.settings.crawl_depth
         visited: set[str] = set()
         queue = asyncio.Queue()
@@ -94,6 +98,7 @@ class WebSpider:
         crawl_state = CrawlState()
         dead_routes: list[RouteCandidate] = []
         spa_detector = SpaFallbackDetector()
+        spa_root_html = ""
         lock = asyncio.Lock()
 
         def should_enqueue(url_candidate: str, depth: int) -> bool:
@@ -135,6 +140,8 @@ class WebSpider:
                 root_response = await client.get(root_url)
                 if "text/html" in root_response.headers.get("content-type", ""):
                     spa_detector.configure_root(root_url, root_response.text)
+                    spa_root_html = root_response.text
+                    self._is_spa = self._is_spa or spa_detector.root_looks_like_spa()
             except Exception as exc:
                 logger.debug("failed to prefetch root shell for SPA fallback detection: %s", exc)
 
@@ -202,6 +209,7 @@ class WebSpider:
                     await asyncio.sleep(delay)
 
             async def worker():
+                nonlocal spa_root_html
                 while True:
                     try:
                         async with lock:
@@ -243,6 +251,8 @@ class WebSpider:
                         )
                         if url == root_url and "text/html" in response.headers.get("content-type", ""):
                             spa_detector.configure_root(root_url, response.text)
+                            spa_root_html = response.text
+                            self._is_spa = self._is_spa or spa_detector.root_looks_like_spa()
 
                         if fallback_signal.is_fallback and url != root_url and source == RouteSource.brute_force:
                             route = RouteCandidate(
@@ -332,6 +342,8 @@ class WebSpider:
             urls=discovered_urls,
             forms=forms,
             session_cookies=self.session_cookies,
+            is_spa=self._is_spa or spa_detector.root_looks_like_spa(),
+            spa_root_html=spa_root_html,
             routes=crawl_state.routes,
             api_endpoints=crawl_state.api_endpoints,
             parameters=crawl_state.parameters,
@@ -344,8 +356,11 @@ class WebSpider:
 
     async def fetch_single(self, target_url: str) -> CrawlResult:
         """Fetch one URL only - no link discovery, sitemaps, or path brute-force."""
+        self._is_spa = False
         forms: list[HtmlForm] = []
         discovered_urls: list[str] = []
+        is_spa = False
+        spa_root_html = ""
 
         async with create_scan_client(
             timeout=self.settings.request_timeout_seconds,
@@ -366,11 +381,20 @@ class WebSpider:
 
             if "text/html" in response.headers.get("content-type", ""):
                 self.session_cookies.update(self._snapshot_cookies(client.cookies))
+                spa_root_html = response.text
+                is_spa = SpaFallbackDetector.looks_like_spa_shell(target_url, response.text)
                 page_forms, _ = self._parse_html(target_url, response.text)
                 forms.extend(page_forms)
 
         parameters = ParamDiscovery.build_parameter_inventory(discovered_urls, forms)
-        result = CrawlResult(urls=discovered_urls, forms=forms, session_cookies=self.session_cookies, parameters=parameters)
+        result = CrawlResult(
+            urls=discovered_urls,
+            forms=forms,
+            session_cookies=self.session_cookies,
+            is_spa=is_spa,
+            spa_root_html=spa_root_html,
+            parameters=parameters,
+        )
         self._log_crawl_inventory(target_url, result)
         return result
 
@@ -601,6 +625,7 @@ class WebSpider:
             try:
                 authenticator = SmartAuthenticator(self.settings)
                 result = await authenticator.authenticate(client, root_url, username, password)
+                self._is_spa = self._is_spa or result.is_spa
                 if result.authenticated:
                     self.session_cookies.update(result.cookies)
                     if result.bearer_token:

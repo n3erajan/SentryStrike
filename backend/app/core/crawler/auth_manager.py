@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ApiEndpoint
+from app.core.crawler.spa import SpaFallbackDetector
 from app.core.crawler.url_parser import normalize_url, same_domain
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ class AuthResult:
     strategy: AuthStrategy | None = None
     replay_state: AuthReplayState | None = None
     authenticated: bool = False
+    is_spa: bool = False
 
 
 @dataclass
@@ -135,39 +137,58 @@ class SmartAuthenticator:
         self, client: httpx.AsyncClient, root_url: str, username: str, password: str
     ) -> AuthResult:
         logger.info("[auth] Starting smart authentication cascade for %s", root_url)
+        is_spa = await self._detect_spa(client, root_url)
 
         # Strategy 1: Redirect Detection
         result = await self._try_redirect_login(client, root_url, username, password)
         if result and result.authenticated:
+            result.is_spa = is_spa
             logger.info("[auth] Strategy 1 (Redirect Detection) succeeded")
             return result
 
         # Strategy 2: HTML Form Extraction
         result = await self._try_html_form_login(client, root_url, username, password)
         if result and result.authenticated:
+            result.is_spa = is_spa
             logger.info("[auth] Strategy 2 (HTML Form Extraction) succeeded")
             return result
 
         # Strategy 3: JS API Discovery + Param Extraction
         result = await self._try_js_api_login(client, root_url, username, password)
         if result and result.authenticated:
+            result.is_spa = is_spa
             logger.info("[auth] Strategy 3 (JS API Discovery) succeeded")
             return result
 
         # Strategy 4: Playwright Browser Login
         result = await self._try_browser_spa_login(client, root_url, username, password)
         if result and result.authenticated:
+            result.is_spa = True
             logger.info("[auth] Strategy 4 (Playwright Browser Login) succeeded")
             return result
 
         # Strategy 5: Brute-Force Endpoints
         result = await self._try_brute_force_login(client, root_url, username, password)
         if result and result.authenticated:
+            result.is_spa = is_spa
             logger.info("[auth] Strategy 5 (Brute-Force Endpoints) succeeded")
             return result
 
         logger.warning("[auth] All authentication strategies failed")
-        return AuthResult(authenticated=False)
+        return AuthResult(authenticated=False, is_spa=is_spa)
+
+    async def _detect_spa(self, client: httpx.AsyncClient, root_url: str) -> bool:
+        try:
+            response = await client.get(root_url, follow_redirects=True)
+            if response.status_code != 200 or "text/html" not in response.headers.get("content-type", "").lower():
+                return False
+            is_spa = SpaFallbackDetector.looks_like_spa_shell(str(response.url), response.text)
+            if is_spa:
+                logger.info("[auth] Root page appears to be an SPA shell")
+            return is_spa
+        except Exception as exc:
+            logger.debug("[auth] SPA detection failed: %s", exc)
+            return False
 
     async def _try_redirect_login(
         self, client: httpx.AsyncClient, root_url: str, username: str, password: str

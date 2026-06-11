@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.config import get_settings
+from app.core.crawler.spa import SpaFallbackDetector
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
@@ -89,6 +90,9 @@ class SensitivePathsDetector(BaseDetector):
 
         settings = get_settings()
         semaphore = asyncio.Semaphore(5)
+        is_spa = bool(kwargs.get("is_spa", False))
+        spa_root_html = str(kwargs.get("spa_root_html") or "")
+        spa_detector = SpaFallbackDetector()
 
         async with create_scan_client(
             timeout=settings.request_timeout_seconds,
@@ -96,6 +100,16 @@ class SensitivePathsDetector(BaseDetector):
             verify=False,  # Similar to other detectors, allow self-signed for scanning
             event_hooks={"response": [make_httpx_response_logger("sensitive_paths", "path_probe")]},
         ) as client:
+            if spa_root_html:
+                spa_detector.configure_root(str(root_url), spa_root_html)
+                is_spa = is_spa or spa_detector.root_looks_like_spa()
+            elif is_spa:
+                try:
+                    root_response = await client.get(str(root_url))
+                    if root_response.status_code == 200 and "text/html" in root_response.headers.get("content-type", "").lower():
+                        spa_detector.configure_root(str(root_url), root_response.text)
+                except Exception as exc:
+                    logger.debug("failed to fetch SPA root shell for sensitive path filtering: %s", exc)
             
             already_checked: set[str] = set()
 
@@ -119,6 +133,24 @@ class SensitivePathsDetector(BaseDetector):
                         # We only care about 200 OK responses
                         if response.status_code != 200:
                             return None
+
+                        content_type = response.headers.get("content-type", "")
+                        if is_spa and "text/html" in content_type.lower():
+                            fallback_signal = spa_detector.detect(
+                                target_url,
+                                response.status_code,
+                                content_type,
+                                response.text,
+                                allow_file_like_path=True,
+                            )
+                            if fallback_signal.is_fallback:
+                                logger.debug(
+                                    "ignoring SPA fallback response for sensitive path %s: %s similarity=%.3f",
+                                    target_url,
+                                    fallback_signal.reason,
+                                    fallback_signal.similarity,
+                                )
+                                return None
                             
                         body_lower = response.text.lower()
                         

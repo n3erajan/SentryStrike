@@ -4,6 +4,7 @@ import re
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from app.core.crawler.spa import SpaFallbackDetector
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder
 from app.models.vulnerability import OwaspCategory, SeverityLevel
@@ -306,6 +307,16 @@ class AccessControlDetector(BaseDetector):
         findings: list[Finding] = []
         session_cookies: dict[str, str] = kwargs.get("session_cookies") or {}
         privileged_cookies: dict[str, str] = kwargs.get("privileged_cookies") or {}
+        is_spa = bool(kwargs.get("is_spa", False))
+        spa_root_html = str(kwargs.get("spa_root_html") or "")
+        root_url = str(kwargs.get("root_url") or "")
+
+        spa_detector: SpaFallbackDetector | None = None
+        if is_spa and spa_root_html:
+            spa_detector = SpaFallbackDetector()
+            spa_detector.configure_root(root_url, spa_root_html)
+            if not spa_detector.root_looks_like_spa():
+                spa_detector = None
 
         authed_verifier = HttpVerifier(cookies=session_cookies)
         authed_verifier.set_request_context(module="access_control")
@@ -320,7 +331,7 @@ class AccessControlDetector(BaseDetector):
 
         try:
             forced_browsing_task = self._check_forced_browsing(
-                urls, unauthed_verifier, authed_verifier
+                urls, unauthed_verifier, authed_verifier, spa_detector=spa_detector
             )
             idor_task = self._check_idor(
                 urls, forms, unauthed_verifier, authed_verifier, privileged_verifier
@@ -347,9 +358,12 @@ class AccessControlDetector(BaseDetector):
         urls: list[str],
         unauthed_verifier: HttpVerifier,
         authed_verifier: HttpVerifier,
+        spa_detector: SpaFallbackDetector | None = None,
     ) -> list[Finding]:
         """
         Detect sensitive paths that are accessible without authentication.
+        When an SPA detector is provided, responses that match the SPA root
+        shell are treated as fallback pages and are not reported.
         """
         findings: list[Finding] = []
         semaphore = asyncio.Semaphore(self._CONCURRENCY)
@@ -378,6 +392,24 @@ class AccessControlDetector(BaseDetector):
 
                     if _looks_like_login_page(resp.body):
                         return []
+
+                    if spa_detector is not None:
+                        fallback = spa_detector.detect(
+                            test_url,
+                            resp.status_code,
+                            resp.headers.get("content-type", ""),
+                            resp.body,
+                            allow_file_like_path=True,
+                        )
+                        if fallback.is_fallback:
+                            logger.debug(
+                                "ignoring SPA fallback response for forced browsing "
+                                "check on %s: %s similarity=%.3f",
+                                test_url,
+                                fallback.reason,
+                                fallback.similarity,
+                            )
+                            return []
 
                     authed_resp = await authed_verifier.send_request(
                         test_url, "GET", test_phase="forced_browsing_authed_baseline"
