@@ -1,4 +1,4 @@
-function Navbar({ page, onGoScan, onGoReport, hasReport }) {
+function Navbar({ page, onGoScan, onGoReport, hasReport, user, onLogout }) {
   return (
     <nav className='navbar'>
       <div
@@ -8,7 +8,9 @@ function Navbar({ page, onGoScan, onGoReport, hasReport }) {
         tabIndex={0}
         onKeyDown={(e) => e.key === "Enter" && onGoScan()}
       >
-        <div className='logo-icon'>🛡</div>
+        <div className='logo-icon'>
+          <img src='/shield.png' alt='SentryStrike' className='logo-img' />
+        </div>
         <div className='logo-text'>
           <div className='brand'>
             Sentry<span>Strike</span>
@@ -30,6 +32,10 @@ function Navbar({ page, onGoScan, onGoReport, hasReport }) {
           title={!hasReport ? "Run a scan first" : undefined}
         >
           Report
+        </button>
+        {user?.email && <span className='nav-user'>{user.email}</span>}
+        <button className='nav-logout' onClick={onLogout}>
+          Logout
         </button>
       </div>
     </nav>

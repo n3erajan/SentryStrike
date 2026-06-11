@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { isValidUrl } from "../utils/helpers.js";
+import { SCAN_STAGES, LOG_LINES } from "../data/constants.js";
 
 function useScan(onComplete) {
   const [url, setUrl] = useState("");
