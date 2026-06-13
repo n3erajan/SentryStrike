@@ -14,8 +14,6 @@ from app.core.crawler.auth_manager import (
     ModernAuthManager,
     SmartAuthenticator,
     AuthReplayState,
-    AuthStrategy,
-    AuthResult,
     AuthVerificationState,
 )
 from app.core.crawler.api_extractor import ApiExtractor

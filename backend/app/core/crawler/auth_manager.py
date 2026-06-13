@@ -226,8 +226,11 @@ class SmartAuthenticator:
     ) -> AuthResult | None:
         logger.info("[auth] Trying Strategy 2: HTML Form Extraction")
         login_paths = ["/login", "/signin", "/auth", "/session/new", "/login.php", "/login.html", "/"]
+        configured_login_url = getattr(self.settings, "authentication_login_url", None)
+        if configured_login_url:
+            login_paths.insert(0, str(configured_login_url))
         for path in login_paths:
-            url = normalize_url(root_url, path)
+            url = path if str(path).startswith(("http://", "https://")) else normalize_url(root_url, path)
             try:
                 resp = await client.get(url, follow_redirects=True)
                 if resp.status_code == 200:

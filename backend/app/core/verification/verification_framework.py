@@ -9,16 +9,16 @@ Provides:
 """
 
 import asyncio
-import copy
 import json
 import logging
 import re
 import httpx
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Optional
 from urllib.parse import urlencode, urlparse, parse_qs, parse_qsl, urlunparse
 
+from app.core.detectors.attack_surface import build_json_body
 from app.core.detectors.base_detector import Finding
 from app.core.crawler.models import ParameterLocation
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
@@ -33,31 +33,6 @@ from app.utils.http_logging import (
 from app.utils.scan_throttle import get_scan_http_semaphore
 
 logger = logging.getLogger(__name__)
-
-
-def _build_json_body(template: object, target: object, injected_value: object) -> object:
-    body = copy.deepcopy(template) if template is not None else {}
-    if not isinstance(body, dict):
-        body = {}
-
-    path = getattr(target, "parent_path", None) or getattr(target, "parameter", "")
-    parts = [part for part in str(path).replace("[", ".[").split(".") if part]
-    current: object = body
-    for index, part in enumerate(parts):
-        if part.startswith("["):
-            continue
-        is_last = index == len(parts) - 1
-        if is_last:
-            if isinstance(current, dict):
-                current[part] = injected_value
-            return body
-        if not isinstance(current, dict):
-            return body
-        current = current.setdefault(part, {})
-
-    if not parts:
-        body[str(getattr(target, "parameter", "value") or "value")] = injected_value
-    return body
 
 
 @dataclass
@@ -374,7 +349,7 @@ class BaseVerifier(ABC):
             return await self._send(url, "GET", None, None, test_phase="pre_test_baseline")
 
         if target and target.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
-            json_body = _build_json_body(getattr(target, "json_template", None), target, value or "")
+            json_body = build_json_body(getattr(target, "json_template", None), target, value or "")
             headers = target.headers or {}
             return await self._send(
                 url,

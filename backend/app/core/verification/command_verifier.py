@@ -12,13 +12,12 @@ import logging
 from typing import Optional
 
 from app.config import get_settings
-from app.core.detectors.base_detector import Finding
+from app.core.detectors.attack_surface import build_json_body
 from app.core.verification.response_analyzer import ResponseAnalyzer
 from app.core.verification.verification_framework import (
     BaseVerifier,
     URLParameterBuilder,
     VerificationResult,
-    _build_json_body,
 )
 from app.core.crawler.models import ParameterLocation
 from app.models.vulnerability import OwaspCategory, SeverityLevel
@@ -77,7 +76,7 @@ class CommandInjectionVerifier(BaseVerifier):
             ParameterLocation.json_body,
             ParameterLocation.graphql_variable,
         }:
-            json_body = _build_json_body(getattr(target, "json_template", None), target, value)
+            json_body = build_json_body(getattr(target, "json_template", None), target, value)
             return url, None, None, json_body, getattr(target, "headers", None)
 
         request_url, params, data = URLParameterBuilder.inject_parameter(

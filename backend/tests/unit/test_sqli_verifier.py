@@ -2,7 +2,6 @@ import pytest
 
 from app.core.detectors.sql_injection import SQLInjectionDetector
 from app.core.verification.sqli_verifier import SQLiVerifier
-from app.core.detectors.base_detector import Finding
 
 def test_sqli_detector_excludes_submit_button():
     detector = SQLInjectionDetector()

@@ -1,12 +1,7 @@
 import pytest
 import httpx
-from types import SimpleNamespace
-from bs4 import BeautifulSoup
 
 from app.core.crawler.auth_manager import (
-    AuthReplayState,
-    AuthResult,
-    AuthStrategy,
     AuthVerificationState,
     SmartAuthenticator,
 )

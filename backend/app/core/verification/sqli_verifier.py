@@ -56,12 +56,11 @@ from typing import Optional
 
 from app.config import get_settings
 from app.core.crawler.models import ParameterLocation
-from app.core.detectors.base_detector import Finding
-from app.core.verification.response_analyzer import DifferentialAnalysis, ResponseAnalyzer, ResponseData
+from app.core.detectors.attack_surface import build_json_body
+from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
 from app.core.verification.verification_framework import (
     BaseVerifier,
     FormPayloadBuilder,
-    HttpVerifier,
     URLParameterBuilder,
     VerificationResult,
 )
@@ -441,8 +440,7 @@ class SQLiVerifier(BaseVerifier):
             return url, None, data, None, None
 
         if target is not None and getattr(target, "location", None) in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
-            from app.core.verification.verification_framework import _build_json_body
-            json_body = _build_json_body(getattr(target, "json_template", None), target, payload_value)
+            json_body = build_json_body(getattr(target, "json_template", None), target, payload_value)
             return url, None, None, json_body, getattr(target, "headers", None)
 
         inj_url, inj_params, inj_data = URLParameterBuilder.inject_parameter(

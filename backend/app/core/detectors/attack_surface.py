@@ -4,7 +4,6 @@ import copy
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
-from urllib.parse import parse_qsl, urlparse
 
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import (
@@ -211,21 +210,6 @@ def _set_json_path(body: dict, path: str, value: Any) -> None:
         if not isinstance(current, dict):
             return
         current = current.setdefault(part, {})
-
-
-def target_from_legacy(candidate: tuple) -> AttackTarget:
-    if len(candidate) == 5:
-        url, param, method, value, form_inputs = candidate
-    else:
-        url, param, method, value = candidate
-        form_inputs = None
-    return AttackTarget(
-        url=url,
-        parameter=param,
-        method=method,
-        value=value,
-        form_inputs=form_inputs,
-    )
 
 
 def query_or_form_targets(targets: list[AttackTarget]) -> list[tuple]:
