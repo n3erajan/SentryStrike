@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     authentication_username: str | None = Field(default=None, alias="SCAN_AUTH_USERNAME")
     authentication_password: str | None = Field(default=None, alias="SCAN_AUTH_PASSWORD")
     authentication_cookie: str | None = Field(default=None, alias="SCAN_AUTH_COOKIE")  # Format: "security=low; PHPSESSID=..."
+    authentication_header: str | None = Field(default=None, alias="SCAN_AUTH_HEADER")  # Format: "Authorization: Bearer ..."
+    authentication_login_url: str | None = Field(default=None, alias="SCAN_AUTH_LOGIN_URL")
+    authentication_success_url: str | None = Field(default=None, alias="SCAN_AUTH_SUCCESS_URL")
+    authentication_success_text: str | None = Field(default=None, alias="SCAN_AUTH_SUCCESS_TEXT")
+    authentication_success_regex: str | None = Field(default=None, alias="SCAN_AUTH_SUCCESS_REGEX")
+    authentication_failure_text: str | None = Field(default=None, alias="SCAN_AUTH_FAILURE_TEXT")
+    authentication_failure_regex: str | None = Field(default=None, alias="SCAN_AUTH_FAILURE_REGEX")
+    authentication_validation_url: str | None = Field(default=None, alias="SCAN_AUTH_VALIDATION_URL")
     max_verification_requests_per_param: int = Field(default=10, alias="MAX_VERIFICATION_REQUESTS")
     blind_injection_timing_threshold: float = Field(
         default=0.7,

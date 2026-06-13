@@ -9,6 +9,8 @@ Provides:
 """
 
 import asyncio
+import copy
+import json
 import logging
 import re
 import httpx
@@ -18,6 +20,7 @@ from typing import Callable, Optional
 from urllib.parse import urlencode, urlparse, parse_qs, parse_qsl, urlunparse
 
 from app.core.detectors.base_detector import Finding
+from app.core.crawler.models import ParameterLocation
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.config import get_settings
@@ -30,6 +33,31 @@ from app.utils.http_logging import (
 from app.utils.scan_throttle import get_scan_http_semaphore
 
 logger = logging.getLogger(__name__)
+
+
+def _build_json_body(template: object, target: object, injected_value: object) -> object:
+    body = copy.deepcopy(template) if template is not None else {}
+    if not isinstance(body, dict):
+        body = {}
+
+    path = getattr(target, "parent_path", None) or getattr(target, "parameter", "")
+    parts = [part for part in str(path).replace("[", ".[").split(".") if part]
+    current: object = body
+    for index, part in enumerate(parts):
+        if part.startswith("["):
+            continue
+        is_last = index == len(parts) - 1
+        if is_last:
+            if isinstance(current, dict):
+                current[part] = injected_value
+            return body
+        if not isinstance(current, dict):
+            return body
+        current = current.setdefault(part, {})
+
+    if not parts:
+        body[str(getattr(target, "parameter", "value") or "value")] = injected_value
+    return body
 
 
 @dataclass
@@ -113,6 +141,7 @@ class HttpVerifier:
         capture_timing: bool = True,
         headers: Optional[dict] = None,
         cookies: Optional[dict] = None,
+        json_body: Optional[object] = None,
         *,
         module: str = "",
         parameter: str = "",
@@ -149,7 +178,9 @@ class HttpVerifier:
         all_headers = {**self.headers, **(headers or {})}
         headers_str = "\n".join([f"{k}: {v}" for k, v in all_headers.items()])
         body_str = ""
-        if data:
+        if json_body is not None:
+            body_str = json.dumps(json_body, separators=(",", ":"), default=str)
+        elif data:
             body_str = urlencode(data)
         
         request_snippet = f"{method} {req_path} HTTP/1.1\nHost: {parsed.netloc}\n{headers_str}\n\n{body_str}"
@@ -176,6 +207,8 @@ class HttpVerifier:
                 request_kwargs["params"] = params
             if data:
                 request_kwargs["data"] = data
+            if json_body is not None:
+                request_kwargs["json"] = json_body
             if headers:
                 request_kwargs["headers"] = headers
             if cookies:
@@ -307,6 +340,7 @@ class BaseVerifier(ABC):
         *,
         headers: Optional[dict] = None,
         cookies: Optional[dict] = None,
+        json_body: Optional[object] = None,
         test_phase: str = "request",
         payload: str = "",
     ) -> ResponseData:
@@ -317,6 +351,7 @@ class BaseVerifier(ABC):
             data,
             headers=headers,
             cookies=cookies,
+            json_body=json_body,
             test_phase=test_phase,
             payload=payload,
         )
@@ -328,6 +363,7 @@ class BaseVerifier(ABC):
         method: str = "GET",
         value: str = "",
         form_inputs: Optional[list] = None,
+        target: Optional[object] = None,
     ) -> ResponseData:
         """
         Fetch a clean snapshot immediately before the first malicious payload.
@@ -336,6 +372,19 @@ class BaseVerifier(ABC):
         """
         if method.upper().startswith("HEADER:"):
             return await self._send(url, "GET", None, None, test_phase="pre_test_baseline")
+
+        if target and target.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
+            json_body = _build_json_body(getattr(target, "json_template", None), target, value or "")
+            headers = target.headers or {}
+            return await self._send(
+                url,
+                method,
+                None,
+                None,
+                headers=headers,
+                json_body=json_body,
+                test_phase="pre_test_baseline",
+            )
 
         if method.upper() == "POST" and form_inputs is not None:
             clean_data = FormPayloadBuilder.build(form_inputs, parameter, value or "")

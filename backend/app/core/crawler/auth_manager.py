@@ -27,6 +27,14 @@ class AuthStrategy(str, Enum):
     brute_force = "brute_force"
 
 
+class AuthVerificationState(str, Enum):
+    unauthenticated = "unauthenticated"
+    attempted = "attempted"
+    authenticated_unverified = "authenticated_unverified"
+    authenticated_verified = "authenticated_verified"
+    expired = "expired"
+
+
 @dataclass
 class AuthReplayState:
     login_url: str
@@ -45,6 +53,8 @@ class AuthResult:
     replay_state: AuthReplayState | None = None
     authenticated: bool = False
     is_spa: bool = False
+    state: AuthVerificationState = AuthVerificationState.unauthenticated
+    verification_evidence: str = ""
 
 
 @dataclass
@@ -672,9 +682,11 @@ class SmartAuthenticator:
         cookies = ModernAuthManager.snapshot_cookies(client.cookies)
 
         bearer_token = None
+        verification_evidence = ""
         auth_header = client.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             bearer_token = auth_header.replace("Bearer ", "").strip()
+            verification_evidence = "authorization header present"
 
         if response is not None:
             if response.status_code in (200, 201, 204, 302):
@@ -700,6 +712,7 @@ class SmartAuthenticator:
                     found_token = search_token(data)
                     if found_token:
                         bearer_token = found_token
+                        verification_evidence = "token-bearing login response"
                         logger.info("[auth] Extracted token from login response: %s", bearer_token)
                 except Exception:
                     pass
@@ -708,21 +721,122 @@ class SmartAuthenticator:
                     tokens = ModernAuthManager.extract_tokens(response.text)
                     if tokens:
                         bearer_token = next(iter(tokens.values()))
+                        verification_evidence = "token pattern in response text"
                         logger.info("[auth] Extracted token pattern from response text: %s", bearer_token)
 
-        authenticated = bool(cookies or bearer_token)
+        state = AuthVerificationState.unauthenticated
 
         if response is not None:
             if response.status_code in (401, 403):
-                authenticated = False
+                state = AuthVerificationState.unauthenticated
             else:
                 body_lower = response.text.lower()
-                invalid_hints = ("invalid credentials", "invalid email", "invalid username", "login failed", "unauthorized", "incorrect password")
+                invalid_hints = self._configured_failure_hints()
                 if any(hint in body_lower for hint in invalid_hints):
-                    authenticated = False
+                    state = AuthVerificationState.unauthenticated
+                elif bearer_token:
+                    state = AuthVerificationState.authenticated_verified
+                elif self._response_has_auth_success_marker(response):
+                    state = AuthVerificationState.authenticated_verified
+                    verification_evidence = verification_evidence or "post-login success marker"
+                elif cookies:
+                    state = AuthVerificationState.authenticated_unverified
+                    verification_evidence = "cookies present but no protected-resource proof"
+        elif bearer_token:
+            state = AuthVerificationState.authenticated_verified
+        elif cookies:
+            state = AuthVerificationState.authenticated_unverified
+            verification_evidence = "cookies present but no response proof"
+
+        validation = await self._verify_configured_protected_target(client)
+        if validation:
+            state = AuthVerificationState.authenticated_verified
+            verification_evidence = validation
+
+        authenticated = state in {
+            AuthVerificationState.authenticated_unverified,
+            AuthVerificationState.authenticated_verified,
+        }
 
         return AuthResult(
             cookies=cookies,
             bearer_token=bearer_token,
-            authenticated=authenticated
+            authenticated=authenticated,
+            state=state,
+            verification_evidence=verification_evidence,
         )
+
+    def _configured_failure_hints(self) -> tuple[str, ...]:
+        configured = getattr(self.settings, "authentication_failure_text", None)
+        hints = [
+            "invalid credentials",
+            "invalid email",
+            "invalid username",
+            "login failed",
+            "unauthorized",
+            "incorrect password",
+            "bad credentials",
+            "authentication failed",
+        ]
+        if configured:
+            hints.append(str(configured).lower())
+        return tuple(hints)
+
+    def _response_has_auth_success_marker(self, response: httpx.Response) -> bool:
+        body_lower = response.text.lower()
+        success_text = getattr(self.settings, "authentication_success_text", None)
+        if success_text and str(success_text).lower() in body_lower:
+            return True
+
+        success_regex = getattr(self.settings, "authentication_success_regex", None)
+        if success_regex:
+            try:
+                if re.search(str(success_regex), response.text, re.I):
+                    return True
+            except re.error:
+                logger.warning("[auth] Ignoring invalid authentication_success_regex")
+
+        if getattr(self.settings, "authentication_failure_regex", None):
+            try:
+                if re.search(str(self.settings.authentication_failure_regex), response.text, re.I):
+                    return False
+            except re.error:
+                logger.warning("[auth] Ignoring invalid authentication_failure_regex")
+
+        success_hints = (
+            "logout",
+            "log out",
+            "sign out",
+            "dashboard",
+            "profile",
+            "my account",
+            "account settings",
+            "welcome",
+        )
+        return any(hint in body_lower for hint in success_hints)
+
+    async def _verify_configured_protected_target(self, client: httpx.AsyncClient) -> str:
+        protected_url = (
+            getattr(self.settings, "authentication_validation_url", None)
+            or getattr(self.settings, "authentication_success_url", None)
+        )
+        if not protected_url:
+            return ""
+        try:
+            resp = await client.get(str(protected_url), follow_redirects=True)
+        except Exception as exc:
+            logger.debug("[auth] Protected target validation failed: %s", exc)
+            return ""
+        if resp.status_code in (401, 403):
+            return ""
+        if getattr(self.settings, "authentication_failure_regex", None):
+            try:
+                if re.search(str(self.settings.authentication_failure_regex), resp.text, re.I):
+                    return ""
+            except re.error:
+                logger.warning("[auth] Ignoring invalid authentication_failure_regex")
+        if self._response_has_auth_success_marker(resp):
+            return f"protected validation target succeeded: {protected_url}"
+        if 200 <= resp.status_code < 300:
+            return f"protected validation target returned HTTP {resp.status_code}: {protected_url}"
+        return ""

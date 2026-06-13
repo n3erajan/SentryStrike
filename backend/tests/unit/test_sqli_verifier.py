@@ -27,7 +27,7 @@ def test_sqli_detector_excludes_submit_button():
     candidates = detector._extract_candidates(["http://example.com"], [FakeForm()])
     
     # We should only get candidates for "username", not the buttons
-    params = [c[1] for c in candidates if c[1]]
+    params = [candidate.parameter for candidate in candidates if candidate.parameter]
     assert "username" in params
     assert "loginBtn" not in params
     assert "resetBtn" not in params
@@ -117,7 +117,7 @@ async def test_sqli_verifier_boolean_requires_confirmation():
 def test_sqli_verifier_prepends_baseline_to_payload():
     verifier = SQLiVerifier()
 
-    url, _, _ = verifier._build_request_args(
+    url, _, _, _, _ = verifier._build_request_args(
         "http://example.com/sqli?id=1",
         "id",
         "' AND '1'='1",

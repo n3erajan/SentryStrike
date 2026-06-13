@@ -129,7 +129,7 @@ class ParamDiscovery:
         type, JSON path, and security relevance are preserved.
         """
         candidates: list[ParameterCandidate] = []
-        seen_keys: set[tuple[str, str, str]] = set()  # (url, param, method) dedup
+        seen_keys: set[tuple[str, str, str, str, str]] = set()
         paths_with_params: set[str] = set()
 
         def _add_candidate(
@@ -147,12 +147,19 @@ class ParamDiscovery:
                 return
             if filter_fn and not filter_fn(param):
                 return
-            key = (url, param, method)
+            key = (url, param, method, location.value, parent_path or "")
             baseline = cls._baseline_value(param, val)
             if key in seen_keys:
                 # Prefer a non-empty observed value over an earlier empty one.
                 for i, existing in enumerate(candidates):
-                    if (existing.url, existing.name, existing.method) == key and not existing.baseline_value and baseline:
+                    existing_key = (
+                        existing.url,
+                        existing.name,
+                        existing.method,
+                        existing.location.value,
+                        existing.parent_path or "",
+                    )
+                    if existing_key == key and not existing.baseline_value and baseline:
                         existing.baseline_value = baseline
                         if form_inputs:
                             existing.context["form_inputs"] = form_inputs
@@ -238,7 +245,7 @@ class ParamDiscovery:
                 if filter_fn and not filter_fn(param):
                     continue
 
-                key = (path_url, param, "GET")
+                key = (path_url, param, "GET", ParameterLocation.query.value, "")
                 if key not in seen_keys:
                     seen_keys.add(key)
                     candidates.append(
@@ -258,7 +265,13 @@ class ParamDiscovery:
             for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
                 if filter_fn and not filter_fn(parameter.name):
                     continue
-                key = (parameter.url, parameter.name, parameter.method)
+                key = (
+                    parameter.url,
+                    parameter.name,
+                    parameter.method,
+                    parameter.location.value,
+                    parameter.parent_path or "",
+                )
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)

@@ -1,8 +1,10 @@
 import asyncio
 import logging
-from urllib.parse import parse_qsl, urlparse
+import re
 
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.detectors.attack_surface import AttackSurface, AttackTarget, build_json_body
+from app.core.crawler.models import ParameterLocation
 from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
@@ -26,27 +28,20 @@ class SSRFDetector(BaseDetector):
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
 
-        # 1. Candidate extraction
-        candidates = set()
+        def ssrf_filter(param_name: str) -> bool:
+            param_lower = param_name.lower()
+            return param_lower in self.ssrf_param_tokens or any(
+                tok in param_lower for tok in ["url", "link", "redirect"]
+            )
 
-        for url in urls:
-            parsed = urlparse(url)
-            query_params = parse_qsl(parsed.query, keep_blank_values=True)
-            for param_name, param_value in query_params:
-                param_lower = param_name.lower()
-                if param_lower in self.ssrf_param_tokens or any(tok in param_lower for tok in ["url", "link", "redirect"]):
-                    candidates.add((url, param_name, "GET", param_value))
-
-        for form in forms:
-            form_url = getattr(form, "action", getattr(form, "page_url", ""))
-            form_method = getattr(form, "method", "POST").upper()
-            raw_inputs = list(getattr(form, "inputs", []))
-            for inp in raw_inputs:
-                inp_name = getattr(inp, "name", "")
-                if inp_name:
-                    inp_name_lower = inp_name.lower()
-                    if inp_name_lower in self.ssrf_param_tokens or any(tok in inp_name_lower for tok in ["url", "link"]):
-                        candidates.add((form_url, inp_name, form_method, ""))
+        candidates = AttackSurface.build(
+            urls,
+            forms,
+            parameters=kwargs.get("parameters") or [],
+            api_endpoints=kwargs.get("api_endpoints") or [],
+            requests=kwargs.get("requests") or [],
+            filter_fn=ssrf_filter,
+        )
 
         if not candidates:
             return []
@@ -56,19 +51,32 @@ class SSRFDetector(BaseDetector):
         verifier = HttpVerifier(cookies=session_cookies)
         verifier.set_request_context(module="ssrf")
 
-        async def verify_candidate(cand) -> list[Finding]:
-            cand_url, param, method, val = cand
+        def build_request(cand: AttackTarget, value: str):
+            if cand.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
+                return cand.url, None, None, build_json_body(cand.json_template, cand, value), cand.headers
+            request_url, params, data = URLParameterBuilder.inject_parameter(
+                cand.url, cand.parameter, value, cand.method, cand.form_inputs
+            )
+            return request_url, params, data, None, None
+
+        async def verify_candidate(cand: AttackTarget) -> list[Finding]:
             cand_findings = []
 
             async with semaphore:
-                verifier.set_request_context(parameter=param)
+                verifier.set_request_context(parameter=cand.parameter)
                 try:
                     # Retrieve baseline first
-                    baseline_url, baseline_params, baseline_data = URLParameterBuilder.inject_parameter(
-                        cand_url, param, val, method
+                    baseline_url, baseline_params, baseline_data, baseline_json, baseline_headers = build_request(
+                        cand, str(cand.value or "")
                     )
                     baseline = await verifier.send_request(
-                        baseline_url, method, baseline_params, baseline_data, test_phase="baseline"
+                        baseline_url,
+                        cand.method,
+                        baseline_params,
+                        baseline_data,
+                        headers=baseline_headers,
+                        json_body=baseline_json,
+                        test_phase="baseline",
                     )
 
                     for payload, regex_pattern, desc in self.SSRF_PAYLOADS:
@@ -76,11 +84,16 @@ class SSRFDetector(BaseDetector):
                         if baseline.status_code == 200 and re.search(regex_pattern, baseline.body, re.I):
                             continue
 
-                        injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
-                            cand_url, param, payload, method
+                        injected_url, injected_params, injected_data, injected_json, injected_headers = build_request(
+                            cand, payload
                         )
                         injected = await verifier.send_request(
-                            injected_url, method, injected_params, injected_data,
+                            injected_url,
+                            cand.method,
+                            injected_params,
+                            injected_data,
+                            headers=injected_headers,
+                            json_body=injected_json,
                             test_phase="ssrf_injection", payload=payload,
                         )
 
@@ -91,9 +104,9 @@ class SSRFDetector(BaseDetector):
                                     category=OwaspCategory.a01,
                                     vuln_type="Server-Side Request Forgery (SSRF)",
                                     severity=SeverityLevel.high,
-                                    url=cand_url,
-                                    parameter=param,
-                                    method=method,
+                                    url=cand.url,
+                                    parameter=cand.parameter,
+                                    method=cand.method,
                                     payload=payload,
                                     evidence=f"SSRF verified via payload '{payload}' ({desc}). Response contains internal host signature.",
                                     confidence_score=95.0,
@@ -106,11 +119,8 @@ class SSRFDetector(BaseDetector):
                             )
                             break
                 except Exception as e:
-                    logger.error("SSRF verification failed for %s param %s: %s", cand_url, param, e)
+                    logger.error("SSRF verification failed for %s param %s: %s", cand.url, cand.parameter, e)
             return cand_findings
-
-        # Import re dynamically to support clean execution
-        import re
 
         tasks = [verify_candidate(c) for c in candidates]
         results = await asyncio.gather(*tasks)

@@ -55,6 +55,7 @@ import logging
 from typing import Optional
 
 from app.config import get_settings
+from app.core.crawler.models import ParameterLocation
 from app.core.detectors.base_detector import Finding
 from app.core.verification.response_analyzer import DifferentialAnalysis, ResponseAnalyzer, ResponseData
 from app.core.verification.verification_framework import (
@@ -282,6 +283,7 @@ class SQLiVerifier(BaseVerifier):
         method: str = "GET",
         value: str = "",
         form_inputs: Optional[list] = None,
+        target: Optional[object] = None,
     ) -> VerificationResult:
         self._begin_verification(parameter)
         results: list[VerificationResult] = []
@@ -292,7 +294,7 @@ class SQLiVerifier(BaseVerifier):
         )
 
         pre_test_baseline = await self.fetch_pre_test_baseline(
-            url, parameter, method, baseline_value, form_inputs
+            url, parameter, method, baseline_value, form_inputs, target=target
         )
 
         _run_differential = True
@@ -321,7 +323,7 @@ class SQLiVerifier(BaseVerifier):
         # Gate 2: Per-Parameter Stability Check
         if _run_differential and pre_test_baseline is not None:
             stability = await self._measure_page_stability(
-                url, parameter, baseline_value, method, form_inputs, pre_test_baseline
+                url, parameter, baseline_value, method, form_inputs, pre_test_baseline, target=target
             )
             if stability < _STABILITY_FLOOR:
                 _run_differential = False
@@ -329,7 +331,7 @@ class SQLiVerifier(BaseVerifier):
         # Gate 3: Parameter Characterisation
         if _run_differential and pre_test_baseline is not None:
             char = await self._characterise_parameter(
-                url, parameter, method, baseline_value, form_inputs, pre_test_baseline
+                url, parameter, method, baseline_value, form_inputs, pre_test_baseline, target=target
             )
             if not char["reflective"]:
                 logger.debug(
@@ -342,7 +344,7 @@ class SQLiVerifier(BaseVerifier):
         # Technique 1: Boolean Differential (Pass baseline_value explicitly)
         if _run_differential:
             result = await self._verify_boolean_based(
-                url, parameter, method, baseline_value, form_inputs, pre_test_baseline
+                url, parameter, method, baseline_value, form_inputs, pre_test_baseline, target=target
             )
             if result.is_vulnerable:
                 results.append(result)
@@ -352,7 +354,7 @@ class SQLiVerifier(BaseVerifier):
         # Technique 2: Error-Based
         if _run_error_time:
             result = await self._verify_error_based(
-                url, parameter, method, baseline_value, form_inputs, pre_test_baseline
+                url, parameter, method, baseline_value, form_inputs, pre_test_baseline, target=target
             )
             if result.is_vulnerable:
                 results.append(result)
@@ -362,7 +364,7 @@ class SQLiVerifier(BaseVerifier):
         # Technique 3: UNION-Based
         if _run_differential:
             result = await self._verify_union_based(
-                url, parameter, method, baseline_value, form_inputs, pre_test_baseline
+                url, parameter, method, baseline_value, form_inputs, pre_test_baseline, target=target
             )
             if result.is_vulnerable:
                 results.append(result)
@@ -370,7 +372,7 @@ class SQLiVerifier(BaseVerifier):
         # Technique 4: Time-Based
         if _run_error_time and not results:
             result = await self._verify_time_based(
-                url, parameter, method, baseline_value, form_inputs, pre_test_baseline
+                url, parameter, method, baseline_value, form_inputs, pre_test_baseline, target=target
             )
             if result.is_vulnerable:
                 results.append(result)
@@ -428,18 +430,25 @@ class SQLiVerifier(BaseVerifier):
         baseline_value: str = "",  # Default value makes it optional positionally!
         *,
         inject: bool = True,
-    ) -> tuple[str, Optional[dict], Optional[dict]]:
+        target: Optional[object] = None,
+    ) -> tuple[str, Optional[dict], Optional[dict], Optional[object], Optional[dict]]:
         
         if inject:
             payload_value = f"{baseline_value}{payload_value}"
 
         if method.upper() == "POST" and form_inputs is not None:
             data = FormPayloadBuilder.build(form_inputs, parameter, payload_value)
-            return url, None, data
+            return url, None, data, None, None
 
-        return URLParameterBuilder.inject_parameter(
+        if target is not None and getattr(target, "location", None) in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
+            from app.core.verification.verification_framework import _build_json_body
+            json_body = _build_json_body(getattr(target, "json_template", None), target, payload_value)
+            return url, None, None, json_body, getattr(target, "headers", None)
+
+        inj_url, inj_params, inj_data = URLParameterBuilder.inject_parameter(
             url, parameter, payload_value, method, form_inputs=form_inputs
         )
+        return inj_url, inj_params, inj_data, None, None
 
     # ======================================================================
     # Helper: page stability measurement
@@ -453,13 +462,16 @@ class SQLiVerifier(BaseVerifier):
         method: str,
         form_inputs: Optional[list],
         pre_test_baseline: ResponseData,
+        target: Optional[object] = None,
     ) -> float:
         try:
-            probe_url, probe_params, probe_data = self._build_request_args(
-                url, parameter, baseline_value, method, form_inputs, baseline_value, inject=False
+            probe_url, probe_params, probe_data, probe_json, probe_headers = self._build_request_args(
+                url, parameter, baseline_value, method, form_inputs, baseline_value, inject=False, target=target
             )
             probe_resp = await self._send(
                 probe_url, method, probe_params, probe_data,
+                headers=probe_headers,
+                json_body=probe_json,
                 test_phase="stability_probe",
             )
             stability = _body_similarity(pre_test_baseline.body, probe_resp.body)
@@ -467,17 +479,19 @@ class SQLiVerifier(BaseVerifier):
         except Exception as e:
             return 1.0
         
-    async def _characterise_parameter(self, url, parameter, method, value, form_inputs, baseline):
+    async def _characterise_parameter(self, url, parameter, method, value, form_inputs, baseline, target=None):
         """
         Determine which techniques are applicable:
           - reflective: true/false content difference exists → boolean/UNION viable
           - error_visible: SQL errors appear in responses → error-based viable
           - always: time-based always attempted (last resort)
         """
-        false_url, false_params, false_data = self._build_request_args(
-            url, parameter, "' AND '1'='2'--", method, form_inputs, baseline_value=value
+        false_url, false_params, false_data, false_json, false_headers = self._build_request_args(
+            url, parameter, "' AND '1'='2'--", method, form_inputs, baseline_value=value, target=target
         )
         false_resp = await self._send(false_url, method, false_params, false_data,
+                                      headers=false_headers,
+                                      json_body=false_json,
                                       test_phase="characterise_false")
         sim = _body_similarity(baseline.body, false_resp.body)
         is_reflective = sim < 0.90
@@ -495,6 +509,7 @@ class SQLiVerifier(BaseVerifier):
         value: str,
         form_inputs: Optional[list] = None,
         pre_test_baseline: Optional[ResponseData] = None,
+        target: Optional[object] = None,
     ) -> VerificationResult:
         """
         Boolean-based blind SQLi using directional similarity checks.
@@ -510,7 +525,7 @@ class SQLiVerifier(BaseVerifier):
         """
         try:
             baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
-                url, parameter, method, value, form_inputs
+                url, parameter, method, value, form_inputs, target=target
             )
 
             confirmed_true_payload  = None
@@ -520,19 +535,21 @@ class SQLiVerifier(BaseVerifier):
 
             for true_payload, false_payload in _BOOL_PAYLOAD_PAIRS:
 
-                true_url, true_params, true_data = self._build_request_args(
-                    url, parameter, true_payload, method, form_inputs,baseline_value=value
+                true_url, true_params, true_data, true_json, true_headers = self._build_request_args(
+                    url, parameter, true_payload, method, form_inputs, baseline_value=value, target=target
                 )
                 true_resp = await self._send(
                     true_url, method, true_params, true_data,
+                    headers=true_headers, json_body=true_json,
                     test_phase="boolean_true", payload=true_payload,
                 )
 
-                false_url, false_params, false_data = self._build_request_args(
-                    url, parameter, false_payload, method, form_inputs,baseline_value=value
+                false_url, false_params, false_data, false_json, false_headers = self._build_request_args(
+                    url, parameter, false_payload, method, form_inputs, baseline_value=value, target=target
                 )
                 false_resp = await self._send(
                     false_url, method, false_params, false_data,
+                    headers=false_headers, json_body=false_json,
                     test_phase="boolean_false", payload=false_payload,
                 )
 
@@ -582,18 +599,20 @@ class SQLiVerifier(BaseVerifier):
             confirm_true  = confirmed_true_payload.replace("1=1", "3=3").replace("'1'='1", "'x'='x")
             confirm_false = confirmed_false_payload.replace("1=2", "3=4").replace("'1'='2", "'x'='y")
 
-            ct_url, ct_params, ct_data = self._build_request_args(
-                url, parameter, confirm_true, method, form_inputs
+            ct_url, ct_params, ct_data, ct_json, ct_headers = self._build_request_args(
+                url, parameter, confirm_true, method, form_inputs, target=target
             )
-            cf_url, cf_params, cf_data = self._build_request_args(
-                url, parameter, confirm_false, method, form_inputs
+            cf_url, cf_params, cf_data, cf_json, cf_headers = self._build_request_args(
+                url, parameter, confirm_false, method, form_inputs, target=target
             )
             ct_resp = await self._send(
                 ct_url, method, ct_params, ct_data,
+                headers=ct_headers, json_body=ct_json,
                 test_phase="boolean_confirm_true", payload=confirm_true,
             )
             cf_resp = await self._send(
                 cf_url, method, cf_params, cf_data,
+                headers=cf_headers, json_body=cf_json,
                 test_phase="boolean_confirm_false", payload=confirm_false,
             )
 
@@ -670,6 +689,7 @@ class SQLiVerifier(BaseVerifier):
         value: str,
         form_inputs: Optional[list] = None,
         pre_test_baseline: Optional[ResponseData] = None,
+        target: Optional[object] = None,
     ) -> VerificationResult:
         """
         Error-based SQLi detection.
@@ -698,7 +718,7 @@ class SQLiVerifier(BaseVerifier):
 
         try:
             baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
-                url, parameter, method, value, form_inputs
+                url, parameter, method, value, form_inputs, target=target
             )
             baseline_body = baseline.body or ""
 
@@ -707,11 +727,13 @@ class SQLiVerifier(BaseVerifier):
             first_hit_resp:    Optional[ResponseData] = None
 
             for payload in error_payloads:
-                inj_url, inj_params, inj_data = self._build_request_args(
-                    url, parameter, payload, method, form_inputs,baseline_value=value
+                inj_url, inj_params, inj_data, inj_json, inj_headers = self._build_request_args(
+                    url, parameter, payload, method, form_inputs, baseline_value=value, target=target
                 )
                 inj_resp = await self._send(
                     inj_url, method, inj_params, inj_data,
+                    headers=inj_headers,
+                    json_body=inj_json,
                     test_phase="error_injection", payload=payload,
                 )
                 inj_body = inj_resp.body or ""
@@ -788,6 +810,7 @@ class SQLiVerifier(BaseVerifier):
             value: str,
             form_inputs: Optional[list] = None,
             pre_test_baseline: Optional[ResponseData] = None,
+            target: Optional[object] = None,
         ) -> VerificationResult:
             """
             UNION-based SQLi detection with robust text-storage/reflection guards.
@@ -802,7 +825,7 @@ class SQLiVerifier(BaseVerifier):
 
             try:
                 baseline = pre_test_baseline or await self.fetch_pre_test_baseline(
-                    url, parameter, method, value, form_inputs
+                    url, parameter, method, value, form_inputs, target=target
                 )
                 baseline_body = baseline.body or ""
                 baseline_body_low = baseline_body.lower()
@@ -816,11 +839,13 @@ class SQLiVerifier(BaseVerifier):
                     cols[0] = f"'{canary}'"
                     canary_payload = f"' UNION SELECT {','.join(cols)}--"
 
-                    inj_url, inj_params, inj_data = self._build_request_args(
-                        url, parameter, canary_payload, method, form_inputs
+                    inj_url, inj_params, inj_data, inj_json, inj_headers = self._build_request_args(
+                        url, parameter, canary_payload, method, form_inputs, target=target
                     )
                     inj_resp = await self._send(
                         inj_url, method, inj_params, inj_data,
+                        headers=inj_headers,
+                        json_body=inj_json,
                         test_phase="union_canary", payload=canary_payload,
                     )
 
@@ -899,11 +924,13 @@ class SQLiVerifier(BaseVerifier):
                 valid_null_probes: list[tuple[str, ResponseData, float]] = []
 
                 for payload in union_null_payloads:
-                    inj_url, inj_params, inj_data = self._build_request_args(
-                        url, parameter, payload, method, form_inputs
+                    inj_url, inj_params, inj_data, inj_json, inj_headers = self._build_request_args(
+                        url, parameter, payload, method, form_inputs, target=target
                     )
                     inj_resp = await self._send(
                         inj_url, method, inj_params, inj_data,
+                        headers=inj_headers,
+                        json_body=inj_json,
                         test_phase="union_null", payload=payload,
                     )
 
@@ -971,11 +998,13 @@ class SQLiVerifier(BaseVerifier):
                             cols[col_idx] = v_expr
                             ver_payload = f"' UNION SELECT {','.join(cols)}--"
 
-                            ver_url, ver_params, ver_data = self._build_request_args(
-                                url, parameter, ver_payload, method, form_inputs
+                            ver_url, ver_params, ver_data, ver_json, ver_headers = self._build_request_args(
+                                url, parameter, ver_payload, method, form_inputs, target=target
                             )
                             ver_resp = await self._send(
                                 ver_url, method, ver_params, ver_data,
+                                headers=ver_headers,
+                                json_body=ver_json,
                                 test_phase="union_version_extract", payload=ver_payload,
                             )
 
@@ -1065,11 +1094,13 @@ class SQLiVerifier(BaseVerifier):
                 confirm_col_count = best_col_count + 1 if best_col_count < 5 else best_col_count - 1
                 confirm_payload = "' UNION SELECT " + ",".join(["NULL"] * confirm_col_count) + "--"
 
-                conf_url, conf_params, conf_data = self._build_request_args(
-                    url, parameter, confirm_payload, method, form_inputs
+                conf_url, conf_params, conf_data, conf_json, conf_headers = self._build_request_args(
+                    url, parameter, confirm_payload, method, form_inputs, target=target
                 )
                 conf_resp = await self._send(
                     conf_url, method, conf_params, conf_data,
+                    headers=conf_headers,
+                    json_body=conf_json,
                     test_phase="union_cross_column_confirm", payload=confirm_payload,
                 )
                 conf_sim = _body_similarity(baseline_body, conf_resp.body or "")
@@ -1157,6 +1188,7 @@ class SQLiVerifier(BaseVerifier):
         value: str,
         form_inputs: Optional[list] = None,
         pre_test_baseline: Optional[ResponseData] = None,
+        target: Optional[object] = None,
     ) -> VerificationResult:
         """
         Time-based blind SQLi.
@@ -1187,8 +1219,8 @@ class SQLiVerifier(BaseVerifier):
         ]
 
         try:
-            baseline_url, baseline_params, baseline_data = self._build_request_args(
-                url, parameter, value, method, form_inputs, inject=False
+            baseline_url, baseline_params, baseline_data, baseline_json, baseline_headers = self._build_request_args(
+                url, parameter, value, method, form_inputs, inject=False, target=target
             )
 
             baseline_times: list[float] = []
@@ -1198,6 +1230,8 @@ class SQLiVerifier(BaseVerifier):
             for _ in range(3 - len(baseline_times)):
                 resp = await self._send(
                     baseline_url, method, baseline_params, baseline_data,
+                    headers=baseline_headers,
+                    json_body=baseline_json,
                     test_phase="time_baseline",
                 )
                 baseline_times.append(resp.response_time_ms)
@@ -1221,14 +1255,16 @@ class SQLiVerifier(BaseVerifier):
 
             for payload, expected_ms in sleep_payloads:
 
-                inj_url, inj_params, inj_data = self._build_request_args(
-                    url, parameter, payload, method, form_inputs,baseline_value=value
+                inj_url, inj_params, inj_data, inj_json, inj_headers = self._build_request_args(
+                    url, parameter, payload, method, form_inputs, baseline_value=value, target=target
                 )
                 inj_times = []
                 last_resp = None
                 for _ in range(2):
                     resp = await self._send(
                         inj_url, method, inj_params, inj_data,
+                        headers=inj_headers,
+                        json_body=inj_json,
                         test_phase="time_injection", payload=payload,
                     )
                     inj_times.append(resp.response_time_ms)

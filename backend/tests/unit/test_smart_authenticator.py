@@ -3,7 +3,13 @@ import httpx
 from types import SimpleNamespace
 from bs4 import BeautifulSoup
 
-from app.core.crawler.auth_manager import SmartAuthenticator, AuthStrategy, AuthResult, AuthReplayState
+from app.core.crawler.auth_manager import (
+    AuthReplayState,
+    AuthResult,
+    AuthStrategy,
+    AuthVerificationState,
+    SmartAuthenticator,
+)
 
 
 class MockSettings:
@@ -11,6 +17,12 @@ class MockSettings:
         self.authentication_cookie = None
         self.authentication_username = "testuser"
         self.authentication_password = "testpassword"
+        self.authentication_failure_text = None
+        self.authentication_failure_regex = None
+        self.authentication_success_text = None
+        self.authentication_success_regex = None
+        self.authentication_success_url = None
+        self.authentication_validation_url = None
 
 
 def test_classify_field_name_and_attrs():
@@ -77,11 +89,29 @@ async def test_verify_auth_with_cookies():
     result = await auth._verify_auth(client)
     assert not result.authenticated
 
-    # With cookies -> authenticated
+    # With cookies alone -> usable but unverified, not proof of login.
     client.cookies.set("sessionid", "xyz123")
     result = await auth._verify_auth(client)
     assert result.authenticated
+    assert result.state == AuthVerificationState.authenticated_unverified
     assert result.cookies == {"sessionid": "xyz123"}
+
+
+@pytest.mark.asyncio
+async def test_verify_auth_with_post_login_marker_is_verified():
+    auth = SmartAuthenticator(MockSettings())
+    client = httpx.AsyncClient()
+    client.cookies.set("sessionid", "xyz123")
+    mock_resp = httpx.Response(
+        200,
+        text="<html><a href='/logout'>Logout</a><h1>Dashboard</h1></html>",
+        request=httpx.Request("POST", "http://example.com/login"),
+    )
+
+    result = await auth._verify_auth(client, response=mock_resp)
+
+    assert result.authenticated
+    assert result.state == AuthVerificationState.authenticated_verified
 
 
 @pytest.mark.asyncio
@@ -98,4 +128,5 @@ async def test_verify_auth_with_json_token():
 
     result = await auth._verify_auth(client, response=mock_resp)
     assert result.authenticated
+    assert result.state == AuthVerificationState.authenticated_verified
     assert result.bearer_token == "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjF9"

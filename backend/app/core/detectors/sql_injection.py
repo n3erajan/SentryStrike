@@ -16,13 +16,11 @@ Architecture:
 
 import asyncio
 import logging
-from urllib.parse import parse_qsl, urlparse
 
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.verification.sqli_verifier import SQLiVerifier
 from app.core.verification.verification_framework import FindingDeduplicator
-from app.models.vulnerability import OwaspCategory, SeverityLevel
-from app.utils.payloads import payload_manager
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +69,13 @@ class SQLInjectionDetector(BaseDetector):
         self.verifier.http_verifier.cookies = session_cookies
 
         # Phase 1: Reconnaissance - Extract candidates
-        candidates = self._extract_candidates(urls, forms)
+        candidates = self._extract_candidates(
+            urls,
+            forms,
+            parameters=kwargs.get("parameters") or [],
+            api_endpoints=kwargs.get("api_endpoints") or [],
+            requests=kwargs.get("requests") or [],
+        )
         logger.info(f"Found {len(candidates)} SQL injection candidates")
 
         # Phase 2: Active Testing - Verify each candidate
@@ -92,13 +96,21 @@ class SQLInjectionDetector(BaseDetector):
         self,
         urls: list[str],
         forms: list[object],
-    ) -> list[tuple]:
+        *,
+        parameters: list[object] | None = None,
+        api_endpoints: list[object] | None = None,
+        requests: list[object] | None = None,
+    ) -> list[AttackTarget]:
         """
         Phase 1 & 2: Reconnaissance - Extract candidates using ParamDiscovery.
         """
-        from app.core.crawler.param_discovery import ParamDiscovery
-        return ParamDiscovery.build_candidates(
-            urls, forms, filter_fn=lambda p: self._get_parameter_priority(p) >= 0
+        return AttackSurface.build(
+            urls,
+            forms,
+            parameters=parameters,
+            api_endpoints=api_endpoints,
+            requests=requests,
+            filter_fn=lambda p: self._get_parameter_priority(p) >= 0,
         )
 
     def _get_parameter_priority(self, param_name: str) -> int:
@@ -138,7 +150,7 @@ class SQLInjectionDetector(BaseDetector):
 
     async def _verify_candidates(
         self,
-        candidates: list[tuple],
+        candidates: list[AttackTarget],
     ) -> list[Finding]:
         """
         Phase 2: Active Testing - Verify each candidate.
@@ -150,21 +162,14 @@ class SQLInjectionDetector(BaseDetector):
 
         # Process sequentially to avoid overwhelming target
         for candidate in candidates:
-            # Unpack: 5-tuple means POST form candidate (has raw_inputs),
-            # 4-tuple means GET/URL candidate (no form_inputs needed).
-            if len(candidate) == 5:
-                url, param_name, method, baseline_value, form_inputs = candidate
-            else:
-                url, param_name, method, baseline_value = candidate
-                form_inputs = None
-
             try:
                 result = await self.verifier.verify(
-                    url=url,
-                    parameter=param_name,
-                    method=method,
-                    value=baseline_value,
-                    form_inputs=form_inputs,
+                    url=candidate.url,
+                    parameter=candidate.parameter,
+                    method=candidate.method,
+                    value=str(candidate.value),
+                    form_inputs=candidate.form_inputs,
+                    target=candidate,
                 )
 
                 findings.extend(result.findings)
@@ -173,7 +178,7 @@ class SQLInjectionDetector(BaseDetector):
                 await asyncio.sleep(0.1)
 
             except Exception as e:
-                logger.warning(f"Verification failed for {url}:{param_name}: {e}")
+                logger.warning("Verification failed for %s:%s: %s", candidate.url, candidate.parameter, e)
                 continue
 
         return findings

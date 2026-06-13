@@ -16,6 +16,7 @@ from app.core.crawler.auth_manager import (
     AuthReplayState,
     AuthStrategy,
     AuthResult,
+    AuthVerificationState,
 )
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.browser_engine import BrowserDiscoveryEngine
@@ -73,6 +74,9 @@ class CrawlResult:
     requests: list[object] = field(default_factory=list)
     assets: list[str] = field(default_factory=list)
     dead_routes: list[RouteCandidate] = field(default_factory=list)
+    auth_state: AuthVerificationState = AuthVerificationState.unauthenticated
+    auth_headers: dict[str, str] = field(default_factory=dict)
+    auth_verification_evidence: str = ""
 
 
 class WebSpider:
@@ -83,11 +87,21 @@ class WebSpider:
         self._configured_auth_cookies: dict[str, str] = {}
         self._auth_headers: dict[str, str] = {}
         self._is_spa: bool = False
+        self._auth_state: AuthVerificationState = AuthVerificationState.unauthenticated
+        self._auth_verification_evidence: str = ""
 
     def _snapshot_cookies(self, cookies: httpx.Cookies) -> dict[str, str]:
         return ModernAuthManager.snapshot_cookies(cookies)
 
+    def _reset_scan_auth_state(self) -> None:
+        self.session_cookies = {}
+        self._auth_headers = {}
+        self._auth_replay_state = None
+        self._auth_state = AuthVerificationState.unauthenticated
+        self._auth_verification_evidence = ""
+
     async def crawl(self, root_url: str, max_depth: int | None = None) -> CrawlResult:
+        self._reset_scan_auth_state()
         self._is_spa = False
         max_depth = max_depth if max_depth is not None else self.settings.crawl_depth
         visited: set[str] = set()
@@ -350,12 +364,16 @@ class WebSpider:
             requests=crawl_state.requests,
             assets=sorted(crawl_state.assets),
             dead_routes=dead_routes,
+            auth_state=self._auth_state,
+            auth_headers=dict(self._auth_headers),
+            auth_verification_evidence=self._auth_verification_evidence,
         )
         self._log_crawl_inventory(root_url, result)
         return result
 
     async def fetch_single(self, target_url: str) -> CrawlResult:
         """Fetch one URL only - no link discovery, sitemaps, or path brute-force."""
+        self._reset_scan_auth_state()
         self._is_spa = False
         forms: list[HtmlForm] = []
         discovered_urls: list[str] = []
@@ -394,6 +412,9 @@ class WebSpider:
             is_spa=is_spa,
             spa_root_html=spa_root_html,
             parameters=parameters,
+            auth_state=self._auth_state,
+            auth_headers=dict(self._auth_headers),
+            auth_verification_evidence=self._auth_verification_evidence,
         )
         self._log_crawl_inventory(target_url, result)
         return result
@@ -591,7 +612,25 @@ class WebSpider:
             cookies = self._configured_auth_cookies
             client.cookies.update(cookies)
             self.session_cookies.update(cookies)
-            logger.info("Session authenticated via provided cookie string")
+            self._auth_state = AuthVerificationState.authenticated_unverified
+            self._auth_verification_evidence = "configured cookie supplied"
+            logger.info("Session configured via provided cookie string")
+
+        if self.settings.authentication_header:
+            header_name, _, header_value = self.settings.authentication_header.partition(":")
+            if header_name and header_value:
+                self._auth_headers[header_name.strip()] = header_value.strip()
+                client.headers[header_name.strip()] = header_value.strip()
+                self._auth_state = AuthVerificationState.authenticated_unverified
+                self._auth_verification_evidence = "configured authentication header supplied"
+
+        if self.settings.authentication_cookie or self.settings.authentication_header:
+            result = await SmartAuthenticator(self.settings)._verify_auth(client)
+            self._auth_state = result.state
+            self._auth_verification_evidence = result.verification_evidence or self._auth_verification_evidence
+            if result.bearer_token:
+                self._auth_headers["Authorization"] = f"Bearer {result.bearer_token}"
+                client.headers["Authorization"] = f"Bearer {result.bearer_token}"
             return
 
         if force and self._auth_replay_state is not None:
@@ -613,10 +652,14 @@ class WebSpider:
                 auth_header = client.headers.get("Authorization")
                 if auth_header:
                     self._auth_headers["Authorization"] = auth_header
+                result = await SmartAuthenticator(self.settings)._verify_auth(client)
+                self._auth_state = result.state
+                self._auth_verification_evidence = result.verification_evidence
                 logger.info("Session refreshed via stored login replay state")
                 return
             except Exception as e:
                 logger.warning("Stored login replay failed, attempting fresh authentication: %s", e)
+                self._auth_state = AuthVerificationState.expired
 
         # 2. Check if username and password are provided
         username = self.settings.authentication_username
@@ -633,11 +676,16 @@ class WebSpider:
                         client.headers["Authorization"] = f"Bearer {result.bearer_token}"
                     if result.replay_state:
                         self._auth_replay_state = result.replay_state
+                    self._auth_state = result.state
+                    self._auth_verification_evidence = result.verification_evidence
                     logger.info("Session authenticated successfully. Cookies: %s, Headers: %s", self.session_cookies, self._auth_headers)
                 else:
+                    self._auth_state = result.state if result.state else AuthVerificationState.attempted
+                    self._auth_verification_evidence = result.verification_evidence
                     logger.warning("Authentication failed using all strategies")
             except Exception as e:
                 logger.error("Smart authentication cascade error: %s", e)
+                self._auth_state = AuthVerificationState.attempted
 
         self.session_cookies.update(self._snapshot_cookies(client.cookies))
 

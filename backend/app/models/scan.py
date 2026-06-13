@@ -34,6 +34,33 @@ class ScanStatistics(BaseModel):
     severity_breakdown: SeverityBreakdown = Field(default_factory=SeverityBreakdown)
 
 
+class SpaApiCoverage(BaseModel):
+    spa_detected: bool = False
+    js_assets_inspected: int = 0
+    routes_extracted: int = 0
+    api_endpoints_extracted: int = 0
+    parameters_extracted: int = 0
+    browser_requests_observed: int = 0
+    dead_spa_fallback_routes_suppressed: int = 0
+
+
+class AuthCoverage(BaseModel):
+    state: str = "unauthenticated"
+    authenticated_url_count: int = 0
+    unauthenticated_url_count: int = 0
+    protected_targets_verified: int = 0
+    auth_headers_present: bool = False
+    session_cookies_present: bool = False
+
+
+class EvidenceStrengthBreakdown(BaseModel):
+    confirmed_exploit: int = 0
+    confirmed_observation: int = 0
+    probable: int = 0
+    possible: int = 0
+    informational: int = 0
+
+
 class AttackChain(BaseModel):
     id: str
     description: str
@@ -46,6 +73,9 @@ class ReportMetadata(BaseModel):
     generated_by: str = "ai"
     summary: str | None = None
     attack_chains: list[AttackChain] = Field(default_factory=list)
+    spa_api_coverage: SpaApiCoverage = Field(default_factory=SpaApiCoverage)
+    auth_coverage: AuthCoverage = Field(default_factory=AuthCoverage)
+    evidence_strength_breakdown: EvidenceStrengthBreakdown = Field(default_factory=EvidenceStrengthBreakdown)
 
 
 class Scan(Document):

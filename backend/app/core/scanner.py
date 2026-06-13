@@ -45,8 +45,11 @@ from app.integrations.cve_database import CveDatabaseService
 from app.integrations.sslyze_wrapper import SslAnalyzer
 from app.integrations.wappalyzer import TechnologyDetector
 from app.models.scan import CrawlMode, ScanStatus
+from app.models.scan import AuthCoverage, EvidenceStrengthBreakdown, SpaApiCoverage
 from app.models.vulnerability import (
+    AuthContext,
     Evidence,
+    EvidenceStrength,
     Exploitability,
     LocationInfo,
     OwaspCategory,
@@ -238,9 +241,18 @@ class ScanOrchestrator:
             crawl_context = {
                 "root_url": scan.target_url,
                 "session_cookies": session_cookies,
+                "auth_headers": getattr(crawl_result, "auth_headers", {}),
+                "auth_state": getattr(crawl_result, "auth_state", "unauthenticated"),
                 "is_spa": getattr(crawl_result, "is_spa", False),
                 "spa_root_html": getattr(crawl_result, "spa_root_html", ""),
+                "api_endpoints": getattr(crawl_result, "api_endpoints", []),
+                "parameters": getattr(crawl_result, "parameters", []),
+                "requests": getattr(crawl_result, "requests", []),
+                "routes": getattr(crawl_result, "routes", []),
+                "assets": getattr(crawl_result, "assets", []),
+                "dead_routes": getattr(crawl_result, "dead_routes", []),
             }
+            self._update_crawl_metadata(scan, crawl_result)
 
             async def run_detector(detector) -> list[Finding]:
                 async with detector_semaphore:
@@ -448,6 +460,7 @@ class ScanOrchestrator:
             
             # Phase 4.4 Attack chain synthesis
             scan.report_metadata.attack_chains = self._synthesize_attack_chains(vulnerabilities)
+            scan.report_metadata.evidence_strength_breakdown = self._evidence_strength_breakdown(vulnerabilities)
             scan.statistics.total_vulnerabilities = len(vulnerabilities)
             scan.statistics.severity_breakdown.critical = len([v for v in vulnerabilities if v.severity.value == "Critical"])
             scan.statistics.severity_breakdown.high = len([v for v in vulnerabilities if v.severity.value == "High"])
@@ -639,6 +652,8 @@ class ScanOrchestrator:
             resp = vuln.evidence.response_snippet or ""
             payload = vuln.evidence.payload or ""
             auth_ctx = "requires_auth" if "cookie" in req.lower() else "unknown_auth"
+            auth_ctx = vuln.auth_context.value if getattr(vuln, "auth_context", None) else auth_ctx
+            evidence_strength = vuln.evidence_strength.value if getattr(vuln, "evidence_strength", None) else "possible"
 
             # Evidence is what the LLM must ground on. Keep it class-agnostic but
             # include request/response/payload so fp scoring can vary by finding.
@@ -650,6 +665,8 @@ class ScanOrchestrator:
                 f"- http_method={vuln.location.http_method}\n"
                 f"- parameter={vuln.location.parameter or 'none'}\n"
                 f"- detector_verified={vuln.evidence.verified}\n"
+                f"- evidence_strength={evidence_strength}\n"
+                f"- auth_context={auth_ctx}\n"
                 f"- detector_confidence_score={vuln.evidence.confidence_score:.1f}/100\n"
                 f"- detection_method={vuln.evidence.detection_method or 'unknown'}\n"
                 f"- detection_evidence={json.dumps(vuln.evidence.detection_evidence)[:1200] if vuln.evidence.detection_evidence else '{}'}\n"
@@ -673,6 +690,8 @@ class ScanOrchestrator:
         resp = vuln.evidence.response_snippet or ""
         payload = vuln.evidence.payload or ""
         auth_ctx = "requires_auth" if "cookie" in req.lower() else "unknown_auth"
+        auth_ctx = vuln.auth_context.value if getattr(vuln, "auth_context", None) else auth_ctx
+        evidence_strength = vuln.evidence_strength.value if getattr(vuln, "evidence_strength", None) else "possible"
 
         evidence_block = (
             "evidence_block=\n"
@@ -680,6 +699,8 @@ class ScanOrchestrator:
             f"- http_method={vuln.location.http_method}\n"
             f"- parameter={vuln.location.parameter or 'none'}\n"
             f"- detector_verified={vuln.evidence.verified}\n"
+            f"- evidence_strength={evidence_strength}\n"
+            f"- auth_context={auth_ctx}\n"
             f"- detector_confidence_score={vuln.evidence.confidence_score:.1f}/100\n"
             f"- detection_method={vuln.evidence.detection_method or 'unknown'}\n"
             f"- detection_evidence={json.dumps(vuln.evidence.detection_evidence)[:1200] if vuln.evidence.detection_evidence else '{}'}\n"
@@ -1071,6 +1092,8 @@ class ScanOrchestrator:
         return chains
 
     def _to_vulnerability(self, finding: Finding) -> Vulnerability:
+        evidence_strength = self._classify_evidence_strength(finding)
+        auth_context = self._classify_auth_context(finding)
         cvss_score = 0.0
         if finding.severity == SeverityLevel.critical:
             cvss_score = 9.5
@@ -1091,7 +1114,12 @@ class ScanOrchestrator:
             vuln_type=finding.vuln_type,
             severity=finding.severity,
             cvss_score=cvss_score,
-            location=LocationInfo(url=finding.url, parameter=finding.parameter, http_method=finding.method),
+            location=LocationInfo(
+                url=finding.url,
+                parameter=finding.parameter,
+                http_method=finding.method,
+                parameter_location=(getattr(finding, "parameter_location", None) or None),
+            ),
             evidence=Evidence(
                 payload=finding.payload,
                 request_snippet=getattr(finding, "verification_request_snippet", None),
@@ -1100,9 +1128,109 @@ class ScanOrchestrator:
                 confidence_score=float(getattr(finding, "confidence_score", 0.0) or 0.0),
                 detection_method=getattr(finding, "detection_method", None),
                 detection_evidence=getattr(finding, "detection_evidence", {}) or {},
+                evidence_strength=evidence_strength,
+                auth_context=auth_context,
             ),
+            evidence_strength=evidence_strength,
+            auth_context=auth_context,
             detected_at=datetime.now(timezone.utc),
         )
+
+    def _update_crawl_metadata(self, scan: 'Scan', crawl_result) -> None:
+        auth_state = getattr(crawl_result, "auth_state", "unauthenticated")
+        auth_state_value = auth_state.value if hasattr(auth_state, "value") else str(auth_state)
+        has_session = bool(getattr(crawl_result, "session_cookies", {}) or {})
+        has_headers = bool(getattr(crawl_result, "auth_headers", {}) or {})
+        verified = auth_state_value == "authenticated_verified"
+
+        scan.report_metadata.spa_api_coverage = SpaApiCoverage(
+            spa_detected=bool(getattr(crawl_result, "is_spa", False)),
+            js_assets_inspected=len(getattr(crawl_result, "assets", []) or []),
+            routes_extracted=len(getattr(crawl_result, "routes", []) or []),
+            api_endpoints_extracted=len(getattr(crawl_result, "api_endpoints", []) or []),
+            parameters_extracted=len(getattr(crawl_result, "parameters", []) or []),
+            browser_requests_observed=len(getattr(crawl_result, "requests", []) or []),
+            dead_spa_fallback_routes_suppressed=len(getattr(crawl_result, "dead_routes", []) or []),
+        )
+        scan.report_metadata.auth_coverage = AuthCoverage(
+            state=auth_state_value,
+            authenticated_url_count=len(getattr(crawl_result, "urls", []) or []) if verified else 0,
+            unauthenticated_url_count=0 if verified else len(getattr(crawl_result, "urls", []) or []),
+            protected_targets_verified=1 if verified else 0,
+            auth_headers_present=has_headers,
+            session_cookies_present=has_session,
+        )
+
+    def _evidence_strength_breakdown(self, vulnerabilities: list[Vulnerability]) -> EvidenceStrengthBreakdown:
+        counts = EvidenceStrengthBreakdown()
+        for vuln in vulnerabilities:
+            strength = vuln.evidence_strength.value if hasattr(vuln.evidence_strength, "value") else str(vuln.evidence_strength)
+            if hasattr(counts, strength):
+                setattr(counts, strength, getattr(counts, strength) + 1)
+        return counts
+
+    def _classify_evidence_strength(self, finding: Finding) -> EvidenceStrength:
+        vt = (finding.vuln_type or "").lower()
+        method = (getattr(finding, "detection_method", "") or "").lower()
+        verified = bool(getattr(finding, "verified", False))
+        confidence = float(getattr(finding, "confidence_score", 0.0) or 0.0)
+
+        active_terms = (
+            "sql injection",
+            "xss",
+            "command injection",
+            "file inclusion",
+            "path traversal",
+            "arbitrary file read",
+            "ssrf",
+            "file upload",
+            "idor",
+            "privilege escalation",
+        )
+        if verified and confidence >= 70.0 and any(term in vt for term in active_terms):
+            return EvidenceStrength.confirmed_exploit
+
+        observation_terms = (
+            "missing security header",
+            "cookie",
+            "tls",
+            "ssl",
+            "insecure transport",
+            "credentials transmitted via http get",
+            "credential / token exposed",
+            "sensitive path",
+            "admin",
+            "csrf",
+            "server banner",
+            "mixed content",
+        )
+        if verified or any(term in vt for term in observation_terms):
+            if "vulnerable component" in vt:
+                return EvidenceStrength.probable
+            return EvidenceStrength.confirmed_observation
+
+        if confidence >= 50.0 or method not in {"heuristic", ""}:
+            return EvidenceStrength.probable
+        if finding.severity == SeverityLevel.low:
+            return EvidenceStrength.informational
+        return EvidenceStrength.possible
+
+    def _classify_auth_context(self, finding: Finding) -> AuthContext:
+        evidence_blob = " ".join(
+            str(part or "")
+            for part in (
+                getattr(finding, "verification_request_snippet", None),
+                getattr(finding, "evidence", None),
+            )
+        ).lower()
+        if "authorization:" in evidence_blob or "cookie:" in evidence_blob:
+            return AuthContext.authenticated
+        vt = (finding.vuln_type or "").lower()
+        if "csrf" in vt or "idor" in vt or "privilege escalation" in vt:
+            return AuthContext.requires_user_session
+        if getattr(finding, "verified", False):
+            return AuthContext.unauthenticated
+        return AuthContext.unknown
 
     def _finding_response_snippet(self, finding: Finding) -> str | None:
         evidence = self._clean_evidence_text(finding.evidence or "")

@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from app.config import get_settings
+from app.core.detectors.attack_surface import AttackSurface, query_or_form_targets
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.verification.response_analyzer import ResponseData
 from app.core.verification.xss_verifier import PendingBrowserVerification, XSSVerifier
@@ -81,8 +82,6 @@ class XSSDetector(BaseDetector):
                 "via kwargs to enable authenticated scanning."
             )
 
-        from app.core.crawler.param_discovery import ParamDiscovery
-
         def xss_filter(param_name: str) -> bool:
             param_lower = param_name.lower()
             is_reflective = (
@@ -92,9 +91,15 @@ class XSSDetector(BaseDetector):
             has_xss_prefix = param_lower[:3] in self._form_input_prefixes
             return is_reflective or has_xss_prefix
 
-        candidates = ParamDiscovery.build_candidates(
-            urls, forms, filter_fn=xss_filter
+        targets = AttackSurface.build(
+            urls,
+            forms,
+            parameters=kwargs.get("parameters") or [],
+            api_endpoints=kwargs.get("api_endpoints") or [],
+            requests=kwargs.get("requests") or [],
+            filter_fn=xss_filter,
         )
+        candidates = query_or_form_targets(targets)
 
         # Supplement with header-injection candidates for every discovered URL.
         # These are 4-tuples like URL candidates but carry the header name in

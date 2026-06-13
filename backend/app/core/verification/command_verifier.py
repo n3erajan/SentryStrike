@@ -18,7 +18,9 @@ from app.core.verification.verification_framework import (
     BaseVerifier,
     URLParameterBuilder,
     VerificationResult,
+    _build_json_body,
 )
+from app.core.crawler.models import ParameterLocation
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,27 @@ class CommandInjectionVerifier(BaseVerifier):
         ("&ping -n 5 127.0.0.1", 5000),
     ]
 
+    def _build_request_args(
+        self,
+        url: str,
+        parameter: str,
+        value: str,
+        method: str,
+        form_inputs: Optional[list] = None,
+        target: Optional[object] = None,
+    ) -> tuple[str, Optional[dict], Optional[dict], Optional[object], Optional[dict]]:
+        if target is not None and getattr(target, "location", None) in {
+            ParameterLocation.json_body,
+            ParameterLocation.graphql_variable,
+        }:
+            json_body = _build_json_body(getattr(target, "json_template", None), target, value)
+            return url, None, None, json_body, getattr(target, "headers", None)
+
+        request_url, params, data = URLParameterBuilder.inject_parameter(
+            url, parameter, value, method, form_inputs
+        )
+        return request_url, params, data, None, None
+
     async def verify(
         self,
         url: str,
@@ -69,6 +92,7 @@ class CommandInjectionVerifier(BaseVerifier):
         method: str = "GET",
         value: str = "",
         form_inputs: Optional[list] = None,
+        target: Optional[object] = None,
     ) -> VerificationResult:
         """
         Verify command injection vulnerability.
@@ -89,13 +113,13 @@ class CommandInjectionVerifier(BaseVerifier):
         findings = []
 
         # Try output-based detection first
-        output_result = await self._verify_output_based(url, parameter, method, value, form_inputs)
+        output_result = await self._verify_output_based(url, parameter, method, value, form_inputs, target)
         if output_result.is_vulnerable:
             findings.extend(output_result.findings)
             return output_result
 
         # Try time-based blind if output-based fails
-        time_result = await self._verify_time_based_blind(url, parameter, method, value, form_inputs)
+        time_result = await self._verify_time_based_blind(url, parameter, method, value, form_inputs, target)
         if time_result.is_vulnerable:
             findings.extend(time_result.findings)
             return time_result
@@ -115,6 +139,7 @@ class CommandInjectionVerifier(BaseVerifier):
             method: str,
             value: str,
             form_inputs: Optional[list] = None,
+            target: Optional[object] = None,
         ) -> VerificationResult:
             """
             Verify via command output detection.
@@ -131,11 +156,14 @@ class CommandInjectionVerifier(BaseVerifier):
 
             try:
                 # Get baseline
-                baseline_url, baseline_params, baseline_data = URLParameterBuilder.inject_parameter(
-                    url, parameter, value, method, form_inputs
+                baseline_url, baseline_params, baseline_data, baseline_json, baseline_headers = self._build_request_args(
+                    url, parameter, value, method, form_inputs, target=target
                 )
                 baseline = await self._send(
-                    baseline_url, method, baseline_params, baseline_data, test_phase="output_baseline"
+                    baseline_url, method, baseline_params, baseline_data,
+                    headers=baseline_headers,
+                    json_body=baseline_json,
+                    test_phase="output_baseline",
                 )
 
                 # Gate: phpinfo/debug page exclusion
@@ -156,11 +184,13 @@ class CommandInjectionVerifier(BaseVerifier):
 
                 # Try each payload
                 for payload in payloads:
-                    injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
-                        url, parameter, payload, method, form_inputs
+                    injected_url, injected_params, injected_data, injected_json, injected_headers = self._build_request_args(
+                        url, parameter, payload, method, form_inputs, target=target
                     )
                     injected = await self._send(
                         injected_url, method, injected_params, injected_data,
+                        headers=injected_headers,
+                        json_body=injected_json,
                         test_phase="output_injection", payload=payload,
                     )
 
@@ -420,32 +450,38 @@ class CommandInjectionVerifier(BaseVerifier):
         method: str,
         value: str,
         form_inputs: Optional[list] = None,
+        target: Optional[object] = None,
     ) -> VerificationResult:
         """Verify via time-based blind command injection."""
         try:
             # Get baseline response times
-            baseline_url, baseline_params, baseline_data = URLParameterBuilder.inject_parameter(
-                url, parameter, value, method, form_inputs
+            baseline_url, baseline_params, baseline_data, baseline_json, baseline_headers = self._build_request_args(
+                url, parameter, value, method, form_inputs, target=target
             )
 
             baseline_times = []
             for _ in range(2):
                 resp = await self._send(
-                    baseline_url, method, baseline_params, baseline_data, test_phase="time_baseline"
+                    baseline_url, method, baseline_params, baseline_data,
+                    headers=baseline_headers,
+                    json_body=baseline_json,
+                    test_phase="time_baseline",
                 )
                 baseline_times.append(resp.response_time_ms)
                 await asyncio.sleep(0.1)
 
             # Try time-based payloads
             for payload, expected_delay_ms in self.BLIND_PAYLOADS:
-                injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
-                    url, parameter, payload, method, form_inputs
+                injected_url, injected_params, injected_data, injected_json, injected_headers = self._build_request_args(
+                    url, parameter, payload, method, form_inputs, target=target
                 )
 
                 injected_times = []
                 for _ in range(2):
                     resp = await self._send(
                         injected_url, method, injected_params, injected_data,
+                        headers=injected_headers,
+                        json_body=injected_json,
                         test_phase="time_injection", payload=payload,
                     )
                     injected_times.append(resp.response_time_ms)
