@@ -1,11 +1,12 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import analysis, health, reports, scan
+from app.api.dependencies import get_current_user
+from app.api.routes import analysis, auth, health, reports, scan
 from app.config import get_settings
 from app.core.exceptions import AppError
 from app.core.scanner import ScanOrchestrator
@@ -48,9 +49,10 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(health.router, prefix="/api/v1")
-    app.include_router(scan.router, prefix="/api/v1")
-    app.include_router(analysis.router, prefix="/api/v1")
-    app.include_router(reports.router, prefix="/api/v1")
+    app.include_router(auth.router, prefix="/api/v1")
+    app.include_router(scan.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
+    app.include_router(analysis.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
+    app.include_router(reports.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
 
     @app.exception_handler(AppError)
     async def app_error_handler(_: Request, exc: AppError) -> JSONResponse:

@@ -1,5 +1,5 @@
 from functools import lru_cache
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +14,12 @@ class Settings(BaseSettings):
 
     mongodb_uri: str = Field(default="mongodb://localhost:27017", alias="MONGODB_URI")
     mongodb_db_name: str = Field(default="sentrystrike", alias="MONGODB_DB_NAME")
+
+    allow_registration: bool = Field(default=False, alias="ALLOW_REGISTRATION")
+    auth_session_ttl_hours: int = Field(default=24, ge=1, alias="AUTH_SESSION_TTL_HOURS")
+    auth_cookie_name: str = Field(default="sentrystrike_session", min_length=1, alias="AUTH_COOKIE_NAME")
+    auth_cookie_secure: bool = Field(default=False, alias="AUTH_COOKIE_SECURE")
+    auth_cookie_samesite: str = Field(default="lax", alias="AUTH_COOKIE_SAMESITE")
 
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
     ollama_model: str = Field(default="gemma4-e4b-8k", alias="OLLAMA_MODEL")
@@ -60,6 +66,14 @@ class Settings(BaseSettings):
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     log_file: str = Field(default="logs/app.log", alias="LOG_FILE")
+
+    @field_validator("auth_cookie_samesite")
+    @classmethod
+    def _validate_cookie_samesite(cls, value: str) -> str:
+        normalized = value.lower()
+        if normalized not in {"lax", "strict", "none"}:
+            raise ValueError("AUTH_COOKIE_SAMESITE must be one of: lax, strict, none")
+        return normalized
 
 
 @lru_cache
