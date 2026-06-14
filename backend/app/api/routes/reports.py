@@ -10,6 +10,40 @@ from app.utils.pdf_generator import build_scan_pdf
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
+SCANNER_LIMITATIONS = [
+    "OWASP A06, A08, and A09 are disclosed as outside active automated detector scope.",
+    "SPA/API coverage depends on crawl visibility and whether browser-based discovery was enabled.",
+    "Authenticated coverage is verified only when the scanner proves access to a protected target.",
+]
+
+
+def _model_dump(value: object) -> dict:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return dict(value or {})
+
+
+def _build_report_payload(scan, scan_id: str) -> dict:
+    report_metadata = _model_dump(scan.report_metadata)
+    generated_at = report_metadata.get("generated_at") or datetime.now().isoformat()
+    report_metadata["generated_at"] = generated_at
+
+    return {
+        "scan_id": scan_id,
+        "generated_at": generated_at,
+        "executive_summary": scan.report_metadata.summary or "No summary available.",
+        "statistics": scan.statistics.model_dump(mode="json"),
+        "risk_score": scan.overall_risk_score,
+        "technology_stack": [tech.model_dump(mode="json") for tech in scan.technology_stack],
+        "vulnerabilities": [v.model_dump(mode="json") for v in scan.vulnerabilities],
+        "report_metadata": report_metadata,
+        "evidence_strength_breakdown": report_metadata.get("evidence_strength_breakdown", {}),
+        "spa_api_coverage": report_metadata.get("spa_api_coverage", {}),
+        "auth_coverage": report_metadata.get("auth_coverage", {}),
+        "attack_chains": report_metadata.get("attack_chains", []),
+        "scanner_limitations": SCANNER_LIMITATIONS,
+    }
+
 
 @router.get("/{scan_id}")
 async def get_report_data(scan_id: str, repo: ScanRepository = Depends(get_scan_repository)) -> dict:
@@ -17,16 +51,7 @@ async def get_report_data(scan_id: str, repo: ScanRepository = Depends(get_scan_
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 
-    data = {
-        "scan_id": scan_id,
-        "generated_at": scan.report_metadata.generated_at,
-        "executive_summary": scan.report_metadata.summary,
-        "statistics": scan.statistics.model_dump(),
-        "risk_score": scan.overall_risk_score,
-        "technology_stack": [tech.model_dump() for tech in scan.technology_stack],
-        "vulnerabilities": [v.model_dump() for v in scan.vulnerabilities],
-    }
-    return json_response(data)
+    return json_response(_build_report_payload(scan, scan_id))
 
 
 @router.post("/{scan_id}/generate")
@@ -50,16 +75,7 @@ async def generate_pdf_report(scan_id: str, repo: ScanRepository = Depends(get_s
 
     scan_data = {
         "success": True,
-        "data": {
-            "scan_id": scan_id,
-            "generated_at": scan.report_metadata.generated_at.isoformat()
-                            if scan.report_metadata.generated_at else datetime.now().isoformat(),
-            "executive_summary": scan.report_metadata.summary or "No summary available.",
-            "statistics": scan.statistics.model_dump(),
-            "risk_score": scan.overall_risk_score,
-            "technology_stack": [tech.model_dump() for tech in scan.technology_stack],
-            "vulnerabilities": [v.model_dump() for v in scan.vulnerabilities],
-        },
+        "data": _build_report_payload(scan, scan_id),
     }
     payload = build_scan_pdf(scan_data=scan_data)
     return Response(

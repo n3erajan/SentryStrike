@@ -196,6 +196,7 @@ SEV_FG = {
     "High":     colors.HexColor("#C2410C"),
     "Medium":   colors.HexColor("#92400E"),
     "Low":      colors.HexColor("#1D4ED8"),
+    "Info":     colors.HexColor("#57606A"),
 }
 
 # ── Severity solid fills - ONLY used as bar/badge backgrounds with WHITE text ─
@@ -204,6 +205,7 @@ SEV_COLOR = {
     "High":     colors.HexColor("#9A3412"),   # deep burnt-orange
     "Medium":   colors.HexColor("#78350F"),   # deep amber-brown
     "Low":      colors.HexColor("#1E3A8A"),   # deep royal blue
+    "Info":     colors.HexColor("#4B5563"),
 }
 
 # ── Severity row tints - very pale, near-black text printed on top ─────────
@@ -212,6 +214,7 @@ SEV_BG = {
     "High":     colors.HexColor("#FFF7ED"),
     "Medium":   colors.HexColor("#FFFBEB"),
     "Low":      colors.HexColor("#EFF6FF"),
+    "Info":     colors.HexColor("#F9FAFB"),
 }
 
 # Legacy aliases so all existing references keep working
@@ -641,6 +644,43 @@ def full_code_block(text: str, styles: dict) -> Flowable:
     return CodeBlock(text)
 
 
+def _report_metadata_value(d: dict, key: str) -> Any:
+    metadata = d.get("report_metadata") or {}
+    return d.get(key) or metadata.get(key) or {}
+
+
+def _display_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if value is None:
+        return "N/A"
+    if isinstance(value, float):
+        return f"{value:.1f}"
+    return str(value)
+
+
+def _metric_table(rows: list[tuple[str, Any]], styles: dict, *, value_width: float = 32*mm) -> Table:
+    table_rows = [[Paragraph("Metric", styles["th"]), Paragraph("Value", styles["th_center"])]]
+    for label, value in rows:
+        table_rows.append([
+            Paragraph(_para_escape(label), styles["body_sm"]),
+            Paragraph(_para_escape(_display_value(value)), styles["body_sm"]),
+        ])
+
+    tbl = Table(table_rows, colWidths=[None, value_width])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), DARK_BG),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), WHITE),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_BG]),
+        ("GRID",       (0, 0), (-1, -1), 0.4, DIVIDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+        ("VALIGN",     (0, 0), (-1, -1), "TOP"),
+    ]))
+    return tbl
+
+
 def _response_evidence_label_and_text(resp: str) -> tuple[str, str]:
     text = str(resp or "").strip()
     evidence_prefix = "VERIFICATION EVIDENCE:"
@@ -772,7 +812,7 @@ def build_statistics(data: dict, styles: dict) -> list:
     ]
     total = stats.get("total_vulnerabilities", 1) or 1
     for sev_label, sev_key in [("Critical", "critical"), ("High", "high"),
-                                ("Medium", "medium"), ("Low", "low")]:
+                                ("Medium", "medium"), ("Low", "low"), ("Info", "info")]:
         count = sev.get(sev_key, 0)
         pct = count / total * 100
         bar_len = max(int(pct * 0.8), 0)  # max ~80 chars
@@ -822,6 +862,57 @@ def build_statistics(data: dict, styles: dict) -> list:
         ("LEFTPADDING",   (0, 0), (-1, -1), 8),
     ]))
     elems.append(cat_tbl)
+
+    evidence = _report_metadata_value(d, "evidence_strength_breakdown")
+    elems.append(Spacer(1, 5*mm))
+    elems += sub_header("Evidence Strength", styles)
+    elems.append(Paragraph(
+        "Findings are grouped by deterministic proof strength, separating confirmed exploits "
+        "from observations and review-needed issues.",
+        styles["body_sm"],
+    ))
+    elems.append(_metric_table([
+        ("Confirmed Exploit", evidence.get("confirmed_exploit", 0)),
+        ("Confirmed Observation", evidence.get("confirmed_observation", 0)),
+        ("Probable", evidence.get("probable", 0)),
+        ("Possible", evidence.get("possible", 0)),
+        ("Informational", evidence.get("informational", 0)),
+    ], styles))
+
+    auth = _report_metadata_value(d, "auth_coverage")
+    elems.append(Spacer(1, 5*mm))
+    elems += sub_header("Authenticated Coverage", styles)
+    elems.append(_metric_table([
+        ("Auth State", _clean_enum(auth.get("state", "unauthenticated"))),
+        ("Authenticated URLs Scanned", auth.get("authenticated_url_count", 0)),
+        ("Unauthenticated URLs Scanned", auth.get("unauthenticated_url_count", 0)),
+        ("Protected Targets Verified", auth.get("protected_targets_verified", 0)),
+        ("Auth Headers Present", auth.get("auth_headers_present", False)),
+        ("Session Cookies Present", auth.get("session_cookies_present", False)),
+    ], styles))
+
+    spa = _report_metadata_value(d, "spa_api_coverage")
+    elems.append(Spacer(1, 5*mm))
+    elems += sub_header("SPA / API Coverage", styles)
+    elems.append(_metric_table([
+        ("SPA Detected", spa.get("spa_detected", False)),
+        ("JS Assets Inspected", spa.get("js_assets_inspected", 0)),
+        ("Routes Extracted", spa.get("routes_extracted", 0)),
+        ("API Endpoints Extracted", spa.get("api_endpoints_extracted", 0)),
+        ("Parameters Extracted", spa.get("parameters_extracted", 0)),
+        ("Browser Requests Observed", spa.get("browser_requests_observed", 0)),
+        ("Dead SPA Fallback Routes Suppressed", spa.get("dead_spa_fallback_routes_suppressed", 0)),
+    ], styles))
+
+    limitations = d.get("scanner_limitations") or [
+        "OWASP A06, A08, and A09 are disclosed as outside active automated detector scope.",
+        "SPA/API coverage depends on crawl visibility and whether browser-based discovery was enabled.",
+        "Authenticated coverage is verified only when the scanner proves access to a protected target.",
+    ]
+    elems.append(Spacer(1, 5*mm))
+    elems += sub_header("Scanner Limitations", styles)
+    for limitation in limitations:
+        elems.append(Paragraph(f"- {_para_escape(limitation)}", styles["body_sm"]))
     return elems
 
 
@@ -874,7 +965,8 @@ def build_vulnerability_summary(data: dict, styles: dict) -> list:
     vulns = d.get("vulnerabilities", [])
     elems = section_header("Vulnerability Summary", styles, "4")
     elems.append(Paragraph(
-        "The table below lists all confirmed vulnerabilities, ordered by CVSS score.",
+        "The table below lists findings ordered by CVSS score, with deterministic evidence "
+        "strength and review status shown separately.",
         styles["body"],
     ))
     elems.append(Spacer(1, 3*mm))
@@ -886,22 +978,28 @@ def build_vulnerability_summary(data: dict, styles: dict) -> list:
         Paragraph("Vulnerability", styles["th"]),
         Paragraph("Category", styles["th"]),
         Paragraph("Severity", styles["th"]),
+        Paragraph("Evidence", styles["th"]),
         Paragraph("CVSS", styles["th_center"]),
+        Paragraph("Review", styles["th"]),
     ]
     rows = [header]
     for i, v in enumerate(sorted_vulns, 1):
         sev   = v.get("severity", "Low")
         sev_display = _clean_enum(sev)
         fg = SEV_FG.get(sev_display, SEV_FG.get(sev, LABEL_TEXT))
+        ev = v.get("evidence") or {}
+        evidence_strength = v.get("evidence_strength") or ev.get("evidence_strength") or "possible"
         rows.append([
             Paragraph(str(i), styles["body_sm"]),
             Paragraph(_para_escape(v.get("vuln_type", "Unknown")), styles["body_sm"]),
             Paragraph(_para_escape(_clean_category(v.get("category", ""))), styles["body_sm"]),
             Paragraph(f'<font color="#{fg.hexval()[2:]}"><b>{sev_display}</b></font>', styles["body_sm"]),
+            Paragraph(_para_escape(_clean_enum(evidence_strength)), styles["body_sm"]),
             Paragraph(f'<b>{v.get("cvss_score", 0):.1f}</b>', styles["body_sm"]),
+            Paragraph(_para_escape(_clean_status(v.get("review_status") or "N/A")), styles["body_sm"]),
         ])
 
-    tbl = Table(rows, colWidths=[10*mm, 65*mm, 55*mm, 22*mm, 16*mm])
+    tbl = Table(rows, colWidths=[8*mm, 44*mm, 39*mm, 19*mm, 27*mm, 14*mm, 19*mm])
     style_cmds = [
         ("BACKGROUND", (0, 0), (-1, 0), DARK_BG),
         ("TEXTCOLOR",  (0, 0), (-1, 0), WHITE),
@@ -941,6 +1039,8 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
         loc      = v.get("location", {})
         ev       = v.get("evidence", {})
         ai       = v.get("ai_analysis", {})
+        evidence_strength = v.get("evidence_strength") or ev.get("evidence_strength") or "possible"
+        auth_context = v.get("auth_context") or ev.get("auth_context") or "unknown"
 
         block = []
 
@@ -974,10 +1074,15 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
         details = [
             detail_row("Category",   _clean_category(v.get("category", ""))),
             detail_row("Severity",   sev),
+            detail_row("Evidence Strength", _clean_enum(evidence_strength)),
+            detail_row("Auth Context", _clean_enum(auth_context)),
             detail_row("CVSS Vector", v.get("cvss_vector", "N/A")),
             detail_row("URL",         loc.get("url", "N/A")),
             detail_row("Parameter",   loc.get("parameter") or "N/A"),
+            detail_row("Parameter Location", _clean_enum(loc.get("parameter_location") or "N/A")),
             detail_row("HTTP Method", loc.get("http_method", "N/A")),
+            detail_row("Detection Method", ev.get("detection_method") or "N/A"),
+            detail_row("Detector Verified", _display_value(ev.get("verified"))),
             detail_row("Review Status", _clean_status(v.get("review_status") or "N/A")),
             detail_row("Detected At",  _fmt_dt(v.get("detected_at"))),
         ]

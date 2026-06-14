@@ -7,9 +7,29 @@ from app.utils.pdf_generator import (
     build_detailed_findings,
     build_remediation_roadmap,
     build_scan_pdf,
+    build_statistics,
     build_styles,
+    build_vulnerability_summary,
     full_code_block,
 )
+
+
+def _flowable_text(flowables: list) -> str:
+    parts: list[str] = []
+    for flowable in flowables:
+        nested = getattr(flowable, "_content", None) or getattr(flowable, "_flowables", None)
+        if nested:
+            parts.append(_flowable_text(list(nested)))
+        if hasattr(flowable, "getPlainText"):
+            parts.append(flowable.getPlainText())
+        if hasattr(flowable, "_cellvalues"):
+            for row in flowable._cellvalues:
+                for cell in row:
+                    if hasattr(cell, "getPlainText"):
+                        parts.append(cell.getPlainText())
+                    else:
+                        parts.append(str(cell))
+    return "\n".join(parts)
 
 
 def test_pdf_helpers_strip_enum_prefixes_and_map_owasp_category() -> None:
@@ -121,6 +141,132 @@ def test_pdf_detailed_findings_do_not_repeat_remediation_section() -> None:
     labels = [getattr(flowable, "getPlainText", lambda: "")() for flowable in flowables]
 
     assert "REMEDIATION" not in labels
+
+
+def test_pdf_statistics_include_evidence_auth_and_spa_api_coverage() -> None:
+    scan_data = {
+        "data": {
+            "statistics": {
+                "total_urls_crawled": 3,
+                "total_vulnerabilities": 4,
+                "severity_breakdown": {"critical": 1, "high": 1, "medium": 1, "low": 0, "info": 1},
+            },
+            "risk_score": 72.5,
+            "vulnerabilities": [
+                {"category": "OwaspCategory.a05"},
+                {"category": "OwaspCategory.a07"},
+            ],
+            "evidence_strength_breakdown": {
+                "confirmed_exploit": 1,
+                "confirmed_observation": 1,
+                "probable": 1,
+                "possible": 0,
+                "informational": 1,
+            },
+            "auth_coverage": {
+                "state": "authenticated_verified",
+                "authenticated_url_count": 2,
+                "unauthenticated_url_count": 1,
+                "protected_targets_verified": 1,
+                "auth_headers_present": True,
+                "session_cookies_present": True,
+            },
+            "spa_api_coverage": {
+                "spa_detected": True,
+                "js_assets_inspected": 4,
+                "routes_extracted": 6,
+                "api_endpoints_extracted": 5,
+                "parameters_extracted": 9,
+                "browser_requests_observed": 7,
+                "dead_spa_fallback_routes_suppressed": 2,
+            },
+            "scanner_limitations": ["Browser discovery was disabled for this scan."],
+        }
+    }
+
+    text = _flowable_text(build_statistics(scan_data, build_styles()))
+
+    assert "Evidence Strength" in text
+    assert "Confirmed Exploit" in text
+    assert "Authenticated Coverage" in text
+    assert "Authenticated Verified" in text
+    assert "SPA / API Coverage" in text
+    assert "API Endpoints Extracted" in text
+    assert "Dead SPA Fallback Routes Suppressed" in text
+    assert "Browser discovery was disabled for this scan." in text
+
+
+def test_pdf_summary_labels_findings_by_evidence_and_review_status() -> None:
+    scan_data = {
+        "data": {
+            "vulnerabilities": [
+                {
+                    "vuln_type": "Component CVE",
+                    "category": "OwaspCategory.a03",
+                    "severity": "SeverityLevel.medium",
+                    "cvss_score": 5.0,
+                    "review_status": "ReviewStatus.likely",
+                    "evidence_strength": "probable",
+                    "evidence": {},
+                }
+            ]
+        }
+    }
+
+    text = _flowable_text(build_vulnerability_summary(scan_data, build_styles()))
+
+    assert "Evidence" in text
+    assert "Probable" in text
+    assert "Likely" in text
+    assert "confirmed vulnerabilities" not in text
+
+
+def test_pdf_detailed_findings_include_evidence_strength_and_auth_context() -> None:
+    scan_data = {
+        "data": {
+            "vulnerabilities": [
+                {
+                    "vuln_type": "JSON SQL Injection",
+                    "category": "OwaspCategory.a05",
+                    "severity": "SeverityLevel.critical",
+                    "cvss_score": 9.0,
+                    "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                    "review_status": "ReviewStatus.confirmed",
+                    "detected_at": "2026-06-08T09:10:17",
+                    "evidence_strength": "confirmed_exploit",
+                    "auth_context": "authenticated",
+                    "location": {
+                        "url": "http://target.test/api/search",
+                        "parameter": "q",
+                        "parameter_location": "json_body",
+                        "http_method": "POST",
+                    },
+                    "evidence": {
+                        "verified": True,
+                        "detection_method": "json_body_sqli",
+                    },
+                    "ai_analysis": {
+                        "business_impact": "Database disclosure.",
+                        "exploitability": "Exploitability.easy",
+                        "exploitability_reasoning": "Payload triggers SQL errors.",
+                    },
+                }
+            ]
+        }
+    }
+
+    text = _flowable_text(build_detailed_findings(scan_data, build_styles()))
+
+    assert "Evidence Strength" in text
+    assert "Confirmed Exploit" in text
+    assert "Auth Context" in text
+    assert "Authenticated" in text
+    assert "Parameter Location" in text
+    assert "Json Body" in text
+    assert "Detection Method" in text
+    assert "json_body_sqli" in text
+    assert "Detector Verified" in text
+    assert "Yes" in text
 
 
 def test_pdf_code_block_wraps_long_encoded_get_request_inside_available_width() -> None:
