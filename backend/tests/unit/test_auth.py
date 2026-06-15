@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from app.api.dependencies import get_auth_service, get_current_user, get_session_token
 from app.api.routes import auth, scan
 from app.config import get_settings
-from app.core.auth import AuthService, RegistrationClosedError, hash_password, verify_password
+from app.core.auth import AuthService, RegistrationClosedError, as_utc_naive, hash_password, utc_now, verify_password
 
 
 class FakeAuthService:
@@ -58,6 +58,16 @@ def test_password_hash_roundtrip_and_rejects_wrong_password() -> None:
     assert verify_password("correct horse battery staple", encoded) is True
     assert verify_password("wrong password", encoded) is False
     assert "correct horse battery staple" not in encoded
+
+
+def test_auth_datetime_helpers_compare_database_naive_values() -> None:
+    naive_expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1)
+    aware_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    assert as_utc_naive(naive_expires_at).tzinfo is None
+    assert as_utc_naive(aware_expires_at).tzinfo is None
+    assert as_utc_naive(naive_expires_at) > utc_now()
+    assert as_utc_naive(aware_expires_at) > utc_now()
 
 
 def test_register_returns_closed_message_when_registration_disabled() -> None:

@@ -81,6 +81,18 @@ def hash_session_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def as_utc_naive(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 class AuthService:
     async def register(self, email: str, password: str) -> User:
         settings = get_settings()
@@ -106,7 +118,7 @@ class AuthService:
     async def create_session(self, user: User) -> tuple[str, UserSession]:
         settings = get_settings()
         token = new_session_token()
-        now = datetime.now(timezone.utc)
+        now = utc_now()
         session = UserSession(
             user_id=str(user.id),
             token_hash=hash_session_token(token),
@@ -121,8 +133,10 @@ class AuthService:
             raise InvalidSessionError()
 
         session = await UserSession.find_one(UserSession.token_hash == hash_session_token(token))
-        now = datetime.now(timezone.utc)
-        if session is None or session.revoked_at is not None or session.expires_at <= now:
+        now = utc_now()
+        expires_at = as_utc_naive(session.expires_at) if session else None
+        revoked_at = as_utc_naive(session.revoked_at) if session else None
+        if session is None or revoked_at is not None or expires_at is None or expires_at <= now:
             raise InvalidSessionError()
 
         try:
@@ -146,6 +160,6 @@ class AuthService:
         if session is None or session.revoked_at is not None:
             return False
 
-        session.revoked_at = datetime.now(timezone.utc)
+        session.revoked_at = utc_now()
         await session.save()
         return True
