@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 
-from app.api.dependencies import get_scan_repository, json_response
+from app.api.dependencies import get_current_user, get_scan_repository, json_response
 from app.database.repositories.scan_repository import ScanRepository
+from app.models.user import User
 from app.schemas.vulnerability_schema import MarkFalsePositiveRequest
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
@@ -13,8 +14,9 @@ async def list_vulnerabilities(
     severity: str | None = None,
     category: str | None = None,
     repo: ScanRepository = Depends(get_scan_repository),
+    current_user: User = Depends(get_current_user),
 ) -> dict:
-    scan = await repo.get_by_id(scan_id)
+    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 
@@ -28,8 +30,13 @@ async def list_vulnerabilities(
 
 
 @router.get("/scans/{scan_id}/vulnerabilities/{vulnerability_id}")
-async def get_vulnerability_details(scan_id: str, vulnerability_id: str, repo: ScanRepository = Depends(get_scan_repository)) -> dict:
-    scan = await repo.get_by_id(scan_id)
+async def get_vulnerability_details(
+    scan_id: str,
+    vulnerability_id: str,
+    repo: ScanRepository = Depends(get_scan_repository),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 
@@ -45,8 +52,9 @@ async def mark_false_positive(
     vulnerability_id: str,
     payload: MarkFalsePositiveRequest,
     repo: ScanRepository = Depends(get_scan_repository),
+    current_user: User = Depends(get_current_user),
 ) -> dict:
-    scan = await repo.get_by_id(scan_id)
+    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 

@@ -143,6 +143,33 @@ def test_pdf_detailed_findings_do_not_repeat_remediation_section() -> None:
     assert "REMEDIATION" not in labels
 
 
+def test_pdf_executive_summary_includes_owner_and_authorization_metadata() -> None:
+    from app.utils.pdf_generator import build_executive_summary
+
+    scan_data = {
+        "data": {
+            "scan_id": "scan-1",
+            "generated_at": "2026-06-08T09:10:17",
+            "executive_summary": "Summary.",
+            "risk_score": 45.0,
+            "owner_email": "user@example.test",
+            "authorization": {
+                "confirmed": True,
+                "confirmed_at": "2026-06-08T09:00:00",
+            },
+            "vulnerabilities": [{"location": {"url": "https://target.example/path"}}],
+        }
+    }
+
+    text = _flowable_text(build_executive_summary(scan_data, build_styles()))
+
+    assert "Submitted By" in text
+    assert "user@example.test" in text
+    assert "Authorization Confirmed" in text
+    assert "Yes" in text
+    assert "Authorization Confirmed At" in text
+
+
 def test_pdf_statistics_include_evidence_auth_and_spa_api_coverage() -> None:
     scan_data = {
         "data": {

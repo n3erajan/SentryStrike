@@ -80,9 +80,14 @@ class ReportMetadata(BaseModel):
 
 class Scan(Document):
     target_url: Indexed(str)
+    owner_user_id: Indexed(str) | None = None
+    owner_email: str | None = None
     crawl_mode: CrawlMode = CrawlMode.full
     status: ScanStatus = ScanStatus.queued
     progress: int = Field(default=0, ge=0, le=100)
+    authorization_confirmed: bool = False
+    authorization_text: str | None = None
+    authorization_confirmed_at: datetime | None = None
 
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -100,7 +105,9 @@ class Scan(Document):
         name = "scans"
         indexes = [
             "target_url",
+            "owner_user_id",
             "status",
+            [("owner_user_id", 1), ("created_at", -1)],
             [("created_at", -1)],
         ]
 

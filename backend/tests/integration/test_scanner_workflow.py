@@ -103,9 +103,14 @@ class FakeScan:
     def __init__(self) -> None:
         self.id = "mock-id"
         self.target_url = "https://example.com"
+        self.owner_user_id = "user-1"
+        self.owner_email = "user@example.test"
         self.crawl_mode = CrawlMode.full
         self.status = ScanStatus.queued
         self.progress = 0
+        self.authorization_confirmed = True
+        self.authorization_text = "Test authorization"
+        self.authorization_confirmed_at = datetime.now(timezone.utc)
         self.created_at = datetime.now(timezone.utc)
         self.updated_at = datetime.now(timezone.utc)
         self.started_at = None

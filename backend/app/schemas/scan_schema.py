@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from app.models.scan import CrawlMode, ScanStatus, ScanStatistics
 from app.models.vulnerability import TechnologyComponent, Vulnerability
@@ -9,6 +9,21 @@ from app.models.vulnerability import TechnologyComponent, Vulnerability
 class CreateScanRequest(BaseModel):
     target_url: HttpUrl
     crawl_mode: CrawlMode = CrawlMode.full
+    authorization_confirmed: bool = Field(
+        description="User confirms they are authorized to security test this target.",
+    )
+    authorization_text: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="Optional authorization note, ticket, contract, or scope reference.",
+    )
+
+    @field_validator("authorization_confirmed")
+    @classmethod
+    def _require_authorization_confirmation(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("You must confirm you are authorized to test this target.")
+        return value
 
 
 class ScanResponse(BaseModel):
