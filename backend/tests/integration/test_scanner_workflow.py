@@ -8,7 +8,7 @@ import pytest
 
 from app.core.scanner import ScanOrchestrator
 from app.core.detectors.base_detector import Finding
-from app.models.scan import CrawlMode, ScanStatus
+from app.models.scan import CrawlMode, ScanPhase, ScanStatus
 from app.models.vulnerability import OwaspCategory, SeverityLevel, TechnologyComponent
 
 
@@ -108,6 +108,8 @@ class FakeScan:
         self.crawl_mode = CrawlMode.full
         self.status = ScanStatus.queued
         self.progress = 0
+        self.current_phase = ScanPhase.queued
+        self.phase_message = "Scan queued"
         self.authorization_confirmed = True
         self.authorization_text = "Test authorization"
         self.authorization_confirmed_at = datetime.now(timezone.utc)
@@ -149,6 +151,9 @@ async def test_scanner_workflow_completes() -> None:
     await orchestrator.run_scan("mock-id")
 
     assert scan.status == ScanStatus.completed
+    assert scan.progress == 100
+    assert scan.current_phase == ScanPhase.completed
+    assert scan.phase_message == "Scan completed"
     assert scan.statistics.total_vulnerabilities >= 1
     assert scan.overall_risk_score > 0
 

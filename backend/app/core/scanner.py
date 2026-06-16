@@ -44,7 +44,7 @@ from app.database.repositories.scan_repository import ScanRepository
 from app.integrations.cve_database import CveDatabaseService
 from app.integrations.sslyze_wrapper import SslAnalyzer
 from app.integrations.wappalyzer import TechnologyDetector
-from app.models.scan import CrawlMode, ScanStatus
+from app.models.scan import CrawlMode, Scan, ScanPhase, ScanStatus
 from app.models.scan import AuthCoverage, EvidenceStrengthBreakdown, SpaApiCoverage
 from app.models.vulnerability import (
     AuthContext,
@@ -192,25 +192,26 @@ class ScanOrchestrator:
             return
 
         try:
-            await self.repository.update_status(scan, ScanStatus.running, progress=5)
+            await self._set_progress(scan, 5, ScanPhase.initializing, "Starting scan")
             await self._check_cancelled(scan_id)
 
+            await self._set_progress(scan, 10, ScanPhase.crawling, "Crawling target and discovering attack surface")
             if scan.crawl_mode == CrawlMode.single:
                 logger.info("single-path scan: skipping spider discovery for %s", scan.target_url)
                 crawl_result = await self.spider.fetch_single(scan.target_url)
             else:
                 crawl_result = await self.spider.crawl(scan.target_url)
             scan.statistics.total_urls_crawled = len(crawl_result.urls)
-            scan.progress = 20
-            await scan.save()
+            await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {len(crawl_result.urls)} URL(s) discovered")
             await self._check_cancelled(scan_id)
 
+            await self._set_progress(scan, 25, ScanPhase.technology_detection, "Detecting technology stack and known CVEs")
             technologies = await self.technology_detector.detect(scan.target_url)
             scan.technology_stack = await self.cve_service.enrich_components(technologies)
-            scan.progress = 35
-            await scan.save()
+            await self._set_progress(scan, 35, ScanPhase.technology_detection, f"Technology analysis complete: {len(scan.technology_stack)} component(s) identified")
             await self._check_cancelled(scan_id)
 
+            await self._set_progress(scan, 40, ScanPhase.tls_analysis, "Analyzing TLS and transport security")
             ssl_result = await self.ssl_analyzer.analyze(scan.target_url)
             findings: list[Finding] = []
             if not ssl_result.get("valid", True):
@@ -263,6 +264,7 @@ class ScanOrchestrator:
                         technology_stack=scan.technology_stack,
                     )
 
+            await self._set_progress(scan, 45, ScanPhase.vulnerability_detection, f"Running {len(active_detectors)} active detector(s)")
             detector_results = await asyncio.gather(
                 *[run_detector(detector) for detector in active_detectors],
                 return_exceptions=True,
@@ -310,12 +312,12 @@ class ScanOrchestrator:
             )
             findings.extend(supply_chain_findings)
 
-            scan.progress = 60
-            await scan.save()
+            await self._set_progress(scan, 60, ScanPhase.vulnerability_detection, f"Detector phase complete: {len(findings)} raw finding(s)")
             await self._check_cancelled(scan_id)
 
             # DEDUPLICATION PHASE: Merge duplicate findings from different detectors
             # Findings with same (url, parameter, vuln_type) are consolidated
+            await self._set_progress(scan, 65, ScanPhase.deduplication, "Deduplicating and filtering findings")
             findings = FindingDeduplicator.deduplicate(findings)
             logger.info("deduplication complete: %d findings after merging", len(findings))
 
@@ -442,6 +444,7 @@ class ScanOrchestrator:
 
             # PHASE 2: Analyze all findings with AI
             logger.info("phase 2 starting: analyzing %d findings", len(vulnerabilities))
+            await self._set_progress(scan, 75, ScanPhase.ai_analysis, f"Analyzing {len(vulnerabilities)} finding(s)")
             vulnerabilities = await self._analyze_all_findings(vulnerabilities, scan)
 
             # Phase 2.1: Sync severity from CVSS (pre-FP adjustment)
@@ -459,6 +462,7 @@ class ScanOrchestrator:
             scan.vulnerabilities = vulnerabilities
             
             # Phase 4.4 Attack chain synthesis
+            await self._set_progress(scan, 90, ScanPhase.risk_scoring, "Calculating severity, evidence strength, and risk score")
             scan.report_metadata.attack_chains = self._synthesize_attack_chains(vulnerabilities)
             scan.report_metadata.evidence_strength_breakdown = self._evidence_strength_breakdown(vulnerabilities)
             scan.statistics.total_vulnerabilities = len(vulnerabilities)
@@ -491,6 +495,7 @@ class ScanOrchestrator:
 
             # PHASE 3: Generate final report from analyzed findings
             logger.info("phase 3 starting: generating report")
+            await self._set_progress(scan, 95, ScanPhase.report_generation, "Generating final report summary")
             report = await self.ai_report.generate(scan)
             scan.report_metadata.generated_at = datetime.now(timezone.utc)
             
@@ -501,25 +506,41 @@ class ScanOrchestrator:
                 executive_summary = executive_summary.get("summary", json.dumps(executive_summary))
             scan.report_metadata.summary = str(executive_summary) if executive_summary else "Report generated successfully."
             
-            scan.progress = 100
-            scan.status = ScanStatus.completed
             scan.completed_at = datetime.now(timezone.utc)
-            await scan.save()
+            await self._set_progress(scan, 100, ScanPhase.completed, "Scan completed", status=ScanStatus.completed)
             logger.info("phase 3 complete: scan %s finished", scan_id)
         except asyncio.CancelledError:
-            scan.status = ScanStatus.cancelled
             scan.completed_at = datetime.now(timezone.utc)
             scan.error_message = "Scan cancelled by user"
-            await scan.save()
+            await self._set_progress(scan, scan.progress, ScanPhase.cancelled, "Scan cancelled by user", status=ScanStatus.cancelled)
         except Exception as exc:
             logger.exception("scan %s failed", scan_id)
-            scan.status = ScanStatus.failed
             scan.error_message = str(exc)
             scan.completed_at = datetime.now(timezone.utc)
-            await scan.save()
+            await self._set_progress(scan, scan.progress, ScanPhase.failed, f"Scan failed: {exc}", status=ScanStatus.failed)
         finally:
             self._tasks.pop(scan_id, None)
             self._cancel_flags.pop(scan_id, None)
+
+    async def _set_progress(
+        self,
+        scan: Scan,
+        progress: int,
+        phase: ScanPhase,
+        message: str,
+        *,
+        status: ScanStatus = ScanStatus.running,
+    ) -> None:
+        scan.status = status
+        scan.progress = progress
+        scan.current_phase = phase
+        scan.phase_message = message
+        scan.updated_at = datetime.now(timezone.utc)
+        if status == ScanStatus.running and scan.started_at is None:
+            scan.started_at = datetime.now(timezone.utc)
+        if status in {ScanStatus.completed, ScanStatus.failed, ScanStatus.cancelled} and scan.completed_at is None:
+            scan.completed_at = datetime.now(timezone.utc)
+        await scan.save()
 
     async def _check_cancelled(self, scan_id: str) -> None:
         if self._cancel_flags.get(scan_id):

@@ -16,6 +16,24 @@ def set_orchestrator(instance: ScanOrchestrator) -> None:
     orchestrator = instance
 
 
+def _scan_summary(scan) -> dict:
+    return {
+        "id": str(scan.id),
+        "target_url": scan.target_url,
+        "owner_user_id": scan.owner_user_id,
+        "owner_email": scan.owner_email,
+        "crawl_mode": scan.crawl_mode,
+        "status": scan.status,
+        "progress": scan.progress,
+        "current_phase": scan.current_phase,
+        "phase_message": scan.phase_message,
+        "authorization_confirmed": scan.authorization_confirmed,
+        "authorization_confirmed_at": scan.authorization_confirmed_at,
+        "created_at": scan.created_at,
+        "updated_at": scan.updated_at,
+    }
+
+
 @router.post("", status_code=status.HTTP_202_ACCEPTED)
 async def create_scan(
     payload: CreateScanRequest,
@@ -38,6 +56,8 @@ async def create_scan(
             "scan_id": str(scan.id),
             "status": scan.status,
             "progress": scan.progress,
+            "current_phase": scan.current_phase,
+            "phase_message": scan.phase_message,
             "owner_user_id": scan.owner_user_id,
             "authorization_confirmed": scan.authorization_confirmed,
             "authorization_confirmed_at": scan.authorization_confirmed_at,
@@ -54,22 +74,7 @@ async def list_scans(
     current_user: User = Depends(get_current_user),
 ) -> dict:
     scans = await repo.list(skip=skip, limit=limit, owner_user_id=str(current_user.id))
-    payload = [
-        {
-            "id": str(scan.id),
-            "target_url": scan.target_url,
-            "owner_user_id": scan.owner_user_id,
-            "owner_email": scan.owner_email,
-            "crawl_mode": scan.crawl_mode,
-            "status": scan.status,
-            "progress": scan.progress,
-            "authorization_confirmed": scan.authorization_confirmed,
-            "authorization_confirmed_at": scan.authorization_confirmed_at,
-            "created_at": scan.created_at,
-            "updated_at": scan.updated_at,
-        }
-        for scan in scans
-    ]
+    payload = [_scan_summary(scan) for scan in scans]
     return json_response({"items": payload, "total": len(payload)})
 
 
@@ -96,7 +101,15 @@ async def get_scan_status(
     scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
-    return json_response({"id": str(scan.id), "status": scan.status, "progress": scan.progress, "error": scan.error_message})
+    return json_response({
+        "id": str(scan.id),
+        "status": scan.status,
+        "progress": scan.progress,
+        "current_phase": scan.current_phase,
+        "phase_message": scan.phase_message,
+        "error": scan.error_message,
+        "updated_at": scan.updated_at,
+    })
 
 
 @router.delete("/{scan_id}", status_code=status.HTTP_200_OK)

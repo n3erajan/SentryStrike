@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
-from app.models.scan import CrawlMode, ScanStatus, ScanStatistics
+from app.models.scan import CrawlMode, ScanPhase, ScanStatus, ScanStatistics
 from app.models.vulnerability import TechnologyComponent, Vulnerability
 
 
@@ -32,6 +32,8 @@ class ScanResponse(BaseModel):
     crawl_mode: CrawlMode = CrawlMode.full
     status: ScanStatus
     progress: int
+    current_phase: ScanPhase = ScanPhase.queued
+    phase_message: str = "Scan queued"
     created_at: datetime
     updated_at: datetime
 
@@ -55,6 +57,8 @@ class ScanStatusResponse(BaseModel):
     id: str
     status: ScanStatus
     progress: int
+    current_phase: ScanPhase = ScanPhase.queued
+    phase_message: str = "Scan queued"
     error_message: str | None = None
 
 

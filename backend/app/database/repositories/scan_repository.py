@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from beanie import PydanticObjectId
 
-from app.models.scan import CrawlMode, Scan, ScanStatus
+from app.models.scan import CrawlMode, Scan, ScanPhase, ScanStatus
 
 
 class ScanRepository:
@@ -66,11 +66,17 @@ class ScanRepository:
         scan: Scan,
         status: ScanStatus,
         progress: int | None = None,
+        current_phase: ScanPhase | None = None,
+        phase_message: str | None = None,
         error_message: str | None = None,
     ) -> Scan:
         scan.status = status
         if progress is not None:
             scan.progress = progress
+        if current_phase is not None:
+            scan.current_phase = current_phase
+        if phase_message is not None:
+            scan.phase_message = phase_message
         if status == ScanStatus.running and scan.started_at is None:
             scan.started_at = datetime.now(timezone.utc)
         if status in {ScanStatus.completed, ScanStatus.failed, ScanStatus.cancelled}:

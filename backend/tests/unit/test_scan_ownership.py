@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.api.dependencies import get_current_user, get_scan_repository
 from app.api.routes import analysis, reports, scan
-from app.models.scan import CrawlMode, ReportMetadata, ScanStatistics, ScanStatus
+from app.models.scan import CrawlMode, ReportMetadata, ScanPhase, ScanStatistics, ScanStatus
 
 
 class FakeOrchestrator:
@@ -31,6 +31,8 @@ class FakeScan:
         self.crawl_mode = CrawlMode.full
         self.status = ScanStatus.queued
         self.progress = 0
+        self.current_phase = ScanPhase.queued
+        self.phase_message = "Scan queued"
         self.authorization_confirmed = True
         self.authorization_text = "Ticket SEC-123"
         self.authorization_confirmed_at = datetime(2026, 6, 8, 9, 10, 17, tzinfo=timezone.utc)
@@ -55,6 +57,8 @@ class FakeScan:
             "crawl_mode": self.crawl_mode,
             "status": self.status,
             "progress": self.progress,
+            "current_phase": self.current_phase,
+            "phase_message": self.phase_message,
             "authorization_confirmed": self.authorization_confirmed,
             "authorization_text": self.authorization_text,
             "authorization_confirmed_at": self.authorization_confirmed_at,
@@ -161,6 +165,26 @@ def test_list_scans_only_returns_current_users_scans() -> None:
     items = response.json()["data"]["items"]
     assert [item["id"] for item in items] == ["scan-owned"]
     assert items[0]["owner_user_id"] == "user-1"
+    assert items[0]["current_phase"] == "queued"
+    assert items[0]["phase_message"] == "Scan queued"
+
+
+def test_scan_status_returns_phase_and_message_for_polling() -> None:
+    repo = FakeScanRepository()
+    owned = repo.scans["scan-owned"]
+    owned.status = ScanStatus.running
+    owned.progress = 45
+    owned.current_phase = ScanPhase.vulnerability_detection
+    owned.phase_message = "Running active detectors"
+    client = _client(repo, user_id="user-1")
+
+    response = client.get("/api/v1/scans/scan-owned/status")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["progress"] == 45
+    assert data["current_phase"] == "vulnerability_detection"
+    assert data["phase_message"] == "Running active detectors"
 
 
 def test_scan_detail_for_other_user_returns_not_found() -> None:

@@ -15,6 +15,22 @@ class ScanStatus(str, Enum):
     cancelled = "cancelled"
 
 
+class ScanPhase(str, Enum):
+    queued = "queued"
+    initializing = "initializing"
+    crawling = "crawling"
+    technology_detection = "technology_detection"
+    tls_analysis = "tls_analysis"
+    vulnerability_detection = "vulnerability_detection"
+    deduplication = "deduplication"
+    ai_analysis = "ai_analysis"
+    risk_scoring = "risk_scoring"
+    report_generation = "report_generation"
+    completed = "completed"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
 class CrawlMode(str, Enum):
     full = "full"
     single = "single"
@@ -85,6 +101,8 @@ class Scan(Document):
     crawl_mode: CrawlMode = CrawlMode.full
     status: ScanStatus = ScanStatus.queued
     progress: int = Field(default=0, ge=0, le=100)
+    current_phase: ScanPhase = ScanPhase.queued
+    phase_message: str = "Scan queued"
     authorization_confirmed: bool = False
     authorization_text: str | None = None
     authorization_confirmed_at: datetime | None = None
