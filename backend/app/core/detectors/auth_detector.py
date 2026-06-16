@@ -758,6 +758,8 @@ class AuthenticationFailuresDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        scan_mode = getattr(get_settings(), "scan_mode", "verified")
+        verified_mode = scan_mode == "verified"
 
         # -----------------------------------------------------------------------
         # Form analysis
@@ -842,9 +844,11 @@ class AuthenticationFailuresDetector(BaseDetector):
             scheme       = parsed.scheme.lower()
 
             # 1. Password reset endpoint - missing token indicator
+            # This is a review hint, not proof of a broken reset flow. In
+            # verified mode it is always dropped later, so avoid emitting it.
             if self._path_hits(path_tokens, self.reset_tokens) or self._url_contains(lowered, self.reset_tokens):
                 has_token = bool(query_keys.intersection(self._security_control_tokens))
-                if not has_token:
+                if not has_token and not verified_mode:
                     findings.append(self._finding(
                         vuln_type="Password Reset Endpoint Without Token Parameter",
                         url=url,
@@ -884,12 +888,15 @@ class AuthenticationFailuresDetector(BaseDetector):
                 ))
 
             # 9. Plaintext HTTP on auth endpoint
+            # CryptoFailuresDetector emits the site-level structural transport
+            # issue that verified mode keeps; this URL-only auth hint is passive
+            # duplication and is dropped by verified-mode filtering.
             if scheme == "http" and (
                 self._path_hits(path_tokens, self.login_tokens)
                 or self._path_hits(path_tokens, self.reset_tokens)
                 or self._path_hits(path_tokens, self.admin_tokens)
                 or self._path_hits(path_tokens, self.api_auth_tokens)
-            ):
+            ) and not verified_mode:
                 findings.append(self._finding(
                     vuln_type="Authentication Endpoint Served Over Plaintext HTTP",
                     url=url,

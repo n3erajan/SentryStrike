@@ -1,5 +1,6 @@
 import pytest
 from types import SimpleNamespace
+from app.config import get_settings
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
 
 def test_auth_bruteforce_verified():
@@ -48,3 +49,74 @@ def test_rate_limit_signal_suppresses_burst_finding():
     ]
 
     assert detector._rate_limit_signals_present(responses) is True
+
+
+@pytest.mark.asyncio
+async def test_verified_mode_suppresses_passive_url_only_auth_hints():
+    settings = get_settings()
+    original_mode = settings.scan_mode
+    settings.scan_mode = "verified"
+
+    try:
+        detector = AuthenticationFailuresDetector()
+        findings = await detector.detect(
+            urls=[
+                "http://example.test/login",
+                "http://example.test/forgot-password",
+                "http://example.test/change-password",
+            ],
+            forms=[],
+        )
+    finally:
+        settings.scan_mode = original_mode
+
+    vuln_types = {finding.vuln_type for finding in findings}
+    assert "Authentication Endpoint Served Over Plaintext HTTP" not in vuln_types
+    assert "Password Reset Endpoint Without Token Parameter" not in vuln_types
+
+
+@pytest.mark.asyncio
+async def test_heuristic_mode_keeps_passive_url_only_auth_hints():
+    settings = get_settings()
+    original_mode = settings.scan_mode
+    settings.scan_mode = "heuristic"
+
+    try:
+        detector = AuthenticationFailuresDetector()
+        findings = await detector.detect(
+            urls=[
+                "http://example.test/login",
+                "http://example.test/forgot-password",
+            ],
+            forms=[],
+        )
+    finally:
+        settings.scan_mode = original_mode
+
+    vuln_types = {finding.vuln_type for finding in findings}
+    assert "Authentication Endpoint Served Over Plaintext HTTP" in vuln_types
+    assert "Password Reset Endpoint Without Token Parameter" in vuln_types
+
+
+@pytest.mark.asyncio
+async def test_verified_mode_still_emits_observable_admin_path_findings():
+    settings = get_settings()
+    original_mode = settings.scan_mode
+    settings.scan_mode = "verified"
+
+    try:
+        detector = AuthenticationFailuresDetector()
+        findings = await detector.detect(
+            urls=[
+                "http://example.test/administration",
+                "http://example.test/.env",
+            ],
+            forms=[],
+        )
+    finally:
+        settings.scan_mode = original_mode
+
+    vuln_types = {finding.vuln_type for finding in findings}
+    assert "Admin / Privileged Endpoint Discovered" in vuln_types
+    assert "Well-Known Admin / Sensitive Path Discovered" in vuln_types
+    assert "Authentication Endpoint Served Over Plaintext HTTP" not in vuln_types
