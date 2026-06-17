@@ -1,6 +1,7 @@
 import pytest
 
 from app.core.crawler.models import ApiEndpoint, ParameterLocation
+from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.param_discovery import ParamDiscovery
 
 def test_param_discovery_path_only_url_uses_contextual_hints():
@@ -100,3 +101,11 @@ def test_parameter_inventory_preserves_json_body_context():
     assert by_name["id"].parent_path == "user.id"
     assert "access_control" in by_name["id"].security_relevance
     assert "redirect_ssrf" in by_name["redirectUrl"].security_relevance
+
+
+def test_api_extractor_finds_relative_rest_login_literal():
+    script = 'this.http.post(this.hostServer+"rest/user/login", {email: e, password: p})'
+
+    _, endpoints = ApiExtractor.extract_from_javascript("http://localhost:3000/", script)
+
+    assert any(endpoint.url == "http://localhost:3000/rest/user/login" for endpoint in endpoints)

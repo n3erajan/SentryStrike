@@ -19,6 +19,14 @@ from app.core.crawler.url_parser import normalize_url, same_domain
 logger = logging.getLogger(__name__)
 
 
+def redact_secret(value: str | None) -> str:
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:6]}...{value[-4:]} len={len(value)}"
+
+
 class AuthStrategy(str, Enum):
     redirect = "redirect"
     html_form = "html_form"
@@ -376,7 +384,7 @@ class SmartAuthenticator:
                     resp = await client.get(script_url)
                     if resp.status_code == 200:
                         script_contents[script_url] = resp.text
-                        routes, endpoints = ApiExtractor.extract_from_javascript(script_url, resp.text)
+                        routes, endpoints = ApiExtractor.extract_from_javascript(root_url, resp.text)
                         for ep in endpoints:
                             login_hints = ("login", "signin", "sign-in", "auth", "session", "oauth", "token")
                             if any(hint in ep.url.lower() for hint in login_hints):
@@ -388,6 +396,7 @@ class SmartAuthenticator:
                 logger.info("[auth] No auth endpoints found in JavaScript assets")
                 return None
 
+            auth_endpoints = self._rank_auth_endpoints(auth_endpoints, script_contents)
             for ep in auth_endpoints:
                 logger.info("[auth] Discovered auth endpoint: %s %s", ep.method, ep.url)
                 params = []
@@ -422,6 +431,47 @@ class SmartAuthenticator:
         except Exception as e:
             logger.warning("[auth] Strategy 3 failed: %s", e)
         return None
+
+    def _rank_auth_endpoints(
+        self, endpoints: list[ApiEndpoint], script_contents: dict[str, str] | None = None
+    ) -> list[ApiEndpoint]:
+        scored: list[tuple[int, int, ApiEndpoint]] = []
+        seen: set[tuple[str, str]] = set()
+        script_values = list((script_contents or {}).values())
+
+        for index, endpoint in enumerate(endpoints):
+            key = (endpoint.url, endpoint.method.upper())
+            if key in seen:
+                continue
+            seen.add(key)
+
+            parsed = urlparse(endpoint.url)
+            path = parsed.path.lower()
+            score = 0
+
+            if any(prefix in path for prefix in ("/rest/", "/api/", "/graphql", "/gql", "/rpc", "/trpc")):
+                score += 100
+            if any(auth_path in path for auth_path in ("/user/login", "/auth/login", "/login", "/signin", "/session")):
+                score += 40
+            if endpoint.method.upper() == "POST":
+                score += 25
+            if path in {"/login", "/signin", "/auth"}:
+                score -= 75
+            if any(marker in (endpoint.evidence or "").lower() for marker in ("fetch", "xhr", "graphql")):
+                score += 15
+
+            for script_text in script_values:
+                if path and path in script_text:
+                    params = self._extract_js_body_params(script_text, path)
+                    if {"email", "username", "user", "login"}.intersection({param.lower() for param in params}):
+                        score += 25
+                    if any("pass" in param.lower() or "pwd" in param.lower() for param in params):
+                        score += 25
+                    break
+
+            scored.append((-score, index, endpoint))
+
+        return [endpoint for _, _, endpoint in sorted(scored)]
 
     def _extract_js_body_params(self, script_text: str, endpoint_path: str) -> list[str]:
         idx = script_text.find(endpoint_path)
@@ -716,7 +766,7 @@ class SmartAuthenticator:
                     if found_token:
                         bearer_token = found_token
                         verification_evidence = "token-bearing login response"
-                        logger.info("[auth] Extracted token from login response: %s", bearer_token)
+                        logger.info("[auth] Extracted token from login response: %s", redact_secret(bearer_token))
                 except Exception:
                     pass
 
@@ -725,7 +775,7 @@ class SmartAuthenticator:
                     if tokens:
                         bearer_token = next(iter(tokens.values()))
                         verification_evidence = "token pattern in response text"
-                        logger.info("[auth] Extracted token pattern from response text: %s", bearer_token)
+                        logger.info("[auth] Extracted token pattern from response text: %s", redact_secret(bearer_token))
 
         state = AuthVerificationState.unauthenticated
 

@@ -16,6 +16,10 @@ class ApiExtractor:
         r"""(?P<quote>["'`])(?P<path>/(?:api|graphql|gql|rest|v[0-9]+|rpc|trpc|auth|oauth|session|login|users?|accounts?|products?|orders?)[^"'`\s<>{}]*) (?P=quote)""",
         re.I | re.X,
     )
+    RELATIVE_API_PATH_RE = re.compile(
+        r"""(?P<quote>["'`])(?P<path>(?:api|graphql|gql|rest|v[0-9]+|rpc|trpc|auth|oauth|session)/(?:[^"'`\s<>{}]+))(?P=quote)""",
+        re.I,
+    )
     FETCH_RE = re.compile(
         r"""(?:fetch|axios\.(?:get|post|put|patch|delete)|\.(?:get|post|put|patch|delete))\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""",
         re.I,
@@ -60,6 +64,10 @@ class ApiExtractor:
         for match in cls.ENDPOINT_RE.finditer(script_text):
             path = match.group("path")
             add_endpoint(path, "POST" if cls._looks_state_changing(path) else "GET")
+
+        for match in cls.RELATIVE_API_PATH_RE.finditer(script_text):
+            path = match.group("path")
+            add_endpoint(f"/{path}", "POST" if cls._looks_state_changing(path) else "GET")
 
         for match in cls.FETCH_RE.finditer(script_text):
             path = match.group("path")

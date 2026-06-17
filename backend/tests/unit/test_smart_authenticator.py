@@ -4,7 +4,9 @@ import httpx
 from app.core.crawler.auth_manager import (
     AuthVerificationState,
     SmartAuthenticator,
+    redact_secret,
 )
+from app.core.crawler.models import ApiEndpoint
 
 
 class MockSettings:
@@ -73,6 +75,32 @@ def test_map_credentials_to_params():
     # Fallback keys
     payload = auth._map_credentials_to_params(["someUser", "somePass"], "admin", "pass")
     assert payload == {"someUser": "admin", "somePass": "pass"}
+
+
+def test_rank_auth_endpoints_prefers_real_api_login_over_spa_route():
+    auth = SmartAuthenticator(MockSettings())
+    script = (
+        'path:"login";'
+        'this.http.post(this.hostServer+"/rest/user/login", {email: t.email, password: t.password})'
+    )
+    endpoints = [
+        ApiEndpoint(url="http://localhost:3000/login", method="POST", evidence="/login"),
+        ApiEndpoint(url="http://localhost:3000/rest/user/login", method="POST", evidence="/rest/user/login"),
+    ]
+
+    ranked = auth._rank_auth_endpoints(endpoints, {"main.js": script})
+
+    assert ranked[0].url == "http://localhost:3000/rest/user/login"
+
+
+def test_redact_secret_keeps_debug_shape_without_exposing_token():
+    token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.payload.signature"
+
+    redacted = redact_secret(token)
+
+    assert redacted.startswith("eyJ0eX")
+    assert redacted.endswith(f" len={len(token)}")
+    assert "payload" not in redacted
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ from app.core.crawler.auth_manager import (
     SmartAuthenticator,
     AuthReplayState,
     AuthVerificationState,
+    redact_secret,
 )
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.browser_engine import BrowserDiscoveryEngine
@@ -97,6 +98,15 @@ class WebSpider:
         self._auth_replay_state = None
         self._auth_state = AuthVerificationState.unauthenticated
         self._auth_verification_evidence = ""
+
+    @staticmethod
+    def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
+        redacted = dict(headers)
+        for key, value in list(redacted.items()):
+            if key.lower() in {"authorization", "proxy-authorization", "x-api-key", "api-key"}:
+                scheme, _, token = value.partition(" ")
+                redacted[key] = f"{scheme} {redact_secret(token)}" if token else redact_secret(value)
+        return redacted
 
     async def crawl(self, root_url: str, max_depth: int | None = None) -> CrawlResult:
         self._reset_scan_auth_state()
@@ -676,7 +686,11 @@ class WebSpider:
                         self._auth_replay_state = result.replay_state
                     self._auth_state = result.state
                     self._auth_verification_evidence = result.verification_evidence
-                    logger.info("Session authenticated successfully. Cookies: %s, Headers: %s", self.session_cookies, self._auth_headers)
+                    logger.info(
+                        "Session authenticated successfully. Cookies: %s, Headers: %s",
+                        self.session_cookies,
+                        self._redact_headers(self._auth_headers),
+                    )
                 else:
                     self._auth_state = result.state if result.state else AuthVerificationState.attempted
                     self._auth_verification_evidence = result.verification_evidence
