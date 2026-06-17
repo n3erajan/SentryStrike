@@ -76,6 +76,8 @@ class CrawlResult:
     auth_state: AuthVerificationState = AuthVerificationState.unauthenticated
     auth_headers: dict[str, str] = field(default_factory=dict)
     auth_verification_evidence: str = ""
+    browser_available: bool | None = None
+    browser_error: str | None = None
 
 
 class WebSpider:
@@ -349,9 +351,15 @@ class WebSpider:
                 await asyncio.gather(*workers, return_exceptions=True)
 
             if self.settings.crawl_browser_enabled:
+                browser_routes = [route.url for route in crawl_state.routes if route.source == RouteSource.javascript]
                 browser_state = await BrowserDiscoveryEngine(
                     max_interactions=self.settings.crawl_browser_max_interactions
-                ).crawl(root_url, auth_cookies=self.session_cookies, auth_headers=self._auth_headers)
+                ).crawl(
+                    root_url,
+                    auth_cookies=self.session_cookies,
+                    auth_headers=self._auth_headers,
+                    routes=browser_routes,
+                )
                 self._merge_crawl_state(crawl_state, browser_state)
 
         for endpoint in crawl_state.api_endpoints:
@@ -375,6 +383,8 @@ class WebSpider:
             auth_state=self._auth_state,
             auth_headers=dict(self._auth_headers),
             auth_verification_evidence=self._auth_verification_evidence,
+            browser_available=crawl_state.browser_available,
+            browser_error=crawl_state.browser_error,
         )
         self._log_crawl_inventory(root_url, result)
         return result
@@ -456,6 +466,10 @@ class WebSpider:
             target.add_parameter(parameter)
         target.requests.extend(source.requests)
         target.assets.update(source.assets)
+        if source.browser_available is not None:
+            target.browser_available = source.browser_available
+        if source.browser_error:
+            target.browser_error = source.browser_error
 
     def _log_crawl_inventory(self, root_url: str, result: CrawlResult) -> None:
         if not logger.isEnabledFor(logging.INFO):

@@ -75,6 +75,9 @@ class RequestObservation:
     post_data: Any = None
     response_status: int | None = None
     response_headers: dict[str, str] = field(default_factory=dict)
+    response_content_type: str | None = None
+    response_snippet: str | None = None
+    redirect_chain: list[str] = field(default_factory=list)
     initiator: str = "browser"
 
 
@@ -86,6 +89,8 @@ class CrawlState:
     requests: list[RequestObservation] = field(default_factory=list)
     assets: set[str] = field(default_factory=set)
     technologies: set[str] = field(default_factory=set)
+    browser_available: bool | None = None
+    browser_error: str | None = None
 
     def add_route(self, candidate: RouteCandidate) -> None:
         if candidate.url not in {route.url for route in self.routes}:

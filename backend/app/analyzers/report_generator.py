@@ -27,6 +27,8 @@ class AiReportGenerator:
         strength = getattr(scan.report_metadata, "evidence_strength_breakdown", EvidenceStrengthBreakdown())
         spa_api = getattr(scan.report_metadata, "spa_api_coverage", SpaApiCoverage())
         auth = getattr(scan.report_metadata, "auth_coverage", AuthCoverage())
+        coverage_warnings = getattr(scan.report_metadata, "coverage_warnings", []) or []
+        coverage_warning_text = "; ".join(coverage_warnings) if coverage_warnings else "None."
         confirmed_exploit_paths = [
             f"{v.vuln_type} at {v.location.url}"
             for v in getattr(scan, "vulnerabilities", []) or []
@@ -58,7 +60,10 @@ class AiReportGenerator:
             f"SPA/API coverage: spa_detected={spa_api.spa_detected}, js_assets={spa_api.js_assets_inspected}, "
             f"routes={spa_api.routes_extracted}, api_endpoints={spa_api.api_endpoints_extracted}, "
             f"parameters={spa_api.parameters_extracted}, browser_requests={spa_api.browser_requests_observed}, "
-            f"dead_spa_fallback_routes_suppressed={spa_api.dead_spa_fallback_routes_suppressed}. "
+            f"dead_spa_fallback_routes_suppressed={spa_api.dead_spa_fallback_routes_suppressed}, "
+            f"static_spa_only={spa_api.static_spa_only}, browser_available={spa_api.browser_available}, "
+            f"replayable_json_bodies={spa_api.replayable_json_bodies}. "
+            f"Coverage warnings that must be stated before any AI summary: {coverage_warning_text}. "
             f"Top confirmed exploit paths: {'; '.join(confirmed_exploit_paths) or 'none'}. "
             f"Needs-review findings: {'; '.join(needs_review) or 'none'}. "
             "Limitations: A06, A08, and A09 are not actively verified by this scanner; "
@@ -79,10 +84,13 @@ class AiReportGenerator:
             "authenticated_coverage": f"Auth state: {auth.state}; authenticated URLs: {auth.authenticated_url_count}.",
             "spa_api_coverage": (
                 f"SPA detected: {spa_api.spa_detected}; API endpoints: {spa_api.api_endpoints_extracted}; "
-                f"browser requests: {spa_api.browser_requests_observed}."
+                f"browser requests: {spa_api.browser_requests_observed}; static SPA only: {spa_api.static_spa_only}."
             ),
             "remediation_roadmap": "Prioritize confirmed exploits, then confirmed observations, then probable and review-needed issues.",
-            "scanner_limitations": "A06, A08, and A09 are disclosed as out of active automated detection scope.",
+            "scanner_limitations": (
+                f"Coverage warnings: {coverage_warning_text} A06, A08, and A09 are disclosed as out of active "
+                "automated detection scope."
+            ),
         }
         try:
             result = await self.client.generate_json(prompt)

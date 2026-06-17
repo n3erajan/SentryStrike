@@ -109,3 +109,31 @@ def test_api_extractor_finds_relative_rest_login_literal():
     _, endpoints = ApiExtractor.extract_from_javascript("http://localhost:3000/", script)
 
     assert any(endpoint.url == "http://localhost:3000/rest/user/login" for endpoint in endpoints)
+
+
+def test_api_extractor_normalizes_js_template_path_parameter():
+    script = "fetch(`${this.hostServer}/rest/basket/${basketId}`)"
+
+    _, endpoints = ApiExtractor.extract_from_javascript("http://localhost:3000/main.js", script)
+
+    endpoint = next(endpoint for endpoint in endpoints if "/rest/basket/" in endpoint.url)
+    assert endpoint.url == "http://localhost:3000/rest/basket/{basketId}"
+    params = ApiExtractor.parameters_from_endpoint(endpoint)
+    assert len(params) == 1
+    assert params[0].name == "basketId"
+    assert params[0].location == ParameterLocation.path
+    assert "access_control" in params[0].security_relevance
+
+
+def test_api_extractor_normalizes_js_template_query_parameter():
+    script = "fetch(`${this.hostServer}/rest/products/search?q=${term}`)"
+
+    _, endpoints = ApiExtractor.extract_from_javascript("http://localhost:3000/main.js", script)
+
+    endpoint = next(endpoint for endpoint in endpoints if "/rest/products/search" in endpoint.url)
+    assert endpoint.url == "http://localhost:3000/rest/products/search?q={term}"
+    params = ApiExtractor.parameters_from_endpoint(endpoint)
+    assert len(params) == 1
+    assert params[0].name == "q"
+    assert params[0].location == ParameterLocation.query
+    assert "injection_xss" in params[0].security_relevance

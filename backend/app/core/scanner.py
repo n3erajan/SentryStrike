@@ -1163,15 +1163,32 @@ class ScanOrchestrator:
         has_session = bool(getattr(crawl_result, "session_cookies", {}) or {})
         has_headers = bool(getattr(crawl_result, "auth_headers", {}) or {})
         verified = auth_state_value == "authenticated_verified"
+        is_spa = bool(getattr(crawl_result, "is_spa", False))
+        requests = getattr(crawl_result, "requests", []) or []
+        replayable_json_bodies = len(
+            [
+                request
+                for request in requests
+                if getattr(request, "post_data", None)
+                and "json" in str(getattr(request, "request_headers", {}).get("content-type", "")).lower()
+            ]
+        )
+        browser_available = getattr(crawl_result, "browser_available", None)
+        browser_error = getattr(crawl_result, "browser_error", None)
+        static_spa_only = is_spa and len(requests) == 0
 
         scan.report_metadata.spa_api_coverage = SpaApiCoverage(
-            spa_detected=bool(getattr(crawl_result, "is_spa", False)),
+            spa_detected=is_spa,
             js_assets_inspected=len(getattr(crawl_result, "assets", []) or []),
             routes_extracted=len(getattr(crawl_result, "routes", []) or []),
             api_endpoints_extracted=len(getattr(crawl_result, "api_endpoints", []) or []),
             parameters_extracted=len(getattr(crawl_result, "parameters", []) or []),
-            browser_requests_observed=len(getattr(crawl_result, "requests", []) or []),
+            browser_requests_observed=len(requests),
             dead_spa_fallback_routes_suppressed=len(getattr(crawl_result, "dead_routes", []) or []),
+            static_spa_only=static_spa_only,
+            browser_available=browser_available,
+            browser_error=browser_error,
+            replayable_json_bodies=replayable_json_bodies,
         )
         scan.report_metadata.auth_coverage = AuthCoverage(
             state=auth_state_value,
@@ -1181,6 +1198,39 @@ class ScanOrchestrator:
             auth_headers_present=has_headers,
             session_cookies_present=has_session,
         )
+        scan.report_metadata.coverage_warnings = self._coverage_warnings(crawl_result)
+
+    def _coverage_warnings(self, crawl_result) -> list[str]:
+        warnings: list[str] = []
+        is_spa = bool(getattr(crawl_result, "is_spa", False))
+        requests = getattr(crawl_result, "requests", []) or []
+        forms = getattr(crawl_result, "forms", []) or []
+        auth_headers = getattr(crawl_result, "auth_headers", {}) or {}
+        session_cookies = getattr(crawl_result, "session_cookies", {}) or {}
+        browser_available = getattr(crawl_result, "browser_available", None)
+        browser_error = getattr(crawl_result, "browser_error", None)
+        replayable_json_bodies = [
+            request
+            for request in requests
+            if getattr(request, "post_data", None)
+            and "json" in str(getattr(request, "request_headers", {}).get("content-type", "")).lower()
+        ]
+
+        if is_spa and not requests:
+            warnings.append(
+                "SPA detected, but no browser runtime requests were observed. API coverage is static extraction only."
+            )
+        if browser_available is False:
+            warnings.append(f"Browser crawling unavailable: {browser_error or 'Playwright could not run.'}")
+        if not forms:
+            warnings.append("No HTML forms were discovered; form-based detector coverage was limited.")
+        if not replayable_json_bodies:
+            warnings.append("No replayable JSON request bodies were observed; API body testing was limited.")
+        if auth_headers and not session_cookies:
+            warnings.append("Authentication was represented by headers only; cookie/session checks were limited.")
+        warnings.append("No second-user account configured for horizontal IDOR comparison.")
+        warnings.append("No OAST callback configured; blind SSRF was not tested.")
+        return warnings
 
     def _evidence_strength_breakdown(self, vulnerabilities: list[Vulnerability]) -> EvidenceStrengthBreakdown:
         counts = EvidenceStrengthBreakdown()

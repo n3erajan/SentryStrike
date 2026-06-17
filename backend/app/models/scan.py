@@ -58,6 +58,10 @@ class SpaApiCoverage(BaseModel):
     parameters_extracted: int = 0
     browser_requests_observed: int = 0
     dead_spa_fallback_routes_suppressed: int = 0
+    static_spa_only: bool = False
+    browser_available: bool | None = None
+    browser_error: str | None = None
+    replayable_json_bodies: int = 0
 
 
 class AuthCoverage(BaseModel):
@@ -92,6 +96,7 @@ class ReportMetadata(BaseModel):
     spa_api_coverage: SpaApiCoverage = Field(default_factory=SpaApiCoverage)
     auth_coverage: AuthCoverage = Field(default_factory=AuthCoverage)
     evidence_strength_breakdown: EvidenceStrengthBreakdown = Field(default_factory=EvidenceStrengthBreakdown)
+    coverage_warnings: list[str] = Field(default_factory=list)
 
 
 class Scan(Document):

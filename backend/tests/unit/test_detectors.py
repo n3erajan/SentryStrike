@@ -1,6 +1,7 @@
 import asyncio
 import pytest
 from unittest.mock import AsyncMock, patch
+from urllib.parse import parse_qsl, urlparse
 
 from app.core.detectors.access_control import AccessControlDetector
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
@@ -39,6 +40,9 @@ def mock_http_verifier():
             payload_val = str(next(iter(params.values()))) if params else ""
         elif data:
             payload_val = str(next(iter(data.values()))) if data else ""
+        else:
+            query_values = parse_qsl(urlparse(url).query, keep_blank_values=True)
+            payload_val = str(query_values[0][1]) if query_values else ""
 
         if kwargs.get("test_phase") in ("idor_unauth_base", "idor_unauth_own", "idor_unauth_mod"):
             return ResponseData(
@@ -164,8 +168,9 @@ async def test_xss_detector_flags_forms_and_query_params() -> None:
     detector = XSSDetector()
     urls = ["https://example.com/search?query=test"]
     forms = [DummyForm("https://example.com/comment", "POST", [DummyInput("comment"), DummyInput("title")])]
-    
-    findings = await detector.detect(urls=urls, forms=forms)
+
+    with patch("app.core.verification.xss_verifier.PLAYWRIGHT_AVAILABLE", False):
+        findings = await detector.detect(urls=urls, forms=forms)
     assert any("XSS" in f.vuln_type or "Cross-Site Scripting" in f.vuln_type for f in findings)
 
 

@@ -1,5 +1,9 @@
+from types import SimpleNamespace
+
 from app.core.detectors.base_detector import Finding
+from app.core.crawler.models import RequestObservation
 from app.core.scanner import ScanOrchestrator
+from app.models.scan import AuthCoverage, EvidenceStrengthBreakdown, ReportMetadata, ScanStatistics, SpaApiCoverage
 from app.models.vulnerability import (
     AiAnalysis,
     Evidence,
@@ -41,6 +45,81 @@ def test_to_vulnerability_preserves_detector_verification_metadata() -> None:
     assert vulnerability.evidence.confidence_score == 90.0
     assert vulnerability.evidence.detection_method == "time_based"
     assert vulnerability.evidence.detection_evidence == {"timing_delta_ms": 5100}
+
+
+def test_static_spa_coverage_warning_is_deterministic() -> None:
+    class CrawlResult:
+        is_spa = True
+        assets = ["http://target.test/app.js"]
+        routes = []
+        api_endpoints = []
+        parameters = []
+        requests = []
+        dead_routes = []
+        forms = []
+        session_cookies = {}
+        auth_headers = {"Authorization": "Bearer token"}
+        auth_state = "authenticated_verified"
+        browser_available = False
+        browser_error = "Playwright import failed: No module named 'playwright'"
+
+    scan = SimpleNamespace(
+        target_url="http://target.test/",
+        statistics=ScanStatistics(),
+        report_metadata=ReportMetadata(
+            spa_api_coverage=SpaApiCoverage(),
+            auth_coverage=AuthCoverage(),
+            evidence_strength_breakdown=EvidenceStrengthBreakdown(),
+        ),
+    )
+    _orchestrator()._update_crawl_metadata(scan, CrawlResult())
+
+    coverage = scan.report_metadata.spa_api_coverage
+    assert coverage.static_spa_only is True
+    assert coverage.browser_available is False
+    assert coverage.replayable_json_bodies == 0
+    assert scan.report_metadata.coverage_warnings[0] == (
+        "SPA detected, but no browser runtime requests were observed. API coverage is static extraction only."
+    )
+    assert any("Browser crawling unavailable" in warning for warning in scan.report_metadata.coverage_warnings)
+
+
+def test_replayable_json_body_suppresses_json_body_warning() -> None:
+    class CrawlResult:
+        is_spa = False
+        assets = []
+        routes = []
+        api_endpoints = []
+        parameters = []
+        requests = [
+            RequestObservation(
+                url="http://target.test/api/login",
+                method="POST",
+                request_headers={"content-type": "application/json"},
+                post_data='{"email":"a@example.com"}',
+            )
+        ]
+        dead_routes = []
+        forms = []
+        session_cookies = {}
+        auth_headers = {}
+        auth_state = "unauthenticated"
+        browser_available = True
+        browser_error = None
+
+    scan = SimpleNamespace(
+        target_url="http://target.test/",
+        statistics=ScanStatistics(),
+        report_metadata=ReportMetadata(
+            spa_api_coverage=SpaApiCoverage(),
+            auth_coverage=AuthCoverage(),
+            evidence_strength_breakdown=EvidenceStrengthBreakdown(),
+        ),
+    )
+    _orchestrator()._update_crawl_metadata(scan, CrawlResult())
+
+    assert scan.report_metadata.spa_api_coverage.replayable_json_bodies == 1
+    assert not any("No replayable JSON request bodies" in warning for warning in scan.report_metadata.coverage_warnings)
 
 
 def test_verified_time_based_sqli_is_not_auto_suppressed_by_high_ai_fp_probability() -> None:

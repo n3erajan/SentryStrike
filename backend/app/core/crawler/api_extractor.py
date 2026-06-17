@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from app.core.crawler.models import ApiEndpoint, ParameterCandidate, ParameterLocation, RouteSource
 from app.core.crawler.url_parser import normalize_url
@@ -13,17 +13,18 @@ class ApiExtractor:
     """Extract API and frontend route candidates from JavaScript and observed requests."""
 
     ENDPOINT_RE = re.compile(
-        r"""(?P<quote>["'`])(?P<path>/(?:api|graphql|gql|rest|v[0-9]+|rpc|trpc|auth|oauth|session|login|users?|accounts?|products?|orders?)[^"'`\s<>{}]*) (?P=quote)""",
+        r"""(?P<quote>["'`])(?P<path>/(?:api|graphql|gql|rest|v[0-9]+|rpc|trpc|auth|oauth|session|login|users?|accounts?|products?|orders?)[^"'`\s<>]*) (?P=quote)""",
         re.I | re.X,
     )
     RELATIVE_API_PATH_RE = re.compile(
-        r"""(?P<quote>["'`])(?P<path>(?:api|graphql|gql|rest|v[0-9]+|rpc|trpc|auth|oauth|session)/(?:[^"'`\s<>{}]+))(?P=quote)""",
+        r"""(?P<quote>["'`])(?P<path>(?:api|graphql|gql|rest|v[0-9]+|rpc|trpc|auth|oauth|session)/(?:[^"'`\s<>]+))(?P=quote)""",
         re.I,
     )
     FETCH_RE = re.compile(
         r"""(?:fetch|axios\.(?:get|post|put|patch|delete)|\.(?:get|post|put|patch|delete))\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""",
         re.I,
     )
+    JS_TEMPLATE_RE = re.compile(r"\$\{\s*(?P<expr>[^}]+?)\s*\}")
     ROUTE_ARRAY_RE = re.compile(r"""path\s*:\s*["'`](?P<path>/[^"'`]+)["'`]""", re.I)
     REACT_ROUTER_RE = re.compile(r"""<Route[^>]+path\s*=\s*["'`](?P<path>/[^"'`]+)["'`]""", re.I)
     ANGULAR_ROUTE_RE = re.compile(r"""\{\s*path\s*:\s*["'`](?P<path>[^"'`]*)["'`]""", re.I)
@@ -47,7 +48,8 @@ class ApiExtractor:
                 routes.append(absolute)
 
         def add_endpoint(path: str, method: str = "GET", operation: str | None = None, evidence: str = "") -> None:
-            absolute = normalize_url(base_url, path)
+            normalized_path = cls.normalize_template_url(path)
+            absolute = normalize_url(base_url, normalized_path)
             key = (absolute, method.upper(), operation or "")
             if key not in seen_endpoints:
                 seen_endpoints.add(key)
@@ -119,6 +121,24 @@ class ApiExtractor:
                     )
                 )
 
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if not name:
+                continue
+            baseline = value
+            if re.fullmatch(r"\{[A-Za-z_][A-Za-z0-9_]*\}", value):
+                baseline = "1"
+            params.append(
+                ParameterCandidate(
+                    name=name,
+                    location=ParameterLocation.query,
+                    url=endpoint.url,
+                    method=endpoint.method,
+                    baseline_value=baseline or "1",
+                    source="api_query",
+                    security_relevance=cls.classify_parameter(name),
+                )
+            )
+
         body = endpoint.request_body
         if isinstance(body, str):
             try:
@@ -142,6 +162,25 @@ class ApiExtractor:
                     )
                 )
         return params
+
+    @classmethod
+    def normalize_template_url(cls, path: str) -> str:
+        placeholder_index = 0
+
+        def replacement(match: re.Match[str]) -> str:
+            nonlocal placeholder_index
+            placeholder_index += 1
+            name = cls._placeholder_name(match.group("expr")) or f"param_{placeholder_index}"
+            return "{" + name + "}"
+
+        path = cls.JS_TEMPLATE_RE.sub(replacement, path)
+        path = re.sub(r"\+\s*([A-Za-z_$][\w$]*)", lambda m: "{" + cls._placeholder_name(m.group(1)) + "}", path)
+        path = re.sub(r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\+", "", path)
+        if not path.startswith("/") and "/" in path:
+            prefix, suffix = path.split("/", 1)
+            if cls._looks_like_base_expression(prefix):
+                path = "/" + suffix
+        return path
 
     @classmethod
     def classify_parameter(cls, name: str) -> set[str]:
@@ -192,6 +231,26 @@ class ApiExtractor:
     def _looks_api_path(path: str) -> bool:
         lowered = path.lower()
         return any(token in lowered for token in ("/api", "/graphql", "/gql", "/rest", "/oauth", "/session", "/auth", "/rpc", "/trpc"))
+
+    @staticmethod
+    def _placeholder_name(expr: str) -> str:
+        expr = expr.strip()
+        if "." in expr:
+            expr = expr.rsplit(".", 1)[-1]
+        match = re.search(r"[A-Za-z_$][A-Za-z0-9_$]*", expr)
+        if not match:
+            return ""
+        name = match.group(0).strip("$")
+        if len(name) <= 1:
+            return "param_1"
+        return re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+    @staticmethod
+    def _looks_like_base_expression(value: str) -> bool:
+        lowered = value.strip("{}").lower()
+        return lowered in {"baseurl", "apiurl", "host", "server", "hostserver"} or any(
+            token in lowered for token in ("base", "api", "host", "server", "origin")
+        )
 
     @staticmethod
     def _looks_state_changing(path: str) -> bool:
