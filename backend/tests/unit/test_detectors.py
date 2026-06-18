@@ -1,8 +1,10 @@
 import asyncio
+import json
 import pytest
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qsl, urlparse
 
+from app.core.crawler.models import ApiEndpoint, RequestObservation
 from app.core.detectors.access_control import AccessControlDetector
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
 from app.core.detectors.crypto_failures import CryptoFailuresDetector
@@ -104,6 +106,146 @@ async def test_access_control_detector_flags_admin_and_idor() -> None:
     findings = await detector.detect(urls=urls, forms=forms)
     assert any("Forced Browsing" in f.vuln_type for f in findings)
     assert any("IDOR" in f.vuln_type or "Insecure Direct Object Reference" in f.vuln_type for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_access_control_tests_json_body_idor_targets() -> None:
+    detector = AccessControlDetector()
+    endpoint = ApiEndpoint(
+        url="https://example.com/api/profile",
+        method="POST",
+        request_body={"userId": 1, "include": "summary"},
+        headers={"Content-Type": "application/json"},
+    )
+    calls: list[tuple[str, object]] = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        calls.append((kwargs.get("test_phase", ""), kwargs.get("json_body")))
+        body = kwargs.get("json_body") or {}
+        user_id = str(body.get("userId", ""))
+        if kwargs.get("test_phase") in {"idor_unauth_own", "idor_unauth_mod"}:
+            return ResponseData(401, {"content-type": "application/json"}, '{"error":"unauthorized"}', 1.0)
+        if kwargs.get("test_phase") == "idor_authed_own":
+            return ResponseData(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"userId": user_id, "email": "alice@example.com", "balance": 100}),
+                1.0,
+                request_snippet=f"{method} {url}",
+                response_snippet="HTTP/1.1 200 OK",
+            )
+        if kwargs.get("test_phase") == "idor_authed_mod":
+            return ResponseData(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"userId": user_id, "email": "bob@example.com", "balance": 900}),
+                1.0,
+                request_snippet=f"{method} {url}",
+                response_snippet="HTTP/1.1 200 OK",
+            )
+        return ResponseData(403, {"content-type": "application/json"}, '{"error":"forbidden"}', 1.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[],
+            forms=[],
+            api_endpoints=[endpoint],
+            session_cookies={"sid": "low"},
+        )
+
+    assert any(f.vuln_type == "Insecure Direct Object Reference (IDOR)" for f in findings)
+    assert any(phase == "idor_authed_mod" and body == {"userId": "2", "include": "summary"} for phase, body in calls)
+
+
+@pytest.mark.asyncio
+async def test_access_control_tests_path_template_idor_targets() -> None:
+    detector = AccessControlDetector()
+    endpoint = ApiEndpoint(url="https://example.com/api/users/{userId}", method="GET")
+    requested_urls: list[tuple[str, str]] = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase", "")
+        requested_urls.append((phase, url))
+        if phase in {"idor_unauth_own", "idor_unauth_mod"}:
+            return ResponseData(401, {"content-type": "application/json"}, '{"error":"unauthorized"}', 1.0)
+        if phase == "idor_authed_own":
+            return ResponseData(200, {"content-type": "application/json"}, '{"userId":1,"email":"alice@example.com"}', 1.0)
+        if phase == "idor_authed_mod":
+            return ResponseData(200, {"content-type": "application/json"}, '{"userId":2,"email":"bob@example.com"}', 1.0)
+        return ResponseData(403, {"content-type": "application/json"}, '{"error":"forbidden"}', 1.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[],
+            forms=[],
+            api_endpoints=[endpoint],
+            session_cookies={"sid": "low"},
+        )
+
+    assert any(f.vuln_type == "Insecure Direct Object Reference (IDOR)" for f in findings)
+    assert ("idor_authed_mod", "https://example.com/api/users/2") in requested_urls
+
+
+@pytest.mark.asyncio
+async def test_access_control_matrix_flags_sensitive_unauthenticated_api_exposure() -> None:
+    detector = AccessControlDetector()
+    request = RequestObservation(
+        url="https://example.com/api/profile",
+        method="GET",
+        request_headers={"authorization": "Bearer browser-token"},
+    )
+    seen_headers: list[dict | None] = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        seen_headers.append(kwargs.get("headers"))
+        phase = kwargs.get("test_phase", "")
+        if phase == "auth_matrix_unauth":
+            return ResponseData(
+                200,
+                {"content-type": "application/json"},
+                '{"userId":1,"email":"alice@example.com","role":"user"}',
+                1.0,
+                request_snippet=f"{method} {url}",
+                response_snippet="HTTP/1.1 200 OK",
+            )
+        if phase == "auth_matrix_low":
+            return ResponseData(
+                200,
+                {"content-type": "application/json"},
+                '{"userId":1,"email":"alice@example.com","role":"user"}',
+                1.0,
+            )
+        return ResponseData(404, {"content-type": "application/json"}, '{"error":"not found"}', 1.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[],
+            forms=[],
+            requests=[request],
+            auth_headers={"Authorization": "Bearer low-user"},
+        )
+
+    assert any(f.vuln_type == "Unauthenticated API Data Exposure" for f in findings)
+    assert all(not headers or "authorization" not in {key.lower() for key in headers} for headers in seen_headers)
+
+
+@pytest.mark.asyncio
+async def test_access_control_matrix_does_not_flag_public_catalog_ids_without_sensitive_fields() -> None:
+    detector = AccessControlDetector()
+    request = RequestObservation(url="https://example.com/api/products", method="GET")
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        return ResponseData(
+            200,
+            {"content-type": "application/json"},
+            '[{"id":1,"name":"apple"},{"id":2,"name":"banana"}]',
+            1.0,
+        )
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(urls=[], forms=[], requests=[request])
+
+    assert not any(f.vuln_type == "Unauthenticated API Data Exposure" for f in findings)
 
 
 @pytest.mark.asyncio

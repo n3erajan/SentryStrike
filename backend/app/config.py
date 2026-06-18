@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     authentication_password: str | None = Field(default=None, alias="SCAN_AUTH_PASSWORD")
     authentication_cookie: str | None = Field(default=None, alias="SCAN_AUTH_COOKIE")  # Format: "security=low; PHPSESSID=..."
     authentication_header: str | None = Field(default=None, alias="SCAN_AUTH_HEADER")  # Format: "Authorization: Bearer ..."
+    authentication_second_cookie: str | None = Field(default=None, alias="SCAN_AUTH_SECOND_COOKIE")
+    authentication_second_header: str | None = Field(default=None, alias="SCAN_AUTH_SECOND_HEADER")
+    authentication_privileged_cookie: str | None = Field(default=None, alias="SCAN_AUTH_PRIVILEGED_COOKIE")
+    authentication_privileged_header: str | None = Field(default=None, alias="SCAN_AUTH_PRIVILEGED_HEADER")
     authentication_login_url: str | None = Field(default=None, alias="SCAN_AUTH_LOGIN_URL")
     authentication_success_url: str | None = Field(default=None, alias="SCAN_AUTH_SUCCESS_URL")
     authentication_success_text: str | None = Field(default=None, alias="SCAN_AUTH_SUCCESS_TEXT")

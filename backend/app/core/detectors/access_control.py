@@ -1,15 +1,54 @@
 import asyncio
+import json
 import logging
 import re
-from contextlib import asynccontextmanager
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
+from app.config import get_settings
 from app.core.crawler.spa import SpaFallbackDetector
+from app.core.crawler.models import ApiEndpoint, ParameterCandidate, ParameterLocation, RequestObservation
+from app.core.detectors.attack_surface import AttackSurface, AttackTarget, PreparedAttackRequest
 from app.core.detectors.base_detector import BaseDetector, Finding
-from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder
+from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _AuthMaterial:
+    label: str
+    cookies: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.cookies or self.headers)
+
+
+@dataclass(frozen=True)
+class _MatrixTarget:
+    request: PreparedAttackRequest
+    source: str
+    parameter: str | None = None
+    parameter_location: str | None = None
+    has_object_reference: bool = False
+    admin_like: bool = False
+
+
+@dataclass(frozen=True)
+class _ResponseProfile:
+    status_code: int
+    content_type: str
+    success: bool
+    is_json: bool
+    json_shape: frozenset[str] = field(default_factory=frozenset)
+    identifiers: frozenset[str] = field(default_factory=frozenset)
+    sensitive_fields: frozenset[str] = field(default_factory=frozenset)
+    item_count: int = 0
+    body_length: int = 0
 
 # ---------------------------------------------------------------------------
 # Regex helpers
@@ -18,7 +57,6 @@ _NUMERIC_RE = re.compile(r"^\d+$")
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
-_SHORT_ALNUM_RE = re.compile(r"^[a-zA-Z0-9]{1,8}$")
 
 # ---------------------------------------------------------------------------
 # IDOR value classification
@@ -305,8 +343,24 @@ class AccessControlDetector(BaseDetector):
         self, urls: list[str], forms: list[object], **kwargs: object
     ) -> list[Finding]:
         findings: list[Finding] = []
-        session_cookies: dict[str, str] = kwargs.get("session_cookies") or {}
-        privileged_cookies: dict[str, str] = kwargs.get("privileged_cookies") or {}
+        settings = get_settings()
+        session_cookies: dict[str, str] = dict(kwargs.get("session_cookies") or {})
+        auth_headers: dict[str, str] = dict(kwargs.get("auth_headers") or {})
+        low_auth = _AuthMaterial(
+            label="low",
+            cookies=session_cookies or self._parse_cookie_string(settings.authentication_cookie),
+            headers=auth_headers or self._parse_header_string(settings.authentication_header),
+        )
+        second_auth = self._build_auth_material(
+            label="second",
+            cookie_value=kwargs.get("second_user_cookies") or settings.authentication_second_cookie,
+            header_value=kwargs.get("second_user_headers") or settings.authentication_second_header,
+        )
+        privileged_auth = self._build_auth_material(
+            label="privileged",
+            cookie_value=kwargs.get("privileged_cookies") or settings.authentication_privileged_cookie,
+            header_value=kwargs.get("privileged_headers") or settings.authentication_privileged_header,
+        )
         is_spa = bool(kwargs.get("is_spa", False))
         spa_root_html = str(kwargs.get("spa_root_html") or "")
         root_url = str(kwargs.get("root_url") or "")
@@ -318,34 +372,59 @@ class AccessControlDetector(BaseDetector):
             if not spa_detector.root_looks_like_spa():
                 spa_detector = None
 
-        authed_verifier = HttpVerifier(cookies=session_cookies)
+        authed_verifier = HttpVerifier(cookies=low_auth.cookies, headers=low_auth.headers)
         authed_verifier.set_request_context(module="access_control")
 
         unauthed_verifier = HttpVerifier()
         unauthed_verifier.set_request_context(module="access_control")
 
         privileged_verifier: HttpVerifier | None = None
-        if privileged_cookies:
-            privileged_verifier = HttpVerifier(cookies=privileged_cookies)
+        if privileged_auth.configured:
+            privileged_verifier = HttpVerifier(cookies=privileged_auth.cookies, headers=privileged_auth.headers)
             privileged_verifier.set_request_context(module="access_control")
+
+        second_verifier: HttpVerifier | None = None
+        if second_auth.configured:
+            second_verifier = HttpVerifier(cookies=second_auth.cookies, headers=second_auth.headers)
+            second_verifier.set_request_context(module="access_control")
 
         try:
             forced_browsing_task = self._check_forced_browsing(
                 urls, unauthed_verifier, authed_verifier, spa_detector=spa_detector
             )
             idor_task = self._check_idor(
-                urls, forms, unauthed_verifier, authed_verifier, privileged_verifier
+                urls,
+                forms,
+                unauthed_verifier,
+                authed_verifier,
+                privileged_verifier,
+                second_verifier,
+                **kwargs,
             )
-            fb_findings, idor_findings = await asyncio.gather(
-                forced_browsing_task, idor_task
+            matrix_task = self._check_api_authorization_matrix(
+                urls,
+                forms,
+                unauthed_verifier,
+                authed_verifier,
+                second_verifier,
+                privileged_verifier,
+                **kwargs,
+            )
+            fb_findings, idor_findings, matrix_findings = await asyncio.gather(
+                forced_browsing_task,
+                idor_task,
+                matrix_task,
             )
             findings.extend(fb_findings)
             findings.extend(idor_findings)
+            findings.extend(matrix_findings)
         finally:
             await authed_verifier.close()
             await unauthed_verifier.close()
             if privileged_verifier:
                 await privileged_verifier.close()
+            if second_verifier:
+                await second_verifier.close()
 
         return findings
 
@@ -459,244 +538,1002 @@ class AccessControlDetector(BaseDetector):
         unauthed_verifier: HttpVerifier,
         authed_verifier: HttpVerifier,
         privileged_verifier: HttpVerifier | None,
+        second_verifier: HttpVerifier | None,
+        **kwargs: object,
     ) -> list[Finding]:
         findings: list[Finding] = []
         semaphore = asyncio.Semaphore(self._CONCURRENCY)
-        idor_candidates: set[tuple[str, str, str, str]] = set()
+        response_ids = self._response_body_ids(kwargs.get("requests") or [])
+        idor_targets = self._build_idor_targets(urls, forms, **kwargs)
 
-        # --- URL params ---
-        for url in urls:
-            parsed = urlparse(url)
-            for param_name, param_value in parse_qsl(parsed.query, keep_blank_values=True):
-                if self._is_idor_param(param_name) and _is_valid_id_value(param_value):
-                    idor_candidates.add((url, param_name, "GET", param_value))
+        if not idor_targets:
+            return findings
 
-        # --- Path segment IDs (e.g. /users/42/profile) ---
-        # Only consider path segments that are purely numeric or UUIDs — not
-        # opaque tokens, which are too ambiguous when embedded in paths.
+        async def _verify(target: AttackTarget) -> list[Finding]:
+            cand_findings: list[Finding] = []
+            baseline_values = self._baseline_values_for_target(target, response_ids)
+
+            async with semaphore:
+                for val in baseline_values:
+                    try:
+                        target_findings = await self._verify_idor_baseline(
+                            target,
+                            str(val),
+                            unauthed_verifier,
+                            authed_verifier,
+                            privileged_verifier,
+                            second_verifier,
+                        )
+                        cand_findings.extend(target_findings)
+                        if target_findings:
+                            break
+                    except Exception:
+                        logger.exception("IDOR verification failed for %s param=%s", target.url, target.parameter)
+
+            return cand_findings
+
+        results = await asyncio.gather(*[_verify(target) for target in idor_targets])
+        for r in results:
+            findings.extend(r)
+        return findings
+
+    # ---------------------------------------------------------------------------
+    # API Authorization Matrix
+    # ---------------------------------------------------------------------------
+
+    async def _check_api_authorization_matrix(
+        self,
+        urls: list[str],
+        forms: list[object],
+        unauthed_verifier: HttpVerifier,
+        authed_verifier: HttpVerifier,
+        second_verifier: HttpVerifier | None,
+        privileged_verifier: HttpVerifier | None,
+        **kwargs: object,
+    ) -> list[Finding]:
+        findings: list[Finding] = []
+        targets = self._build_matrix_targets(urls, forms, **kwargs)
+        if not targets:
+            return findings
+
+        semaphore = asyncio.Semaphore(self._CONCURRENCY)
+
+        async def _verify(target: _MatrixTarget) -> list[Finding]:
+            async with semaphore:
+                try:
+                    return await self._verify_matrix_target(
+                        target,
+                        unauthed_verifier,
+                        authed_verifier,
+                        second_verifier,
+                        privileged_verifier,
+                    )
+                except Exception:
+                    logger.exception("authorization matrix failed for %s", target.request.url)
+                    return []
+
+        results = await asyncio.gather(*[_verify(target) for target in targets])
+        for result in results:
+            findings.extend(result)
+        return findings
+
+    async def _verify_matrix_target(
+        self,
+        target: _MatrixTarget,
+        unauthed_verifier: HttpVerifier,
+        authed_verifier: HttpVerifier,
+        second_verifier: HttpVerifier | None,
+        privileged_verifier: HttpVerifier | None,
+    ) -> list[Finding]:
+        request = target.request
+        unauth = await self._send_prepared_request(
+            unauthed_verifier, request, test_phase="auth_matrix_unauth"
+        )
+        low = await self._send_prepared_request(
+            authed_verifier, request, test_phase="auth_matrix_low"
+        )
+        second = (
+            await self._send_prepared_request(
+                second_verifier, request, test_phase="auth_matrix_second"
+            )
+            if second_verifier
+            else None
+        )
+        privileged = (
+            await self._send_prepared_request(
+                privileged_verifier, request, test_phase="auth_matrix_privileged"
+            )
+            if privileged_verifier
+            else None
+        )
+
+        unauth_profile = self._response_profile(unauth)
+        low_profile = self._response_profile(low)
+        second_profile = self._response_profile(second) if second is not None else None
+        privileged_profile = self._response_profile(privileged) if privileged is not None else None
+
+        findings: list[Finding] = []
+        protected_low = low_profile.success and not _looks_like_login_page(low.body)
+        unauth_success = unauth_profile.success and not _looks_like_login_page(unauth.body)
+        unauth_sensitive = self._profile_exposes_nonpublic_data(target, unauth_profile)
+
+        if (
+            unauth_success
+            and unauth_sensitive
+            and not _looks_like_error_page(unauth.body)
+            and (not protected_low or self._profiles_compatible(unauth_profile, low_profile, unauth.body, low.body))
+        ):
+            findings.append(
+                Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Unauthenticated API Data Exposure",
+                    severity=SeverityLevel.high if target.admin_like or unauth_profile.sensitive_fields else SeverityLevel.medium,
+                    url=request.url,
+                    parameter=target.parameter,
+                    method=request.method,
+                    evidence=(
+                        f"API authorization matrix: unauthenticated request returned HTTP "
+                        f"{unauth.status_code} with sensitive/object data. "
+                        f"Low-privilege baseline returned HTTP {low.status_code}. "
+                        f"Sensitive fields: {', '.join(sorted(unauth_profile.sensitive_fields)) or 'none'}. "
+                        f"Stable identifiers observed: {len(unauth_profile.identifiers)}."
+                    ),
+                    confidence_score=88.0,
+                    detection_method="authorization_matrix",
+                    detection_evidence=self._matrix_evidence(
+                        unauth_profile, low_profile, second_profile, privileged_profile, target
+                    ),
+                    verified=True,
+                    verification_request_snippet=unauth.request_snippet,
+                    verification_response_snippet=unauth.response_snippet,
+                    reproducible=True,
+                )
+            )
+
+        if (
+            second is not None
+            and second_profile is not None
+            and protected_low
+            and second_profile.success
+            and not unauth_success
+            and not target.has_object_reference
+            and self._shared_identifiers(low_profile, second_profile)
+            and (bool(low_profile.sensitive_fields) or target.admin_like)
+        ):
+            findings.append(
+                Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Horizontal Authorization Bypass",
+                    severity=SeverityLevel.high,
+                    url=request.url,
+                    parameter=target.parameter,
+                    method=request.method,
+                    evidence=(
+                        "API authorization matrix: a second authenticated user received "
+                        "the same stable object identifiers as the low-privilege baseline "
+                        f"while unauthenticated access was blocked with HTTP {unauth.status_code}."
+                    ),
+                    confidence_score=90.0,
+                    detection_method="authorization_matrix_second_user",
+                    detection_evidence=self._matrix_evidence(
+                        unauth_profile, low_profile, second_profile, privileged_profile, target
+                    ),
+                    verified=True,
+                    verification_request_snippet=second.request_snippet,
+                    verification_response_snippet=second.response_snippet,
+                    reproducible=True,
+                )
+            )
+
+        if (
+            privileged is not None
+            and privileged_profile is not None
+            and protected_low
+            and privileged_profile.success
+            and target.admin_like
+            and self._profiles_compatible(low_profile, privileged_profile, low.body, privileged.body)
+        ):
+            findings.append(
+                Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Vertical Privilege Bypass",
+                    severity=SeverityLevel.critical,
+                    url=request.url,
+                    parameter=target.parameter,
+                    method=request.method,
+                    evidence=(
+                        "API authorization matrix: low-privilege credentials reached an "
+                        "admin/privileged API target with a response compatible with the "
+                        f"privileged baseline (low HTTP {low.status_code}, privileged HTTP "
+                        f"{privileged.status_code})."
+                    ),
+                    confidence_score=92.0,
+                    detection_method="authorization_matrix_privileged_baseline",
+                    detection_evidence=self._matrix_evidence(
+                        unauth_profile, low_profile, second_profile, privileged_profile, target
+                    ),
+                    verified=True,
+                    verification_request_snippet=low.request_snippet,
+                    verification_response_snippet=low.response_snippet,
+                    reproducible=True,
+                )
+            )
+
+        return findings
+
+    # ---------------------------------------------------------------------------
+    # Shared target construction / request helpers
+    # ---------------------------------------------------------------------------
+
+    def _build_idor_targets(self, urls: list[str], forms: list[object], **kwargs: object) -> list[AttackTarget]:
+        parameters = kwargs.get("parameters")
+        api_endpoints = kwargs.get("api_endpoints")
+        requests = kwargs.get("requests")
+        targets = AttackSurface.build(
+            urls,
+            forms,
+            parameters=parameters if isinstance(parameters, list) else None,
+            api_endpoints=api_endpoints if isinstance(api_endpoints, list) else None,
+            requests=requests if isinstance(requests, list) else None,
+            filter_fn=self._is_idor_param,
+        )
+
+        concrete_path_targets = self._concrete_path_idor_targets(urls)
+        targets.extend(concrete_path_targets)
+
+        deduped: list[AttackTarget] = []
+        seen: set[tuple[str, str, str, str, str]] = set()
+        for target in targets:
+            if not self._target_has_access_control_relevance(target):
+                continue
+            key = (
+                target.url,
+                target.method.upper(),
+                target.parameter,
+                target.location.value,
+                target.parent_path or "",
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(target)
+        return deduped[:80]
+
+    def _build_matrix_targets(self, urls: list[str], forms: list[object], **kwargs: object) -> list[_MatrixTarget]:
+        targets: list[_MatrixTarget] = []
+        api_endpoints = kwargs.get("api_endpoints") if isinstance(kwargs.get("api_endpoints"), list) else []
+        requests = kwargs.get("requests") if isinstance(kwargs.get("requests"), list) else []
+        parameters = kwargs.get("parameters") if isinstance(kwargs.get("parameters"), list) else None
+
+        for observation in requests:
+            request = self._request_from_observation(observation)
+            if request is None:
+                continue
+            targets.append(
+                _MatrixTarget(
+                    request=request,
+                    source="browser_request",
+                    has_object_reference=self._request_has_object_reference(request),
+                    admin_like=self._is_admin_like_url(request.url),
+                )
+            )
+
+        for endpoint in api_endpoints:
+            request = self._request_from_endpoint(endpoint)
+            if request is None:
+                continue
+            targets.append(
+                _MatrixTarget(
+                    request=request,
+                    source="api_endpoint",
+                    has_object_reference=self._request_has_object_reference(request),
+                    admin_like=self._is_admin_like_url(request.url),
+                )
+            )
+
+        for attack_target in AttackSurface.build(
+            urls,
+            forms,
+            parameters=parameters,
+            api_endpoints=api_endpoints,
+            requests=requests,
+            filter_fn=self._is_matrix_relevant_param,
+        ):
+            request = self._build_request_for_value(attack_target, attack_target.value or "1")
+            targets.append(
+                _MatrixTarget(
+                    request=request,
+                    source=attack_target.source,
+                    parameter=attack_target.parameter,
+                    parameter_location=attack_target.location.value,
+                    has_object_reference=self._target_has_access_control_relevance(attack_target),
+                    admin_like=self._is_admin_like_url(request.url),
+                )
+            )
+
+        deduped: list[_MatrixTarget] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for target in targets:
+            if not self._is_replayable_matrix_request(target.request):
+                continue
+            key = (
+                target.request.method.upper(),
+                self._canonical_request_url(target.request.url),
+                self._body_schema_key(target.request.json_body or target.request.data),
+                target.parameter or "",
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(target)
+        return deduped[:80]
+
+    async def _verify_idor_baseline(
+        self,
+        target: AttackTarget,
+        val: str,
+        unauthed_verifier: HttpVerifier,
+        authed_verifier: HttpVerifier,
+        privileged_verifier: HttpVerifier | None,
+        second_verifier: HttpVerifier | None,
+    ) -> list[Finding]:
+        cand_findings: list[Finding] = []
+        mutated_vals = _mutate_id(val)
+
+        own_request = self._build_request_for_value(target, val)
+        unauth_own_resp = await self._send_prepared_request(
+            unauthed_verifier, own_request, test_phase="idor_unauth_own"
+        )
+
+        if self._is_public_resource_response(unauth_own_resp):
+            logger.debug(
+                "IDOR skip: original resource is public at %s param=%s val=%s",
+                target.url,
+                target.parameter,
+                val,
+            )
+            return []
+
+        auth_own_resp = await self._send_prepared_request(
+            authed_verifier, own_request, test_phase="idor_authed_own"
+        )
+
+        if auth_own_resp.status_code not in (200, 201):
+            logger.debug(
+                "IDOR skip: authed session cannot access own resource %s param=%s",
+                target.url,
+                target.parameter,
+            )
+            return []
+
+        if _looks_like_error_page(auth_own_resp.body):
+            logger.debug(
+                "IDOR skip: own resource response looks like an error page %s param=%s",
+                target.url,
+                target.parameter,
+            )
+            return []
+
+        if second_verifier is not None:
+            second_own_resp = await self._send_prepared_request(
+                second_verifier, own_request, test_phase="idor_second_user_own"
+            )
+            if (
+                second_own_resp.status_code in (200, 201)
+                and not _looks_like_login_page(second_own_resp.body)
+                and not _looks_like_error_page(second_own_resp.body)
+            ):
+                similarity = _body_similarity(auth_own_resp.body, second_own_resp.body)
+                own_profile = self._response_profile(auth_own_resp)
+                second_profile = self._response_profile(second_own_resp)
+                if similarity > 0.70 and (
+                    self._shared_identifiers(own_profile, second_profile)
+                    or self._profile_has_sensitive_data(own_profile)
+                ):
+                    cand_findings.append(
+                        Finding(
+                            category=OwaspCategory.a01,
+                            vuln_type="Insecure Direct Object Reference (IDOR)",
+                            severity=SeverityLevel.high,
+                            url=target.url,
+                            parameter=target.parameter,
+                            method=target.method,
+                            payload=val,
+                            evidence=(
+                                "Horizontal IDOR confirmed with second-user credentials: "
+                                f"second user accessed low-user object reference '{target.parameter}'={val}. "
+                                f"Unauthenticated baseline returned HTTP {unauth_own_resp.status_code}. "
+                                f"Body similarity (low vs second user): {similarity:.0%}."
+                            ),
+                            confidence_score=95.0,
+                            detection_method="second_user_idor",
+                            detection_evidence={
+                                "parameter_location": target.location.value,
+                                "source": target.source,
+                                "shared_identifiers": sorted(self._shared_identifiers(own_profile, second_profile)),
+                            },
+                            verified=True,
+                            verification_request_snippet=second_own_resp.request_snippet,
+                            verification_response_snippet=second_own_resp.response_snippet,
+                            reproducible=True,
+                        )
+                    )
+                    return cand_findings
+
+        for mutated_val in mutated_vals:
+            mod_request = self._build_request_for_value(target, mutated_val)
+            auth_mod_resp = await self._send_prepared_request(
+                authed_verifier, mod_request, test_phase="idor_authed_mod"
+            )
+
+            if auth_mod_resp.status_code not in (200, 201):
+                continue
+            if _looks_like_login_page(auth_mod_resp.body):
+                continue
+
+            unauth_mod_resp = await self._send_prepared_request(
+                unauthed_verifier, mod_request, test_phase="idor_unauth_mod"
+            )
+            mutated_unauthed_body: str | None = (
+                unauth_mod_resp.body
+                if self._is_public_resource_response(unauth_mod_resp)
+                else None
+            )
+
+            is_idor, similarity, reason = _differential_idor_verdict(
+                own_body=auth_own_resp.body,
+                mutated_authed_body=auth_mod_resp.body,
+                mutated_unauthed_body=mutated_unauthed_body,
+            )
+
+            if not is_idor:
+                logger.debug(
+                    "IDOR false-positive suppressed at %s param=%s mutated=%s: %s",
+                    target.url,
+                    target.parameter,
+                    mutated_val,
+                    reason,
+                )
+                continue
+
+            cand_findings.append(
+                Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Insecure Direct Object Reference (IDOR)",
+                    severity=SeverityLevel.high,
+                    url=target.url,
+                    parameter=target.parameter,
+                    method=target.method,
+                    payload=mutated_val,
+                    evidence=(
+                        f"Horizontal privilege escalation: authenticated session accessed "
+                        f"'{target.parameter}'={mutated_val} (modified from owned value '{val}'). "
+                        f"Parameter location: {target.location.value}. "
+                        f"Unauthenticated baseline for original value returned HTTP "
+                        f"{unauth_own_resp.status_code}. "
+                        f"Unauthenticated access to mutated value: "
+                        f"{'blocked' if mutated_unauthed_body is None else 'public (skipped)'}. "
+                        f"Body similarity (own vs mutated): {similarity:.0%}. "
+                        f"Differential verdict: {reason}."
+                    ),
+                    confidence_score=90.0,
+                    detection_method="differential_idor",
+                    detection_evidence={
+                        "parameter_location": target.location.value,
+                        "parent_path": target.parent_path,
+                        "source": target.source,
+                    },
+                    verified=True,
+                    verification_request_snippet=auth_mod_resp.request_snippet,
+                    verification_response_snippet=auth_mod_resp.response_snippet,
+                    reproducible=True,
+                )
+            )
+            break
+
+        if privileged_verifier and not cand_findings:
+            for mutated_val in mutated_vals:
+                mod_request = self._build_request_for_value(target, mutated_val)
+                priv_resp = await self._send_prepared_request(
+                    privileged_verifier, mod_request, test_phase="vertical_priv_check"
+                )
+                auth_check_resp = await self._send_prepared_request(
+                    authed_verifier, mod_request, test_phase="vertical_authed_check"
+                )
+                if (
+                    priv_resp.status_code in (200, 201)
+                    and auth_check_resp.status_code in (200, 201)
+                    and not _looks_like_login_page(auth_check_resp.body)
+                    and not _looks_like_error_page(auth_check_resp.body)
+                ):
+                    similarity = _body_similarity(priv_resp.body, auth_check_resp.body)
+                    if similarity > 0.7:
+                        cand_findings.append(
+                            Finding(
+                                category=OwaspCategory.a01,
+                                vuln_type="Vertical Privilege Escalation (IDOR)",
+                                severity=SeverityLevel.critical,
+                                url=target.url,
+                                parameter=target.parameter,
+                                method=target.method,
+                                payload=mutated_val,
+                                evidence=(
+                                    f"Low-privilege session accessed resource "
+                                    f"'{target.parameter}'={mutated_val} which is also accessible to a "
+                                    f"high-privilege session (body similarity: {similarity:.0%}). "
+                                    f"Parameter location: {target.location.value}."
+                                ),
+                                confidence_score=90.0,
+                                detection_method="vertical_idor",
+                                detection_evidence={
+                                    "parameter_location": target.location.value,
+                                    "source": target.source,
+                                },
+                                verified=True,
+                                verification_request_snippet=auth_check_resp.request_snippet,
+                                verification_response_snippet=auth_check_resp.response_snippet,
+                                reproducible=True,
+                            )
+                        )
+                        break
+
+        return cand_findings
+
+    async def _send_prepared_request(
+        self,
+        verifier: HttpVerifier | None,
+        request: PreparedAttackRequest,
+        *,
+        test_phase: str,
+    ):
+        if verifier is None:
+            raise ValueError("verifier is required")
+        headers = self._sanitize_replay_headers(request.headers or {})
+        return await verifier.send_request(
+            request.url,
+            request.method,
+            request.params,
+            request.data,
+            headers=headers or None,
+            cookies=request.cookies or None,
+            json_body=request.json_body,
+            test_phase=test_phase,
+            parameter="",
+        )
+
+    def _build_request_for_value(self, target: AttackTarget, value: Any) -> PreparedAttackRequest:
+        if target.location == ParameterLocation.path and target.parameter.startswith("__path_seg_"):
+            return PreparedAttackRequest(
+                url=self._replace_concrete_path_segment(target.url, target.parameter, str(value)),
+                method=target.method.upper(),
+                headers=target.headers or None,
+                cookies=target.cookies or None,
+            )
+        return target.build_request(value)
+
+    @staticmethod
+    def _replace_concrete_path_segment(url: str, parameter: str, value: str) -> str:
+        match = re.match(r"__path_seg_(?P<index>\d+)__:(?P<original>.*)", parameter)
+        if not match:
+            return url
+        index = int(match.group("index"))
+        original = match.group("original")
+        parsed = urlparse(url)
+        segments = parsed.path.split("/")
+        non_empty_index = -1
+        for i, segment in enumerate(segments):
+            if not segment:
+                continue
+            non_empty_index += 1
+            if non_empty_index == index and segment == original:
+                segments[i] = value
+                break
+        return urlunparse(parsed._replace(path="/".join(segments)))
+
+    def _request_from_observation(self, observation: RequestObservation) -> PreparedAttackRequest | None:
+        method = str(getattr(observation, "method", "GET") or "GET").upper()
+        headers = self._sanitize_replay_headers(getattr(observation, "request_headers", {}) or {})
+        post_data = getattr(observation, "post_data", None)
+        json_body = self._parse_json(post_data)
+        data = None
+        if json_body is None and isinstance(post_data, str) and post_data.strip():
+            data = dict(parse_qsl(post_data, keep_blank_values=True)) or None
+        return PreparedAttackRequest(
+            url=str(getattr(observation, "url", "") or ""),
+            method=method,
+            data=data,
+            json_body=json_body,
+            headers=headers or None,
+        )
+
+    def _request_from_endpoint(self, endpoint: ApiEndpoint) -> PreparedAttackRequest | None:
+        url = endpoint.url
+        if "{" in url or re.search(r"/:[A-Za-z_]", url):
+            params = [p for p in self._parameters_from_endpoint(endpoint) if p.location == ParameterLocation.path]
+            if not params:
+                return None
+            target = AttackTarget(
+                url=url,
+                parameter=params[0].name,
+                method=endpoint.method,
+                value=params[0].baseline_value,
+                location=ParameterLocation.path,
+                source="api_path",
+            )
+            built = self._build_request_for_value(target, params[0].baseline_value or "1")
+            if "{" in built.url or re.search(r"/:[A-Za-z_]", built.url):
+                return None
+            return built
+
+        headers = self._sanitize_replay_headers(endpoint.headers or {})
+        body = self._parse_json(endpoint.request_body)
+        data = None
+        if body is None and isinstance(endpoint.request_body, str):
+            data = dict(parse_qsl(endpoint.request_body, keep_blank_values=True)) or None
+        return PreparedAttackRequest(
+            url=url,
+            method=endpoint.method.upper(),
+            data=data,
+            json_body=body,
+            headers=headers or None,
+        )
+
+    @staticmethod
+    def _parameters_from_endpoint(endpoint: ApiEndpoint) -> list[ParameterCandidate]:
+        from app.core.crawler.api_extractor import ApiExtractor
+
+        return ApiExtractor.parameters_from_endpoint(endpoint)
+
+    def _concrete_path_idor_targets(self, urls: list[str]) -> list[AttackTarget]:
+        targets: list[AttackTarget] = []
         for url in urls:
             parsed = urlparse(url)
             segments = [s for s in parsed.path.split("/") if s]
             for i, segment in enumerate(segments):
                 if _NUMERIC_RE.match(segment) or _UUID_RE.match(segment):
-                    idor_candidates.add((url, f"__path_seg_{i}__:{segment}", "GET", segment))
-
-        # --- Form inputs ---
-        for form in forms:
-            form_url: str = getattr(form, "action", getattr(form, "page_url", "")) or ""
-            form_method: str = getattr(form, "method", "POST").upper()
-            for inp in getattr(form, "inputs", []):
-                inp_name: str = getattr(inp, "name", "") or ""
-                inp_value: str = str(getattr(inp, "value", "") or "")
-                if self._is_idor_param(inp_name) and _is_valid_id_value(inp_value):
-                    idor_candidates.add((form_url, inp_name, form_method, inp_value))
-
-        if not idor_candidates:
-            return findings
-
-        async def _verify(cand: tuple[str, str, str, str]) -> list[Finding]:
-            cand_url, param, method, val = cand
-            cand_findings: list[Finding] = []
-
-            mutated_vals = _mutate_id(val)
-
-            async with semaphore:
-                try:
-                    # -------------------------------------------------------
-                    # Step 1 (Burp-style): unauthenticated baseline for the
-                    # ORIGINAL value.  If the original resource is already
-                    # publicly accessible, IDOR is not applicable — any user
-                    # can already reach it without credentials.
-                    # -------------------------------------------------------
-                    unauth_own_url, unauth_own_params, unauth_own_data = URLParameterBuilder.inject_parameter(
-                        cand_url, param, val, method
+                    targets.append(
+                        AttackTarget(
+                            url=url,
+                            parameter=f"__path_seg_{i}__:{segment}",
+                            method="GET",
+                            value=segment,
+                            location=ParameterLocation.path,
+                            source="path_segment",
+                            security_relevance={"access_control"},
+                        )
                     )
-                    unauth_own_resp = await unauthed_verifier.send_request(
-                        unauth_own_url, method, unauth_own_params, unauth_own_data,
-                        test_phase="idor_unauth_own"
-                    )
+        return targets
 
-                    if (
-                        unauth_own_resp.status_code == 200
-                        and not _looks_like_login_page(unauth_own_resp.body)
-                        and not _looks_like_error_page(unauth_own_resp.body)
-                    ):
-                        # The original resource is publicly accessible → skip
-                        logger.debug(
-                            "IDOR skip: original resource is public at %s param=%s val=%s",
-                            cand_url, param, val,
-                        )
-                        return []
+    def _baseline_values_for_target(
+        self,
+        target: AttackTarget,
+        response_ids: dict[str, set[str]],
+    ) -> list[str]:
+        values: list[str] = []
+        raw = str(target.value if target.value is not None else "")
+        if _is_valid_id_value(raw):
+            values.append(raw)
+        elif raw in {"", "test", "sample.txt"} and self._target_has_access_control_relevance(target):
+            values.append("1")
 
-                    # -------------------------------------------------------
-                    # Step 2: Authenticated request for the ORIGINAL value
-                    # (the "own resource" baseline).
-                    # -------------------------------------------------------
-                    auth_own_url, auth_own_params, auth_own_data = URLParameterBuilder.inject_parameter(
-                        cand_url, param, val, method
-                    )
-                    auth_own_resp = await authed_verifier.send_request(
-                        auth_own_url, method, auth_own_params, auth_own_data,
-                        test_phase="idor_authed_own"
-                    )
+        param_key = self._normalize_param_name(target.parameter)
+        for key, ids in response_ids.items():
+            if key == param_key or key.endswith(param_key) or param_key.endswith(key):
+                for value in ids:
+                    if value not in values:
+                        values.append(value)
+        for value in response_ids.get("*", set()):
+            if len(values) >= 3:
+                break
+            if value not in values:
+                values.append(value)
+        return values[:3]
 
-                    # If authenticated session cannot reach its own resource,
-                    # the session cookie is invalid / expired — skip entirely.
-                    if auth_own_resp.status_code not in (200, 201):
-                        logger.debug(
-                            "IDOR skip: authed session cannot access own resource %s param=%s",
-                            cand_url, param,
-                        )
-                        return []
+    def _response_body_ids(self, requests: list[RequestObservation]) -> dict[str, set[str]]:
+        ids: dict[str, set[str]] = {"*": set()}
+        for request in requests:
+            body = self._parse_json(getattr(request, "response_snippet", None))
+            self._collect_json_ids(body, ids)
+        return ids
 
-                    # If the own resource response itself looks like an error
-                    # page, we have no meaningful baseline to compare against.
-                    if _looks_like_error_page(auth_own_resp.body):
-                        logger.debug(
-                            "IDOR skip: own resource response looks like an error page %s param=%s",
-                            cand_url, param,
-                        )
-                        return []
+    def _collect_json_ids(self, value: Any, ids: dict[str, set[str]], parent: str = "") -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                path = f"{parent}.{key}" if parent else key
+                if isinstance(child, (str, int)):
+                    child_value = str(child)
+                    if self._is_idor_param(key) and _is_valid_id_value(child_value):
+                        normalized = self._normalize_param_name(key)
+                        ids.setdefault(normalized, set()).add(child_value)
+                        ids["*"].add(child_value)
+                self._collect_json_ids(child, ids, path)
+        elif isinstance(value, list):
+            for child in value[:10]:
+                self._collect_json_ids(child, ids, parent)
 
-                    # -------------------------------------------------------
-                    # Step 3 (Burp-style differential): for each mutated ID,
-                    # fetch with authenticated session AND unauthenticated
-                    # session, then apply the differential verdict.
-                    # -------------------------------------------------------
-                    for mutated_val in mutated_vals:
-                        # Authenticated request for mutated ID
-                        auth_mod_url, auth_mod_params, auth_mod_data = URLParameterBuilder.inject_parameter(
-                            cand_url, param, mutated_val, method
-                        )
-                        auth_mod_resp = await authed_verifier.send_request(
-                            auth_mod_url, method, auth_mod_params, auth_mod_data,
-                            test_phase="idor_authed_mod"
-                        )
+    @staticmethod
+    def _parse_json(value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return value
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
 
-                        if auth_mod_resp.status_code not in (200, 201):
-                            continue
-                        if _looks_like_login_page(auth_mod_resp.body):
-                            continue
+    @staticmethod
+    def _sanitize_replay_headers(headers: dict[str, str]) -> dict[str, str]:
+        stripped = {}
+        blocked = {
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-api-key",
+            "api-key",
+            "host",
+            "content-length",
+        }
+        for key, value in headers.items():
+            if key.lower() in blocked:
+                continue
+            stripped[key] = value
+        return stripped
 
-                        # Unauthenticated request for the MUTATED value
-                        # (Burp-style: check if the mutated resource is itself public)
-                        unauth_mod_url, unauth_mod_params, unauth_mod_data = URLParameterBuilder.inject_parameter(
-                            cand_url, param, mutated_val, method
-                        )
-                        unauth_mod_resp = await unauthed_verifier.send_request(
-                            unauth_mod_url, method, unauth_mod_params, unauth_mod_data,
-                            test_phase="idor_unauth_mod"
-                        )
-                        mutated_unauthed_body: str | None = (
-                            unauth_mod_resp.body
-                            if unauth_mod_resp.status_code == 200
-                            and not _looks_like_login_page(unauth_mod_resp.body)
-                            and not _looks_like_error_page(unauth_mod_resp.body)
-                            else None
-                        )
+    def _response_profile(self, response) -> _ResponseProfile:
+        if response is None:
+            return _ResponseProfile(0, "", False, False)
+        content_type = str((response.headers or {}).get("content-type", "")).lower()
+        parsed = self._parse_json(response.body)
+        is_json = isinstance(parsed, (dict, list)) or "json" in content_type
+        json_shape: set[str] = set()
+        identifiers: set[str] = set()
+        sensitive_fields: set[str] = set()
+        item_count = 0
 
-                        # Apply Burp-style differential verdict
-                        is_idor, similarity, reason = _differential_idor_verdict(
-                            own_body=auth_own_resp.body,
-                            mutated_authed_body=auth_mod_resp.body,
-                            mutated_unauthed_body=mutated_unauthed_body,
-                        )
+        def walk(value: Any, path: str = "") -> None:
+            nonlocal item_count
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    child_path = f"{path}.{key}" if path else key
+                    json_shape.add(child_path)
+                    lowered = key.lower()
+                    if self._is_sensitive_field(lowered):
+                        sensitive_fields.add(child_path)
+                    if self._is_idor_param(key) and isinstance(child, (str, int)):
+                        child_value = str(child)
+                        if _is_valid_id_value(child_value):
+                            identifiers.add(f"{self._normalize_param_name(key)}={child_value}")
+                    walk(child, child_path)
+            elif isinstance(value, list):
+                item_count = max(item_count, len(value))
+                for child in value[:10]:
+                    walk(child, path + "[]")
 
-                        if not is_idor:
-                            logger.debug(
-                                "IDOR false-positive suppressed at %s param=%s mutated=%s: %s",
-                                cand_url, param, mutated_val, reason,
-                            )
-                            continue
+        if parsed is not None:
+            walk(parsed)
 
-                        cand_findings.append(
-                            Finding(
-                                category=OwaspCategory.a01,
-                                vuln_type="Insecure Direct Object Reference (IDOR)",
-                                severity=SeverityLevel.high,
-                                url=cand_url,
-                                parameter=param,
-                                method=method,
-                                payload=mutated_val,
-                                evidence=(
-                                    f"Horizontal privilege escalation: authenticated session accessed "
-                                    f"'{param}'={mutated_val} (modified from owned value '{val}'). "
-                                    f"Unauthenticated baseline for original value returned HTTP "
-                                    f"{unauth_own_resp.status_code}. "
-                                    f"Unauthenticated access to mutated value: "
-                                    f"{'blocked' if mutated_unauthed_body is None else 'public (skipped)'}. "
-                                    f"Body similarity (own vs mutated): {similarity:.0%}. "
-                                    f"Differential verdict: {reason}."
-                                ),
-                                verified=True,
-                                verification_request_snippet=auth_mod_resp.request_snippet,
-                                verification_response_snippet=auth_mod_resp.response_snippet,
-                                reproducible=True,
-                            )
-                        )
-                        # One confirmed finding per param is enough; stop mutating.
-                        break
+        return _ResponseProfile(
+            status_code=response.status_code,
+            content_type=content_type,
+            success=response.status_code in (200, 201, 202, 206),
+            is_json=is_json,
+            json_shape=frozenset(json_shape),
+            identifiers=frozenset(identifiers),
+            sensitive_fields=frozenset(sensitive_fields),
+            item_count=item_count,
+            body_length=len(response.body or ""),
+        )
 
-                    # -------------------------------------------------------
-                    # Step 4: Vertical privilege escalation (if a high-priv
-                    # session was supplied).
-                    # -------------------------------------------------------
-                    if privileged_verifier and not cand_findings:
-                        for mutated_val in mutated_vals:
-                            priv_url, priv_params, priv_data = URLParameterBuilder.inject_parameter(
-                                cand_url, param, mutated_val, method
-                            )
-                            priv_resp = await privileged_verifier.send_request(
-                                priv_url, method, priv_params, priv_data,
-                                test_phase="vertical_priv_check"
-                            )
-                            auth_check_url, auth_check_params, auth_check_data = URLParameterBuilder.inject_parameter(
-                                cand_url, param, mutated_val, method
-                            )
-                            auth_check_resp = await authed_verifier.send_request(
-                                auth_check_url, method, auth_check_params, auth_check_data,
-                                test_phase="vertical_authed_check"
-                            )
-                            if (
-                                priv_resp.status_code in (200, 201)
-                                and auth_check_resp.status_code in (200, 201)
-                                and not _looks_like_login_page(auth_check_resp.body)
-                                and not _looks_like_error_page(auth_check_resp.body)
-                            ):
-                                similarity = _body_similarity(priv_resp.body, auth_check_resp.body)
-                                if similarity > 0.7:
-                                    cand_findings.append(
-                                        Finding(
-                                            category=OwaspCategory.a01,
-                                            vuln_type="Vertical Privilege Escalation (IDOR)",
-                                            severity=SeverityLevel.critical,
-                                            url=cand_url,
-                                            parameter=param,
-                                            method=method,
-                                            payload=mutated_val,
-                                            evidence=(
-                                                f"Low-privilege session accessed resource "
-                                                f"'{param}'={mutated_val} which is also accessible to a "
-                                                f"high-privilege session (body similarity: {similarity:.0%}). "
-                                                f"Possible vertical privilege escalation."
-                                            ),
-                                            verified=True,
-                                            verification_request_snippet=auth_check_resp.request_snippet,
-                                            verification_response_snippet=auth_check_resp.response_snippet,
-                                            reproducible=True,
-                                        )
-                                    )
-                                    break
+    def _matrix_evidence(
+        self,
+        unauth: _ResponseProfile,
+        low: _ResponseProfile,
+        second: _ResponseProfile | None,
+        privileged: _ResponseProfile | None,
+        target: _MatrixTarget,
+    ) -> dict[str, Any]:
+        return {
+            "source": target.source,
+            "parameter_location": target.parameter_location,
+            "has_object_reference": target.has_object_reference,
+            "admin_like": target.admin_like,
+            "states": {
+                "unauthenticated": self._profile_summary(unauth),
+                "low": self._profile_summary(low),
+                "second": self._profile_summary(second) if second else None,
+                "privileged": self._profile_summary(privileged) if privileged else None,
+            },
+        }
 
-                except Exception:
-                    logger.exception("IDOR verification failed for %s param=%s", cand_url, param)
+    @staticmethod
+    def _profile_summary(profile: _ResponseProfile) -> dict[str, Any]:
+        return {
+            "status_code": profile.status_code,
+            "success": profile.success,
+            "is_json": profile.is_json,
+            "json_shape": sorted(profile.json_shape)[:20],
+            "identifiers": sorted(profile.identifiers)[:20],
+            "sensitive_fields": sorted(profile.sensitive_fields)[:20],
+            "item_count": profile.item_count,
+        }
 
-            return cand_findings
+    def _profiles_compatible(
+        self,
+        left: _ResponseProfile,
+        right: _ResponseProfile,
+        left_body: str,
+        right_body: str,
+    ) -> bool:
+        if not left.success or not right.success:
+            return False
+        if left.is_json and right.is_json:
+            if left.json_shape and right.json_shape:
+                overlap = len(left.json_shape & right.json_shape)
+                smaller = max(1, min(len(left.json_shape), len(right.json_shape)))
+                if overlap / smaller >= 0.70:
+                    return True
+            if self._shared_identifiers(left, right):
+                return True
+        return _body_similarity(left_body or "", right_body or "") > 0.85
 
-        results = await asyncio.gather(*[_verify(c) for c in idor_candidates])
-        for r in results:
-            findings.extend(r)
-        return findings
+    @staticmethod
+    def _shared_identifiers(left: _ResponseProfile, right: _ResponseProfile) -> set[str]:
+        return set(left.identifiers & right.identifiers)
+
+    @staticmethod
+    def _profile_has_sensitive_data(profile: _ResponseProfile) -> bool:
+        return bool(profile.sensitive_fields or profile.identifiers or profile.item_count > 0)
+
+    @staticmethod
+    def _profile_exposes_nonpublic_data(target: _MatrixTarget, profile: _ResponseProfile) -> bool:
+        return target.admin_like or bool(profile.sensitive_fields)
+
+    @staticmethod
+    def _is_sensitive_field(name: str) -> bool:
+        return any(
+            token in name
+            for token in (
+                "email",
+                "username",
+                "password",
+                "passwd",
+                "token",
+                "secret",
+                "role",
+                "permission",
+                "address",
+                "phone",
+                "balance",
+                "credit",
+                "card",
+                "ssn",
+                "jwt",
+                "api_key",
+                "apikey",
+            )
+        )
+
+    def _target_has_access_control_relevance(self, target: AttackTarget) -> bool:
+        if "access_control" in target.security_relevance:
+            return True
+        return self._is_idor_param(target.parameter)
+
+    def _request_has_object_reference(self, request: PreparedAttackRequest) -> bool:
+        parsed = urlparse(request.url)
+        if any(_NUMERIC_RE.match(seg) or _UUID_RE.match(seg) for seg in parsed.path.split("/") if seg):
+            return True
+        if any(self._is_idor_param(name) for name, _ in parse_qsl(parsed.query, keep_blank_values=True)):
+            return True
+        body = request.json_body if request.json_body is not None else request.data
+        return self._body_has_idor_key(body)
+
+    def _body_has_idor_key(self, value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(self._is_idor_param(str(key)) or self._body_has_idor_key(child) for key, child in value.items())
+        if isinstance(value, list):
+            return any(self._body_has_idor_key(child) for child in value[:5])
+        return False
+
+    def _is_matrix_relevant_param(self, name: str) -> bool:
+        return self._is_idor_param(name) or any(
+            token in name.lower()
+            for token in ("role", "admin", "tenant", "org", "owner", "account", "user")
+        )
+
+    def _is_public_resource_response(self, response) -> bool:
+        return (
+            response.status_code == 200
+            and not _looks_like_login_page(response.body)
+            and not _looks_like_error_page(response.body)
+        )
+
+    def _is_replayable_matrix_request(self, request: PreparedAttackRequest) -> bool:
+        if not request.url or "{" in request.url or re.search(r"/:[A-Za-z_]", request.url):
+            return False
+        method = request.method.upper()
+        if method in {"OPTIONS", "HEAD"}:
+            return False
+        if method == "DELETE":
+            return False
+        if method in {"POST", "PUT", "PATCH"} and request.data is None and request.json_body is None:
+            return False
+        path = urlparse(request.url).path.lower()
+        destructive_tokens = ("delete", "remove", "purchase", "checkout", "pay", "transfer", "withdraw")
+        settings = get_settings()
+        if getattr(settings, "scan_mode", "verified") != "aggressive" and any(token in path for token in destructive_tokens):
+            return False
+        return True
+
+    def _is_admin_like_url(self, url: str) -> bool:
+        lowered = urlparse(url).path.lower()
+        return any(token in lowered for token in self.sensitive_path_tokens)
+
+    @staticmethod
+    def _canonical_request_url(url: str) -> str:
+        parsed = urlparse(url)
+        query_names = "&".join(sorted(name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)))
+        suffix = f"?{query_names}" if query_names else ""
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}{suffix}".lower()
+
+    def _body_schema_key(self, value: Any) -> str:
+        if value is None:
+            return ""
+        paths: set[str] = set()
+
+        def walk(child: Any, prefix: str = "") -> None:
+            if isinstance(child, dict):
+                for key, grandchild in child.items():
+                    path = f"{prefix}.{key}" if prefix else str(key)
+                    paths.add(path)
+                    walk(grandchild, path)
+            elif isinstance(child, list):
+                for item in child[:1]:
+                    walk(item, prefix + "[]")
+
+        walk(value)
+        return "|".join(sorted(paths))
+
+    @staticmethod
+    def _parse_cookie_string(value: object) -> dict[str, str]:
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items()}
+        if not isinstance(value, str):
+            return {}
+        cookies: dict[str, str] = {}
+        for cookie in value.split(";"):
+            cookie = cookie.strip()
+            if "=" in cookie:
+                key, val = cookie.split("=", 1)
+                cookies[key.strip()] = val.strip()
+        return cookies
+
+    @staticmethod
+    def _parse_header_string(value: object) -> dict[str, str]:
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items()}
+        if not isinstance(value, str) or ":" not in value:
+            return {}
+        key, val = value.split(":", 1)
+        return {key.strip(): val.strip()} if key.strip() and val.strip() else {}
+
+    def _build_auth_material(
+        self,
+        *,
+        label: str,
+        cookie_value: object,
+        header_value: object,
+    ) -> _AuthMaterial:
+        return _AuthMaterial(
+            label=label,
+            cookies=self._parse_cookie_string(cookie_value),
+            headers=self._parse_header_string(header_value),
+        )
+
+    @staticmethod
+    def _normalize_param_name(name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", name.lower())
 
     # ---------------------------------------------------------------------------
     # Helpers
