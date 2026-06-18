@@ -12,11 +12,10 @@ import logging
 from typing import Optional
 
 from app.config import get_settings
-from app.core.detectors.attack_surface import build_json_body
+from app.core.detectors.attack_surface import AttackTarget
 from app.core.verification.response_analyzer import ResponseAnalyzer
 from app.core.verification.verification_framework import (
     BaseVerifier,
-    URLParameterBuilder,
     VerificationResult,
 )
 from app.core.crawler.models import ParameterLocation
@@ -72,17 +71,20 @@ class CommandInjectionVerifier(BaseVerifier):
         form_inputs: Optional[list] = None,
         target: Optional[object] = None,
     ) -> tuple[str, Optional[dict], Optional[dict], Optional[object], Optional[dict]]:
-        if target is not None and getattr(target, "location", None) in {
-            ParameterLocation.json_body,
-            ParameterLocation.graphql_variable,
-        }:
-            json_body = build_json_body(getattr(target, "json_template", None), target, value)
-            return url, None, None, json_body, getattr(target, "headers", None)
+        if isinstance(target, AttackTarget):
+            prepared = target.build_request(value)
+            return prepared.url, prepared.params, prepared.data, prepared.json_body, prepared.headers
 
-        request_url, params, data = URLParameterBuilder.inject_parameter(
-            url, parameter, value, method, form_inputs
+        location = ParameterLocation.form if method.upper() == "POST" and form_inputs is not None else ParameterLocation.query
+        fallback_target = AttackTarget(
+            url=url,
+            parameter=parameter,
+            method=method,
+            form_inputs=form_inputs,
+            location=location,
         )
-        return request_url, params, data, None, None
+        prepared = fallback_target.build_request(value)
+        return prepared.url, prepared.params, prepared.data, prepared.json_body, prepared.headers
 
     async def verify(
         self,

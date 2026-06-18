@@ -137,3 +137,39 @@ def test_api_extractor_normalizes_js_template_query_parameter():
     assert params[0].name == "q"
     assert params[0].location == ParameterLocation.query
     assert "injection_xss" in params[0].security_relevance
+
+
+def test_api_extractor_infers_json_body_schema_from_fetch():
+    script = """
+    fetch('/api/login', {
+      method: 'POST',
+      body: JSON.stringify({ email: userEmail, password: password, basketId: id })
+    })
+    """
+
+    _, endpoints = ApiExtractor.extract_from_javascript("http://localhost:3000/main.js", script)
+
+    endpoint = next(endpoint for endpoint in endpoints if endpoint.url == "http://localhost:3000/api/login")
+    assert endpoint.request_body == {
+        "email": "scanner@example.com",
+        "password": "Password123!",
+        "basketId": 1,
+    }
+    params = ApiExtractor.parameters_from_endpoint(endpoint)
+    assert {param.name for param in params} >= {"email", "password", "basketId"}
+    assert all(param.location == ParameterLocation.json_body for param in params)
+
+
+def test_api_extractor_infers_formdata_schema_from_fetch():
+    script = """
+    const data = new FormData()
+    data.append('avatarFile', file)
+    data.append('userId', user.id)
+    fetch('/api/upload', { method: 'POST', body: data })
+    """
+
+    _, endpoints = ApiExtractor.extract_from_javascript("http://localhost:3000/main.js", script)
+
+    endpoint = next(endpoint for endpoint in endpoints if endpoint.url == "http://localhost:3000/api/upload")
+    assert endpoint.content_type == "multipart/form-data"
+    assert endpoint.request_body == {"avatarFile": "sample.txt", "userId": 1}

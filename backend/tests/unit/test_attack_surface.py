@@ -41,3 +41,88 @@ def test_attack_surface_extracts_browser_observed_json_request():
     assert target.location == ParameterLocation.json_body
     assert target.source == "browser_request"
     assert build_json_body(target.json_template, target, "http://127.0.0.1/")["url"] == "http://127.0.0.1/"
+
+
+def test_attack_target_builds_query_request():
+    target = AttackSurface.build(["http://example.com/search?q=test"], [], filter_fn=lambda name: name == "q")[0]
+
+    request = target.build_request("payload")
+
+    assert request.method == "GET"
+    assert request.url == "http://example.com/search?q=payload"
+    assert request.params is None
+    assert request.data is None
+
+
+def test_attack_target_builds_path_template_request():
+    endpoint = ApiEndpoint(url="http://example.com/api/users/{userId}", method="GET")
+    target = AttackSurface.build([], [], api_endpoints=[endpoint], filter_fn=lambda name: name == "userId")[0]
+
+    request = target.build_request("42")
+
+    assert request.url == "http://example.com/api/users/42"
+    assert request.method == "GET"
+
+
+def test_attack_target_builds_form_request_with_sibling_values():
+    class Input:
+        def __init__(self, name, input_type="text", value=""):
+            self.name = name
+            self.input_type = input_type
+            self.value = value
+
+    class Form:
+        action = "http://example.com/comment"
+        method = "POST"
+        inputs = [Input("comment"), Input("csrf", "hidden", "abc"), Input("Submit", "submit", "Save")]
+
+    target = AttackSurface.build([], [Form()], filter_fn=lambda name: name == "comment")[0]
+
+    request = target.build_request("<x>")
+
+    assert request.url == "http://example.com/comment"
+    assert request.data == {"comment": "<x>", "csrf": "abc", "Submit": "Save"}
+
+
+def test_attack_target_builds_json_request():
+    endpoint = ApiEndpoint(
+        url="http://example.com/api/search",
+        method="POST",
+        request_body={"query": "alice", "filters": {"user_id": 7}},
+        headers={"Authorization": "Bearer token"},
+    )
+    targets = AttackSurface.build([], [], api_endpoints=[endpoint], filter_fn=lambda name: name == "user_id")
+    target = next(target for target in targets if target.parent_path == "filters.user_id")
+
+    request = target.build_request("9")
+
+    assert request.url == "http://example.com/api/search"
+    assert request.method == "POST"
+    assert request.json_body == {"query": "alice", "filters": {"user_id": "9"}}
+    assert request.headers == {"Authorization": "Bearer token", "Content-Type": "application/json"}
+
+
+def test_attack_target_builds_header_and_cookie_requests():
+    header_target = AttackSurface.build(
+        [],
+        [],
+        parameters=[],
+        api_endpoints=[],
+        requests=[],
+    )
+    from app.core.detectors.attack_surface import AttackTarget
+
+    header = AttackTarget(
+        url="http://example.com/",
+        parameter="X-Test",
+        location=ParameterLocation.header,
+    ).build_request("canary")
+    cookie = AttackTarget(
+        url="http://example.com/",
+        parameter="session",
+        location=ParameterLocation.cookie,
+    ).build_request("canary")
+
+    assert header.headers == {"X-Test": "canary"}
+    assert cookie.cookies == {"session": "canary"}
+    assert header_target == []

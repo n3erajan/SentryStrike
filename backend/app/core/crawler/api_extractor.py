@@ -37,6 +37,7 @@ class ApiExtractor:
         endpoints: list[ApiEndpoint] = []
         seen_routes: set[str] = set()
         seen_endpoints: set[tuple[str, str, str]] = set()
+        endpoint_by_key: dict[tuple[str, str, str], ApiEndpoint] = {}
 
         def add_route(path: str) -> None:
             if not path or path.startswith(("http://", "https://", "//")):
@@ -47,21 +48,52 @@ class ApiExtractor:
                 seen_routes.add(absolute)
                 routes.append(absolute)
 
-        def add_endpoint(path: str, method: str = "GET", operation: str | None = None, evidence: str = "") -> None:
+        def add_endpoint(
+            path: str,
+            method: str = "GET",
+            operation: str | None = None,
+            evidence: str = "",
+            request_body: Any = None,
+            content_type: str | None = None,
+        ) -> None:
             normalized_path = cls.normalize_template_url(path)
             absolute = normalize_url(base_url, normalized_path)
             key = (absolute, method.upper(), operation or "")
+            existing = endpoint_by_key.get(key)
+            if existing is not None:
+                if request_body is not None and existing.request_body is None:
+                    existing.request_body = request_body
+                if content_type and not existing.content_type:
+                    existing.content_type = content_type
+                if evidence and existing.evidence != "fetch/xhr":
+                    existing.evidence = evidence
+                return
+
+            if evidence == "fetch/xhr":
+                for existing_key, existing_endpoint in list(endpoint_by_key.items()):
+                    if (
+                        existing_endpoint.url == absolute
+                        and (existing_endpoint.operation or "") == (operation or "")
+                        and existing_endpoint.evidence not in {"fetch/xhr", "graphql"}
+                        and existing_endpoint.request_body is None
+                    ):
+                        endpoints.remove(existing_endpoint)
+                        seen_endpoints.discard(existing_key)
+                        endpoint_by_key.pop(existing_key, None)
+
             if key not in seen_endpoints:
                 seen_endpoints.add(key)
-                endpoints.append(
-                    ApiEndpoint(
-                        url=absolute,
-                        method=method.upper(),
-                        source=RouteSource.javascript,
-                        operation=operation,
-                        evidence=evidence or path,
-                    )
+                endpoint = ApiEndpoint(
+                    url=absolute,
+                    method=method.upper(),
+                    source=RouteSource.javascript,
+                    content_type=content_type,
+                    operation=operation,
+                    request_body=request_body,
+                    evidence=evidence or path,
                 )
+                endpoint_by_key[key] = endpoint
+                endpoints.append(endpoint)
 
         for match in cls.ENDPOINT_RE.finditer(script_text):
             path = match.group("path")
@@ -74,7 +106,14 @@ class ApiExtractor:
         for match in cls.FETCH_RE.finditer(script_text):
             path = match.group("path")
             if cls._looks_api_path(path):
-                add_endpoint(path, cls._infer_method_near(script_text, match.start()), evidence="fetch/xhr")
+                body, content_type = cls._infer_request_schema_near(script_text, match.start())
+                add_endpoint(
+                    path,
+                    cls._infer_method_near(script_text, match.start()),
+                    evidence="fetch/xhr",
+                    request_body=body,
+                    content_type=content_type,
+                )
 
         for regex in (cls.ROUTE_ARRAY_RE, cls.REACT_ROUTER_RE, cls.ANGULAR_ROUTE_RE):
             for match in regex.finditer(script_text):
@@ -87,7 +126,7 @@ class ApiExtractor:
         operation_names = [name for _, name in operations] or [None]
         for path in graphql_paths:
             for operation in operation_names:
-                add_endpoint(path, "POST", operation=operation, evidence="graphql")
+                add_endpoint(path, "POST", operation=operation, evidence="graphql", request_body=script_text)
 
         return routes, endpoints
 
@@ -251,6 +290,56 @@ class ApiExtractor:
         return lowered in {"baseurl", "apiurl", "host", "server", "hostserver"} or any(
             token in lowered for token in ("base", "api", "host", "server", "origin")
         )
+
+    @classmethod
+    def _infer_request_schema_near(cls, script_text: str, start: int) -> tuple[Any, str | None]:
+        window = script_text[max(0, start - 800) : start + 1200]
+
+        append_names = re.findall(r"\.append\s*\(\s*[\"'](?P<name>[A-Za-z_][A-Za-z0-9_-]*)[\"']", window)
+        if "FormData" in window and append_names:
+            return {name: cls._baseline_for_name(name) for name in append_names}, "multipart/form-data"
+
+        search_params = re.findall(r"\.(?:set|append)\s*\(\s*[\"'](?P<name>[A-Za-z_][A-Za-z0-9_-]*)[\"']", window)
+        if "URLSearchParams" in window and search_params:
+            return {name: cls._baseline_for_name(name) for name in search_params}, "application/x-www-form-urlencoded"
+
+        json_match = re.search(r"JSON\.stringify\s*\(\s*(?P<object>\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})", window, re.S)
+        if json_match:
+            return cls._object_literal_template(json_match.group("object")), "application/json"
+
+        object_match = re.search(r",\s*(?P<object>\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})\s*\)?", window, re.S)
+        if object_match and any(token in object_match.group("object").lower() for token in ("email", "password", "id", "query", "url", "name", "body")):
+            return cls._object_literal_template(object_match.group("object")), "application/json"
+
+        return None, None
+
+    @classmethod
+    def _object_literal_template(cls, literal: str) -> dict[str, Any]:
+        template: dict[str, Any] = {}
+        for match in re.finditer(r"(?:[\"'](?P<quoted>[^\"']+)[\"']|(?P<bare>[A-Za-z_$][A-Za-z0-9_$]*))\s*:", literal):
+            key = match.group("quoted") or match.group("bare")
+            if key:
+                template[key] = cls._baseline_for_name(key)
+        return template
+
+    @staticmethod
+    def _baseline_for_name(name: str) -> Any:
+        lowered = name.lower()
+        if lowered in {"id", "userid", "user_id", "accountid", "account_id", "orderid", "order_id", "quantity", "qty"}:
+            return 1
+        if lowered.endswith("id") or lowered.endswith("_id") or lowered.endswith("-id"):
+            return 1
+        if "email" in lowered:
+            return "scanner@example.com"
+        if "password" in lowered:
+            return "Password123!"
+        if "url" in lowered or "uri" in lowered:
+            return "https://example.com/"
+        if lowered in {"q", "query", "search", "term"}:
+            return "test"
+        if "file" in lowered:
+            return "sample.txt"
+        return "test"
 
     @staticmethod
     def _looks_state_changing(path: str) -> bool:

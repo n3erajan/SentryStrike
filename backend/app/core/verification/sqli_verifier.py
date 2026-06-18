@@ -56,11 +56,10 @@ from typing import Optional
 
 from app.config import get_settings
 from app.core.crawler.models import ParameterLocation
-from app.core.detectors.attack_surface import build_json_body
+from app.core.detectors.attack_surface import AttackTarget
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
 from app.core.verification.verification_framework import (
     BaseVerifier,
-    FormPayloadBuilder,
     URLParameterBuilder,
     VerificationResult,
 )
@@ -432,21 +431,39 @@ class SQLiVerifier(BaseVerifier):
         target: Optional[object] = None,
     ) -> tuple[str, Optional[dict], Optional[dict], Optional[object], Optional[dict]]:
         
+        if isinstance(target, AttackTarget):
+            prepared = target.build_request(payload_value, merge_with_baseline=inject)
+            return (
+                prepared.url,
+                prepared.params,
+                prepared.data,
+                prepared.json_body,
+                prepared.headers,
+            )
+
         if inject:
             payload_value = f"{baseline_value}{payload_value}"
 
         if method.upper() == "POST" and form_inputs is not None:
-            data = FormPayloadBuilder.build(form_inputs, parameter, payload_value)
-            return url, None, data, None, None
+            target = AttackTarget(
+                url=url,
+                parameter=parameter,
+                method=method,
+                form_inputs=form_inputs,
+                location=ParameterLocation.form,
+            )
+            prepared = target.build_request(payload_value, merge_with_baseline=inject)
+            return prepared.url, prepared.params, prepared.data, prepared.json_body, prepared.headers
 
-        if target is not None and getattr(target, "location", None) in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
-            json_body = build_json_body(getattr(target, "json_template", None), target, payload_value)
-            return url, None, None, json_body, getattr(target, "headers", None)
-
-        inj_url, inj_params, inj_data = URLParameterBuilder.inject_parameter(
-            url, parameter, payload_value, method, form_inputs=form_inputs
+        fallback_target = AttackTarget(
+            url=url,
+            parameter=parameter,
+            method=method,
+            form_inputs=form_inputs,
+            location=ParameterLocation.query,
         )
-        return inj_url, inj_params, inj_data, None, None
+        prepared = fallback_target.build_request(payload_value, merge_with_baseline=inject)
+        return prepared.url, prepared.params, prepared.data, prepared.json_body, prepared.headers
 
     # ======================================================================
     # Helper: page stability measurement

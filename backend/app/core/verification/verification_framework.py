@@ -16,7 +16,7 @@ import httpx
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import urlencode, urlparse, parse_qs, parse_qsl, urlunparse
+from urllib.parse import urlparse, parse_qsl
 
 from app.core.detectors.attack_surface import build_json_body
 from app.core.detectors.base_detector import Finding
@@ -689,39 +689,9 @@ class URLParameterBuilder:
         Returns:
             (url, params, data) tuple for httpx request
         """
-        parsed = urlparse(base_url)
-        query_params = parse_qs(parsed.query, keep_blank_values=True)
+        from app.core.detectors.attack_surface import inject_url_or_form_parameter
 
-        # Flatten single-element lists
-        for key in query_params:
-            if isinstance(query_params[key], list):
-                query_params[key] = query_params[key][0] if query_params[key] else ""
-
-        if form_inputs is not None:
-            payload = FormPayloadBuilder.build(form_inputs, parameter_name, parameter_value)
-            merged_params = {**query_params, **payload}
-            new_query = urlencode(merged_params, doseq=False)
-            new_parsed = parsed._replace(query=new_query)
-            new_url = urlunparse(new_parsed)
-
-            if method.upper() == "GET":
-                return new_url, {}, {}
-
-            return base_url, {}, merged_params
-
-        # Update or add parameter
-        query_params[parameter_name] = parameter_value
-
-        # Rebuild URL
-        new_query = urlencode(query_params, doseq=False)
-        new_parsed = parsed._replace(query=new_query)
-        new_url = urlunparse(new_parsed)
-
-        if method.upper() == "GET":
-            return new_url, {}, {}
-        else:
-            # For POST, put params in body
-            return base_url, {}, query_params
+        return inject_url_or_form_parameter(base_url, parameter_name, parameter_value, method, form_inputs)
 
 
 class FormPayloadBuilder:
@@ -750,26 +720,6 @@ class FormPayloadBuilder:
         Returns:
             Dict suitable for ``data=`` in an ``httpx`` POST request.
         """
-        payload: dict[str, str] = {}
-        for inp in form_inputs:
-            name = getattr(inp, "name", "")
-            if not name:
-                continue
-            inp_type = getattr(inp, "input_type", "text").lower()
-            if name == target_param:
-                payload[name] = target_value
-            elif inp_type == "password":
-                payload[name] = "sentry_password123"
-            elif inp_type in ("submit", "button"):
-                payload[name] = getattr(inp, "value", "Submit") or "Submit"
-            elif inp_type == "hidden":
-                # Preserve hidden fields (CSRF tokens, etc.)
-                payload[name] = getattr(inp, "value", "")
-            else:
-                payload[name] = getattr(inp, "value", "") or "sentry_test_val"
+        from app.core.detectors.attack_surface import build_form_payload
 
-        # Ensure the target parameter is always present
-        if target_param not in payload:
-            payload[target_param] = target_value
-
-        return payload
+        return build_form_payload(form_inputs, target_param, target_value)

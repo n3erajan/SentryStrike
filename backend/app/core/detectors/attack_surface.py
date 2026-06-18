@@ -4,6 +4,7 @@ import copy
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import (
@@ -13,6 +14,18 @@ from app.core.crawler.models import (
     RequestObservation,
 )
 from app.core.crawler.param_discovery import ParamDiscovery
+
+
+@dataclass
+class PreparedAttackRequest:
+    url: str
+    method: str
+    params: dict[str, Any] | None = None
+    data: Any = None
+    json_body: Any = None
+    headers: dict[str, str] | None = None
+    cookies: dict[str, str] | None = None
+    files: dict[str, Any] | None = None
 
 
 @dataclass
@@ -28,10 +41,71 @@ class AttackTarget:
     source: str = "observed"
     json_template: Any = None
     headers: dict[str, str] = field(default_factory=dict)
+    cookies: dict[str, str] = field(default_factory=dict)
     security_relevance: set[str] = field(default_factory=set)
 
     def legacy_tuple(self) -> tuple:
         return (self.url, self.parameter, self.method, str(self.value), self.form_inputs)
+
+    def build_request(self, injected_value: Any, *, merge_with_baseline: bool = False) -> PreparedAttackRequest:
+        value = f"{self.value}{injected_value}" if merge_with_baseline else injected_value
+        method = self.method.upper()
+        headers = dict(self.headers or {})
+        cookies = dict(self.cookies or {})
+
+        if self.location == ParameterLocation.path:
+            return PreparedAttackRequest(
+                url=inject_path_parameter(self.url, self.parameter, str(value)),
+                method=method,
+                headers=headers or None,
+                cookies=cookies or None,
+            )
+
+        if self.location == ParameterLocation.query:
+            url, params, data = inject_url_or_form_parameter(
+                self.url, self.parameter, str(value), method, self.form_inputs
+            )
+            return PreparedAttackRequest(
+                url=url,
+                method=method,
+                params=params or None,
+                data=data or None,
+                headers=headers or None,
+                cookies=cookies or None,
+            )
+
+        if self.location == ParameterLocation.form:
+            url, params, data = inject_url_or_form_parameter(
+                self.url, self.parameter, str(value), method, self.form_inputs
+            )
+            return PreparedAttackRequest(
+                url=url,
+                method=method,
+                params=params or None,
+                data=data or None,
+                headers=headers or None,
+                cookies=cookies or None,
+            )
+
+        if self.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
+            headers.setdefault("Content-Type", "application/json")
+            return PreparedAttackRequest(
+                url=self.url,
+                method=method,
+                json_body=build_json_body(self.json_template, self, value),
+                headers=headers or None,
+                cookies=cookies or None,
+            )
+
+        if self.location == ParameterLocation.header:
+            headers[self.parameter] = str(value)
+            return PreparedAttackRequest(url=self.url, method=method, headers=headers or None, cookies=cookies or None)
+
+        if self.location == ParameterLocation.cookie:
+            cookies[self.parameter] = str(value)
+            return PreparedAttackRequest(url=self.url, method=method, headers=headers or None, cookies=cookies or None)
+
+        return PreparedAttackRequest(url=self.url, method=method, headers=headers or None, cookies=cookies or None)
 
 
 class AttackSurface:
@@ -93,6 +167,7 @@ class AttackSurface:
                     source=candidate.source,
                     json_template=template,
                     headers=headers,
+                    cookies=candidate.context.get("cookies") or {},
                     security_relevance=set(candidate.security_relevance),
                 )
             )
@@ -190,6 +265,68 @@ def build_json_body(template: Any, target: AttackTarget, injected_value: Any) ->
     path = target.parent_path or target.parameter
     _set_json_path(body, path, injected_value)
     return body
+
+
+def inject_url_or_form_parameter(
+    base_url: str,
+    parameter_name: str,
+    parameter_value: str,
+    method: str = "GET",
+    form_inputs: list | None = None,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    parsed = urlparse(base_url)
+    query_params = parse_qs(parsed.query, keep_blank_values=True)
+    for key in query_params:
+        if isinstance(query_params[key], list):
+            query_params[key] = query_params[key][0] if query_params[key] else ""
+
+    if form_inputs is not None:
+        payload = build_form_payload(form_inputs, parameter_name, parameter_value)
+        merged_params = {**query_params, **payload}
+        if method.upper() == "GET":
+            new_query = urlencode(merged_params, doseq=False)
+            return urlunparse(parsed._replace(query=new_query)), {}, {}
+        return base_url, {}, merged_params
+
+    query_params[parameter_name] = parameter_value
+    new_query = urlencode(query_params, doseq=False)
+    new_url = urlunparse(parsed._replace(query=new_query))
+    if method.upper() == "GET":
+        return new_url, {}, {}
+    return base_url, {}, query_params
+
+
+def build_form_payload(form_inputs: list, target_param: str, target_value: str) -> dict[str, str]:
+    payload: dict[str, str] = {}
+    for inp in form_inputs:
+        name = getattr(inp, "name", "")
+        if not name:
+            continue
+        inp_type = getattr(inp, "input_type", "text").lower()
+        if name == target_param:
+            payload[name] = target_value
+        elif inp_type == "password":
+            payload[name] = "sentry_password123"
+        elif inp_type in ("submit", "button"):
+            payload[name] = getattr(inp, "value", "Submit") or "Submit"
+        elif inp_type == "hidden":
+            payload[name] = getattr(inp, "value", "")
+        else:
+            payload[name] = getattr(inp, "value", "") or "sentry_test_val"
+    if target_param not in payload:
+        payload[target_param] = target_value
+    return payload
+
+
+def inject_path_parameter(url: str, parameter_name: str, parameter_value: str) -> str:
+    parsed = urlparse(url)
+    placeholder = "{" + parameter_name + "}"
+    path = parsed.path
+    if placeholder in path:
+        path = path.replace(placeholder, parameter_value)
+    elif f":{parameter_name}" in path:
+        path = path.replace(f":{parameter_name}", parameter_value)
+    return urlunparse(parsed._replace(path=path))
 
 
 def _set_json_path(body: dict, path: str, value: Any) -> None:
