@@ -1,7 +1,11 @@
 import asyncio
+import base64
+import copy
+import json
 import logging
 import re
 import statistics
+import time
 from urllib.parse import parse_qsl, urlparse
 
 from app.config import get_settings
@@ -192,6 +196,7 @@ class AuthenticationFailuresDetector(BaseDetector):
         category: OwaspCategory = OwaspCategory.a07,
         verification_request_snippet: str | None = None,
         verification_response_snippet: str | None = None,
+        detection_evidence: dict | None = None,
     ) -> Finding:
         kwargs: dict = dict(
             category=category,
@@ -205,6 +210,8 @@ class AuthenticationFailuresDetector(BaseDetector):
             verification_request_snippet=verification_request_snippet,
             verification_response_snippet=verification_response_snippet,
         )
+        if detection_evidence is not None:
+            kwargs["detection_evidence"] = detection_evidence
         if method is not None:
             kwargs["method"] = method
         if parameter is not None:
@@ -755,6 +762,626 @@ class AuthenticationFailuresDetector(BaseDetector):
 
         return findings
 
+    # ---------------------------------------------------------------------------
+    # API-first authentication workflow checks
+    # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _json_body(value: object) -> dict | None:
+        if isinstance(value, dict):
+            return copy.deepcopy(value)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _body_paths(body: dict, prefix: str = "") -> list[tuple[str, object]]:
+        paths: list[tuple[str, object]] = []
+        for key, value in body.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            paths.append((path, value))
+            if isinstance(value, dict):
+                paths.extend(AuthenticationFailuresDetector._body_paths(value, path))
+        return paths
+
+    @staticmethod
+    def _set_body_path(body: dict, path: str, value: object) -> None:
+        current = body
+        parts = path.split(".")
+        for part in parts[:-1]:
+            next_value = current.get(part)
+            if not isinstance(next_value, dict):
+                next_value = {}
+                current[part] = next_value
+            current = next_value
+        current[parts[-1]] = value
+
+    def _classify_api_auth_fields(self, body: dict) -> dict[str, str | None]:
+        fields: dict[str, str | None] = {
+            "username": None,
+            "password": None,
+            "current_password": None,
+            "new_password": None,
+            "confirm_password": None,
+            "token": None,
+            "mfa_code": None,
+        }
+        for path, _ in self._body_paths(body):
+            key = path.rsplit(".", 1)[-1].lower()
+            normalized = key.replace("-", "_")
+            if fields["username"] is None and normalized in {
+                "email", "username", "user", "login", "identifier", "account", "phone", "mobile",
+            }:
+                fields["username"] = path
+            elif fields["password"] is None and normalized in {"password", "pass", "passwd", "pwd"}:
+                fields["password"] = path
+            elif fields["current_password"] is None and normalized in {
+                "current_password", "old_password", "existing_password",
+            }:
+                fields["current_password"] = path
+            elif fields["new_password"] is None and normalized in {
+                "new_password", "newpassword", "password_new", "newpass", "new_pass",
+            }:
+                fields["new_password"] = path
+            elif fields["confirm_password"] is None and normalized in {
+                "confirm_password", "confirmpassword", "password_confirm", "passwordconfirm",
+                "password_confirmation", "confirm",
+            }:
+                fields["confirm_password"] = path
+            elif fields["token"] is None and any(
+                token in normalized for token in ("token", "nonce", "state", "signature", "reset")
+            ):
+                fields["token"] = path
+            elif fields["mfa_code"] is None and normalized in {
+                "otp", "mfa", "mfa_code", "totp", "code", "verification_code", "security_code",
+            }:
+                fields["mfa_code"] = path
+        return fields
+
+    def _api_records(self, kwargs: dict[str, object]) -> list[dict]:
+        records: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def add(url: str, method: str, body: object, headers: object, source: str) -> None:
+            json_body = self._json_body(body)
+            if not url or json_body is None:
+                return
+            method_upper = (method or "GET").upper()
+            key = (url, method_upper, json.dumps(json_body, sort_keys=True, default=str))
+            if key in seen:
+                return
+            seen.add(key)
+            records.append(
+                {
+                    "url": url,
+                    "method": method_upper,
+                    "body": json_body,
+                    "headers": dict(headers or {}),
+                    "source": source,
+                    "fields": self._classify_api_auth_fields(json_body),
+                }
+            )
+
+        for request in kwargs.get("requests") or []:
+            add(
+                str(getattr(request, "url", "") or ""),
+                str(getattr(request, "method", "GET") or "GET"),
+                getattr(request, "post_data", None),
+                getattr(request, "request_headers", {}) or {},
+                "browser_request",
+            )
+        for endpoint in kwargs.get("api_endpoints") or []:
+            add(
+                str(getattr(endpoint, "url", "") or ""),
+                str(getattr(endpoint, "method", "GET") or "GET"),
+                getattr(endpoint, "request_body", None),
+                getattr(endpoint, "headers", {}) or {},
+                "api_endpoint",
+            )
+        return records
+
+    def _api_flow_type(self, record: dict) -> str | None:
+        lowered_url = str(record["url"]).lower()
+        path_tokens = {seg for seg in urlparse(str(record["url"])).path.lower().replace("_", "-").split("/") if seg}
+        fields = record["fields"]
+
+        if fields.get("new_password") or "change-password" in lowered_url or "password/change" in lowered_url:
+            return "password_change"
+        if self._url_contains(lowered_url, self.reset_tokens):
+            return "password_reset"
+        if self._url_contains(lowered_url, self.mfa_tokens) or self._path_hits(path_tokens, self.mfa_tokens):
+            return "mfa"
+        if fields.get("username") and fields.get("password") and (
+            self._url_contains(lowered_url, self.login_tokens | self.api_auth_tokens)
+            or self._path_hits(path_tokens, self.login_tokens)
+        ):
+            return "login"
+        return None
+
+    async def _test_api_login_rate_limit(
+        self,
+        record: dict,
+        session_cookies: dict,
+    ) -> list[Finding]:
+        from app.core.verification.verification_framework import HttpVerifier
+
+        fields = record["fields"]
+        username_path = fields.get("username")
+        password_path = fields.get("password")
+        if not username_path or not password_path:
+            return []
+
+        verifier = HttpVerifier(cookies=session_cookies)
+        verifier.set_request_context(module="auth", parameter=username_path)
+        responses: list[object] = []
+        try:
+            for idx in range(6):
+                body = copy.deepcopy(record["body"])
+                self._set_body_path(body, username_path, f"sentry_invalid_{idx}@example.invalid")
+                self._set_body_path(body, password_path, f"sentry_wrong_password_{idx}")
+                headers = {**record["headers"], "Content-Type": "application/json"}
+                resp = await verifier.send_request(
+                    record["url"],
+                    record["method"],
+                    None,
+                    None,
+                    headers=headers,
+                    json_body=body,
+                    test_phase="api_login_rate_limit",
+                    parameter=username_path,
+                    payload="invalid-api-login",
+                )
+                responses.append(resp)
+                if self._rate_limit_signals_present([resp]):
+                    return []
+        finally:
+            await verifier.close()
+
+        if len(responses) < 6 or not self._burst_responses_stable([{"size": len(responses), "responses": responses}]):
+            return []
+
+        last = responses[-1]
+        return [
+            self._finding(
+                vuln_type="API Login Lacks Safe-Probe Rate-Limit Signal",
+                url=record["url"],
+                method=record["method"],
+                parameter=username_path,
+                severity=SeverityLevel.medium,
+                evidence=(
+                    "Sent 6 bounded invalid JSON login attempts to a replayable API login flow. "
+                    "Responses stayed stable and no lockout, rate-limit status, or challenge signal was observed."
+                ),
+                verified=True,
+                detection_method="api_login_rate_limit_probe",
+                confidence_score=70.0,
+                verification_request_snippet=getattr(last, "request_snippet", None),
+                verification_response_snippet=getattr(last, "response_snippet", None),
+                detection_evidence={"attempts": len(responses), "source": record["source"]},
+            )
+        ]
+
+    async def _test_api_single_request_control(
+        self,
+        record: dict,
+        *,
+        session_cookies: dict,
+        auth_headers: dict,
+        flow_type: str,
+    ) -> list[Finding]:
+        from app.core.verification.verification_framework import HttpVerifier
+
+        fields = record["fields"]
+        body = copy.deepcopy(record["body"])
+        headers = {**record["headers"], **auth_headers, "Content-Type": "application/json"}
+        vuln_type = ""
+        parameter = None
+        severity = SeverityLevel.high
+        evidence = ""
+        detection_method = ""
+
+        if flow_type == "password_reset":
+            if not fields.get("new_password") or fields.get("token") or fields.get("mfa_code"):
+                return []
+            parameter = fields.get("new_password")
+            self._set_body_path(body, parameter, f"SentryStrikeResetCheck{int(time.time())}!")
+            vuln_type = "Password Reset API May Not Enforce Reset Token"
+            severity = SeverityLevel.critical
+            evidence = (
+                "Replayable password-reset API body sets a new password without any token, code, nonce, "
+                "or signature field. The endpoint accepted the safe verification request without a token error."
+            )
+            detection_method = "api_reset_token_enforcement_probe"
+        elif flow_type == "password_change":
+            if not fields.get("new_password") or fields.get("current_password"):
+                return []
+            parameter = fields.get("new_password")
+            self._set_body_path(body, parameter, f"SentryStrikeChangeCheck{int(time.time())}!")
+            if fields.get("confirm_password"):
+                self._set_body_path(body, fields["confirm_password"], f"SentryStrikeChangeCheck{int(time.time())}!")
+            vuln_type = "Password Change API Missing Current Password Requirement"
+            evidence = (
+                "Authenticated password-change API body contains a new-password field but no current-password "
+                "field. A safe verification request was accepted without a current-password error."
+            )
+            detection_method = "api_password_change_current_password_probe"
+        elif flow_type == "mfa":
+            if fields.get("mfa_code") or fields.get("token"):
+                return []
+            parameter = fields.get("username") or "mfa"
+            vuln_type = "MFA API Flow Missing Verification Code Parameter"
+            evidence = (
+                "Replayable MFA/verification API request was accepted even though the JSON body contains no "
+                "OTP, verification code, token, or signed challenge field."
+            )
+            detection_method = "api_mfa_missing_code_probe"
+        else:
+            return []
+
+        verifier = HttpVerifier(cookies=session_cookies)
+        verifier.set_request_context(module="auth", parameter=str(parameter))
+        try:
+            resp = await verifier.send_request(
+                record["url"],
+                record["method"],
+                None,
+                None,
+                headers=headers,
+                json_body=body,
+                test_phase=detection_method,
+                parameter=str(parameter),
+            )
+        finally:
+            await verifier.close()
+
+        body_lower = (getattr(resp, "body", "") or "").lower()
+        rejection_terms = {
+            "invalid", "required", "missing", "token", "code", "otp", "current password",
+            "old password", "unauthorized", "forbidden", "csrf", "mfa",
+        }
+        success_terms = {"success", "updated", "changed", "reset", "ok", "verified"}
+        accepted = 200 <= getattr(resp, "status_code", 0) < 400
+        rejected = any(term in body_lower for term in rejection_terms)
+        explicit_success = any(term in body_lower for term in success_terms)
+        if not accepted or rejected or not explicit_success:
+            return []
+
+        return [
+            self._finding(
+                vuln_type=vuln_type,
+                url=record["url"],
+                method=record["method"],
+                parameter=str(parameter),
+                severity=severity,
+                evidence=evidence,
+                verified=True,
+                detection_method=detection_method,
+                confidence_score=85.0,
+                verification_request_snippet=getattr(resp, "request_snippet", None),
+                verification_response_snippet=getattr(resp, "response_snippet", None),
+                detection_evidence={"flow_type": flow_type, "source": record["source"]},
+            )
+        ]
+
+    async def _test_api_auth_workflows(
+        self,
+        kwargs: dict[str, object],
+        session_cookies: dict,
+    ) -> list[Finding]:
+        findings: list[Finding] = []
+        auth_headers = dict(kwargs.get("auth_headers") or {})
+        for record in self._api_records(kwargs):
+            flow_type = self._api_flow_type(record)
+            if flow_type == "login":
+                findings.extend(await self._test_api_login_rate_limit(record, session_cookies))
+            elif flow_type in {"password_reset", "password_change", "mfa"}:
+                findings.extend(
+                    await self._test_api_single_request_control(
+                        record,
+                        session_cookies=session_cookies,
+                        auth_headers=auth_headers,
+                        flow_type=flow_type,
+                    )
+                )
+        return findings
+
+    # ---------------------------------------------------------------------------
+    # JWT/session token checks
+    # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _looks_like_jwt(token: str) -> bool:
+        parts = token.split(".")
+        return len(parts) == 3 and all(parts[:2]) and len(token) > 40
+
+    @staticmethod
+    def _b64url_decode_json(segment: str) -> dict | None:
+        try:
+            padded = segment + "=" * (-len(segment) % 4)
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+            parsed = json.loads(decoded.decode("utf-8"))
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _decode_jwt(self, token: str) -> tuple[dict, dict] | None:
+        if not self._looks_like_jwt(token):
+            return None
+        header_segment, payload_segment, _signature = token.split(".", 2)
+        header = self._b64url_decode_json(header_segment)
+        payload = self._b64url_decode_json(payload_segment)
+        if header is None or payload is None:
+            return None
+        return header, payload
+
+    @staticmethod
+    def _extract_bearer(headers: dict) -> str | None:
+        for key, value in (headers or {}).items():
+            if key.lower() == "authorization":
+                match = re.match(r"Bearer\s+(.+)", str(value), re.I)
+                if match:
+                    return match.group(1).strip()
+        return None
+
+    def _tokens_from_context(self, kwargs: dict[str, object], session_cookies: dict) -> list[dict]:
+        tokens: list[dict] = []
+        auth_headers = dict(kwargs.get("auth_headers") or {})
+        bearer = self._extract_bearer(auth_headers)
+        if bearer:
+            tokens.append({"token": bearer, "source": "auth_headers.Authorization", "url": str(kwargs.get("root_url") or "")})
+
+        for name, value in (session_cookies or {}).items():
+            if self._looks_like_jwt(str(value)):
+                tokens.append({"token": str(value), "source": f"session_cookie.{name}", "url": str(kwargs.get("root_url") or "")})
+
+        for request in kwargs.get("requests") or []:
+            request_headers = getattr(request, "request_headers", {}) or {}
+            bearer = self._extract_bearer(dict(request_headers))
+            if bearer:
+                tokens.append({"token": bearer, "source": "observed_request.Authorization", "url": getattr(request, "url", "")})
+            cookie_header = next((v for k, v in dict(request_headers).items() if k.lower() == "cookie"), "")
+            for cookie_part in str(cookie_header).split(";"):
+                if "=" not in cookie_part:
+                    continue
+                name, value = [part.strip() for part in cookie_part.split("=", 1)]
+                if self._looks_like_jwt(value):
+                    tokens.append({"token": value, "source": f"observed_request.cookie.{name}", "url": getattr(request, "url", "")})
+
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for item in tokens:
+            if item["token"] in seen:
+                continue
+            seen.add(item["token"])
+            unique.append(item)
+        return unique
+
+    def _jwt_findings(self, kwargs: dict[str, object], session_cookies: dict) -> list[Finding]:
+        findings: list[Finding] = []
+        now = int(time.time())
+        sensitive_claim_terms = (
+            "password", "passwd", "pwd", "secret", "api_key", "apikey", "private_key",
+            "reset_token", "refresh_token", "access_token", "hash",
+        )
+        for item in self._tokens_from_context(kwargs, session_cookies):
+            decoded = self._decode_jwt(item["token"])
+            if not decoded:
+                continue
+            header, payload = decoded
+            url = str(item.get("url") or kwargs.get("root_url") or "")
+            source = str(item.get("source") or "jwt")
+            alg = str(header.get("alg", "")).lower()
+            if alg == "none":
+                findings.append(
+                    self._finding(
+                        vuln_type="JWT Uses alg=none",
+                        url=url,
+                        severity=SeverityLevel.critical,
+                        evidence="Bearer/session JWT declares alg=none, meaning signature verification may be disabled.",
+                        verified=True,
+                        detection_method="jwt_metadata_inspection",
+                        confidence_score=95.0,
+                        detection_evidence={"source": source, "header": header},
+                    )
+                )
+
+            exp = payload.get("exp")
+            if exp is None:
+                findings.append(
+                    self._finding(
+                        vuln_type="JWT Missing Expiration Claim",
+                        url=url,
+                        severity=SeverityLevel.high,
+                        evidence="Bearer/session JWT has no exp claim, so token lifetime cannot be bounded by the token itself.",
+                        verified=True,
+                        detection_method="jwt_claim_inspection",
+                        confidence_score=85.0,
+                        detection_evidence={"source": source, "claims": sorted(payload.keys())},
+                    )
+                )
+            else:
+                try:
+                    exp_int = int(exp)
+                    iat_int = int(payload.get("iat", now))
+                    if exp_int - iat_int > 60 * 60 * 24 * 30 or exp_int - now > 60 * 60 * 24 * 30:
+                        findings.append(
+                            self._finding(
+                                vuln_type="JWT Expiration Is Excessively Long",
+                                url=url,
+                                severity=SeverityLevel.medium,
+                                evidence="Bearer/session JWT remains valid for more than 30 days.",
+                                verified=True,
+                                detection_method="jwt_claim_inspection",
+                                confidence_score=80.0,
+                                detection_evidence={"source": source, "exp": exp_int, "iat": payload.get("iat")},
+                            )
+                        )
+                except Exception:
+                    pass
+
+            sensitive_claims = [
+                key for key in payload.keys()
+                if any(term in str(key).lower() for term in sensitive_claim_terms)
+            ]
+            if sensitive_claims:
+                findings.append(
+                    self._finding(
+                        vuln_type="JWT Contains Sensitive Claims",
+                        url=url,
+                        severity=SeverityLevel.high,
+                        evidence=f"JWT payload exposes sensitive claim names: {sorted(sensitive_claims)}.",
+                        verified=True,
+                        detection_method="jwt_sensitive_claim_inspection",
+                        confidence_score=90.0,
+                        detection_evidence={"source": source, "sensitive_claims": sorted(sensitive_claims)},
+                    )
+                )
+        return findings
+
+    def _cookie_attribute_findings(self, kwargs: dict[str, object]) -> list[Finding]:
+        findings: list[Finding] = []
+        seen: set[tuple[str, str]] = set()
+        for request in kwargs.get("requests") or []:
+            headers = getattr(request, "response_headers", {}) or {}
+            set_cookie_values = [v for k, v in dict(headers).items() if k.lower() == "set-cookie"]
+            for header in set_cookie_values:
+                parts = [part.strip().lower() for part in str(header).split(";")]
+                if not parts or "=" not in parts[0]:
+                    continue
+                cookie_name = parts[0].split("=", 1)[0]
+                if not any(token in cookie_name for token in self._session_cookie_names):
+                    continue
+                missing = []
+                if "httponly" not in parts:
+                    missing.append("HttpOnly")
+                if "secure" not in parts:
+                    missing.append("Secure")
+                if not any(part.startswith("samesite") for part in parts):
+                    missing.append("SameSite")
+                if not missing:
+                    continue
+                key = (str(getattr(request, "url", "") or ""), cookie_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(
+                    self._finding(
+                        vuln_type="Insecure Session Cookie Attributes",
+                        url=key[0],
+                        severity=SeverityLevel.medium,
+                        evidence=f"Observed session cookie '{cookie_name}' lacks secure attributes: {', '.join(missing)}.",
+                        verified=True,
+                        detection_method="observed_set_cookie_inspection",
+                        confidence_score=90.0,
+                        detection_evidence={"missing_attributes": missing},
+                    )
+                )
+        return findings
+
+    async def _logout_token_reuse_findings(
+        self,
+        kwargs: dict[str, object],
+        session_cookies: dict,
+    ) -> list[Finding]:
+        from app.core.verification.verification_framework import HttpVerifier
+
+        auth_headers = dict(kwargs.get("auth_headers") or {})
+        bearer = self._extract_bearer(auth_headers)
+        if not bearer:
+            return []
+
+        requests = list(kwargs.get("requests") or [])
+        logout = next(
+            (
+                request for request in requests
+                if self._url_contains(str(getattr(request, "url", "")).lower(), self.logout_tokens)
+            ),
+            None,
+        )
+        protected = next(
+            (
+                request for request in requests
+                if str(getattr(request, "method", "GET")).upper() == "GET"
+                and not self._url_contains(str(getattr(request, "url", "")).lower(), self.logout_tokens | self.login_tokens)
+            ),
+            None,
+        )
+        if logout is None or protected is None:
+            return []
+
+        verifier = HttpVerifier(cookies=session_cookies)
+        verifier.set_request_context(module="auth", parameter="Authorization")
+        try:
+            baseline = await verifier.send_request(
+                str(getattr(protected, "url", "")),
+                "GET",
+                None,
+                None,
+                headers=auth_headers,
+                test_phase="token_reuse_baseline",
+            )
+            await verifier.send_request(
+                str(getattr(logout, "url", "")),
+                str(getattr(logout, "method", "POST") or "POST").upper(),
+                None,
+                None,
+                headers=auth_headers,
+                test_phase="logout_revoke",
+            )
+            replay = await verifier.send_request(
+                str(getattr(protected, "url", "")),
+                "GET",
+                None,
+                None,
+                headers=auth_headers,
+                test_phase="token_reuse_after_logout",
+            )
+        finally:
+            await verifier.close()
+
+        if not (200 <= getattr(baseline, "status_code", 0) < 300):
+            return []
+        if not (200 <= getattr(replay, "status_code", 0) < 300):
+            return []
+        baseline_body = getattr(baseline, "body", "") or ""
+        replay_body = getattr(replay, "body", "") or ""
+        if abs(len(baseline_body) - len(replay_body)) > max(200, len(baseline_body) * 0.20):
+            return []
+
+        return [
+            self._finding(
+                vuln_type="Bearer Token Accepted After Logout",
+                url=str(getattr(protected, "url", "")),
+                method="GET",
+                parameter="Authorization",
+                severity=SeverityLevel.high,
+                evidence=(
+                    "Observed logout flow was replayed with the bearer token, then the same token still "
+                    "successfully accessed a protected API request."
+                ),
+                verified=True,
+                detection_method="logout_token_reuse_probe",
+                confidence_score=85.0,
+                verification_request_snippet=getattr(replay, "request_snippet", None),
+                verification_response_snippet=getattr(replay, "response_snippet", None),
+            )
+        ]
+
+    async def _inspect_tokens_and_sessions(
+        self,
+        kwargs: dict[str, object],
+        session_cookies: dict,
+    ) -> list[Finding]:
+        findings = []
+        findings.extend(self._jwt_findings(kwargs, session_cookies))
+        findings.extend(self._cookie_attribute_findings(kwargs))
+        findings.extend(await self._logout_token_reuse_findings(kwargs, session_cookies))
+        return findings
+
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
@@ -830,6 +1457,9 @@ class AuthenticationFailuresDetector(BaseDetector):
                         "can silently change the password (account takeover)."
                     ),
                 ))
+
+        findings.extend(await self._test_api_auth_workflows(kwargs, session_cookies))
+        findings.extend(await self._inspect_tokens_and_sessions(kwargs, session_cookies))
 
         # -----------------------------------------------------------------------
         # URL analysis
