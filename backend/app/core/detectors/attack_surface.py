@@ -4,7 +4,7 @@ import copy
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import (
@@ -322,10 +322,11 @@ def inject_path_parameter(url: str, parameter_name: str, parameter_value: str) -
     parsed = urlparse(url)
     placeholder = "{" + parameter_name + "}"
     path = parsed.path
+    encoded_value = quote(parameter_value, safe="")
     if placeholder in path:
-        path = path.replace(placeholder, parameter_value)
+        path = path.replace(placeholder, encoded_value)
     elif f":{parameter_name}" in path:
-        path = path.replace(f":{parameter_name}", parameter_value)
+        path = path.replace(f":{parameter_name}", encoded_value)
     return urlunparse(parsed._replace(path=path))
 
 

@@ -2,7 +2,7 @@ import asyncio
 import logging
 
 from app.config import get_settings
-from app.core.detectors.attack_surface import AttackSurface, query_or_form_targets
+from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.verification.response_analyzer import ResponseData
 from app.core.verification.xss_verifier import PendingBrowserVerification, XSSVerifier
@@ -82,6 +82,8 @@ class XSSDetector(BaseDetector):
                 "via kwargs to enable authenticated scanning."
             )
 
+        findings.extend(await self._static_dom_findings_with_browser_confirmation(kwargs, session_cookies))
+
         def xss_filter(param_name: str) -> bool:
             param_lower = param_name.lower()
             is_reflective = (
@@ -99,7 +101,7 @@ class XSSDetector(BaseDetector):
             requests=kwargs.get("requests") or [],
             filter_fn=xss_filter,
         )
-        candidates = query_or_form_targets(targets)
+        candidates: list[AttackTarget | tuple] = list(targets)
 
         # Supplement with header-injection candidates for every discovered URL.
         # These are 4-tuples like URL candidates but carry the header name in
@@ -113,13 +115,15 @@ class XSSDetector(BaseDetector):
                 "XSSDetector: no testable candidates found across %d URLs and %d forms.",
                 len(urls), len(forms),
             )
-            return []
+            return findings
 
         logger.debug("XSSDetector: testing %d candidates.", len(candidates))
 
         settings = get_settings()
         worker_count = max(1, min(4, settings.scanner_concurrency // 2 or 1))
-        stored_probe_urls = XSSVerifier.select_stored_probe_urls(urls)
+        stored_probe_urls = XSSVerifier.select_stored_probe_urls(
+            list(dict.fromkeys([*urls, *(target.url for target in targets)]))
+        )
         shared_baselines = await self._prefetch_stored_baselines(
             stored_probe_urls, session_cookies,
         )
@@ -128,9 +132,16 @@ class XSSDetector(BaseDetector):
         pending_browser_jobs: list[PendingBrowserVerification] = []
 
         async def verify_candidate(
-            cand: tuple,
+            cand: AttackTarget | tuple,
         ) -> tuple[list[Finding], list[PendingBrowserVerification]]:
-            if len(cand) == 5:
+            target = cand if isinstance(cand, AttackTarget) else None
+            if isinstance(cand, AttackTarget):
+                cand_url = cand.url
+                param = cand.parameter
+                method = cand.method
+                val = str(cand.value)
+                form_inputs = cand.form_inputs
+            elif len(cand) == 5:
                 cand_url, param, method, val, form_inputs = cand
             else:
                 cand_url, param, method, val = cand
@@ -144,6 +155,7 @@ class XSSDetector(BaseDetector):
                     form_inputs=form_inputs,
                     stored_display_urls=stored_probe_urls,
                     stored_baselines=shared_baselines,
+                    target=target,
                 )
                 pending: list[PendingBrowserVerification] = []
                 if result.evidence.get("browser_verification_pending"):
@@ -159,7 +171,7 @@ class XSSDetector(BaseDetector):
                 await verifier.close()
             return [], []
 
-        queue: asyncio.Queue[tuple] = asyncio.Queue()
+        queue: asyncio.Queue[AttackTarget | tuple] = asyncio.Queue()
         for cand in candidates:
             queue.put_nowait(cand)
 
@@ -202,6 +214,72 @@ class XSSDetector(BaseDetector):
                     findings.extend(browser_findings)
             finally:
                 await browser_verifier.close()
+
+        return findings
+
+    @staticmethod
+    def _static_dom_findings(kwargs: dict[str, object]) -> list[Finding]:
+        """Analyze crawled HTML and response snippets for source-to-sink DOM XSS hints."""
+        verifier = XSSVerifier()
+        findings: list[Finding] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(url: str, body: str, source_name: str) -> None:
+            if not body:
+                return
+            finding = verifier._check_dom_xss(url, body, source_name=source_name)
+            if not finding:
+                return
+            key = (finding.url, ",".join(finding.detection_evidence.get("found_sinks", [])))
+            if key in seen:
+                return
+            seen.add(key)
+            findings.append(finding)
+
+        root_url = str(kwargs.get("root_url") or "")
+        add(root_url, str(kwargs.get("spa_root_html") or ""), "spa_root_html")
+
+        for request in kwargs.get("requests") or []:
+            url = getattr(request, "url", root_url)
+            snippet = getattr(request, "response_snippet", "") or ""
+            add(url, snippet, "browser_response_snippet")
+
+        return findings
+
+    @staticmethod
+    async def _static_dom_findings_with_browser_confirmation(
+        kwargs: dict[str, object],
+        session_cookies: dict,
+    ) -> list[Finding]:
+        findings = XSSDetector._static_dom_findings(kwargs)
+        if not findings:
+            return findings
+
+        verifier = XSSVerifier()
+        verifier.http_verifier.cookies = session_cookies
+        try:
+            confirmed_urls: set[str] = set()
+            for finding in findings:
+                if not finding.url or finding.url in confirmed_urls:
+                    continue
+                try:
+                    confirmed = await verifier.verify_dom_xss_execution(finding.url)
+                except Exception as exc:
+                    logger.debug("DOM XSS browser confirmation failed for %s: %s", finding.url, exc)
+                    continue
+                if not confirmed:
+                    continue
+                confirmed_urls.add(finding.url)
+                finding.verified = True
+                finding.confidence_score = max(finding.confidence_score, 90.0)
+                finding.detection_method = "dom_xss_browser_execution"
+                finding.evidence = (
+                    "Browser execution confirmed for a DOM XSS canary on a route containing "
+                    "client-side user-controlled sources and risky sinks."
+                )
+                finding.detection_evidence["browser_execution_confirmed"] = True
+        finally:
+            await verifier.close()
 
         return findings
 

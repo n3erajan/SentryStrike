@@ -8,13 +8,14 @@ browser validation to preserve performance while eliminating false positives.
 """
 
 import asyncio
+import json
 import html
 import logging
 import random
 import re
 import string
 from typing import Optional
-from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
+from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse, quote
 
 # Import Playwright's async framework smoothly
 try:
@@ -23,6 +24,8 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
+from app.core.crawler.models import ParameterLocation
+from app.core.detectors.attack_surface import AttackTarget
 from app.core.detectors.base_detector import Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
 from app.core.verification.verification_framework import (
@@ -51,6 +54,7 @@ class PendingBrowserVerification:
     context_analysis: dict
     # The partial finding built from HTTP evidence - browser will confirm or discard it
     partial_finding: Finding
+    target: object | None = None
 
 
 def _random_canary(prefix: str = "sentry", length: int = 8) -> str:
@@ -122,7 +126,8 @@ class XSSVerifier(BaseVerifier):
         r"location\.hash", r"location\.search", r"location\.href", r"document\.URL",
         r"document\.documentURI", r"document\.referrer", r"window\.location",
         r"document\.cookie", r"localStorage\.", r"sessionStorage\.", r"window\.name",
-        r"addEventListener\(['\"]message['\"]",
+        r"URLSearchParams\s*\([^)]*location\.search", r"new\s+URL\s*\([^)]*location",
+        r"addEventListener\(['\"]message['\"]", r"\.onmessage\s*=",
     )
 
     _DOM_SINKS: tuple[str, ...] = (
@@ -130,7 +135,8 @@ class XSSVerifier(BaseVerifier):
         r"\.outerHTML\s*=", r"\.insertAdjacentHTML\(", r"setTimeout\(", r"setInterval\(",
         r"new\s+Function\(", r"\$\s*\(", r"\.html\s*\(", r"\.append\s*\(", r"\.prepend\s*\(",
         r"\.after\s*\(", r"\.before\s*\(", r"location\.assign\s*\(", r"location\.replace\s*\(",
-        r"location\.href\s*=",
+        r"location\.href\s*=", r"dangerouslySetInnerHTML", r"bypassSecurityTrust(?:Html|Script|Url)\s*\(",
+        r"\bv-html\b", r"\bng-bind-html\b",
     )
     
     _HEADER_SINK_PATTERNS: re.Pattern = re.compile(
@@ -156,6 +162,40 @@ class XSSVerifier(BaseVerifier):
         capped = sinks + others[: cls._STORED_PROBE_URL_CAP]
         return list(dict.fromkeys(capped))
 
+    def _build_attack_request(
+        self,
+        url: str,
+        parameter: str,
+        method: str,
+        payload: str,
+        form_inputs: Optional[list] = None,
+        target: Optional[object] = None,
+    ) -> tuple[str, str, Optional[dict], Optional[dict], Optional[object], Optional[dict], Optional[dict]]:
+        """Build a concrete request for legacy tuple candidates or rich AttackTargets."""
+        if isinstance(target, AttackTarget):
+            prepared = target.build_request(payload)
+            return (
+                prepared.url,
+                prepared.method,
+                prepared.params,
+                prepared.data,
+                prepared.json_body,
+                prepared.headers,
+                prepared.cookies,
+            )
+
+        if method.upper().startswith("HEADER:"):
+            header_name = method.split(":", 1)[1]
+            return url, "GET", None, None, None, {header_name: payload}, None
+
+        if method.upper() == "POST" and form_inputs is not None:
+            return url, method, None, self._build_form_payload(form_inputs, parameter, payload), None, None, None
+
+        injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
+            url, parameter, payload, method
+        )
+        return injected_url, method, injected_params, injected_data, None, None, None
+
     async def verify(
             self,
             url: str,
@@ -165,6 +205,7 @@ class XSSVerifier(BaseVerifier):
             form_inputs: Optional[list] = None,
             stored_display_urls: Optional[list[str]] = None,
             stored_baselines: Optional[dict[str, ResponseData]] = None,
+            target: Optional[object] = None,
         ) -> VerificationResult:
             """Verify XSS vulnerability safely utilizing integrated hybrid checks."""
             
@@ -174,42 +215,40 @@ class XSSVerifier(BaseVerifier):
             is_header_injection = method.upper().startswith("HEADER:")
             is_jsonp = parameter.lower() in self._JSONP_PARAM_NAMES
 
-            # Reuse shared baselines when provided; otherwise fetch only missing entries.
-            self._stored_baselines = {}
-            pre_test_baseline = None
-
-            # Only pre-fetch baseline for the origin URL itself.
-            # _probe_stored fetches baselines lazily per-URL only when needed,
-            # so we don't pre-fetch the entire crawled URL list upfront.
+            # Reuse shared stored-XSS baselines when provided. The active baseline
+            # below must keep the candidate request shape, especially for API JSON
+            # and path targets.
+            self._stored_baselines = dict(stored_baselines or {})
             if not is_header_injection:
                 bare = url.split("?")[0]
-                try:
-                    baseline_resp = await self._send(
-                        bare, "GET", test_phase="stored_pre_test_baseline",
-                    )
-                    self._stored_baselines[bare] = baseline_resp
-                    pre_test_baseline = baseline_resp  # Fix: Ensure bound if try succeeds
-                except Exception as e:
-                    logger.debug("Failed to pre-fetch clean baseline for %s: %s", bare, e)
-                    pre_test_baseline = await self.fetch_pre_test_baseline(url, parameter, method, value, form_inputs)
-
-                    # Retain original static DOM heuristics path
+                if bare not in self._stored_baselines:
                     try:
-                        dom_finding = self._check_dom_xss(url, pre_test_baseline.body)
-                        if dom_finding:
-                            findings.append(dom_finding)
+                        self._stored_baselines[bare] = await self._send(
+                            bare, "GET", test_phase="stored_pre_test_baseline",
+                        )
                     except Exception as e:
-                        logger.debug("Failed to perform DOM XSS check: %s", e)
-            else:
-                # Fix: Ensure header injections have a baseline to prevent downstream failures
-                try:
-                    pre_test_baseline = await self.fetch_pre_test_baseline(url, parameter, method, value, form_inputs)
-                except Exception as e:
-                    logger.debug("Failed to fetch pre-test baseline for header injection: %s", e)
+                        logger.debug("Failed to pre-fetch clean baseline for %s: %s", bare, e)
+
+            pre_test_baseline = None
+            try:
+                pre_test_baseline = await self.fetch_pre_test_baseline(
+                    url, parameter, method, value, form_inputs, target=target
+                )
+            except Exception as e:
+                logger.debug("Failed to fetch pre-test baseline for XSS candidate: %s", e)
 
             # Fallback safeguard guarantee
             if pre_test_baseline is None:
-                pre_test_baseline = await self.fetch_pre_test_baseline(url, parameter, method, value, form_inputs)
+                pre_test_baseline = await self.fetch_pre_test_baseline(
+                    url, parameter, method, value, form_inputs, target=target
+                )
+
+            try:
+                dom_finding = self._check_dom_xss(url, pre_test_baseline.body)
+                if dom_finding:
+                    findings.append(dom_finding)
+            except Exception as e:
+                logger.debug("Failed to perform DOM XSS check: %s", e)
 
             # Fast HTTP canary reflection triage. 
             # Skip browser instantiation completely if the param doesn't echo anything.
@@ -217,17 +256,15 @@ class XSSVerifier(BaseVerifier):
                 canary = ResponseAnalyzer.generate_probe_canary()
                 canary_payload = canary
                 try:
-                    if method.upper() == "POST" and form_inputs is not None:
-                        canary_url = url
-                        canary_params = None
-                        canary_data = self._build_form_payload(form_inputs, parameter, canary_payload)
-                    else:
-                        canary_url, canary_params, canary_data = (
-                            URLParameterBuilder.inject_parameter(url, parameter, canary_payload, method)
-                        )
+                    canary_url, canary_method, canary_params, canary_data, canary_json, canary_headers, canary_cookies = (
+                        self._build_attack_request(url, parameter, method, canary_payload, form_inputs, target)
+                    )
 
                     canary_resp = await self._send(
-                        canary_url, method, canary_params, canary_data,
+                        canary_url, canary_method, canary_params, canary_data,
+                        headers=canary_headers,
+                        cookies=canary_cookies,
+                        json_body=canary_json,
                         test_phase="canary", payload=canary_payload,
                     )
 
@@ -264,7 +301,7 @@ class XSSVerifier(BaseVerifier):
             for payload_type, payload in payload_set.items():
                 result = await self._test_payload(
                     url, parameter, method, value, payload, payload_type,
-                    form_inputs, stored_display_urls, pre_test_baseline,
+                    form_inputs, stored_display_urls, pre_test_baseline, target=target,
                 )
                 
                 if result.is_vulnerable:
@@ -302,18 +339,73 @@ class XSSVerifier(BaseVerifier):
 
             return VerificationResult(is_vulnerable=False, confidence_score=0.0, detection_method="none", findings=[], evidence={})
 
-    def _check_dom_xss(self, url: str, html_body: str) -> Optional[Finding]:
+    def _looks_like_api_response(self, response: ResponseData, target: Optional[object] = None) -> bool:
+        content_type = " ".join(
+            str(value).lower() for key, value in (response.headers or {}).items() if key.lower() == "content-type"
+        )
+        if any(token in content_type for token in ("json", "xml", "javascript")):
+            return True
+        return (
+            isinstance(target, AttackTarget)
+            and target.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}
+        )
+
+    def _create_api_reflection_finding(
+        self,
+        *,
+        url: str,
+        parameter: str,
+        method: str,
+        payload: str,
+        response: ResponseData,
+        context_analysis: dict,
+        confidence_score: float,
+    ) -> Finding:
+        evidence = (
+            "XSS payload was reflected by an API response. Execution depends on a client-side "
+            "sink rendering this value into the DOM."
+        )
+        return self._create_finding(
+            category=OwaspCategory.a05,
+            vuln_type="Reflected XSS in API Response",
+            severity=SeverityLevel.medium,
+            url=url,
+            parameter=parameter,
+            payload=payload,
+            evidence=evidence,
+            confidence_score=confidence_score,
+            detection_method="api_response_reflection",
+            method=method,
+            detection_evidence={**context_analysis, "requires_client_side_sink": True},
+            reproducible=True,
+            verified=False,
+            verification_request_snippet=response.request_snippet,
+            verification_response_snippet=response.response_snippet,
+        )
+
+    def _check_dom_xss(self, url: str, html_body: str, source_name: str | None = None) -> Optional[Finding]:
         """Perform static analysis of HTML/JS for DOM-based XSS indicators."""
+        if not html_body:
+            return None
         found_sources = [src for src in self._DOM_SOURCES if re.search(src, html_body, re.I)]
         found_sinks = [sink for sink in self._DOM_SINKS if re.search(sink, html_body, re.I)]
 
         if found_sources and found_sinks:
-            evidence = f"Page source contains potential DOM XSS sources {found_sources} and sinks {found_sinks}."
+            source_label = f" in {source_name}" if source_name else ""
+            evidence = (
+                f"Client-side source{source_label} contains user-controlled DOM sources "
+                f"{found_sources} reaching risky sinks {found_sinks}. Browser execution is not confirmed."
+            )
             return self._create_finding(
                 category=OwaspCategory.a05, vuln_type="DOM-Based XSS", severity=SeverityLevel.medium,
                 url=url, parameter="javascript", payload="location.hash", evidence=evidence,
                 confidence_score=60.0, detection_method="dom_xss_heuristics", method="GET",
-                detection_evidence={"found_sources": found_sources, "found_sinks": found_sinks},
+                detection_evidence={
+                    "found_sources": found_sources,
+                    "found_sinks": found_sinks,
+                    "source_name": source_name,
+                    "browser_execution_confirmed": False,
+                },
                 reproducible=True, verified=False,
             )
         return None
@@ -321,6 +413,7 @@ class XSSVerifier(BaseVerifier):
     async def _test_payload(
         self, url: str, parameter: str, method: str, value: str, payload: str, payload_type: str,
         form_inputs: Optional[list], stored_display_urls: Optional[list[str]], pre_test_baseline: ResponseData,
+        target: Optional[object] = None,
     ) -> VerificationResult:
         """Test a single XSS payload using rapid static check followed by safe dynamic execution fallback."""
         try:
@@ -328,24 +421,20 @@ class XSSVerifier(BaseVerifier):
             canary = ResponseAnalyzer.generate_probe_canary()
             injected_payload = _embed_canary(payload, canary)
 
-            if is_header:
-                header_name = method.split(":", 1)[1]
-                injected = await self._send(
-                    url, "GET", None, None, headers={header_name: injected_payload},
-                    test_phase=f"payload_{payload_type}", payload=injected_payload,
-                )
-            elif method.upper() == "POST" and form_inputs is not None:
-                injected_url, injected_params, injected_data = url, None, self._build_form_payload(form_inputs, parameter, injected_payload)
-                injected = await self._send(
-                    injected_url, method, injected_params, injected_data,
-                    test_phase=f"payload_{payload_type}", payload=injected_payload,
-                )
-            else:
-                injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(url, parameter, injected_payload, method)
-                injected = await self._send(
-                    injected_url, method, injected_params, injected_data,
-                    test_phase=f"payload_{payload_type}", payload=injected_payload,
-                )
+            (
+                injected_url,
+                injected_method,
+                injected_params,
+                injected_data,
+                injected_json,
+                injected_headers,
+                injected_cookies,
+            ) = self._build_attack_request(url, parameter, method, injected_payload, form_inputs, target)
+            injected = await self._send(
+                injected_url, injected_method, injected_params, injected_data,
+                headers=injected_headers, cookies=injected_cookies, json_body=injected_json,
+                test_phase=f"payload_{payload_type}", payload=injected_payload,
+            )
 
             is_reflected, locations, was_encoded = self._detect_reflection(injected_payload, injected.body)
             is_stored = False
@@ -382,6 +471,26 @@ class XSSVerifier(BaseVerifier):
                 context_analysis["encoding_type"] = "html_encoded"
                 context_analysis["is_executable"] = False
 
+            if self._looks_like_api_response(injected, target) and not context_analysis["is_executable"]:
+                confidence_score = 60.0 if reflection_evidence.get("canary_verified") else 55.0
+                finding = self._create_api_reflection_finding(
+                    url=url,
+                    parameter=parameter,
+                    method=method,
+                    payload=injected_payload,
+                    response=injected,
+                    context_analysis=context_analysis,
+                    confidence_score=confidence_score,
+                )
+                return VerificationResult(
+                    is_vulnerable=True,
+                    confidence_score=confidence_score,
+                    detection_method="api_response_reflection",
+                    findings=[finding],
+                    evidence=context_analysis,
+                    reproducible=True,
+                )
+
             if context_analysis["is_executable"] and PLAYWRIGHT_AVAILABLE:
                 logger.debug("Static check suspects XSS. Deferring browser verification to post-HTTP phase.")
                 confidence_score = self._calculate_xss_confidence(payload, context_analysis)
@@ -409,7 +518,7 @@ class XSSVerifier(BaseVerifier):
                             payload=injected_payload, canary=canary,
                             form_inputs=form_inputs, stored_display_urls=stored_display_urls,
                             is_header_injection=is_header, context_analysis=context_analysis,
-                            partial_finding=partial_finding,
+                            partial_finding=partial_finding, target=target,
                         ),
                     },
                 )
@@ -439,9 +548,69 @@ class XSSVerifier(BaseVerifier):
             logger.error("XSS verification failed for %s:%s: %s", url, parameter, e)
             return VerificationResult(is_vulnerable=False, confidence_score=0.0, detection_method=payload_type, findings=[], evidence={"error": str(e)})
 
+    async def _install_xss_browser_hooks(self, page, canary: str) -> None:
+        script = f"""
+(() => {{
+  const sentryCanary = {json.dumps(canary)};
+  const mark = (kind, value) => {{
+    window.__sentry_xss_fired = true;
+    window.__sentry_xss_events = window.__sentry_xss_events || [];
+    window.__sentry_xss_events.push({{kind, value: String(value || '')}});
+  }};
+  window.__sentry_xss_fired = false;
+  window.__sentry_xss_events = [];
+  window.sentry_hook = (value) => {{
+    if (!sentryCanary || String(value).includes(sentryCanary)) mark('hook', value);
+  }};
+  for (const name of ['alert', 'confirm', 'prompt']) {{
+    window[name] = (message) => {{
+      if (!sentryCanary || String(message || '').includes(sentryCanary)) mark(name, message);
+      return name === 'prompt' ? '' : true;
+    }};
+  }}
+  const hasCanary = (value) => !!value && String(value).includes(sentryCanary);
+  const scanNode = (node) => {{
+    if (!node) return;
+    if (hasCanary(node.textContent) || hasCanary(node.outerHTML)) mark('dom_mutation', sentryCanary);
+    if (node.tagName && String(node.tagName).toLowerCase() === 'script' && hasCanary(node.textContent)) {{
+      mark('script_canary', sentryCanary);
+    }}
+  }};
+  const startObserver = () => {{
+    try {{
+      new MutationObserver((mutations) => {{
+        for (const mutation of mutations) {{
+          scanNode(mutation.target);
+          for (const node of mutation.addedNodes || []) scanNode(node);
+        }}
+      }}).observe(document.documentElement || document, {{
+        childList: true, subtree: true, attributes: true, characterData: true
+      }});
+    }} catch (err) {{}}
+  }};
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', startObserver, {{once: true}});
+  }} else {{
+    startObserver();
+  }}
+}})();
+"""
+        await page.add_init_script(script)
+
+    async def _browser_xss_fired(self, page) -> bool:
+        try:
+            return bool(
+                await page.evaluate(
+                    "Boolean(window.__sentry_xss_fired || (window.__sentry_xss_events || []).length)"
+                )
+            )
+        except Exception:
+            return bool(getattr(page, "_fired", False))
+
     async def _verify_browser_execution(
         self, url: str, parameter: str, method: str, payload: str, canary: str,
-        form_inputs: Optional[list], stored_display_urls: Optional[list[str]], is_header_injection: bool
+        form_inputs: Optional[list], stored_display_urls: Optional[list[str]], is_header_injection: bool,
+        target: Optional[object] = None,
     ) -> bool:
         """Isolated Headless Engine handles explicit runtime execution proofs securely."""
         xss_fired = False
@@ -457,11 +626,37 @@ class XSSVerifier(BaseVerifier):
                         await context.add_cookies(playwright_cookies)
 
                 page = await context.new_page()
+                await self._install_xss_browser_hooks(page, canary)
 
-                await page.expose_binding("sentry_hook", lambda source, msg_canary: setattr(page, '_fired', True) if msg_canary == canary else None)
-                page.on("dialog", lambda dialog: asyncio.create_task(dialog.dismiss()) or setattr(page, '_fired', True) if canary in dialog.message else None)
+                async def handle_dialog(dialog):
+                    try:
+                        if canary in (dialog.message or ""):
+                            setattr(page, "_fired", True)
+                        await dialog.dismiss()
+                    except Exception:
+                        pass
 
-                if is_header_injection:
+                page.on("dialog", lambda dialog: asyncio.create_task(handle_dialog(dialog)))
+
+                if isinstance(target, AttackTarget):
+                    prepared = target.build_request(payload)
+                    if prepared.headers:
+                        await page.set_extra_http_headers(prepared.headers)
+                    if prepared.method.upper() == "GET":
+                        await page.goto(prepared.url, wait_until="networkidle", timeout=4000)
+                    elif prepared.method.upper() == "POST" and form_inputs:
+                        await page.goto(url, wait_until="networkidle", timeout=4000)
+                        resolved_inputs = {item.get('name') or item.get('id'): item.get('value', '') for item in form_inputs if hasattr(item, 'get')} if isinstance(form_inputs, list) else form_inputs
+                        for field_name, baseline_val in resolved_inputs.items():
+                            fill_value = payload if field_name == parameter else baseline_val
+                            sel = f"input[name='{field_name}'], textarea[name='{field_name}'], [id='{field_name}']"
+                            if await page.query_selector(sel):
+                                await page.fill(sel, str(fill_value))
+                        await page.evaluate("document.querySelector('form').submit()")
+                        await page.wait_for_load_state("networkidle", timeout=4000)
+                    else:
+                        return False
+                elif is_header_injection:
                     header_name = method.split(":", 1)[1]
                     await page.set_extra_http_headers({header_name: payload})
                     await page.goto(url, wait_until="networkidle", timeout=4000)
@@ -497,12 +692,68 @@ class XSSVerifier(BaseVerifier):
                             pass
 
                 await asyncio.sleep(0.3)
-                xss_fired = getattr(page, '_fired', False)
+                xss_fired = bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page)
                 await context.close()
                 await browser.close()
             except Exception as e:
                 logger.debug(f"Playwright runtime loop bypassed safely: {e}")
         return xss_fired
+
+    async def verify_dom_xss_execution(self, url: str) -> bool:
+        """Probe URL/query/hash/postMessage DOM sinks with inert canary payloads."""
+        if not PLAYWRIGHT_AVAILABLE:
+            return False
+
+        canary = ResponseAnalyzer.generate_probe_canary()
+        payload = f"<img src=x onerror=alert('{canary}')>"
+        encoded_payload = quote(payload, safe="")
+        parsed = urlparse(url)
+
+        query_parts = list(parsed)
+        query_params = dict(parse_qsl(query_parts[4], keep_blank_values=True))
+        query_params.setdefault("sentry_xss", payload)
+        query_parts[4] = urlencode(query_params)
+
+        fragment_parts = list(parsed)
+        fragment_parts[5] = encoded_payload
+        probes = [urlunparse(query_parts), urlunparse(fragment_parts)]
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(ignore_https_errors=True, user_agent="SentryStrikeScanner/1.0")
+            try:
+                if hasattr(self.http_verifier, "cookies") and self.http_verifier.cookies:
+                    domain = parsed.netloc.split(":")[0]
+                    await context.add_cookies(
+                        [
+                            {"name": str(k), "value": str(v), "domain": domain, "path": "/"}
+                            for k, v in self.http_verifier.cookies.items()
+                        ]
+                    )
+
+                for probe_url in probes:
+                    page = await context.new_page()
+                    await self._install_xss_browser_hooks(page, canary)
+                    try:
+                        await page.goto(probe_url, wait_until="networkidle", timeout=5000)
+                        await page.evaluate(
+                            "(payload) => window.postMessage(payload, window.location.origin)",
+                            payload,
+                        )
+                        await asyncio.sleep(0.4)
+                        if await self._browser_xss_fired(page):
+                            await page.close()
+                            return True
+                    except Exception as exc:
+                        logger.debug("DOM XSS browser probe failed for %s: %s", probe_url, exc)
+                    finally:
+                        if not page.is_closed():
+                            await page.close()
+            finally:
+                await context.close()
+                await browser.close()
+
+        return False
 
     async def run_browser_verification(self, job: PendingBrowserVerification) -> list[Finding]:
         """
@@ -517,6 +768,7 @@ class XSSVerifier(BaseVerifier):
             execution_confirmed = await self._verify_browser_execution(
                 job.url, job.parameter, job.method, job.payload, job.canary,
                 job.form_inputs, job.stored_display_urls, job.is_header_injection,
+                target=job.target,
             )
         except Exception as e:
             logger.error("Browser verification failed for %s: %s", job.url, e)

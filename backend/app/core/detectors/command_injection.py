@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from urllib.parse import urlparse
 
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
@@ -12,7 +13,16 @@ class CommandInjectionDetector(BaseDetector):
     name = "command_injection"
 
     cmd_param_tokens = {
-        "ip", "host", "cmd", "exec", "ping", "command", "run", "args", "query", "target", "addr", "address"
+        "ip", "host", "cmd", "exec", "ping", "command", "run", "args", "query", "target", "addr", "address",
+        "domain", "server", "destination", "uri", "url"
+    }
+    endpoint_context_tokens = {
+        "ping", "trace", "traceroute", "lookup", "nslookup", "dns", "whois", "network", "diagnostic",
+        "command", "exec", "shell", "run", "proxy", "connect",
+    }
+    contextual_param_tokens = {
+        "target", "value", "input", "query", "host", "ip", "addr", "address", "domain", "server",
+        "destination", "url", "uri",
     }
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
@@ -20,10 +30,7 @@ class CommandInjectionDetector(BaseDetector):
         session_cookies = kwargs.get("session_cookies") or {}
 
         def cmd_filter(param_name: str) -> bool:
-            param_lower = param_name.lower()
-            return param_lower in self.cmd_param_tokens or any(
-                token in param_lower for token in ["cmd", "command", "exec", "run", "shell", "ping"]
-            )
+            return self._name_may_be_command_input(param_name)
 
         candidates = AttackSurface.build(
             urls,
@@ -33,6 +40,7 @@ class CommandInjectionDetector(BaseDetector):
             requests=kwargs.get("requests") or [],
             filter_fn=cmd_filter,
         )
+        candidates = [cand for cand in candidates if self._is_command_candidate(cand)]
 
         if not candidates:
             return []
@@ -69,3 +77,26 @@ class CommandInjectionDetector(BaseDetector):
 
         await verifier.close()
         return findings
+
+    def _name_may_be_command_input(self, param_name: str) -> bool:
+        param_lower = param_name.lower()
+        return (
+            param_lower in self.cmd_param_tokens
+            or param_lower in self.contextual_param_tokens
+            or any(token in param_lower for token in ["cmd", "command", "exec", "run", "shell", "ping"])
+        )
+
+    def _is_command_candidate(self, target: AttackTarget) -> bool:
+        param_lower = target.parameter.lower()
+        if param_lower in self.cmd_param_tokens or any(
+            token in param_lower for token in ["cmd", "command", "exec", "run", "shell", "ping"]
+        ):
+            return True
+
+        path_tokens = {
+            token
+            for token in urlparse(target.url).path.lower().replace("-", "/").replace("_", "/").split("/")
+            if token
+        }
+        has_endpoint_context = not path_tokens.isdisjoint(self.endpoint_context_tokens)
+        return has_endpoint_context and param_lower in self.contextual_param_tokens

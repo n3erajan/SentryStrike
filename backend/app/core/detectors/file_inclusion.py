@@ -6,10 +6,12 @@ from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode, quote
 
 import httpx
 
+from app.core.crawler.models import ParameterLocation
+from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.payload_profile import PayloadProfile, build_payload_profile
 from app.core.verification.response_analyzer import ResponseAnalyzer
-from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder, FormPayloadBuilder
+from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
@@ -180,13 +182,18 @@ class FileInclusionDetector(BaseDetector):
         lfi_payloads = self._select_lfi_payloads(payload_profile)
         rfi_payloads = self._select_rfi_payloads(payload_profile)
 
-        from app.core.crawler.param_discovery import ParamDiscovery
-        
         def fi_filter(param_name: str) -> bool:
             param_lower = param_name.lower()
             return param_lower in self.fi_param_tokens or any(tok in param_lower for tok in ["file", "page", "path", "inc"])
             
-        candidates = ParamDiscovery.build_candidates(urls, forms, filter_fn=fi_filter)
+        candidates = AttackSurface.build(
+            urls,
+            forms,
+            parameters=kwargs.get("parameters") or [],
+            api_endpoints=kwargs.get("api_endpoints") or [],
+            requests=kwargs.get("requests") or [],
+            filter_fn=fi_filter,
+        )
 
         if not candidates:
             return []
@@ -197,36 +204,59 @@ class FileInclusionDetector(BaseDetector):
 
         rfi_fingerprints = await self._fetch_rfi_fingerprints() if rfi_payloads else {}
 
-        async def verify_candidate(cand) -> list[Finding]:
-            if len(cand) == 5:
-                cand_url, param, method, val, form_inputs = cand
-            else:
-                cand_url, param, method, val = cand
-                form_inputs = None
-
+        async def verify_candidate(cand: AttackTarget) -> list[Finding]:
+            cand_url = cand.url
+            param = cand.parameter
+            method = cand.method
+            val = str(cand.value or "")
             cand_findings = []
 
-            def _build_request_args(payload: str) -> tuple[str, dict | None, dict | None]:
-                if method.upper() == "POST" and form_inputs is not None:
-                    data = FormPayloadBuilder.build(form_inputs, param, payload)
-                    return cand_url, None, data
-                return URLParameterBuilder.inject_parameter(cand_url, param, payload, method)
+            def _build_request_args(
+                payload: str,
+            ) -> tuple[str, dict | None, dict | None, object | None, dict | None, dict | None]:
+                prepared = cand.build_request(payload)
+                return (
+                    prepared.url,
+                    prepared.params,
+                    prepared.data,
+                    prepared.json_body,
+                    prepared.headers,
+                    prepared.cookies,
+                )
 
             async with semaphore:
                 verifier.set_request_context(parameter=param)
                 try:
-                    baseline_url, baseline_params, baseline_data = _build_request_args(val)
+                    baseline_url, baseline_params, baseline_data, baseline_json, baseline_headers, baseline_cookies = (
+                        _build_request_args(val)
+                    )
                     baseline = await verifier.send_request(
-                        baseline_url, method, baseline_params, baseline_data, test_phase="baseline"
+                        baseline_url,
+                        method,
+                        baseline_params,
+                        baseline_data,
+                        headers=baseline_headers,
+                        cookies=baseline_cookies,
+                        json_body=baseline_json,
+                        test_phase="baseline",
                     )
                     baseline_len = len(baseline.body)
 
                     if ResponseAnalyzer.is_phpinfo_or_debug_page(baseline.body or ""):
                         return cand_findings
 
-                    control_url, control_params, control_data = _build_request_args("sentry_non_existent_file_control_marker")
+                    control_url, control_params, control_data, control_json, control_headers, control_cookies = (
+                        _build_request_args("sentry_non_existent_file_control_marker")
+                    )
                     control_res = await verifier.send_request(
-                        control_url, method, control_params, control_data, test_phase="lfi_control"
+                        control_url,
+                        method,
+                        control_params,
+                        control_data,
+                        headers=control_headers,
+                        cookies=control_cookies,
+                        json_body=control_json,
+                        test_phase="lfi_control",
                     )
                     control_len = len(control_res.body)
 
@@ -268,9 +298,14 @@ class FileInclusionDetector(BaseDetector):
                             if re.search(verify_rule, baseline.body, re.I):
                                 continue
 
-                        injected_url, injected_params, injected_data = _build_request_args(payload)
+                        injected_url, injected_params, injected_data, injected_json, injected_headers, injected_cookies = (
+                            _build_request_args(payload)
+                        )
                         injected = await verifier.send_request(
                             injected_url, method, injected_params, injected_data,
+                            headers=injected_headers,
+                            cookies=injected_cookies,
+                            json_body=injected_json,
                             test_phase="lfi_injection", payload=payload,
                         )
 
@@ -407,18 +442,25 @@ class FileInclusionDetector(BaseDetector):
                         raw_query = "&".join(parts)
                         return urlunparse(parsed._replace(query=raw_query))
 
+                    def _build_rfi_request_args(
+                        rfi_payload: str,
+                    ) -> tuple[str, dict | None, dict | None, object | None, dict | None, dict | None]:
+                        if cand.location == ParameterLocation.query:
+                            return _build_rfi_request_url(rfi_payload), None, None, None, cand.headers or None, cand.cookies or None
+                        return _build_request_args(rfi_payload)
+
                     # --- Execute Advanced RFI Suite ---
                     verifier.set_request_context(module="rfi")
                     for payload, desc in rfi_payloads:
-                        if method.upper() == "POST" and form_inputs is not None:
-                            injected_url, injected_params, injected_data = _build_request_args(payload)
-                        else:
-                            injected_url = _build_rfi_request_url(payload)
-                            injected_params = None
-                            injected_data = None
+                        injected_url, injected_params, injected_data, injected_json, injected_headers, injected_cookies = (
+                            _build_rfi_request_args(payload)
+                        )
                         
                         injected = await verifier.send_request(
                             injected_url, method, injected_params, injected_data,
+                            headers=injected_headers,
+                            cookies=injected_cookies,
+                            json_body=injected_json,
                             test_phase="rfi_injection", payload=payload,
                         )
                         
@@ -504,17 +546,15 @@ class FileInclusionDetector(BaseDetector):
                             # Step 2: send example.com and require its known content to
                             # appear in the response.  A network error alone is never
                             # enough to report — we need the actual remote body reflected.
-                            if method.upper() == "POST" and form_inputs is not None:
-                                confirm_url, confirm_params, confirm_data = _build_request_args(
-                                    self._RFI_CONFIRM_PAYLOAD
-                                )
-                            else:
-                                confirm_url = _build_rfi_request_url(self._RFI_CONFIRM_PAYLOAD)
-                                confirm_params = None
-                                confirm_data = None
+                            confirm_url, confirm_params, confirm_data, confirm_json, confirm_headers, confirm_cookies = (
+                                _build_rfi_request_args(self._RFI_CONFIRM_PAYLOAD)
+                            )
 
                             confirm_res = await verifier.send_request(
                                 confirm_url, method, confirm_params, confirm_data,
+                                headers=confirm_headers,
+                                cookies=confirm_cookies,
+                                json_body=confirm_json,
                                 test_phase="rfi_content_confirm", payload=self._RFI_CONFIRM_PAYLOAD,
                             )
 

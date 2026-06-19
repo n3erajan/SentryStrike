@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse, parse_qsl
 
-from app.core.detectors.attack_surface import build_json_body
+from app.core.detectors.attack_surface import AttackTarget, build_json_body
 from app.core.detectors.base_detector import Finding
 from app.core.crawler.models import ParameterLocation
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
@@ -348,16 +348,16 @@ class BaseVerifier(ABC):
         if method.upper().startswith("HEADER:"):
             return await self._send(url, "GET", None, None, test_phase="pre_test_baseline")
 
-        if target and target.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
-            json_body = build_json_body(getattr(target, "json_template", None), target, value or "")
-            headers = target.headers or {}
+        if isinstance(target, AttackTarget):
+            prepared = target.build_request(value or "")
             return await self._send(
-                url,
-                method,
-                None,
-                None,
-                headers=headers,
-                json_body=json_body,
+                prepared.url,
+                prepared.method,
+                prepared.params,
+                prepared.data,
+                headers=prepared.headers,
+                cookies=prepared.cookies,
+                json_body=prepared.json_body,
                 test_phase="pre_test_baseline",
             )
 
