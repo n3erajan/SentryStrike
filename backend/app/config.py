@@ -61,6 +61,8 @@ class Settings(BaseSettings):
             "Default 0.7 = 70% of expected delay."
         ),
     )
+    oast_callback_base_url: str | None = Field(default=None, alias="OAST_CALLBACK_BASE_URL")
+    oast_poll_url: str | None = Field(default=None, alias="OAST_POLL_URL")
 
     cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
 

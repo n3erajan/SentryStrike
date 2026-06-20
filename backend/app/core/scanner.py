@@ -26,6 +26,7 @@ from app.core.detectors.file_inclusion import FileInclusionDetector
 from app.core.detectors.file_upload import FileUploadDetector
 from app.core.detectors.csrf_detector import CSRFDetector
 from app.core.detectors.ssrf_detector import SSRFDetector
+from app.core.detectors.open_redirect import OpenRedirectDetector
 from app.core.detectors.sensitive_paths import SensitivePathsDetector
 from app.core.verification.verification_framework import FindingDeduplicator, TestPollutionFilter
 
@@ -88,6 +89,7 @@ class ScanOrchestrator:
             FileInclusionDetector(),
             CSRFDetector(),
             SSRFDetector(),
+            OpenRedirectDetector(),
             FileUploadDetector(),
             SensitivePathsDetector(),
         ]

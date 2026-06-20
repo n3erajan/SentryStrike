@@ -2,10 +2,11 @@ import asyncio
 import logging
 import re
 
+from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
-from app.core.detectors.attack_surface import AttackSurface, AttackTarget, build_json_body
-from app.core.crawler.models import ParameterLocation
-from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder
+from app.core.detectors.attack_surface import AttackSurface, AttackTarget
+from app.core.verification.oast import OastClient
+from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,14 @@ class SSRFDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        settings = get_settings()
+        oast = kwargs.get("oast_client")
+        if not isinstance(oast, OastClient):
+            oast = OastClient(
+                settings.oast_callback_base_url,
+                settings.oast_poll_url,
+                timeout_seconds=settings.request_timeout_seconds,
+            )
 
         def ssrf_filter(param_name: str) -> bool:
             param_lower = param_name.lower()
@@ -52,12 +61,15 @@ class SSRFDetector(BaseDetector):
         verifier.set_request_context(module="ssrf")
 
         def build_request(cand: AttackTarget, value: str):
-            if cand.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
-                return cand.url, None, None, build_json_body(cand.json_template, cand, value), cand.headers
-            request_url, params, data = URLParameterBuilder.inject_parameter(
-                cand.url, cand.parameter, value, cand.method, cand.form_inputs
+            prepared = cand.build_request(value)
+            return (
+                prepared.url,
+                prepared.params,
+                prepared.data,
+                prepared.json_body,
+                prepared.headers,
+                prepared.cookies,
             )
-            return request_url, params, data, None, None
 
         async def verify_candidate(cand: AttackTarget) -> list[Finding]:
             cand_findings = []
@@ -66,7 +78,7 @@ class SSRFDetector(BaseDetector):
                 verifier.set_request_context(parameter=cand.parameter)
                 try:
                     # Retrieve baseline first
-                    baseline_url, baseline_params, baseline_data, baseline_json, baseline_headers = build_request(
+                    baseline_url, baseline_params, baseline_data, baseline_json, baseline_headers, baseline_cookies = build_request(
                         cand, str(cand.value or "")
                     )
                     baseline = await verifier.send_request(
@@ -75,6 +87,7 @@ class SSRFDetector(BaseDetector):
                         baseline_params,
                         baseline_data,
                         headers=baseline_headers,
+                        cookies=baseline_cookies,
                         json_body=baseline_json,
                         test_phase="baseline",
                     )
@@ -84,7 +97,7 @@ class SSRFDetector(BaseDetector):
                         if baseline.status_code == 200 and re.search(regex_pattern, baseline.body, re.I):
                             continue
 
-                        injected_url, injected_params, injected_data, injected_json, injected_headers = build_request(
+                        injected_url, injected_params, injected_data, injected_json, injected_headers, injected_cookies = build_request(
                             cand, payload
                         )
                         injected = await verifier.send_request(
@@ -93,6 +106,7 @@ class SSRFDetector(BaseDetector):
                             injected_params,
                             injected_data,
                             headers=injected_headers,
+                            cookies=injected_cookies,
                             json_body=injected_json,
                             test_phase="ssrf_injection", payload=payload,
                         )
@@ -118,6 +132,56 @@ class SSRFDetector(BaseDetector):
                                 )
                             )
                             break
+
+                    if not cand_findings and oast.enabled:
+                        callback_url, interaction_id = oast.new_callback_url("ssrf")
+                        (
+                            callback_req_url,
+                            callback_params,
+                            callback_data,
+                            callback_json,
+                            callback_headers,
+                            callback_cookies,
+                        ) = build_request(cand, callback_url)
+                        callback_response = await verifier.send_request(
+                            callback_req_url,
+                            cand.method,
+                            callback_params,
+                            callback_data,
+                            headers=callback_headers,
+                            cookies=callback_cookies,
+                            json_body=callback_json,
+                            test_phase="ssrf_blind_oast",
+                            payload=callback_url,
+                        )
+                        await asyncio.sleep(0.2)
+                        interactions = await oast.poll(interaction_id)
+                        if interactions:
+                            cand_findings.append(
+                                Finding(
+                                    category=OwaspCategory.a01,
+                                    vuln_type="Blind Server-Side Request Forgery (SSRF)",
+                                    severity=SeverityLevel.high,
+                                    url=cand.url,
+                                    parameter=cand.parameter,
+                                    method=cand.method,
+                                    payload=callback_url,
+                                    evidence=(
+                                        "Blind SSRF verified through an out-of-band callback interaction "
+                                        f"for interaction id '{interaction_id}'."
+                                    ),
+                                    confidence_score=95.0,
+                                    detection_method="ssrf_oast_callback",
+                                    reproducible=True,
+                                    verified=True,
+                                    verification_request_snippet=callback_response.request_snippet,
+                                    verification_response_snippet=callback_response.response_snippet,
+                                    detection_evidence={
+                                        "interaction_id": interaction_id,
+                                        "interaction_count": len(interactions),
+                                    },
+                                )
+                            )
                 except Exception as e:
                     logger.error("SSRF verification failed for %s param %s: %s", cand.url, cand.parameter, e)
             return cand_findings

@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -12,6 +13,17 @@ from app.utils.http_logging import make_httpx_response_logger
 from app.utils.scan_http import create_scan_client
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class UploadCandidate:
+    url: str
+    method: str
+    file_field: str
+    raw_inputs: list = field(default_factory=list)
+    data: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+    source: str = "form"
 
 
 class FileUploadDetector(BaseDetector):
@@ -45,7 +57,7 @@ class FileUploadDetector(BaseDetector):
         session_cookies = kwargs.get("session_cookies") or {}
         settings = get_settings()
 
-        candidates = []
+        candidates: list[UploadCandidate] = []
         for form in forms:
             # Resolve the form action against its page URL to get an absolute URL.
             # form.action may be relative (e.g. "" or "../upload") so we must
@@ -67,19 +79,29 @@ class FileUploadDetector(BaseDetector):
                 if getattr(inp, "input_type", "").lower() == "file"
             ]
             if file_inputs:
-                candidates.append((form_url, form_method, raw_inputs, file_inputs[0].name))
+                candidates.append(
+                    UploadCandidate(
+                        url=form_url,
+                        method=form_method,
+                        raw_inputs=raw_inputs,
+                        file_field=file_inputs[0].name,
+                        source="html_form",
+                    )
+                )
+
+        candidates.extend(self._api_upload_candidates(kwargs))
 
         if not candidates:
             logger.info(
-                "file_upload: no forms with file inputs found in %d form(s) - skipping",
+                "file_upload: no upload candidates found in %d form(s) - skipping",
                 len(forms),
             )
             return []
 
         logger.info(
-            "file_upload: testing %d upload form(s): %s",
+            "file_upload: testing %d upload candidate(s): %s",
             len(candidates),
-            ", ".join(sorted({url for url, _, _, _ in candidates})),
+            ", ".join(sorted({candidate.url for candidate in candidates})),
         )
 
         # Derive the site root once so candidate upload paths can be built
@@ -91,13 +113,11 @@ class FileUploadDetector(BaseDetector):
             cookies=session_cookies,
             event_hooks={"response": [make_httpx_response_logger("file_upload", "upload_test")]},
         ) as client:
-            for form_url, method, raw_inputs, file_field in candidates:
+            for candidate in candidates:
                 try:
-                    await self._test_uploads(
-                        client, findings, form_url, method, raw_inputs, file_field
-                    )
+                    await self._test_uploads(client, findings, candidate)
                 except Exception as exc:
-                    logger.error("File upload test failed for %s: %s", form_url, exc)
+                    logger.error("File upload test failed for %s: %s", candidate.url, exc)
 
         return findings
 
@@ -114,20 +134,20 @@ class FileUploadDetector(BaseDetector):
         self,
         client: httpx.AsyncClient,
         findings: list[Finding],
-        form_url: str,
-        method: str,
-        raw_inputs: list,
-        file_field: str,
+        candidate: UploadCandidate,
     ) -> None:
         php_name = "sentry_test.php"
         php_content = b'<?php echo "SENTRY_UPLOAD_TEST_CANARY"; ?>'
         txt_name = "sentry_test.txt"
         txt_content = b"SENTRY_UPLOAD_TEST_CANARY"
+        form_url = candidate.url
+        method = candidate.method
+        file_field = candidate.file_field
         site_root = self._site_root(form_url)
 
         # --- Test 1: plain .php upload with correct content-type ---
         accepted, response = await self._send_upload(
-            client, form_url, method, raw_inputs, file_field,
+            client, candidate,
             php_name, php_content, "application/x-php",
         )
         if accepted:
@@ -155,7 +175,7 @@ class FileUploadDetector(BaseDetector):
 
         # --- Test 2: .php upload with spoofed image/jpeg content-type ---
         accepted, response = await self._send_upload(
-            client, form_url, method, raw_inputs, file_field,
+            client, candidate,
             php_name, php_content, "image/jpeg",
         )
         if accepted:
@@ -198,7 +218,7 @@ class FileUploadDetector(BaseDetector):
         # --- Test 3: double extension (.php.jpg) ---
         dbl_name = "sentry_test.php.jpg"
         accepted, response = await self._send_upload(
-            client, form_url, method, raw_inputs, file_field,
+            client, candidate,
             dbl_name, php_content, "image/jpeg",
         )
         if accepted:
@@ -240,7 +260,7 @@ class FileUploadDetector(BaseDetector):
 
         # --- Test 4: unrestricted type - accepts plain .txt ---
         accepted, response = await self._send_upload(
-            client, form_url, method, raw_inputs, file_field,
+            client, candidate,
             txt_name, txt_content, "text/plain",
         )
         if accepted and not self._has_error_terms(response.text or ""):
@@ -262,26 +282,26 @@ class FileUploadDetector(BaseDetector):
     async def _send_upload(
         self,
         client: httpx.AsyncClient,
-        form_url: str,
-        method: str,
-        raw_inputs: list,
-        file_field: str,
+        candidate: UploadCandidate,
         filename: str,
         content: bytes,
         content_type: str,
     ) -> tuple[bool, httpx.Response]:
-        data = self._build_form_payload(raw_inputs, file_field)
-        files = {file_field: (filename, content, content_type)}
+        data = dict(candidate.data)
+        if candidate.raw_inputs:
+            data.update(self._build_form_payload(candidate.raw_inputs, candidate.file_field))
+        files = {candidate.file_field: (filename, content, content_type)}
 
         # BUG FIX: original code had inverted ternary:
         #   method="POST" if method != "POST" else method
         # which always resolves to "POST" but was clearly intended to
         # normalise the value - just pass method directly.
         response = await client.request(
-            method=method,
-            url=form_url,
+            method=candidate.method,
+            url=candidate.url,
             data=data,
             files=files,
+            headers=candidate.headers or None,
         )
         body = response.text or ""
         accepted = (
@@ -289,6 +309,88 @@ class FileUploadDetector(BaseDetector):
             and not self._has_error_terms(body)
         )
         return accepted, response
+
+    def _api_upload_candidates(self, kwargs: dict[str, object]) -> list[UploadCandidate]:
+        candidates: list[UploadCandidate] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def add(url: str, method: str, field_name: str, data: dict[str, str], headers: dict[str, str], source: str) -> None:
+            if not url or not field_name:
+                return
+            key = (url, method.upper(), field_name)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(
+                UploadCandidate(
+                    url=url,
+                    method=method.upper() or "POST",
+                    file_field=field_name,
+                    data=data,
+                    headers={
+                        key: value
+                        for key, value in (headers or {}).items()
+                        if key.lower() not in {"content-type", "content-length"}
+                    },
+                    source=source,
+                )
+            )
+
+        for request in kwargs.get("requests") or []:
+            headers = dict(getattr(request, "request_headers", {}) or {})
+            content_type = " ".join(
+                str(value).lower() for key, value in headers.items() if key.lower() == "content-type"
+            )
+            post_data = getattr(request, "post_data", None)
+            if "multipart/form-data" not in content_type:
+                continue
+            fields = self._field_names_from_multipart_post_data(str(post_data or ""))
+            file_field = next(
+                (field for field in fields if any(token in field.lower() for token in ("file", "upload", "avatar", "image", "document"))),
+                fields[0] if fields else "file",
+            )
+            data = {field: "sentry_test_val" for field in fields if field != file_field}
+            add(
+                str(getattr(request, "url", "") or ""),
+                str(getattr(request, "method", "POST") or "POST"),
+                file_field,
+                data,
+                headers,
+                "browser_multipart_request",
+            )
+
+        for asset in kwargs.get("assets") or []:
+            text = str(asset)
+            if "FormData" not in text and ".append(" not in text:
+                continue
+            endpoint_matches = [
+                match
+                for match in re.findall(r"""['"]([^'"]*(?:upload|file|avatar|image|document)[^'"]*)['"]""", text, re.I)
+                if match.startswith(("/", "http://", "https://")) or "/" in match
+            ]
+            field_matches = re.findall(r"""\.append\(\s*['"]([^'"]+)['"]""", text)
+            file_fields = [
+                field for field in field_matches
+                if any(token in field.lower() for token in ("file", "upload", "avatar", "image", "document"))
+            ]
+            root_url = str(kwargs.get("root_url") or "")
+            for endpoint in endpoint_matches:
+                url = urljoin(root_url, endpoint)
+                add(
+                    url,
+                    "POST",
+                    file_fields[0] if file_fields else "file",
+                    {field: "sentry_test_val" for field in field_matches if field not in file_fields},
+                    {},
+                    "static_formdata_javascript",
+                )
+
+        return candidates
+
+    @staticmethod
+    def _field_names_from_multipart_post_data(post_data: str) -> list[str]:
+        fields = re.findall(r'name="([^"]+)"', post_data or "")
+        return list(dict.fromkeys(fields))
 
     def _build_form_payload(self, raw_inputs: list, file_field: str) -> dict:
         # FormPayloadBuilder.build() requires (form_inputs, target_param, target_value)
