@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -49,6 +49,17 @@ class SensitivePathsDetector(BaseDetector):
         "/actuator/health",
         "/actuator/prometheus",
         "/__debug__",
+        "/swagger.json",
+        "/swagger/v1/swagger.json",
+        "/openapi.json",
+        "/api-docs",
+        "/v3/api-docs",
+        "/graphql",
+        "/graphiql",
+        "/sitemap.xml",
+        "/app.js.map",
+        "/main.js.map",
+        "/bundle.js.map",
     ]
 
     _DEBUG_METRICS_PATTERNS: list[re.Pattern] = [
@@ -65,8 +76,190 @@ class SensitivePathsDetector(BaseDetector):
         ]
     ]
 
+    _STACK_TRACE_PATTERNS: list[re.Pattern] = [
+        re.compile(p, re.IGNORECASE)
+        for p in [
+            r"Traceback \(most recent call last\)",
+            r"at\s+[A-Za-z0-9_$.[\]<>]+\([^)]*\.js:\d+:\d+\)",
+            r"Exception in thread|java\.lang\.[A-Za-z]+Exception",
+            r"System\.[A-Za-z]+Exception",
+            r"Stack trace:",
+            r"SQLSTATE\[[A-Z0-9]+\]|PDOException|Sequelize(Database)?Error",
+        ]
+    ]
+
+    _SECRET_PATTERNS: list[re.Pattern] = [
+        re.compile(p, re.IGNORECASE)
+        for p in [
+            r"['\"]?\b(?:api[_-]?key|secret|secret[_-]?key|client[_-]?secret|private[_-]?key)\b['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9_\-./+=]{8,}",
+            r"['\"]?\b(?:password|passwd|db_password|database_password)\b['\"]?\s*[:=]\s*['\"]?[^'\"\s,;}{]{8,}",
+            r"['\"]?\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|jwt)\b['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+",
+            r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+        ]
+    ]
+
+    _SOURCE_MAP_PATTERNS: list[re.Pattern] = [
+        re.compile(r'"version"\s*:\s*3', re.IGNORECASE),
+        re.compile(r'"sources"\s*:\s*\[', re.IGNORECASE),
+        re.compile(r'"mappings"\s*:\s*"', re.IGNORECASE),
+        re.compile(r"sourceMappingURL=.*\.map", re.IGNORECASE),
+    ]
+
+    _API_DOC_PATTERNS: list[re.Pattern] = [
+        re.compile(r'"openapi"\s*:\s*"3\.', re.IGNORECASE),
+        re.compile(r'"swagger"\s*:\s*"2\.0"', re.IGNORECASE),
+        re.compile(r'"paths"\s*:\s*\{', re.IGNORECASE),
+        re.compile(r"Swagger UI|OpenAPI|api-docs", re.IGNORECASE),
+        re.compile(r"__schema|IntrospectionQuery|GraphQL", re.IGNORECASE),
+    ]
+
+    def _classify_content(self, path: str, body: str, content_type: str = "") -> tuple[bool, str, str, SeverityLevel]:
+        body_lower = body.lower()
+        path_lower = path.lower()
+
+        if ".git/config" in path_lower and "[core]" in body_lower:
+            return True, "Sensitive File Exposure", "Git configuration file exposed.", SeverityLevel.high
+        if ".env" in path_lower and (
+            any(pattern.search(body) for pattern in self._SECRET_PATTERNS)
+            or re.search(r"\b(?:db_password|database_password|app_key|secret)\b\s*=", body, re.I)
+        ):
+            return True, "Sensitive File Exposure", "Environment file with secret-like values exposed.", SeverityLevel.high
+        if "phpinfo" in path_lower and "<title>phpinfo()</title>" in body_lower:
+            return True, "Debug / Metrics Endpoint Exposed", "PHP configuration details (phpinfo) exposed.", SeverityLevel.medium
+        if (".sql" in path_lower or "backup" in path_lower or "dump" in path_lower) and (
+            "insert into" in body_lower or "create table" in body_lower or "mysqldump" in body_lower
+        ):
+            return True, "Backup / Database Dump Exposed", "Database dump or backup content exposed.", SeverityLevel.high
+        if (path_lower.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".bak", ".old")) or "backup" in path_lower) and len(body) > 0:
+            if "application" in content_type.lower() or "octet-stream" in content_type.lower() or "<html" not in body_lower:
+                return True, "Backup / Archive File Exposed", "Backup/archive-like file content is reachable.", SeverityLevel.high
+        if ("docker" in path_lower or path_lower.endswith((".yml", ".yaml"))) and (
+            "services:" in body_lower or "image:" in body_lower or "version:" in body_lower
+        ):
+            return True, "Sensitive File Exposure", "Docker or YAML configuration file exposed.", SeverityLevel.medium
+        if "web.xml" in path_lower and "<web-app" in body_lower:
+            return True, "Sensitive File Exposure", "Java web.xml configuration file exposed.", SeverityLevel.medium
+        if self._looks_like_source_map(path, body, content_type):
+            return True, "Exposed Source Map", "JavaScript source map content is reachable.", SeverityLevel.medium
+        if self._looks_like_api_docs(path, body, content_type):
+            return True, "Exposed API Documentation", "OpenAPI/Swagger/GraphQL documentation content is reachable.", SeverityLevel.medium
+        if any(pattern.search(body) for pattern in self._DEBUG_METRICS_PATTERNS):
+            return True, "Debug / Metrics Endpoint Exposed", "Debug, metrics, or actuator content exposed.", SeverityLevel.medium
+        if any(pattern.search(body) for pattern in self._STACK_TRACE_PATTERNS):
+            return True, "Verbose Stack Trace Exposure", "Verbose exception stack trace exposed.", SeverityLevel.medium
+        if any(pattern.search(body) for pattern in self._SECRET_PATTERNS):
+            return True, "Secret-Like Value Exposure", "Secret-like key, token, or credential value exposed.", SeverityLevel.high
+
+        return False, "", "", SeverityLevel.low
+
+    def _looks_like_source_map(self, path: str, body: str, content_type: str = "") -> bool:
+        path_lower = path.lower()
+        if path_lower.endswith(".map") and sum(1 for pattern in self._SOURCE_MAP_PATTERNS if pattern.search(body)) >= 2:
+            return True
+        if "application/json" in content_type.lower() and sum(1 for pattern in self._SOURCE_MAP_PATTERNS if pattern.search(body)) >= 3:
+            return True
+        return False
+
+    def _looks_like_api_docs(self, path: str, body: str, content_type: str = "") -> bool:
+        path_lower = path.lower()
+        if any(token in path_lower for token in ("swagger", "openapi", "api-docs", "graphql", "graphiql")):
+            return any(pattern.search(body) for pattern in self._API_DOC_PATTERNS)
+        if "application/json" in content_type.lower():
+            return sum(1 for pattern in self._API_DOC_PATTERNS if pattern.search(body)) >= 2
+        return False
+
+    def _finding(
+        self,
+        *,
+        vuln_type: str,
+        severity: SeverityLevel,
+        url: str,
+        evidence: str,
+        detection_method: str,
+        proof_type: str,
+        response_snippet: str | None = None,
+        request_snippet: str | None = None,
+        confidence_score: float = 90.0,
+    ) -> Finding:
+        return Finding(
+            category=OwaspCategory.a02,
+            vuln_type=vuln_type,
+            severity=severity,
+            url=url,
+            evidence=evidence,
+            confidence_score=confidence_score,
+            detection_method=detection_method,
+            detection_evidence={"proof_type": proof_type},
+            verified=True,
+            reproducible=True,
+            verification_request_snippet=request_snippet,
+            verification_response_snippet=response_snippet,
+        )
+
+    def _observed_response_findings(self, kwargs: dict[str, object]) -> list[Finding]:
+        findings: list[Finding] = []
+        seen: set[tuple[str, str]] = set()
+        for request in kwargs.get("requests") or []:
+            url = str(getattr(request, "url", "") or "")
+            body = str(getattr(request, "response_snippet", "") or "")
+            if not url or not body:
+                continue
+            headers = getattr(request, "response_headers", {}) or {}
+            content_type = str(getattr(request, "response_content_type", "") or headers.get("content-type", ""))
+            matched, vuln_type, evidence, severity = self._classify_content(urlparse(url).path, body, content_type)
+            if not matched:
+                continue
+            key = (url, vuln_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(
+                self._finding(
+                    vuln_type=vuln_type,
+                    severity=severity,
+                    url=url,
+                    evidence=f"Observed response disclosure: {evidence}",
+                    detection_method="observed_response_content",
+                    proof_type="content_verified_observed_response",
+                    response_snippet=body[:500],
+                )
+            )
+        return findings
+
+    def _spa_fallback_context_findings(self, kwargs: dict[str, object]) -> list[Finding]:
+        dead_routes = list(kwargs.get("dead_routes") or [])
+        fallback_routes = [
+            route for route in dead_routes
+            if bool(getattr(route, "is_spa_fallback", False))
+        ]
+        if not fallback_routes:
+            return []
+        sample = ", ".join(str(getattr(route, "url", "")) for route in fallback_routes[:3])
+        return [
+            Finding(
+                category=OwaspCategory.a02,
+                vuln_type="SPA Fallback Sensitive Path Suppression",
+                severity=SeverityLevel.low,
+                url=str(kwargs.get("root_url") or ""),
+                evidence=(
+                    f"Suppressed {len(fallback_routes)} route(s) that returned the SPA shell instead of "
+                    f"real sensitive content. Sample: {sample}"
+                ),
+                confidence_score=95.0,
+                detection_method="spa_fallback_context",
+                detection_evidence={
+                    "proof_type": "fallback_suppression_context",
+                    "suppressed_count": len(fallback_routes),
+                },
+                verified=True,
+                reproducible=True,
+            )
+        ]
+
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
+        findings.extend(self._observed_response_findings(kwargs))
+        findings.extend(self._spa_fallback_context_findings(kwargs))
         root_url = kwargs.get("root_url")
 
         if not root_url and urls:
@@ -159,59 +352,25 @@ class SensitivePathsDetector(BaseDetector):
                         if "<html" in body_lower and ("404" in body_lower or "not found" in body_lower):
                             return None
                             
-                        # Specific pattern matching for high confidence
-                        is_sensitive = False
-                        evidence = ""
-                        
-                        if ".git/config" in path and "[core]" in body_lower:
-                            is_sensitive = True
-                            evidence = "Git configuration file exposed."
-                        elif ".env" in path and ("db_password" in body_lower or "app_key" in body_lower or "secret" in body_lower):
-                            is_sensitive = True
-                            evidence = "Environment variables exposed."
-                        elif "phpinfo" in path and "<title>phpinfo()</title>" in body_lower:
-                            is_sensitive = True
-                            evidence = "PHP configuration details (phpinfo) exposed."
-                        elif ".sql" in path and ("insert into" in body_lower or "create table" in body_lower):
-                            is_sensitive = True
-                            evidence = "Database dump file exposed."
-                        elif ("docker" in path or "yml" in path) and ("services:" in body_lower or "image:" in body_lower or "run" in body_lower):
-                             is_sensitive = True
-                             evidence = "Docker configuration file exposed."
-                        elif "web.xml" in path and "<web-app" in body_lower:
-                            is_sensitive = True
-                            evidence = "Java web.xml configuration file exposed."
-                        elif any(p.search(response.text) for p in self._DEBUG_METRICS_PATTERNS):
-                            is_sensitive = True
-                            evidence = "Debug / metrics / actuator endpoint exposed."
-                        else:
-                            # If it's a 200 OK and not HTML, it's highly suspicious
-                            if "<html" not in body_lower and len(response.text.strip()) > 0:
-                                is_sensitive = True
-                                evidence = f"Sensitive file {path} is accessible."
-                        
-                        if is_sensitive:
-                            # Determine vuln_type based on path category
-                            is_debug_or_metrics = any(
-                                p.search(response.text) for p in self._DEBUG_METRICS_PATTERNS
-                            )
-                            vuln_type = (
-                                "Debug / Metrics Endpoint Exposed"
-                                if is_debug_or_metrics
-                                else "Sensitive File Exposure"
-                            )
-
-                            severity = SeverityLevel.high if ".env" in path or ".sql" in path else SeverityLevel.medium
-
-                            return Finding(
-                                category=OwaspCategory.a02,
+                        matched, vuln_type, evidence, severity = self._classify_content(
+                            path,
+                            response.text,
+                            content_type,
+                        )
+                        if matched:
+                            return self._finding(
                                 vuln_type=vuln_type,
                                 severity=severity,
                                 url=target_url,
-                                evidence=f"Accessible sensitive path: {evidence} Snippet: {response.text[:200]}...",
+                                evidence=(
+                                    f"Accessible sensitive path with content proof: {evidence} "
+                                    f"Snippet: {response.text[:200]}..."
+                                ),
+                                detection_method="path_content_fingerprint",
+                                proof_type="content_verified_path_probe",
+                                request_snippet=f"GET {target_url}",
+                                response_snippet=response.text[:500],
                                 confidence_score=95.0,
-                                detection_method="path_bruteforce",
-                                verified=True,
                             )
                     except Exception as e:
                         logger.debug("Error checking path %s: %s", target_url, e)
