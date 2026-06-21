@@ -1387,6 +1387,7 @@ class AuthenticationFailuresDetector(BaseDetector):
         session_cookies = kwargs.get("session_cookies") or {}
         scan_mode = getattr(get_settings(), "scan_mode", "verified")
         verified_mode = scan_mode == "verified"
+        is_spa = bool(kwargs.get("is_spa", False))
 
         # -----------------------------------------------------------------------
         # Form analysis
@@ -1489,8 +1490,15 @@ class AuthenticationFailuresDetector(BaseDetector):
                             "and bound to the requesting user."
                         ),
                     ))
-            # 3. Admin / privileged endpoint discovered
-            if self._path_hits(path_tokens, self.admin_tokens) or self._url_contains(lowered, self.admin_tokens):
+            # 3. Admin / privileged endpoint discovered.
+            # URL names alone are not proof of an exposed admin surface. This is
+            # especially noisy for SPAs, where client routes often return the
+            # same index shell and strict MIME errors for relative assets.
+            if (
+                not verified_mode
+                and not is_spa
+                and (self._path_hits(path_tokens, self.admin_tokens) or self._url_contains(lowered, self.admin_tokens))
+            ):
                 findings.append(self._finding(
                     vuln_type="Admin / Privileged Endpoint Discovered",
                     url=url,
@@ -1577,7 +1585,14 @@ class AuthenticationFailuresDetector(BaseDetector):
                 "/graphql", "/graphiql", "/altair",
             )
             for admin_path in well_known_admin_paths:
-                if parsed.path.lower().startswith(admin_path) or admin_path.rstrip("/") == parsed.path.lower().rstrip("/"):
+                if (
+                    not verified_mode
+                    and not is_spa
+                    and (
+                        parsed.path.lower().startswith(admin_path)
+                        or admin_path.rstrip("/") == parsed.path.lower().rstrip("/")
+                    )
+                ):
                     findings.append(self._finding(
                         vuln_type="Well-Known Admin / Sensitive Path Discovered",
                         url=url,

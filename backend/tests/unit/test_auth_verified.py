@@ -107,7 +107,7 @@ async def test_heuristic_mode_keeps_passive_url_only_auth_hints():
 
 
 @pytest.mark.asyncio
-async def test_verified_mode_still_emits_observable_admin_path_findings():
+async def test_verified_mode_suppresses_url_only_admin_path_findings():
     settings = get_settings()
     original_mode = settings.scan_mode
     settings.scan_mode = "verified"
@@ -125,9 +125,33 @@ async def test_verified_mode_still_emits_observable_admin_path_findings():
         settings.scan_mode = original_mode
 
     vuln_types = {finding.vuln_type for finding in findings}
-    assert "Admin / Privileged Endpoint Discovered" in vuln_types
-    assert "Well-Known Admin / Sensitive Path Discovered" in vuln_types
+    assert "Admin / Privileged Endpoint Discovered" not in vuln_types
+    assert "Well-Known Admin / Sensitive Path Discovered" not in vuln_types
     assert "Authentication Endpoint Served Over Plaintext HTTP" not in vuln_types
+
+
+@pytest.mark.asyncio
+async def test_heuristic_mode_suppresses_spa_admin_route_name_hints():
+    settings = get_settings()
+    original_mode = settings.scan_mode
+    settings.scan_mode = "heuristic"
+
+    try:
+        detector = AuthenticationFailuresDetector()
+        findings = await detector.detect(
+            urls=[
+                "http://example.test/administration",
+                "http://example.test/.env",
+            ],
+            forms=[],
+            is_spa=True,
+        )
+    finally:
+        settings.scan_mode = original_mode
+
+    vuln_types = {finding.vuln_type for finding in findings}
+    assert "Admin / Privileged Endpoint Discovered" not in vuln_types
+    assert "Well-Known Admin / Sensitive Path Discovered" not in vuln_types
 
 
 def _jwt(header: dict, payload: dict) -> str:

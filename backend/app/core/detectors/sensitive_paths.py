@@ -227,34 +227,7 @@ class SensitivePathsDetector(BaseDetector):
         return findings
 
     def _spa_fallback_context_findings(self, kwargs: dict[str, object]) -> list[Finding]:
-        dead_routes = list(kwargs.get("dead_routes") or [])
-        fallback_routes = [
-            route for route in dead_routes
-            if bool(getattr(route, "is_spa_fallback", False))
-        ]
-        if not fallback_routes:
-            return []
-        sample = ", ".join(str(getattr(route, "url", "")) for route in fallback_routes[:3])
-        return [
-            Finding(
-                category=OwaspCategory.a02,
-                vuln_type="SPA Fallback Sensitive Path Suppression",
-                severity=SeverityLevel.low,
-                url=str(kwargs.get("root_url") or ""),
-                evidence=(
-                    f"Suppressed {len(fallback_routes)} route(s) that returned the SPA shell instead of "
-                    f"real sensitive content. Sample: {sample}"
-                ),
-                confidence_score=95.0,
-                detection_method="spa_fallback_context",
-                detection_evidence={
-                    "proof_type": "fallback_suppression_context",
-                    "suppressed_count": len(fallback_routes),
-                },
-                verified=True,
-                reproducible=True,
-            )
-        ]
+        return []
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []

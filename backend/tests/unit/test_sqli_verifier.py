@@ -65,6 +65,52 @@ async def test_sqli_verifier_union_requires_version_proof():
     # Since similarity > 0.85 and no canary was found, it should not be verified or is_vulnerable
     assert not result.is_vulnerable or not any(f.verified for f in result.findings)
 
+
+@pytest.mark.asyncio
+async def test_sqli_verifier_suppresses_null_differential_without_extraction_proof():
+    verifier = SQLiVerifier()
+    baseline = ResponseData(
+        status_code=200,
+        headers={},
+        body="A" * 1000,
+        response_time_ms=10.0,
+        request_snippet="",
+        response_snippet="",
+    )
+
+    async def mock_send(url, method, params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase")
+        if phase == "union_canary":
+            body = baseline.body
+        elif phase in {"union_null", "union_cross_column_confirm"}:
+            body = ("A" * 850) + ("B" * 150)
+        elif phase == "union_version_extract":
+            body = ("A" * 850) + ("C" * 150)
+        else:
+            body = baseline.body
+        return ResponseData(
+            status_code=200,
+            headers={},
+            body=body,
+            response_time_ms=10.0,
+            request_snippet="",
+            response_snippet="",
+        )
+
+    verifier._send = mock_send
+
+    result = await verifier._verify_union_based(
+        url="http://example.com/search?q=1",
+        parameter="q",
+        method="GET",
+        value="1",
+        pre_test_baseline=baseline,
+    )
+
+    assert result.is_vulnerable is False
+    assert result.findings == []
+    assert result.evidence["reason"] == "null_differential_without_extraction_proof"
+
 @pytest.mark.asyncio
 async def test_sqli_verifier_boolean_requires_confirmation():
     verifier = SQLiVerifier()

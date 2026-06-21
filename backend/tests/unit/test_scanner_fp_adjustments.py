@@ -183,6 +183,51 @@ def test_verified_payload_execution_is_confirmed_exploit() -> None:
     assert strength == EvidenceStrength.confirmed_exploit
 
 
+def test_data_exposure_finding_includes_long_response_excerpt() -> None:
+    finding = Finding(
+        category=OwaspCategory.a01,
+        vuln_type="Unauthenticated API Data Exposure",
+        severity=SeverityLevel.medium,
+        url="http://target.test/api/users",
+        evidence="Unauthenticated request returned object data.",
+        verified=True,
+        confidence_score=88.0,
+        detection_method="authorization_matrix",
+        verification_response_snippet='{"data":[' + ('{"id":1,"email":"a@example.test"},' * 40) + "]}",
+    )
+
+    snippet = _orchestrator()._finding_response_snippet(finding)
+
+    assert snippet is not None
+    assert "RESPONSE EXCERPT" in snippet
+    assert '"email":"a@example.test"' in snippet
+
+
+def test_union_sqli_without_extraction_proof_is_probable_not_confirmed_exploit() -> None:
+    finding = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="SQL Injection (UNION-Based)",
+        severity=SeverityLevel.critical,
+        url="http://target.test/api/search?q=test",
+        parameter="q",
+        payload="' UNION SELECT NULL--",
+        evidence="UNION NULL payloads produced response differences.",
+        verified=True,
+        confidence_score=75.0,
+        detection_method="union_based",
+        detection_evidence={
+            "valid_null_probes": 4,
+            "avg_similarity": 0.83,
+            "canary_verified": False,
+            "version_extracted": False,
+        },
+    )
+
+    strength = _orchestrator()._classify_evidence_strength(finding)
+
+    assert strength == EvidenceStrength.probable
+
+
 def test_unverified_non_heuristic_evidence_is_probable() -> None:
     finding = Finding(
         category=OwaspCategory.a05,

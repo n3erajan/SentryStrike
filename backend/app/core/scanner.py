@@ -457,13 +457,7 @@ class ScanOrchestrator:
                 "authentication form may lack csrf",
                 "csrf protection",
                 "csrf token",
-                # Exposed admin / sensitive paths - confirmed by HTTP 200/redirect response
-                "admin / privileged endpoint",
-                "admin endpoint",
-                "privileged endpoint",
-                "well-known admin",
-                "sensitive path",
-                "admin panel",
+                # Exposed admin / sensitive paths require content or access-control proof.
                 "phpmyadmin",
                 # Security-header absence - confirmed from response headers
                 "missing security header",
@@ -1449,7 +1443,6 @@ class ScanOrchestrator:
             if getattr(request, "post_data", None)
             and "json" in str(getattr(request, "request_headers", {}).get("content-type", "")).lower()
         ]
-
         if is_spa and not requests:
             warnings.append(
                 "SPA detected, but no browser runtime requests were observed. API coverage is static extraction only."
@@ -1492,6 +1485,11 @@ class ScanOrchestrator:
         )
         if finding.severity == SeverityLevel.info or any(term in vt for term in informational_terms):
             return EvidenceStrength.informational
+
+        if method == "union_based" and "sql injection" in vt:
+            evidence = getattr(finding, "detection_evidence", {}) or {}
+            if not evidence.get("canary_verified") and not evidence.get("version_extracted"):
+                return EvidenceStrength.probable if verified else EvidenceStrength.possible
 
         active_terms = (
             "sql injection",
@@ -1611,6 +1609,8 @@ class ScanOrchestrator:
             "xss", "command injection", "file inclusion", "path traversal",
             "arbitrary file read", "ssrf", "verbose error", "debug / metrics",
             "sensitive path", "information disclosure", "vulnerable component", "mixed content",
+            "data exposure", "authorization bypass", "forced browsing",
+            "access control", "idor", "privilege bypass",
         )
         if any(term in vt for term in body_proof_terms):
             return True
@@ -1623,6 +1623,9 @@ class ScanOrchestrator:
             "stream_decoding_oracle",
             "command_output",
             "remote_include_error_oracle",
+            "authorization_matrix",
+            "authorization_matrix_second_user",
+            "authorization_matrix_privileged_baseline",
         }:
             return True
 

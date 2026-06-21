@@ -45,8 +45,8 @@ UNION detection hierarchy (confidence order):
   90 - Canary reflected in response, absent from baseline       (proof of extraction)
   90 - Version indicator in response, absent from baseline,
        AND parent NULL probe passed similarity gate             (strong proof)
-  75 - 3+ NULL payloads in valid window, cross-column confirm   (circumstantial but reproducible)
-  suppressed - anything below 3 NULL payloads, or unconfirmed   (not reported)
+  suppressed - NULL-only differential changes without extraction proof
+               are treated as instability/semantic response changes, not SQLi
 """
 
 import asyncio
@@ -1153,34 +1153,20 @@ class SQLiVerifier(BaseVerifier):
                         },
                     )
 
-                finding = self._create_finding(
-                    category=OwaspCategory.a05,
-                    vuln_type="SQL Injection (UNION-Based)",
-                    severity=SeverityLevel.high,
-                    url=url, parameter=parameter, payload=best_payload,
-                    evidence=(
-                        f"UNION NULL payloads produced consistent response changes "
-                        f"across {n} column-count variants (avg similarity: {avg_sim:.2f}). "
-                        f"Cross-column confirmation probe similarity: {conf_sim:.2f}."
-                    ),
-                    confidence_score=confidence, detection_method="union_based",
-                    method=method,
-                    detection_evidence={
+                return VerificationResult(
+                    is_vulnerable=False,
+                    confidence_score=0.0,
+                    detection_method="union_based",
+                    findings=[],
+                    evidence={
+                        "suppressed": True,
+                        "reason": "null_differential_without_extraction_proof",
                         "valid_null_probes": n,
                         "avg_similarity": avg_sim,
                         "confirm_sim": conf_sim,
-                        "version_extracted": False,
-                        "canary_verified": False,
+                        "best_payload": best_payload,
                     },
-                    reproducible=True, verified=True,
-                    verification_request_snippet=conf_resp.request_snippet,
-                    verification_response_snippet=conf_resp.response_snippet,
-                )
-                return VerificationResult(
-                    is_vulnerable=True, confidence_score=confidence,
-                    detection_method="union_based", findings=[finding],
-                    evidence={"valid_null_probes": n, "avg_similarity": avg_sim},
-                    reproducible=True,
+                    reproducible=False,
                 )
 
             except Exception as e:

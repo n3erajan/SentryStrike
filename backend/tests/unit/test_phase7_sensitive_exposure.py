@@ -54,7 +54,7 @@ def test_plain_env_without_secret_pattern_is_not_classified_as_sensitive():
     assert matched is False
 
 
-def test_spa_fallback_context_finding_preserves_suppression_count():
+def test_spa_fallback_context_is_metadata_not_vulnerability():
     detector = SensitivePathsDetector()
     route = RouteCandidate(
         url="https://example.test/admin",
@@ -66,9 +66,7 @@ def test_spa_fallback_context_finding_preserves_suppression_count():
         {"root_url": "https://example.test/", "dead_routes": [route]}
     )
 
-    assert len(findings) == 1
-    assert findings[0].vuln_type == "SPA Fallback Sensitive Path Suppression"
-    assert findings[0].detection_evidence["suppressed_count"] == 1
+    assert findings == []
 
 
 @pytest.mark.asyncio
