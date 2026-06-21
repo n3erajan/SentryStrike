@@ -81,6 +81,15 @@ class EvidenceStrengthBreakdown(BaseModel):
     informational: int = 0
 
 
+class DetectorCoverageMetric(BaseModel):
+    detector: str
+    candidates_built: int = 0
+    requests_sent: int = 0
+    verified_findings: int = 0
+    dropped_findings_verified_mode: int = 0
+    skipped_reasons: dict[str, int] = Field(default_factory=dict)
+
+
 class AttackChain(BaseModel):
     id: str
     description: str
@@ -97,6 +106,7 @@ class ReportMetadata(BaseModel):
     auth_coverage: AuthCoverage = Field(default_factory=AuthCoverage)
     evidence_strength_breakdown: EvidenceStrengthBreakdown = Field(default_factory=EvidenceStrengthBreakdown)
     coverage_warnings: list[str] = Field(default_factory=list)
+    detector_coverage: list[DetectorCoverageMetric] = Field(default_factory=list)
 
 
 class Scan(Document):

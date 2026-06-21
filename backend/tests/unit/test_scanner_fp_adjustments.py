@@ -3,10 +3,18 @@ from types import SimpleNamespace
 from app.core.detectors.base_detector import Finding
 from app.core.crawler.models import RequestObservation
 from app.core.scanner import ScanOrchestrator
-from app.models.scan import AuthCoverage, EvidenceStrengthBreakdown, ReportMetadata, ScanStatistics, SpaApiCoverage
+from app.models.scan import (
+    AuthCoverage,
+    DetectorCoverageMetric,
+    EvidenceStrengthBreakdown,
+    ReportMetadata,
+    ScanStatistics,
+    SpaApiCoverage,
+)
 from app.models.vulnerability import (
     AiAnalysis,
     Evidence,
+    EvidenceStrength,
     Exploitability,
     LocationInfo,
     OwaspCategory,
@@ -120,6 +128,112 @@ def test_replayable_json_body_suppresses_json_body_warning() -> None:
 
     assert scan.report_metadata.spa_api_coverage.replayable_json_bodies == 1
     assert not any("No replayable JSON request bodies" in warning for warning in scan.report_metadata.coverage_warnings)
+
+
+def test_unverified_admin_route_hint_is_not_confirmed_observation() -> None:
+    finding = Finding(
+        category=OwaspCategory.a01,
+        vuln_type="Admin / Privileged Endpoint Discovered",
+        severity=SeverityLevel.medium,
+        url="http://target.test/administration",
+        evidence="Client-side route name was discovered in JavaScript.",
+        verified=False,
+        confidence_score=0.0,
+        detection_method="heuristic",
+    )
+
+    strength = _orchestrator()._classify_evidence_strength(finding)
+
+    assert strength == EvidenceStrength.possible
+
+
+def test_verified_sensitive_content_is_confirmed_observation() -> None:
+    finding = Finding(
+        category=OwaspCategory.a02,
+        vuln_type="Sensitive Path Exposure",
+        severity=SeverityLevel.medium,
+        url="http://target.test/.env",
+        evidence="Response body contained KEY=value configuration markers.",
+        verified=True,
+        confidence_score=90.0,
+        detection_method="content_fingerprint",
+    )
+
+    strength = _orchestrator()._classify_evidence_strength(finding)
+
+    assert strength == EvidenceStrength.confirmed_observation
+
+
+def test_verified_payload_execution_is_confirmed_exploit() -> None:
+    finding = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="SQL Injection (Time-Based Blind)",
+        severity=SeverityLevel.critical,
+        url="http://target.test/item",
+        parameter="id",
+        payload="' OR SLEEP(5)--",
+        evidence="Time delta confirmed.",
+        verified=True,
+        confidence_score=90.0,
+        detection_method="time_based",
+    )
+
+    strength = _orchestrator()._classify_evidence_strength(finding)
+
+    assert strength == EvidenceStrength.confirmed_exploit
+
+
+def test_unverified_non_heuristic_evidence_is_probable() -> None:
+    finding = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="DOM-Based XSS Sink",
+        severity=SeverityLevel.medium,
+        url="http://target.test/#/search",
+        evidence="Static sink matched URL fragment flow into innerHTML.",
+        verified=False,
+        confidence_score=60.0,
+        detection_method="static_dom_sink",
+    )
+
+    strength = _orchestrator()._classify_evidence_strength(finding)
+
+    assert strength == EvidenceStrength.probable
+
+
+def test_low_risk_coverage_note_is_informational() -> None:
+    finding = Finding(
+        category=OwaspCategory.a02,
+        vuln_type="Scanner Coverage Note",
+        severity=SeverityLevel.low,
+        url="http://target.test/",
+        evidence="Browser crawling was unavailable.",
+        verified=False,
+        confidence_score=0.0,
+        detection_method="heuristic",
+    )
+
+    strength = _orchestrator()._classify_evidence_strength(finding)
+
+    assert strength == EvidenceStrength.informational
+
+
+def test_detector_coverage_request_counts_use_module_aliases() -> None:
+    orchestrator = _orchestrator()
+    metrics = [
+        DetectorCoverageMetric(detector="authentication_failures"),
+        DetectorCoverageMetric(detector="file_inclusion"),
+        DetectorCoverageMetric(detector="injection_sql_command"),
+    ]
+
+    orchestrator._apply_detector_request_counts(
+        metrics,
+        {"auth": 3, "lfi": 2, "rfi": 1, "sqli": 4},
+    )
+
+    by_detector = {metric.detector: metric for metric in metrics}
+    assert by_detector["authentication_failures"].requests_sent == 3
+    assert by_detector["file_inclusion"].requests_sent == 3
+    assert by_detector["injection_sql_command"].requests_sent == 4
 
 
 def test_verified_time_based_sqli_is_not_auto_suppressed_by_high_ai_fp_probability() -> None:

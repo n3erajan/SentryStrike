@@ -5,6 +5,7 @@ from app.utils.http_logging import (
     resolve_request_context,
     truncate,
 )
+from app.utils.scan_metrics import begin_request_counting, end_request_counting, snapshot_request_counts
 
 
 def test_truncate_shortens_long_payloads():
@@ -67,3 +68,14 @@ def test_log_http_response_includes_scan_fields(caplog):
     assert "phase=payload_simple" in message
     assert "payload=<script>alert(1)</script>" in message
     assert "time=42ms" in message
+
+
+def test_log_http_response_records_detector_request_count():
+    begin_request_counting()
+    try:
+        log_http_response("GET", "http://example.test/", 200, module="xss")
+        log_http_response("POST", "http://example.test/login", 403, module="auth")
+
+        assert snapshot_request_counts() == {"xss": 1, "auth": 1}
+    finally:
+        end_request_counting()

@@ -46,7 +46,7 @@ from app.integrations.cve_database import CveDatabaseService
 from app.integrations.sslyze_wrapper import SslAnalyzer
 from app.integrations.wappalyzer import TechnologyDetector
 from app.models.scan import CrawlMode, Scan, ScanPhase, ScanStatus
-from app.models.scan import AuthCoverage, EvidenceStrengthBreakdown, SpaApiCoverage
+from app.models.scan import AuthCoverage, DetectorCoverageMetric, EvidenceStrengthBreakdown, SpaApiCoverage
 from app.models.vulnerability import (
     AuthContext,
     Evidence,
@@ -61,6 +61,7 @@ from app.models.vulnerability import (
     AiAnalysisStatus,
 )
 from app.utils.cvss_calculator import CvssCalculator
+from app.utils.scan_metrics import begin_request_counting, end_request_counting, snapshot_request_counts
 
 logger = logging.getLogger(__name__)
 
@@ -255,64 +256,146 @@ class ScanOrchestrator:
                 "assets": getattr(crawl_result, "assets", []),
                 "dead_routes": getattr(crawl_result, "dead_routes", []),
             }
+            coverage_context = {
+                **crawl_context,
+                "urls": crawl_result.urls,
+                "forms": crawl_result.forms,
+            }
             self._update_crawl_metadata(scan, crawl_result)
 
-            async def run_detector(detector) -> list[Finding]:
+            await self._set_progress(scan, 45, ScanPhase.vulnerability_detection, f"Running {len(active_detectors)} active detector(s)")
+            detector_metrics: list[DetectorCoverageMetric] = []
+            metric_by_detector: dict[str, DetectorCoverageMetric] = {}
+
+            def record_metric(metric: DetectorCoverageMetric) -> DetectorCoverageMetric:
+                detector_metrics.append(metric)
+                metric_by_detector[metric.detector] = metric
+                return metric
+
+            async def run_detector(detector) -> tuple[object, list[Finding], DetectorCoverageMetric]:
+                detector_name = self._detector_name(detector)
                 async with detector_semaphore:
-                    return await detector.detect(
-                        crawl_result.urls,
-                        crawl_result.forms,
-                        **crawl_context,
+                    try:
+                        result = await detector.detect(
+                            crawl_result.urls,
+                            crawl_result.forms,
+                            **crawl_context,
+                            technology_stack=scan.technology_stack,
+                        )
+                    except Exception as exc:
+                        logger.warning("detector failure: %s", exc)
+                        return detector, [], DetectorCoverageMetric(
+                            detector=detector_name,
+                            skipped_reasons={"detector_exception": 1},
+                        )
+                self._tag_detector_findings(result, detector_name)
+                return detector, result, self._detector_metric_for_findings(
+                    detector,
+                    result,
+                    coverage_context,
+                    technology_stack=scan.technology_stack,
+                )
+
+            detector_request_counts: dict[str, int] = {}
+            begin_request_counting()
+            try:
+                detector_results = await asyncio.gather(
+                    *[run_detector(detector) for detector in active_detectors],
+                    return_exceptions=True,
+                )
+                for result in detector_results:
+                    if isinstance(result, Exception):
+                        logger.warning("detector failure: %s", result)
+                        record_metric(
+                            DetectorCoverageMetric(
+                                detector="unknown",
+                                skipped_reasons={"detector_exception": 1},
+                            )
+                        )
+                        continue
+                    _, result_findings, metric = result
+                    record_metric(metric)
+                    findings.extend(result_findings)
+
+                exception_detector = next((detector for detector in self.detectors if isinstance(detector, ExceptionHandlingDetector)), None)
+                if exception_detector is not None:
+                    observed_exception_findings = exception_detector.findings_from_observed_evidence(findings, target_url=scan.target_url)
+                    self._tag_detector_findings(observed_exception_findings, self._detector_name(exception_detector))
+                    if observed_exception_findings:
+                        logger.info(
+                            "derived %d exception-handling finding(s) from observed active-verification evidence",
+                            len(observed_exception_findings),
+                        )
+                        metric = metric_by_detector.get(self._detector_name(exception_detector))
+                        if metric is None:
+                            metric = record_metric(self._detector_metric_for_findings(exception_detector, [], coverage_context))
+                        self._add_findings_to_metric(metric, observed_exception_findings)
+                        findings.extend(observed_exception_findings)
+
+                auth_detector_obj = next((detector for detector in self.detectors if isinstance(detector, AuthenticationFailuresDetector)), None)
+                if auth_detector_obj is not None:
+                    observed_credential_findings = auth_detector_obj.findings_from_observed_evidence(findings)
+                    self._tag_detector_findings(observed_credential_findings, self._detector_name(auth_detector_obj))
+                    if observed_credential_findings:
+                        logger.info(
+                            "derived %d credential-disclosure finding(s) from observed evidence",
+                            len(observed_credential_findings),
+                        )
+                        metric = metric_by_detector.get(self._detector_name(auth_detector_obj))
+                        if metric is None:
+                            metric = record_metric(self._detector_metric_for_findings(auth_detector_obj, [], coverage_context))
+                        self._add_findings_to_metric(metric, observed_credential_findings)
+                        findings.extend(observed_credential_findings)
+
+                # Provide the scan root URL so site-wide detectors can avoid duplicate page-level findings.
+                crypto_detector = next((detector for detector in self.detectors if isinstance(detector, CryptoFailuresDetector)), None)
+                if crypto_detector is not None:
+                    crypto_findings = await crypto_detector.detect(crawl_result.urls, crawl_result.forms, **crawl_context)
+                    self._tag_detector_findings(crypto_findings, self._detector_name(crypto_detector))
+                    record_metric(
+                        self._detector_metric_for_findings(
+                            crypto_detector,
+                            crypto_findings,
+                            coverage_context,
+                            technology_stack=scan.technology_stack,
+                        )
+                    )
+                    findings.extend(crypto_findings)
+
+                header_detector = next((detector for detector in self.detectors if isinstance(detector, SecurityHeadersDetector)), None)
+                if header_detector is not None:
+                    header_findings = await header_detector.detect(crawl_result.urls, crawl_result.forms, **crawl_context)
+                    self._tag_detector_findings(header_findings, self._detector_name(header_detector))
+                    record_metric(
+                        self._detector_metric_for_findings(
+                            header_detector,
+                            header_findings,
+                            coverage_context,
+                            technology_stack=scan.technology_stack,
+                        )
+                    )
+                    findings.extend(header_findings)
+
+                supply_chain_findings = await self.supply_chain_detector.detect(
+                    crawl_result.urls,
+                    crawl_result.forms,
+                    technologies=scan.technology_stack,
+                    **crawl_context,
+                )
+                self._tag_detector_findings(supply_chain_findings, self._detector_name(self.supply_chain_detector))
+                record_metric(
+                    self._detector_metric_for_findings(
+                        self.supply_chain_detector,
+                        supply_chain_findings,
+                        coverage_context,
                         technology_stack=scan.technology_stack,
                     )
-
-            await self._set_progress(scan, 45, ScanPhase.vulnerability_detection, f"Running {len(active_detectors)} active detector(s)")
-            detector_results = await asyncio.gather(
-                *[run_detector(detector) for detector in active_detectors],
-                return_exceptions=True,
-            )
-            for result in detector_results:
-                if isinstance(result, Exception):
-                    logger.warning("detector failure: %s", result)
-                    continue
-                findings.extend(result)
-
-            exception_detector = next((detector for detector in self.detectors if isinstance(detector, ExceptionHandlingDetector)), None)
-            if exception_detector is not None:
-                observed_exception_findings = exception_detector.findings_from_observed_evidence(findings, target_url=scan.target_url)
-                if observed_exception_findings:
-                    logger.info(
-                        "derived %d exception-handling finding(s) from observed active-verification evidence",
-                        len(observed_exception_findings),
-                    )
-                    findings.extend(observed_exception_findings)
-
-            auth_detector_obj = next((detector for detector in self.detectors if isinstance(detector, AuthenticationFailuresDetector)), None)
-            if auth_detector_obj is not None:
-                observed_credential_findings = auth_detector_obj.findings_from_observed_evidence(findings)
-                if observed_credential_findings:
-                    logger.info(
-                        "derived %d credential-disclosure finding(s) from observed evidence",
-                        len(observed_credential_findings),
-                    )
-                    findings.extend(observed_credential_findings)
-
-            # Provide the scan root URL so site-wide detectors can avoid duplicate page-level findings.
-            crypto_detector = next((detector for detector in self.detectors if isinstance(detector, CryptoFailuresDetector)), None)
-            if crypto_detector is not None:
-                findings.extend(await crypto_detector.detect(crawl_result.urls, crawl_result.forms, **crawl_context))
-
-            header_detector = next((detector for detector in self.detectors if isinstance(detector, SecurityHeadersDetector)), None)
-            if header_detector is not None:
-                findings.extend(await header_detector.detect(crawl_result.urls, crawl_result.forms, **crawl_context))
-
-            supply_chain_findings = await self.supply_chain_detector.detect(
-                crawl_result.urls,
-                crawl_result.forms,
-                technologies=scan.technology_stack,
-                **crawl_context,
-            )
-            findings.extend(supply_chain_findings)
+                )
+                findings.extend(supply_chain_findings)
+                detector_request_counts = snapshot_request_counts()
+            finally:
+                end_request_counting()
+            self._apply_detector_request_counts(detector_metrics, detector_request_counts)
 
             await self._set_progress(scan, 60, ScanPhase.vulnerability_detection, f"Detector phase complete: {len(findings)} raw finding(s)")
             await self._check_cancelled(scan_id)
@@ -401,6 +484,7 @@ class ScanOrchestrator:
             settings = get_settings()
             scan_mode = getattr(settings, "scan_mode", "verified")
             if scan_mode == "verified":
+                dropped_by_detector: dict[str, int] = {}
                 kept, dropped = [], []
                 for f in findings:
                     vuln_lower = f.vuln_type.lower()
@@ -426,6 +510,8 @@ class ScanOrchestrator:
                         kept.append(f)
                     else:
                         dropped.append(f)
+                        detector_name = str(getattr(f, "detector_name", "verified_mode_filter") or "verified_mode_filter")
+                        dropped_by_detector[detector_name] = dropped_by_detector.get(detector_name, 0) + 1
                         logger.warning(
                             "verified scan mode DROPPED finding: vuln_type=%r severity=%s verified=%s "
                             "url=%s parameter=%s detection_method=%s confidence=%.1f",
@@ -438,7 +524,18 @@ class ScanOrchestrator:
                             getattr(f, "confidence_score", 0.0),
                         )
                 findings = kept
+                for detector_name, drop_count in dropped_by_detector.items():
+                    metric = metric_by_detector.get(detector_name)
+                    if metric is None:
+                        metric = record_metric(DetectorCoverageMetric(detector=detector_name))
+                    metric.dropped_findings_verified_mode += drop_count
+                    metric.skipped_reasons["dropped_unverified_in_verified_mode"] = (
+                        metric.skipped_reasons.get("dropped_unverified_in_verified_mode", 0) + drop_count
+                    )
                 logger.info("filtered findings for verified scan mode: %d findings remaining", len(findings))
+
+            scan.report_metadata.detector_coverage = detector_metrics
+            self._log_detector_coverage(detector_metrics)
 
             # PHASE 1: Detect all vulnerabilities
             vulnerabilities = [self._to_vulnerability(f) for f in findings]
@@ -523,6 +620,141 @@ class ScanOrchestrator:
         finally:
             self._tasks.pop(scan_id, None)
             self._cancel_flags.pop(scan_id, None)
+
+    def _detector_name(self, detector: object) -> str:
+        return str(getattr(detector, "name", None) or detector.__class__.__name__)
+
+    def _tag_detector_findings(self, findings: list[Finding], detector_name: str) -> None:
+        for finding in findings or []:
+            setattr(finding, "detector_name", detector_name)
+
+    def _add_findings_to_metric(self, metric: DetectorCoverageMetric, findings: list[Finding]) -> None:
+        metric.candidates_built += len(findings or [])
+        metric.verified_findings += len([finding for finding in findings or [] if getattr(finding, "verified", False)])
+        metric.requests_sent = max(metric.requests_sent, self._request_snippet_count(findings))
+
+    def _detector_metric_for_findings(
+        self,
+        detector: object,
+        findings: list[Finding],
+        crawl_context: dict,
+        *,
+        technology_stack: list[object] | None = None,
+    ) -> DetectorCoverageMetric:
+        detector_name = self._detector_name(detector)
+        candidates_built = self._estimate_detector_candidates(
+            detector_name,
+            findings,
+            crawl_context,
+            technology_stack=technology_stack,
+        )
+        skipped_reasons: dict[str, int] = {}
+        if candidates_built == 0 and not findings:
+            skipped_reasons["no_candidates_built"] = 1
+
+        settings = get_settings()
+        if detector_name == "access_control" and not (
+            settings.authentication_second_cookie or settings.authentication_second_header
+        ):
+            skipped_reasons["second_user_account_missing"] = 1
+        if detector_name == "ssrf" and not settings.oast_callback_base_url:
+            skipped_reasons["oast_callback_missing"] = 1
+
+        return DetectorCoverageMetric(
+            detector=detector_name,
+            candidates_built=candidates_built,
+            requests_sent=self._request_snippet_count(findings),
+            verified_findings=len([finding for finding in findings or [] if getattr(finding, "verified", False)]),
+            skipped_reasons=skipped_reasons,
+        )
+
+    def _estimate_detector_candidates(
+        self,
+        detector_name: str,
+        findings: list[Finding],
+        crawl_context: dict,
+        *,
+        technology_stack: list[object] | None = None,
+    ) -> int:
+        urls = crawl_context.get("urls") or []
+        forms = crawl_context.get("forms") or []
+        parameters = crawl_context.get("parameters") or []
+        api_endpoints = crawl_context.get("api_endpoints") or []
+        requests = crawl_context.get("requests") or []
+        routes = crawl_context.get("routes") or []
+
+        if detector_name in {"security_headers", "crypto_failures"}:
+            return max(len(urls), len(findings or []))
+        if detector_name == "supply_chain":
+            return max(len(technology_stack or []), len(findings or []))
+        if detector_name == "sensitive_paths":
+            return max(len(urls) + len(routes) + len(api_endpoints), len(findings or []))
+        if detector_name == "file_upload":
+            multipart_requests = [
+                request
+                for request in requests
+                if "multipart" in str((getattr(request, "request_headers", {}) or {}).get("content-type", "")).lower()
+            ]
+            return max(len(forms) + len(multipart_requests), len(findings or []))
+        if detector_name in {"csrf", "authentication_failures"}:
+            return max(len(forms) + len(requests), len(findings or []))
+        if detector_name == "exception_handling":
+            return max(len(parameters) + len(forms), len(findings or []))
+
+        return max(len(parameters) + len(forms) + len(api_endpoints) + len(requests), len(findings or []))
+
+    def _request_snippet_count(self, findings: list[Finding]) -> int:
+        snippets = {
+            getattr(finding, "verification_request_snippet", None)
+            for finding in findings or []
+            if getattr(finding, "verification_request_snippet", None)
+        }
+        return len(snippets)
+
+    def _detector_request_aliases(self, detector_name: str) -> tuple[str, ...]:
+        aliases = {
+            "authentication_failures": ("authentication_failures", "auth"),
+            "file_inclusion": ("file_inclusion", "lfi", "rfi"),
+            "injection_sql_command": ("injection_sql_command", "sqli"),
+        }
+        return aliases.get(detector_name, (detector_name,))
+
+    def _apply_detector_request_counts(
+        self,
+        detector_metrics: list[DetectorCoverageMetric],
+        request_counts: dict[str, int],
+    ) -> None:
+        matched_modules: set[str] = set()
+        for metric in detector_metrics:
+            aliases = self._detector_request_aliases(metric.detector)
+            request_total = sum(request_counts.get(alias, 0) for alias in aliases)
+            if request_total:
+                metric.requests_sent = max(metric.requests_sent, request_total)
+                matched_modules.update(aliases)
+
+        for module, count in request_counts.items():
+            if module in matched_modules:
+                continue
+            detector_metrics.append(
+                DetectorCoverageMetric(
+                    detector=module,
+                    requests_sent=count,
+                    candidates_built=count,
+                )
+            )
+
+    def _log_detector_coverage(self, detector_metrics: list[DetectorCoverageMetric]) -> None:
+        for metric in detector_metrics:
+            logger.info(
+                "detector coverage: detector=%s candidates_built=%d requests_sent=%d "
+                "verified_findings=%d dropped_verified_mode=%d skipped_reasons=%s",
+                metric.detector,
+                metric.candidates_built,
+                metric.requests_sent,
+                metric.verified_findings,
+                metric.dropped_findings_verified_mode,
+                metric.skipped_reasons,
+            )
 
     async def _set_progress(
         self,
@@ -1230,8 +1462,11 @@ class ScanOrchestrator:
             warnings.append("No replayable JSON request bodies were observed; API body testing was limited.")
         if auth_headers and not session_cookies:
             warnings.append("Authentication was represented by headers only; cookie/session checks were limited.")
-        warnings.append("No second-user account configured for horizontal IDOR comparison.")
-        warnings.append("No OAST callback configured; blind SSRF was not tested.")
+        settings = get_settings()
+        if not (settings.authentication_second_cookie or settings.authentication_second_header):
+            warnings.append("No second-user account configured; horizontal IDOR comparison was not tested.")
+        if not settings.oast_callback_base_url:
+            warnings.append("No OAST callback configured; blind SSRF was not tested.")
         return warnings
 
     def _evidence_strength_breakdown(self, vulnerabilities: list[Vulnerability]) -> EvidenceStrengthBreakdown:
@@ -1248,6 +1483,16 @@ class ScanOrchestrator:
         verified = bool(getattr(finding, "verified", False))
         confidence = float(getattr(finding, "confidence_score", 0.0) or 0.0)
 
+        informational_terms = (
+            "coverage",
+            "scanner limitation",
+            "not tested",
+            "out of scope",
+            "informational",
+        )
+        if finding.severity == SeverityLevel.info or any(term in vt for term in informational_terms):
+            return EvidenceStrength.informational
+
         active_terms = (
             "sql injection",
             "xss",
@@ -1260,26 +1505,33 @@ class ScanOrchestrator:
             "idor",
             "privilege escalation",
         )
-        if verified and confidence >= 70.0 and any(term in vt for term in active_terms):
+        active_methods = {
+            "boolean",
+            "boolean_based",
+            "error",
+            "error_based",
+            "time",
+            "time_based",
+            "union",
+            "union_based",
+            "command_output",
+            "token_bypass",
+            "stored_xss_execution",
+            "dom_execution",
+            "path_traversal",
+            "file_content",
+            "ssrf_callback",
+            "open_redirect",
+            "upload_canary",
+        }
+        if verified and any(term in vt for term in active_terms) and (
+            confidence >= 70.0 or method in active_methods
+        ):
             return EvidenceStrength.confirmed_exploit
 
-        observation_terms = (
-            "missing security header",
-            "cookie",
-            "tls",
-            "ssl",
-            "insecure transport",
-            "credentials transmitted via http get",
-            "credential / token exposed",
-            "sensitive path",
-            "admin",
-            "csrf",
-            "server banner",
-            "mixed content",
-        )
-        if verified or any(term in vt for term in observation_terms):
-            if "vulnerable component" in vt:
-                return EvidenceStrength.probable
+        if "vulnerable component" in vt:
+            return EvidenceStrength.probable
+        if verified:
             return EvidenceStrength.confirmed_observation
 
         if confidence >= 50.0 or method not in {"heuristic", ""}:

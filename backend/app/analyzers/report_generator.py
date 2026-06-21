@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from app.analyzers.ai_client import OllamaClient
-from app.models.scan import AuthCoverage, EvidenceStrengthBreakdown, Scan, SpaApiCoverage
+from app.models.scan import AuthCoverage, DetectorCoverageMetric, EvidenceStrengthBreakdown, Scan, SpaApiCoverage
 
 
 class AiReportGenerator:
@@ -29,6 +29,8 @@ class AiReportGenerator:
         auth = getattr(scan.report_metadata, "auth_coverage", AuthCoverage())
         coverage_warnings = getattr(scan.report_metadata, "coverage_warnings", []) or []
         coverage_warning_text = "; ".join(coverage_warnings) if coverage_warnings else "None."
+        detector_coverage = getattr(scan.report_metadata, "detector_coverage", []) or []
+        detector_coverage_text = self._detector_coverage_text(detector_coverage)
         confirmed_exploit_paths = [
             f"{v.vuln_type} at {v.location.url}"
             for v in getattr(scan, "vulnerabilities", []) or []
@@ -64,6 +66,7 @@ class AiReportGenerator:
             f"static_spa_only={spa_api.static_spa_only}, browser_available={spa_api.browser_available}, "
             f"replayable_json_bodies={spa_api.replayable_json_bodies}. "
             f"Coverage warnings that must be stated before any AI summary: {coverage_warning_text}. "
+            f"Detector coverage metrics: {detector_coverage_text}. "
             f"Top confirmed exploit paths: {'; '.join(confirmed_exploit_paths) or 'none'}. "
             f"Needs-review findings: {'; '.join(needs_review) or 'none'}. "
             "Limitations: A06, A08, and A09 are not actively verified by this scanner; "
@@ -89,7 +92,7 @@ class AiReportGenerator:
             "remediation_roadmap": "Prioritize confirmed exploits, then confirmed observations, then probable and review-needed issues.",
             "scanner_limitations": (
                 f"Coverage warnings: {coverage_warning_text} A06, A08, and A09 are disclosed as out of active "
-                "automated detection scope."
+                f"automated detection scope. Detector coverage: {detector_coverage_text}."
             ),
         }
         try:
@@ -99,3 +102,16 @@ class AiReportGenerator:
         result.setdefault("technologies_detected", technologies_detected)
         result["generated_at"] = datetime.now(timezone.utc).isoformat()
         return result
+
+    def _detector_coverage_text(self, metrics: list[DetectorCoverageMetric]) -> str:
+        if not metrics:
+            return "None."
+        lines = []
+        for metric in metrics[:12]:
+            skipped = ", ".join(f"{reason}={count}" for reason, count in sorted(metric.skipped_reasons.items()))
+            lines.append(
+                f"{metric.detector}: candidates={metric.candidates_built}, requests={metric.requests_sent}, "
+                f"verified={metric.verified_findings}, dropped_verified_mode={metric.dropped_findings_verified_mode}"
+                + (f", skipped={skipped}" if skipped else "")
+            )
+        return "; ".join(lines)
