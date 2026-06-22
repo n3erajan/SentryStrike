@@ -1,31 +1,24 @@
-// Auth service — matches the backend `/auth/*` routes.
+// Auth service — talks to the backend `/auth/*` routes via apiClient.
 //
-// Contract (branch: backend):
-//   POST /auth/register { email, password } -> { user, access_token, expires_at }
-//   POST /auth/login    { email, password } -> { user, access_token, expires_at }
-//   POST /auth/logout                       -> { logged_out: true }
-//   GET  /auth/me                           -> { id, email, created_at }
+// Contract (branch: backend, mounted under /api/v1):
+//   POST /auth/register { email, password } -> 201 { user, access_token, token_type, expires_at }
+//   POST /auth/login    { email, password } ->     { user, access_token, token_type, expires_at }
+//   POST /auth/logout                        ->     { logged_out: true }
+//   GET  /auth/me                            ->     { id, email, created_at }
 //
-// While USE_MOCK is true the calls resolve locally so the UI works without a
-// running backend. Flip it to false once the API is reachable.
-const USE_MOCK = true;
-const TOKEN_KEY = "sentrystrike_token";
+// The backend also sets an httponly session cookie, but we authenticate with
+// the returned bearer token so the client works regardless of cross-origin
+// cookie rules.
+import { apiRequest, getToken, setToken, clearToken } from "./apiClient.js";
 
-function setToken(token) {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-}
-
-function getToken() {
-  return localStorage.getItem(TOKEN_KEY);
-}
-
-function clearToken() {
-  localStorage.removeItem(TOKEN_KEY);
-}
 const USER_KEY = "sentrystrike_user";
 
 function saveUser(user) {
   if (user) localStorage.setItem(USER_KEY, JSON.stringify(user));
+}
+
+function clearUser() {
+  localStorage.removeItem(USER_KEY);
 }
 
 export function getCurrentUser() {
@@ -41,32 +34,11 @@ export function isAuthenticated() {
   return !!getToken();
 }
 
-export function logout() {
-  if (!USE_MOCK) {
-    apiRequest("/auth/logout", { method: "POST" }).catch(() => {});
-  }
-  clearToken();
-  localStorage.removeItem(USER_KEY);
-}
-
-async function authenticate(path, { email, password }) {
-  if (USE_MOCK) {
-    await new Promise((r) => setTimeout(r, 500));
-    if (!email || !password) throw new Error("Missing credentials");
-    const user = {
-      id: "mock-user",
-      email,
-      created_at: new Date().toISOString(),
-    };
-    setToken("mock-token");
-    saveUser(user);
-    return user;
-  }
-
+async function authenticate(path, credentials) {
   const data = await apiRequest(path, {
     method: "POST",
     auth: false,
-    body: { email, password },
+    body: credentials,
   });
   setToken(data.access_token);
   saveUser(data.user);
@@ -79,4 +51,14 @@ export function login(credentials) {
 
 export function register(credentials) {
   return authenticate("/auth/register", credentials);
+}
+
+export async function logout() {
+  try {
+    await apiRequest("/auth/logout", { method: "POST" });
+  } catch {
+    // Ignore network/session errors — we clear local state regardless.
+  }
+  clearToken();
+  clearUser();
 }

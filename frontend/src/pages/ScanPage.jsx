@@ -1,23 +1,38 @@
 import { useScan } from "../hooks/useScan.js";
 import { SCAN_STAGES } from "../data/constants.js";
 
+const STATUS_LABEL = {
+  queued: "Queued",
+  running: "Scanning",
+  completed: "Complete",
+  failed: "Failed",
+  cancelled: "Cancelled",
+};
+
 function ScanPage({ onComplete }) {
   const {
     url,
     setUrl,
+    crawlMode,
+    setCrawlMode,
+    authText,
+    setAuthText,
     consent,
     setConsent,
     touched,
     setTouched,
     scanning,
-    setScanning,
+    status,
     progress,
     stageIdx,
+    eta,
     logs,
     logRef,
+    error,
     valid,
     canStart,
-    eta,
+    startScan,
+    cancel,
   } = useScan(onComplete);
 
   return (
@@ -37,7 +52,9 @@ function ScanPage({ onComplete }) {
         </p>
       </div>
 
-      <div className='card card-elevated' style={{ marginBottom: 20 }}>
+      <div className='card card-elevated scan-form'>
+        {error && <div className='auth-error'>{error}</div>}
+
         <label className='form-label' htmlFor='target-url'>
           Target URL
         </label>
@@ -59,10 +76,57 @@ function ScanPage({ onComplete }) {
           )}
         </div>
         {touched && url && !valid && (
-          <p style={{ fontSize: 12, color: "#ef4444", marginTop: 6 }}>
+          <p className='field-error'>
             Enter a valid URL including http:// or https://
           </p>
         )}
+
+        <label className='form-label' style={{ marginTop: 20 }}>
+          Crawl mode
+        </label>
+        <div className='segmented' role='group' aria-label='Crawl mode'>
+          <button
+            type='button'
+            className={`segmented-btn ${crawlMode === "full" ? "active" : ""}`}
+            onClick={() => setCrawlMode("full")}
+            disabled={scanning}
+          >
+            <span className='segmented-title'>Full site</span>
+            <span className='segmented-desc'>
+              Crawl and test every reachable page
+            </span>
+          </button>
+          <button
+            type='button'
+            className={`segmented-btn ${crawlMode === "single" ? "active" : ""}`}
+            onClick={() => setCrawlMode("single")}
+            disabled={scanning}
+          >
+            <span className='segmented-title'>Single page</span>
+            <span className='segmented-desc'>Test only the URL above</span>
+          </button>
+        </div>
+
+        <label
+          className='form-label'
+          htmlFor='auth-text'
+          style={{ marginTop: 20 }}
+        >
+          Authorization reference <span className='label-optional'>optional</span>
+        </label>
+        <div className='input-group'>
+          <span className='input-icon'>📝</span>
+          <input
+            id='auth-text'
+            type='text'
+            maxLength={1000}
+            placeholder='Ticket, contract, or scope note'
+            value={authText}
+            onChange={(event) => setAuthText(event.target.value)}
+            disabled={scanning}
+          />
+        </div>
+
         <label className='consent-label'>
           <input
             type='checkbox'
@@ -75,11 +139,8 @@ function ScanPage({ onComplete }) {
             may be illegal.
           </span>
         </label>
-        <button
-          className='btn-scan'
-          disabled={!canStart}
-          onClick={() => canStart && setScanning(true)}
-        >
+
+        <button className='btn-scan' disabled={!canStart} onClick={startScan}>
           {scanning ? (
             <>
               <span className='spin'>⟳</span> Scanning…
@@ -91,7 +152,7 @@ function ScanPage({ onComplete }) {
       </div>
 
       {scanning && (
-        <div className='card card-elevated'>
+        <div className='card card-elevated scan-progress'>
           <div className='progress-header'>
             <div className='progress-stage'>
               <span className='spin' style={{ color: "var(--accent)" }}>
@@ -100,8 +161,11 @@ function ScanPage({ onComplete }) {
               {SCAN_STAGES[stageIdx]}
             </div>
             <div className='progress-meta'>
-              <span>ETA {eta}s</span>
-              <span className='progress-pct'>{progress.toFixed(0)}%</span>
+              <span className={`status-pill status-${status || "queued"}`}>
+                {STATUS_LABEL[status] || "Queued"}
+              </span>
+              {eta != null && eta > 0 && <span>~{eta}s left</span>}
+              <span className='progress-pct'>{Math.round(progress)}%</span>
             </div>
           </div>
           <div className='progress-bar'>
@@ -119,21 +183,24 @@ function ScanPage({ onComplete }) {
           </div>
           <div className='terminal'>
             <div className='terminal-bar'>
-              <span style={{ color: "var(--accent)", fontSize: 14 }}>▶</span>{" "}
-              Live Log
+              <span style={{ color: "var(--accent)", fontSize: 14 }}>▶</span> Live
+              Log
             </div>
             <div className='terminal-body' ref={logRef}>
-              {logs.map((l, i) => (
+              {logs.map((line, index) => (
                 <div
-                  key={i}
-                  className={l.kind === "ok" ? "log-ok" : "log-warn"}
+                  key={index}
+                  className={line.kind === "ok" ? "log-ok" : "log-warn"}
                 >
-                  {l.text}
+                  {line.text}
                 </div>
               ))}
               <div className='log-cursor'>▮</div>
             </div>
           </div>
+          <button type='button' className='btn-ghost' onClick={cancel}>
+            Cancel scan
+          </button>
         </div>
       )}
     </div>
