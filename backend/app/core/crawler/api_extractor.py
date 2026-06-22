@@ -197,6 +197,7 @@ class ApiExtractor:
                         url=endpoint.url,
                         method=endpoint.method,
                         baseline_value=value if not isinstance(value, (dict, list)) else "1",
+                        content_type=endpoint.content_type,
                         source="api_form_body",
                         security_relevance=cls.classify_parameter(key),
                     )

@@ -84,8 +84,10 @@ class EvidenceStrengthBreakdown(BaseModel):
 class DetectorCoverageMetric(BaseModel):
     detector: str
     candidates_built: int = 0
+    candidates_filtered: int = 0
     requests_sent: int = 0
     verified_findings: int = 0
+    unverified_findings: int = 0
     dropped_findings_verified_mode: int = 0
     skipped_reasons: dict[str, int] = Field(default_factory=dict)
 

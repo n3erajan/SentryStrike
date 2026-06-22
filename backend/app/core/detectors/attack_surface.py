@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
@@ -82,6 +83,21 @@ class AttackTarget:
             )
 
         if self.location == ParameterLocation.form:
+            if _is_multipart_content_type(self.content_type):
+                data, files = build_multipart_payload(self.form_inputs, self.parameter, value)
+                headers = {
+                    key: header_value
+                    for key, header_value in headers.items()
+                    if key.lower() not in {"content-type", "content-length"}
+                }
+                return PreparedAttackRequest(
+                    url=self.url,
+                    method=method,
+                    data=data or None,
+                    files=files or None,
+                    headers=headers or None,
+                    cookies=cookies or None,
+                )
             url, params, data = inject_url_or_form_parameter(
                 self.url, self.parameter, str(value), method, self.form_inputs
             )
@@ -189,12 +205,19 @@ class AttackSurface:
             body = cls._parse_json(request.post_data)
             if not isinstance(body, dict):
                 form_body = cls._parse_form_data(request.post_data, request.request_headers or {})
-                if not form_body:
+                multipart_fields = cls._parse_multipart_fields(request.post_data, request.request_headers or {})
+                if not form_body and not multipart_fields:
                     continue
-                form_inputs = [
-                    _ObservedFormInput(name=name, value=str(value))
-                    for name, value in form_body.items()
-                ]
+                if multipart_fields:
+                    form_body = {field.name: field.value for field in multipart_fields}
+                    form_inputs = multipart_fields
+                    content_type = "multipart/form-data"
+                else:
+                    form_inputs = [
+                        _ObservedFormInput(name=name, value=str(value))
+                        for name, value in form_body.items()
+                    ]
+                    content_type = "application/x-www-form-urlencoded"
                 for name, value in form_body.items():
                     if filter_fn and not filter_fn(name):
                         continue
@@ -216,6 +239,7 @@ class AttackSurface:
                             value=value,
                             location=ParameterLocation.form,
                             form_inputs=form_inputs,
+                            content_type=content_type,
                             source="browser_form_request",
                             headers={
                                 key: value
@@ -288,7 +312,16 @@ class AttackSurface:
                 continue
             templates[(endpoint.url, endpoint.method.upper())] = (
                 [
-                    _ObservedFormInput(name=name, value=str(value))
+                    _ObservedFormInput(
+                        name=name,
+                        input_type=(
+                            "file"
+                            if "multipart/form-data" in content_type
+                            and _looks_like_file_field(name)
+                            else "text"
+                        ),
+                        value=str(value),
+                    )
                     for name, value in body.items()
                     if name and not isinstance(value, (dict, list))
                 ],
@@ -363,6 +396,40 @@ class AttackSurface:
             if name
         }
 
+    @staticmethod
+    def _parse_multipart_fields(value: Any, headers: dict[str, str]) -> list[_ObservedFormInput]:
+        content_type = " ".join(
+            str(header_value).lower()
+            for header_name, header_value in headers.items()
+            if header_name.lower() == "content-type"
+        )
+        if "multipart/form-data" not in content_type:
+            return []
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "ignore")
+        if not isinstance(value, str) or not value.strip():
+            return []
+        inputs: list[_ObservedFormInput] = []
+        seen: set[str] = set()
+        for match in re.finditer(
+            r'Content-Disposition:\s*form-data;\s*name="(?P<name>[^"]+)"(?P<rest>[^\r\n]*)',
+            value,
+            re.I,
+        ):
+            name = match.group("name")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            is_file = "filename=" in match.group("rest").lower() or _looks_like_file_field(name)
+            inputs.append(
+                _ObservedFormInput(
+                    name=name,
+                    input_type="file" if is_file else "text",
+                    value="" if is_file else "sentry_test_val",
+                )
+            )
+        return inputs
+
 
 def build_json_body(template: Any, target: AttackTarget, injected_value: Any) -> Any:
     body = copy.deepcopy(template) if template is not None else {}
@@ -423,6 +490,55 @@ def build_form_payload(form_inputs: list, target_param: str, target_value: str) 
     if target_param not in payload:
         payload[target_param] = target_value
     return payload
+
+
+def build_multipart_payload(
+    form_inputs: list | None,
+    target_param: str,
+    target_value: Any,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    data: dict[str, str] = {}
+    files: dict[str, Any] = {}
+    inputs = list(form_inputs or [])
+
+    for inp in inputs:
+        name = getattr(inp, "name", "")
+        if not name:
+            continue
+        inp_type = getattr(inp, "input_type", "text").lower()
+        if inp_type == "file":
+            value = target_value if name == target_param else getattr(inp, "value", "") or b"SENTRY_UPLOAD_TEST_CANARY"
+            files[name] = _multipart_file_tuple(value)
+        elif name == target_param:
+            data[name] = str(target_value)
+        else:
+            data[name] = getattr(inp, "value", "") or "sentry_test_val"
+
+    if target_param not in data and target_param not in files:
+        if _looks_like_file_field(target_param):
+            files[target_param] = _multipart_file_tuple(target_value)
+        else:
+            data[target_param] = str(target_value)
+    return data, files
+
+
+def _multipart_file_tuple(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, bytes):
+        return ("sentry_upload.bin", value, "application/octet-stream")
+    if isinstance(value, str) and value:
+        return ("sentry_upload.txt", value.encode("utf-8"), "text/plain")
+    return ("sentry_upload.txt", b"SENTRY_UPLOAD_TEST_CANARY", "text/plain")
+
+
+def _is_multipart_content_type(value: str | None) -> bool:
+    return "multipart/form-data" in (value or "").lower()
+
+
+def _looks_like_file_field(name: str) -> bool:
+    lowered = (name or "").lower()
+    return any(token in lowered for token in ("file", "upload", "avatar", "image", "document", "attachment"))
 
 
 def inject_path_parameter(url: str, parameter_name: str, parameter_value: str) -> str:

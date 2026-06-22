@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 from app.core.detectors.base_detector import Finding
 from app.core.crawler.models import RequestObservation
-from app.core.scanner import ScanOrchestrator
+from app.core.scanner import (
+    ATTACK_SURFACE_BACKED_DETECTORS,
+    SPECIALIZED_INPUT_DETECTORS,
+    ScanOrchestrator,
+)
 from app.models.scan import (
     AuthCoverage,
     DetectorCoverageMetric,
@@ -317,6 +321,49 @@ def test_detector_coverage_request_counts_use_module_aliases() -> None:
     assert by_detector["authentication_failures"].requests_sent == 3
     assert by_detector["file_inclusion"].requests_sent == 3
     assert by_detector["injection_sql_command"].requests_sent == 4
+
+
+def test_detector_metric_records_actionable_skip_reasons() -> None:
+    class Detector:
+        name = "xss"
+
+    metric = _orchestrator()._detector_metric_for_findings(
+        Detector(),
+        [],
+        {
+            "urls": [],
+            "forms": [],
+            "parameters": [],
+            "api_endpoints": [],
+            "requests": [],
+            "browser_available": False,
+        },
+    )
+
+    assert metric.unverified_findings == 0
+    assert metric.skipped_reasons["no_replayable_attack_targets"] == 1
+    assert metric.skipped_reasons["browser_unavailable"] == 1
+    assert metric.skipped_reasons["no_replayable_request_bodies"] == 1
+
+
+def test_parameterized_detector_input_policy_is_explicit() -> None:
+    assert {
+        "access_control",
+        "injection_sql_command",
+        "xss",
+        "file_inclusion",
+        "ssrf",
+        "open_redirect",
+        "file_upload",
+    } <= ATTACK_SURFACE_BACKED_DETECTORS
+    assert {
+        "security_headers",
+        "crypto_failures",
+        "sensitive_paths",
+        "csrf",
+        "authentication_failures",
+    } <= SPECIALIZED_INPUT_DETECTORS
+    assert ATTACK_SURFACE_BACKED_DETECTORS.isdisjoint(SPECIALIZED_INPUT_DETECTORS)
 
 
 def test_verified_time_based_sqli_is_not_auto_suppressed_by_high_ai_fp_probability() -> None:

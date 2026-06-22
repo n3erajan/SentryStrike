@@ -87,6 +87,42 @@ def test_api_endpoint_form_content_type_yields_form_target():
     }
 
 
+def test_attack_target_builds_multipart_request_from_api_endpoint():
+    endpoint = ApiEndpoint(
+        url="http://example.com/upload",
+        method="POST",
+        content_type="multipart/form-data",
+        request_body={"avatarFile": "old.png", "userId": 7},
+        headers={"Content-Type": "multipart/form-data; boundary=old", "Authorization": "Bearer token"},
+    )
+
+    targets = AttackSurface.build([], [], api_endpoints=[endpoint], filter_fn=lambda name: name == "avatarFile")
+
+    target = targets[0]
+    prepared = target.build_request(("avatar.txt", b"canary", "text/plain"))
+    assert prepared.url == "http://example.com/upload"
+    assert prepared.data == {"userId": "7"}
+    assert prepared.files == {"avatarFile": ("avatar.txt", b"canary", "text/plain")}
+    assert prepared.headers == {"Authorization": "Bearer token"}
+
+
+def test_attack_surface_extracts_browser_observed_multipart_request():
+    request = RequestObservation(
+        url="http://example.com/upload",
+        method="POST",
+        request_headers={"content-type": "multipart/form-data; boundary=abc"},
+        post_data='--abc\r\nContent-Disposition: form-data; name="avatar"; filename="old.png"\r\n\r\nx'
+        '\r\n--abc\r\nContent-Disposition: form-data; name="userId"\r\n\r\n1\r\n--abc--',
+    )
+
+    targets = AttackSurface.build([], [], requests=[request], filter_fn=lambda name: name == "avatar")
+
+    assert len(targets) == 1
+    prepared = targets[0].build_request(("avatar.txt", b"canary", "text/plain"))
+    assert prepared.data == {"userId": "sentry_test_val"}
+    assert prepared.files == {"avatar": ("avatar.txt", b"canary", "text/plain")}
+
+
 def test_attack_target_builds_query_request():
     target = AttackSurface.build(["http://example.com/search?q=test"], [], filter_fn=lambda name: name == "q")[0]
 

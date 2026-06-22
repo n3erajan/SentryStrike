@@ -65,6 +65,30 @@ from app.utils.scan_metrics import begin_request_counting, end_request_counting,
 
 logger = logging.getLogger(__name__)
 
+ATTACK_SURFACE_BACKED_DETECTORS = frozenset(
+    {
+        "access_control",
+        "injection_sql_command",
+        "xss",
+        "file_inclusion",
+        "ssrf",
+        "open_redirect",
+        "file_upload",
+    }
+)
+
+SPECIALIZED_INPUT_DETECTORS = frozenset(
+    {
+        "security_headers",
+        "crypto_failures",
+        "supply_chain",
+        "sensitive_paths",
+        "exception_handling",
+        "csrf",
+        "authentication_failures",
+    }
+)
+
 
 class ScanOrchestrator:
     def __init__(self, repository: ScanRepository) -> None:
@@ -255,6 +279,8 @@ class ScanOrchestrator:
                 "routes": getattr(crawl_result, "routes", []),
                 "assets": getattr(crawl_result, "assets", []),
                 "dead_routes": getattr(crawl_result, "dead_routes", []),
+                "browser_available": getattr(crawl_result, "browser_available", None),
+                "browser_error": getattr(crawl_result, "browser_error", None),
             }
             coverage_context = {
                 **crawl_context,
@@ -625,6 +651,7 @@ class ScanOrchestrator:
     def _add_findings_to_metric(self, metric: DetectorCoverageMetric, findings: list[Finding]) -> None:
         metric.candidates_built += len(findings or [])
         metric.verified_findings += len([finding for finding in findings or [] if getattr(finding, "verified", False)])
+        metric.unverified_findings += len([finding for finding in findings or [] if not getattr(finding, "verified", False)])
         metric.requests_sent = max(metric.requests_sent, self._request_snippet_count(findings))
 
     def _detector_metric_for_findings(
@@ -642,7 +669,7 @@ class ScanOrchestrator:
             crawl_context,
             technology_stack=technology_stack,
         )
-        skipped_reasons: dict[str, int] = {}
+        skipped_reasons = self._detector_skip_reasons(detector_name, candidates_built, findings, crawl_context)
         if candidates_built == 0 and not findings:
             skipped_reasons["no_candidates_built"] = 1
 
@@ -659,8 +686,57 @@ class ScanOrchestrator:
             candidates_built=candidates_built,
             requests_sent=self._request_snippet_count(findings),
             verified_findings=len([finding for finding in findings or [] if getattr(finding, "verified", False)]),
+            unverified_findings=len([finding for finding in findings or [] if not getattr(finding, "verified", False)]),
             skipped_reasons=skipped_reasons,
         )
+
+    def _detector_skip_reasons(
+        self,
+        detector_name: str,
+        candidates_built: int,
+        findings: list[Finding],
+        crawl_context: dict,
+    ) -> dict[str, int]:
+        skipped: dict[str, int] = {}
+        forms = crawl_context.get("forms") or []
+        parameters = crawl_context.get("parameters") or []
+        api_endpoints = crawl_context.get("api_endpoints") or []
+        requests = crawl_context.get("requests") or []
+        auth_headers = crawl_context.get("auth_headers") or {}
+        session_cookies = crawl_context.get("session_cookies") or {}
+        browser_available = crawl_context.get("browser_available")
+
+        replayable_body_count = len(
+            [
+                request
+                for request in requests
+                if getattr(request, "post_data", None)
+            ]
+        )
+        if detector_name in {
+            "access_control",
+            "authentication_failures",
+            "csrf",
+        } and not (auth_headers or session_cookies):
+            skipped["missing_auth_context"] = 1
+        if detector_name == "csrf" and not session_cookies:
+            skipped["missing_session_cookies"] = 1
+        if detector_name in {
+            "injection_sql_command",
+            "xss",
+            "file_inclusion",
+            "ssrf",
+            "open_redirect",
+            "access_control",
+        } and candidates_built == 0 and not (parameters or forms or api_endpoints or requests):
+            skipped["no_replayable_attack_targets"] = 1
+        if detector_name in {"xss", "authentication_failures", "access_control"} and browser_available is False:
+            skipped["browser_unavailable"] = 1
+        if detector_name in {"injection_sql_command", "xss", "file_inclusion"} and not replayable_body_count:
+            skipped["no_replayable_request_bodies"] = 1
+        if not findings and candidates_built > 0:
+            skipped["no_findings_after_verification"] = 1
+        return skipped
 
     def _estimate_detector_candidates(
         self,
@@ -741,11 +817,12 @@ class ScanOrchestrator:
         for metric in detector_metrics:
             logger.info(
                 "detector coverage: detector=%s candidates_built=%d requests_sent=%d "
-                "verified_findings=%d dropped_verified_mode=%d skipped_reasons=%s",
+                "verified_findings=%d unverified_findings=%d dropped_verified_mode=%d skipped_reasons=%s",
                 metric.detector,
                 metric.candidates_built,
                 metric.requests_sent,
                 metric.verified_findings,
+                metric.unverified_findings,
                 metric.dropped_findings_verified_mode,
                 metric.skipped_reasons,
             )

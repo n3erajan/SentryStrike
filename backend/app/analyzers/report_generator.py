@@ -111,7 +111,8 @@ class AiReportGenerator:
             skipped = ", ".join(f"{reason}={count}" for reason, count in sorted(metric.skipped_reasons.items()))
             lines.append(
                 f"{metric.detector}: candidates={metric.candidates_built}, requests={metric.requests_sent}, "
-                f"verified={metric.verified_findings}, dropped_verified_mode={metric.dropped_findings_verified_mode}"
+                f"verified={metric.verified_findings}, unverified={metric.unverified_findings}, "
+                f"filtered={metric.candidates_filtered}, dropped_verified_mode={metric.dropped_findings_verified_mode}"
                 + (f", skipped={skipped}" if skipped else "")
             )
         return "; ".join(lines)

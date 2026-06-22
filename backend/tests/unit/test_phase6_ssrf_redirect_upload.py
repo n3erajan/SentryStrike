@@ -178,6 +178,7 @@ def test_file_upload_candidate_extraction_from_api_endpoint():
     assert candidates[0].file_field == "avatar"
     assert candidates[0].data == {"userId": "1"}
     assert candidates[0].headers == {"authorization": "Bearer token"}
+    assert candidates[0].source == "attack_surface_api_form_body"
 
 
 def test_oast_client_extracts_interactions_from_common_payload_shapes():

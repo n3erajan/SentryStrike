@@ -8,6 +8,7 @@ import httpx
 
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.detectors.attack_surface import AttackSurface
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
 from app.utils.scan_http import create_scan_client
@@ -334,6 +335,32 @@ class FileUploadDetector(BaseDetector):
                     },
                     source=source,
                 )
+            )
+
+        upload_name = lambda name: any(
+            token in (name or "").lower()
+            for token in ("file", "upload", "avatar", "image", "document", "attachment")
+        )
+
+        for target in AttackSurface.build(
+            [],
+            [],
+            api_endpoints=list(kwargs.get("api_endpoints") or []),
+            requests=list(kwargs.get("requests") or []),
+            filter_fn=upload_name,
+        ):
+            if "multipart/form-data" not in str(target.content_type or "").lower():
+                continue
+            prepared = target.build_request(
+                ("sentry_probe.txt", b"SENTRY_UPLOAD_TEST_CANARY", "text/plain")
+            )
+            add(
+                prepared.url,
+                prepared.method,
+                target.parameter,
+                dict(prepared.data or {}),
+                dict(prepared.headers or {}),
+                f"attack_surface_{target.source}",
             )
 
         for request in kwargs.get("requests") or []:
