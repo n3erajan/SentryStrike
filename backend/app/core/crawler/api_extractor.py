@@ -184,7 +184,24 @@ class ApiExtractor:
                 body = json.loads(body)
             except Exception:
                 body = None
-        if isinstance(body, dict):
+        content_type = (endpoint.content_type or "").lower()
+        if isinstance(body, dict) and (
+            "application/x-www-form-urlencoded" in content_type
+            or "multipart/form-data" in content_type
+        ):
+            for key, value in body.items():
+                params.append(
+                    ParameterCandidate(
+                        name=key,
+                        location=ParameterLocation.form,
+                        url=endpoint.url,
+                        method=endpoint.method,
+                        baseline_value=value if not isinstance(value, (dict, list)) else "1",
+                        source="api_form_body",
+                        security_relevance=cls.classify_parameter(key),
+                    )
+                )
+        elif isinstance(body, dict):
             cls._walk_json_params(body, endpoint.url, endpoint.method, params)
 
         if endpoint.operation:
@@ -269,7 +286,30 @@ class ApiExtractor:
     @staticmethod
     def _looks_api_path(path: str) -> bool:
         lowered = path.lower()
-        return any(token in lowered for token in ("/api", "/graphql", "/gql", "/rest", "/oauth", "/session", "/auth", "/rpc", "/trpc"))
+        return any(
+            token in lowered
+            for token in (
+                "/api",
+                "/graphql",
+                "/gql",
+                "/rest",
+                "/oauth",
+                "/session",
+                "/auth",
+                "/rpc",
+                "/trpc",
+                "/login",
+                "/logout",
+                "/user",
+                "/users",
+                "/account",
+                "/accounts",
+                "/product",
+                "/products",
+                "/order",
+                "/orders",
+            )
+        )
 
     @staticmethod
     def _placeholder_name(expr: str) -> str:

@@ -1443,6 +1443,14 @@ class ScanOrchestrator:
             if getattr(request, "post_data", None)
             and "json" in str(getattr(request, "request_headers", {}).get("content-type", "")).lower()
         ]
+        replayable_form_bodies = [
+            request
+            for request in requests
+            if getattr(request, "post_data", None)
+            and "application/x-www-form-urlencoded" in str(
+                getattr(request, "request_headers", {}).get("content-type", "")
+            ).lower()
+        ]
         if is_spa and not requests:
             warnings.append(
                 "SPA detected, but no browser runtime requests were observed. API coverage is static extraction only."
@@ -1451,8 +1459,8 @@ class ScanOrchestrator:
             warnings.append(f"Browser crawling unavailable: {browser_error or 'Playwright could not run.'}")
         if not forms:
             warnings.append("No HTML forms were discovered; form-based detector coverage was limited.")
-        if not replayable_json_bodies:
-            warnings.append("No replayable JSON request bodies were observed; API body testing was limited.")
+        if not replayable_json_bodies and not replayable_form_bodies:
+            warnings.append("No replayable JSON or form request bodies were observed; API body testing was limited.")
         if auth_headers and not session_cookies:
             warnings.append("Authentication was represented by headers only; cookie/session checks were limited.")
         settings = get_settings()

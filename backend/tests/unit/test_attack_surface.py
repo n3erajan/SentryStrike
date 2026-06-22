@@ -43,6 +43,50 @@ def test_attack_surface_extracts_browser_observed_json_request():
     assert build_json_body(target.json_template, target, "http://127.0.0.1/")["url"] == "http://127.0.0.1/"
 
 
+def test_attack_surface_extracts_browser_observed_form_encoded_request():
+    request = RequestObservation(
+        url="http://example.com/login",
+        method="POST",
+        request_headers={"content-type": "application/x-www-form-urlencoded"},
+        post_data="email=alice%40example.test&password=Secret123%21&csrf=abc",
+    )
+
+    targets = AttackSurface.build([], [], requests=[request], filter_fn=lambda name: name == "email")
+
+    assert len(targets) == 1
+    target = targets[0]
+    assert target.location == ParameterLocation.form
+    assert target.source == "browser_form_request"
+    prepared = target.build_request("' OR 1=1--")
+    assert prepared.url == "http://example.com/login"
+    assert prepared.data == {
+        "email": "' OR 1=1--",
+        "password": "Secret123!",
+        "csrf": "abc",
+    }
+
+
+def test_api_endpoint_form_content_type_yields_form_target():
+    endpoint = ApiEndpoint(
+        url="http://example.com/session",
+        method="POST",
+        content_type="application/x-www-form-urlencoded",
+        request_body={"email": "alice@example.test", "password": "Secret123!"},
+    )
+
+    targets = AttackSurface.build([], [], api_endpoints=[endpoint], filter_fn=lambda name: name == "email")
+
+    assert len(targets) == 1
+    target = targets[0]
+    assert target.location == ParameterLocation.form
+    assert target.value == "alice@example.test"
+    prepared = target.build_request("' OR 1=1--")
+    assert prepared.data == {
+        "email": "' OR 1=1--",
+        "password": "Secret123!",
+    }
+
+
 def test_attack_target_builds_query_request():
     target = AttackSurface.build(["http://example.com/search?q=test"], [], filter_fn=lambda name: name == "q")[0]
 

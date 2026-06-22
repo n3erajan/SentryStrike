@@ -6,6 +6,7 @@ import re
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+from app.config import get_settings
 from app.core.crawler.models import ApiEndpoint, CrawlState, RequestObservation, RouteCandidate, RouteSource
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class BrowserDiscoveryEngine:
 
     def __init__(self, max_interactions: int = 25) -> None:
         self.max_interactions = max_interactions
+        self.settings = get_settings()
 
     @staticmethod
     async def check_readiness() -> tuple[bool, str | None]:
@@ -72,7 +74,7 @@ class BrowserDiscoveryEngine:
             return CrawlState(browser_available=False, browser_error=f"Playwright import failed: {exc}")
 
         state = CrawlState(browser_available=True)
-        observed_by_url: dict[str, RequestObservation] = {}
+        observed_by_key: dict[tuple[str, str, str], RequestObservation] = {}
 
         async with async_playwright() as pw:
             try:
@@ -106,7 +108,7 @@ class BrowserDiscoveryEngine:
 
             async def on_request(request):
                 if request.resource_type in {"xhr", "fetch", "websocket"}:
-                    observed_by_url[request.url] = RequestObservation(
+                    observed_by_key[self._observation_key(request.url, request.method, request.post_data)] = RequestObservation(
                         url=request.url,
                         method=request.method,
                         resource_type=request.resource_type,
@@ -118,7 +120,8 @@ class BrowserDiscoveryEngine:
                 request = response.request
                 if request.resource_type not in {"xhr", "fetch", "websocket"}:
                     return
-                observed = observed_by_url.get(request.url) or RequestObservation(
+                observation_key = self._observation_key(request.url, request.method, request.post_data)
+                observed = observed_by_key.get(observation_key) or RequestObservation(
                     url=request.url,
                     method=request.method,
                     resource_type=request.resource_type,
@@ -134,7 +137,7 @@ class BrowserDiscoveryEngine:
                     observed.response_snippet = (await response.text())[:1000]
                 except Exception:
                     observed.response_snippet = None
-                observed_by_url[request.url] = observed
+                observed_by_key[observation_key] = observed
 
             page.on("request", on_request)
             page.on("response", on_response)
@@ -155,7 +158,7 @@ class BrowserDiscoveryEngine:
                     except Exception as exc:
                         logger.warning("browser discovery failed for %s: %s", target_url, exc)
             finally:
-                for observation in self._dedupe_observations(observed_by_url.values()):
+                for observation in self._dedupe_observations(observed_by_key.values()):
                     state.requests.append(observation)
                     state.add_api_endpoint(
                         ApiEndpoint(
@@ -171,6 +174,10 @@ class BrowserDiscoveryEngine:
                 await context.close()
                 await browser.close()
         return state
+
+    @staticmethod
+    def _observation_key(url: str, method: str, post_data: Any = None) -> tuple[str, str, str]:
+        return (method.upper(), url, str(post_data or ""))
 
     async def _exercise_page(self, page: Any) -> None:
         await self._fill_safe_fields(page)
@@ -198,8 +205,11 @@ class BrowserDiscoveryEngine:
                 continue
 
     async def _fill_safe_fields(self, page: Any) -> None:
+        input_selector = "input:not([type=hidden]):not([type=file])"
+        if not self.settings.authentication_password:
+            input_selector = "input:not([type=hidden]):not([type=password]):not([type=file])"
         fields = page.locator(
-            "input:not([type=hidden]):not([type=password]):not([type=file]), textarea, [contenteditable=true]"
+            f"{input_selector}, textarea, [contenteditable=true]"
         )
         count = min(await fields.count(), self.max_interactions)
         for index in range(count):
@@ -217,6 +227,12 @@ class BrowserDiscoveryEngine:
     async def _value_for_field(self, field: Any) -> str:
         attrs = await self._field_attrs(field)
         joined = " ".join(attrs).lower()
+        if "password" in joined and self.settings.authentication_password:
+            return self.settings.authentication_password
+        if self.settings.authentication_username and any(
+            token in joined for token in ("email", "username", "user", "login", "account")
+        ):
+            return self.settings.authentication_username
         for token, value in SAFE_FIELD_VALUES.items():
             if token in joined:
                 return value

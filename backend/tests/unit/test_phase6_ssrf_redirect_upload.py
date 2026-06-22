@@ -4,7 +4,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from app.core.crawler.models import ParameterCandidate, ParameterLocation, RequestObservation
+from app.core.crawler.models import ApiEndpoint, ParameterCandidate, ParameterLocation, RequestObservation
 from app.core.detectors.file_upload import FileUploadDetector
 from app.core.detectors.open_redirect import OpenRedirectDetector
 from app.core.detectors.ssrf_detector import SSRFDetector
@@ -159,6 +159,25 @@ def test_file_upload_static_formdata_candidate_extraction():
     assert candidates[0].url == "https://example.test/api/files/upload"
     assert candidates[0].file_field == "document"
     assert candidates[0].data == {"folder": "sentry_test_val"}
+
+
+def test_file_upload_candidate_extraction_from_api_endpoint():
+    detector = FileUploadDetector()
+    endpoint = ApiEndpoint(
+        url="https://example.test/api/profile/upload",
+        method="POST",
+        content_type="multipart/form-data",
+        request_body={"avatar": "sample.txt", "userId": 1},
+        headers={"authorization": "Bearer token", "content-type": "multipart/form-data"},
+    )
+
+    candidates = detector._api_upload_candidates({"api_endpoints": [endpoint]})
+
+    assert len(candidates) == 1
+    assert candidates[0].url == "https://example.test/api/profile/upload"
+    assert candidates[0].file_field == "avatar"
+    assert candidates[0].data == {"userId": "1"}
+    assert candidates[0].headers == {"authorization": "Bearer token"}
 
 
 def test_oast_client_extracts_interactions_from_common_payload_shapes():

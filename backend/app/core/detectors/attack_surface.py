@@ -29,6 +29,13 @@ class PreparedAttackRequest:
 
 
 @dataclass
+class _ObservedFormInput:
+    name: str
+    input_type: str = "text"
+    value: str = ""
+
+
+@dataclass
 class AttackTarget:
     url: str
     parameter: str
@@ -134,15 +141,19 @@ class AttackSurface:
             candidates = [candidate for candidate in candidates if filter_fn(candidate.name)]
 
         endpoint_templates = cls._endpoint_templates(api_endpoints or [])
+        endpoint_form_templates = cls._endpoint_form_templates(api_endpoints or [])
         request_templates = cls._request_templates(requests or [])
         targets: list[AttackTarget] = []
         seen: set[tuple[str, str, str, str, str]] = set()
 
         for candidate in candidates:
             template = None
+            form_inputs = candidate.context.get("form_inputs")
             headers: dict[str, str] = {}
             if candidate.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
                 template, headers = cls._find_template(candidate, endpoint_templates, request_templates)
+            elif candidate.location == ParameterLocation.form and form_inputs is None:
+                form_inputs, headers = cls._find_form_template(candidate, endpoint_form_templates)
 
             key = (
                 candidate.url,
@@ -161,7 +172,7 @@ class AttackSurface:
                     method=candidate.method.upper(),
                     value=candidate.baseline_value,
                     location=candidate.location,
-                    form_inputs=candidate.context.get("form_inputs"),
+                    form_inputs=form_inputs,
                     content_type=candidate.content_type,
                     parent_path=candidate.parent_path,
                     source=candidate.source,
@@ -177,40 +188,77 @@ class AttackSurface:
                 continue
             body = cls._parse_json(request.post_data)
             if not isinstance(body, dict):
-                continue
-            endpoint = ApiEndpoint(
-                url=request.url,
-                method=request.method,
-                request_body=body,
-                headers=request.request_headers,
-            )
-            for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
-                if filter_fn and not filter_fn(parameter.name):
+                form_body = cls._parse_form_data(request.post_data, request.request_headers or {})
+                if not form_body:
                     continue
-                key = (
-                    parameter.url,
-                    parameter.method.upper(),
-                    parameter.name,
-                    parameter.location.value,
-                    parameter.parent_path or "",
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                targets.append(
-                    AttackTarget(
-                        url=parameter.url,
-                        parameter=parameter.name,
-                        method=parameter.method.upper(),
-                        value=parameter.baseline_value,
-                        location=parameter.location,
-                        parent_path=parameter.parent_path,
-                        source="browser_request",
-                        json_template=body,
-                        headers=request.request_headers,
-                        security_relevance=set(parameter.security_relevance),
+                form_inputs = [
+                    _ObservedFormInput(name=name, value=str(value))
+                    for name, value in form_body.items()
+                ]
+                for name, value in form_body.items():
+                    if filter_fn and not filter_fn(name):
+                        continue
+                    key = (
+                        request.url,
+                        request.method.upper(),
+                        name,
+                        ParameterLocation.form.value,
+                        "",
                     )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    targets.append(
+                        AttackTarget(
+                            url=request.url,
+                            parameter=name,
+                            method=request.method.upper(),
+                            value=value,
+                            location=ParameterLocation.form,
+                            form_inputs=form_inputs,
+                            source="browser_form_request",
+                            headers={
+                                key: value
+                                for key, value in (request.request_headers or {}).items()
+                                if key.lower() not in {"content-length"}
+                            },
+                            security_relevance=ApiExtractor.classify_parameter(name),
+                        )
+                    )
+            else:
+                endpoint = ApiEndpoint(
+                    url=request.url,
+                    method=request.method,
+                    request_body=body,
+                    headers=request.request_headers,
                 )
+                for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
+                    if filter_fn and not filter_fn(parameter.name):
+                        continue
+                    key = (
+                        parameter.url,
+                        parameter.method.upper(),
+                        parameter.name,
+                        parameter.location.value,
+                        parameter.parent_path or "",
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    targets.append(
+                        AttackTarget(
+                            url=parameter.url,
+                            parameter=parameter.name,
+                            method=parameter.method.upper(),
+                            value=parameter.baseline_value,
+                            location=parameter.location,
+                            parent_path=parameter.parent_path,
+                            source="browser_request",
+                            json_template=body,
+                            headers=request.request_headers,
+                            security_relevance=set(parameter.security_relevance),
+                        )
+                    )
 
         return targets
 
@@ -221,6 +269,35 @@ class AttackSurface:
             body = AttackSurface._parse_json(endpoint.request_body)
             if isinstance(body, dict):
                 templates[(endpoint.url, endpoint.method.upper())] = (body, endpoint.headers or {})
+        return templates
+
+    @staticmethod
+    def _endpoint_form_templates(
+        endpoints: list[ApiEndpoint],
+    ) -> dict[tuple[str, str], tuple[list[_ObservedFormInput], dict[str, str]]]:
+        templates: dict[tuple[str, str], tuple[list[_ObservedFormInput], dict[str, str]]] = {}
+        for endpoint in endpoints:
+            content_type = (endpoint.content_type or "").lower()
+            if (
+                "application/x-www-form-urlencoded" not in content_type
+                and "multipart/form-data" not in content_type
+            ):
+                continue
+            body = AttackSurface._parse_json(endpoint.request_body)
+            if not isinstance(body, dict):
+                continue
+            templates[(endpoint.url, endpoint.method.upper())] = (
+                [
+                    _ObservedFormInput(name=name, value=str(value))
+                    for name, value in body.items()
+                    if name and not isinstance(value, (dict, list))
+                ],
+                {
+                    key: value
+                    for key, value in (endpoint.headers or {}).items()
+                    if key.lower() not in {"content-length"}
+                },
+            )
         return templates
 
     @staticmethod
@@ -246,6 +323,16 @@ class AttackSurface:
         return None, {}
 
     @staticmethod
+    def _find_form_template(
+        candidate: ParameterCandidate,
+        endpoint_form_templates: dict[tuple[str, str], tuple[list[_ObservedFormInput], dict[str, str]]],
+    ) -> tuple[list[_ObservedFormInput] | None, dict[str, str]]:
+        key = (candidate.url, candidate.method.upper())
+        if key in endpoint_form_templates:
+            return endpoint_form_templates[key]
+        return None, {}
+
+    @staticmethod
     def _parse_json(value: Any) -> Any:
         if isinstance(value, (dict, list)):
             return value
@@ -255,6 +342,26 @@ class AttackSurface:
             return json.loads(value)
         except Exception:
             return None
+
+    @staticmethod
+    def _parse_form_data(value: Any, headers: dict[str, str]) -> dict[str, str]:
+        content_type = " ".join(
+            str(header_value).lower()
+            for header_name, header_value in headers.items()
+            if header_name.lower() == "content-type"
+        )
+        if "application/x-www-form-urlencoded" not in content_type:
+            return {}
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "ignore")
+        if not isinstance(value, str) or not value.strip():
+            return {}
+        parsed = parse_qs(value, keep_blank_values=True)
+        return {
+            name: values[0] if values else ""
+            for name, values in parsed.items()
+            if name
+        }
 
 
 def build_json_body(template: Any, target: AttackTarget, injected_value: Any) -> Any:

@@ -130,6 +130,44 @@ def test_replayable_json_body_suppresses_json_body_warning() -> None:
     assert not any("No replayable JSON request bodies" in warning for warning in scan.report_metadata.coverage_warnings)
 
 
+def test_replayable_form_body_suppresses_api_body_warning() -> None:
+    class CrawlResult:
+        is_spa = False
+        assets = []
+        routes = []
+        api_endpoints = []
+        parameters = []
+        requests = [
+            RequestObservation(
+                url="http://target.test/login",
+                method="POST",
+                request_headers={"content-type": "application/x-www-form-urlencoded"},
+                post_data="email=a%40example.com&password=secret",
+            )
+        ]
+        dead_routes = []
+        forms = []
+        session_cookies = {}
+        auth_headers = {}
+        auth_state = "unauthenticated"
+        browser_available = True
+        browser_error = None
+
+    scan = SimpleNamespace(
+        target_url="http://target.test/",
+        statistics=ScanStatistics(),
+        report_metadata=ReportMetadata(
+            spa_api_coverage=SpaApiCoverage(),
+            auth_coverage=AuthCoverage(),
+            evidence_strength_breakdown=EvidenceStrengthBreakdown(),
+        ),
+    )
+    _orchestrator()._update_crawl_metadata(scan, CrawlResult())
+
+    assert scan.report_metadata.spa_api_coverage.replayable_json_bodies == 0
+    assert not any("API body testing was limited" in warning for warning in scan.report_metadata.coverage_warnings)
+
+
 def test_unverified_admin_route_hint_is_not_confirmed_observation() -> None:
     finding = Finding(
         category=OwaspCategory.a01,

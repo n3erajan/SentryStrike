@@ -160,6 +160,24 @@ def test_api_extractor_infers_json_body_schema_from_fetch():
     assert all(param.location == ParameterLocation.json_body for param in params)
 
 
+def test_api_extractor_infers_body_schema_from_non_api_login_fetch():
+    script = """
+    fetch('/login', {
+      method: 'POST',
+      body: JSON.stringify({ email: userEmail, password: password })
+    })
+    """
+
+    _, endpoints = ApiExtractor.extract_from_javascript("http://localhost:3000/main.js", script)
+
+    endpoint = next(endpoint for endpoint in endpoints if endpoint.url == "http://localhost:3000/login")
+    assert endpoint.evidence == "fetch/xhr"
+    assert endpoint.request_body == {
+        "email": "scanner@example.com",
+        "password": "Password123!",
+    }
+
+
 def test_api_extractor_infers_formdata_schema_from_fetch():
     script = """
     const data = new FormData()

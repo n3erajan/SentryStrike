@@ -359,6 +359,34 @@ class FileUploadDetector(BaseDetector):
                 "browser_multipart_request",
             )
 
+        for endpoint in kwargs.get("api_endpoints") or []:
+            content_type = str(getattr(endpoint, "content_type", "") or "").lower()
+            url = str(getattr(endpoint, "url", "") or "")
+            body = getattr(endpoint, "request_body", None)
+            if "multipart/form-data" not in content_type and not (
+                url and any(token in url.lower() for token in ("upload", "file", "avatar", "image", "document"))
+            ):
+                continue
+            fields = list(body.keys()) if isinstance(body, dict) else []
+            file_fields = [
+                field for field in fields
+                if any(token in field.lower() for token in ("file", "upload", "avatar", "image", "document"))
+            ]
+            file_field = file_fields[0] if file_fields else "file"
+            sibling_data = {
+                field: str(value)
+                for field, value in body.items()
+                if field != file_field
+            } if isinstance(body, dict) else {}
+            add(
+                url,
+                str(getattr(endpoint, "method", "POST") or "POST"),
+                file_field,
+                sibling_data,
+                dict(getattr(endpoint, "headers", {}) or {}),
+                "api_multipart_endpoint",
+            )
+
         for asset in kwargs.get("assets") or []:
             text = str(asset)
             if "FormData" not in text and ".append(" not in text:
