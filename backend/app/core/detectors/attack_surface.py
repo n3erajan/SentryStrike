@@ -51,6 +51,9 @@ class AttackTarget:
     headers: dict[str, str] = field(default_factory=dict)
     cookies: dict[str, str] = field(default_factory=dict)
     security_relevance: set[str] = field(default_factory=set)
+    replayable: bool = True
+    body_schema: list[str] = field(default_factory=list)
+    source_confidence: str = "observed"
 
     def legacy_tuple(self) -> tuple:
         return (self.url, self.parameter, self.method, str(self.value), self.form_inputs)
@@ -196,16 +199,23 @@ class AttackSurface:
                     headers=headers,
                     cookies=candidate.context.get("cookies") or {},
                     security_relevance=set(candidate.security_relevance),
+                    replayable=bool(candidate.context.get("replayable", True)),
+                    body_schema=list(candidate.context.get("body_schema") or []),
                 )
             )
 
         for request in requests or []:
             if not request.post_data:
                 continue
+            content_type = cls._request_content_type(request)
             body = cls._parse_json(request.post_data)
             if not isinstance(body, dict):
-                form_body = cls._parse_form_data(request.post_data, request.request_headers or {})
-                multipart_fields = cls._parse_multipart_fields(request.post_data, request.request_headers or {})
+                form_body = cls._parse_form_data(request.post_data, request.request_headers or {}, content_type)
+                multipart_fields = cls._observed_multipart_inputs(request) or cls._parse_multipart_fields(
+                    request.post_data,
+                    request.request_headers or {},
+                    content_type,
+                )
                 if not form_body and not multipart_fields:
                     continue
                 if multipart_fields:
@@ -246,7 +256,11 @@ class AttackSurface:
                                 for key, value in (request.request_headers or {}).items()
                                 if key.lower() not in {"content-length"}
                             },
+                            cookies=dict(getattr(request, "request_cookies", {}) or {}),
                             security_relevance=ApiExtractor.classify_parameter(name),
+                            replayable=bool(getattr(request, "replayable", True)),
+                            body_schema=list(getattr(request, "body_schema", []) or []),
+                            source_confidence="browser_replayable" if getattr(request, "replayable", False) else "browser_observed",
                         )
                     )
             else:
@@ -280,7 +294,11 @@ class AttackSurface:
                             source="browser_request",
                             json_template=body,
                             headers=request.request_headers,
+                            cookies=dict(getattr(request, "request_cookies", {}) or {}),
                             security_relevance=set(parameter.security_relevance),
+                            replayable=bool(getattr(request, "replayable", True)),
+                            body_schema=list(getattr(request, "body_schema", []) or []),
+                            source_confidence="browser_replayable" if getattr(request, "replayable", False) else "browser_observed",
                         )
                     )
 
@@ -377,12 +395,12 @@ class AttackSurface:
             return None
 
     @staticmethod
-    def _parse_form_data(value: Any, headers: dict[str, str]) -> dict[str, str]:
-        content_type = " ".join(
+    def _parse_form_data(value: Any, headers: dict[str, str], content_type: str | None = None) -> dict[str, str]:
+        content_type = (content_type or " ".join(
             str(header_value).lower()
             for header_name, header_value in headers.items()
             if header_name.lower() == "content-type"
-        )
+        )).lower()
         if "application/x-www-form-urlencoded" not in content_type:
             return {}
         if isinstance(value, bytes):
@@ -397,12 +415,16 @@ class AttackSurface:
         }
 
     @staticmethod
-    def _parse_multipart_fields(value: Any, headers: dict[str, str]) -> list[_ObservedFormInput]:
-        content_type = " ".join(
+    def _parse_multipart_fields(
+        value: Any,
+        headers: dict[str, str],
+        content_type: str | None = None,
+    ) -> list[_ObservedFormInput]:
+        content_type = (content_type or " ".join(
             str(header_value).lower()
             for header_name, header_value in headers.items()
             if header_name.lower() == "content-type"
-        )
+        )).lower()
         if "multipart/form-data" not in content_type:
             return []
         if isinstance(value, bytes):
@@ -429,6 +451,26 @@ class AttackSurface:
                 )
             )
         return inputs
+
+    @staticmethod
+    def _observed_multipart_inputs(request: RequestObservation) -> list[_ObservedFormInput]:
+        inputs: list[_ObservedFormInput] = []
+        for field in getattr(request, "multipart_fields", []) or []:
+            name = field.get("name")
+            if not name:
+                continue
+            input_type = "file" if field.get("type") == "file" else "text"
+            inputs.append(_ObservedFormInput(name=name, input_type=input_type, value=""))
+        return inputs
+
+    @staticmethod
+    def _request_content_type(request: RequestObservation) -> str | None:
+        if getattr(request, "request_content_type", None):
+            return request.request_content_type
+        for name, value in (request.request_headers or {}).items():
+            if name.lower() == "content-type":
+                return value
+        return None
 
 
 def build_json_body(template: Any, target: AttackTarget, injected_value: Any) -> Any:

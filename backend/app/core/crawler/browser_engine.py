@@ -4,9 +4,10 @@ import json
 import logging
 import re
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from app.config import get_settings
+from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ApiEndpoint, CrawlState, RequestObservation, RouteCandidate, RouteSource
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,23 @@ SAFE_FIELD_VALUES = {
     "url": "https://example.com/",
     "file": "sample.txt",
     "filename": "sample.txt",
+}
+VOLATILE_REQUEST_HEADERS = {
+    "accept-encoding",
+    "connection",
+    "content-length",
+    "host",
+    "proxy-authorization",
+    "proxy-connection",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+    "sec-fetch-user",
+    "te",
+    "upgrade-insecure-requests",
 }
 
 
@@ -108,12 +126,8 @@ class BrowserDiscoveryEngine:
 
             async def on_request(request):
                 if request.resource_type in {"xhr", "fetch", "websocket"}:
-                    observed_by_key[self._observation_key(request.url, request.method, request.post_data)] = RequestObservation(
-                        url=request.url,
-                        method=request.method,
-                        resource_type=request.resource_type,
-                        request_headers=dict(request.headers),
-                        post_data=request.post_data,
+                    observed_by_key[self._observation_key(request.url, request.method, request.post_data)] = (
+                        await self._build_request_observation(request)
                     )
 
             async def on_response(response):
@@ -121,13 +135,7 @@ class BrowserDiscoveryEngine:
                 if request.resource_type not in {"xhr", "fetch", "websocket"}:
                     return
                 observation_key = self._observation_key(request.url, request.method, request.post_data)
-                observed = observed_by_key.get(observation_key) or RequestObservation(
-                    url=request.url,
-                    method=request.method,
-                    resource_type=request.resource_type,
-                    request_headers=dict(request.headers),
-                    post_data=request.post_data,
-                )
+                observed = observed_by_key.get(observation_key) or await self._build_request_observation(request)
                 headers = dict(response.headers)
                 observed.response_status = response.status
                 observed.response_headers = headers
@@ -160,17 +168,24 @@ class BrowserDiscoveryEngine:
             finally:
                 for observation in self._dedupe_observations(observed_by_key.values()):
                     state.requests.append(observation)
-                    state.add_api_endpoint(
-                        ApiEndpoint(
-                            url=observation.url,
-                            method=observation.method,
-                            source=RouteSource.browser,
-                            content_type=observation.response_content_type,
-                            request_body=observation.post_data,
-                            headers=observation.request_headers,
-                            evidence=f"{observation.resource_type}:{observation.response_status or 'unknown'}",
-                        )
+                    endpoint = ApiEndpoint(
+                        url=observation.url,
+                        method=observation.method,
+                        source=RouteSource.browser,
+                        content_type=observation.request_content_type,
+                        request_body=observation.post_data,
+                        body_schema=list(observation.body_schema),
+                        multipart_fields=list(observation.multipart_fields),
+                        replayable=observation.replayable,
+                        headers=observation.request_headers,
+                        evidence=f"{observation.resource_type}:{observation.response_status or 'unknown'}",
                     )
+                    state.add_api_endpoint(endpoint)
+                    for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
+                        parameter.source = "browser_request"
+                        parameter.context["replayable"] = observation.replayable
+                        parameter.context["cookies"] = dict(observation.request_cookies)
+                        state.add_parameter(parameter)
                 await context.close()
                 await browser.close()
         return state
@@ -277,17 +292,146 @@ class BrowserDiscoveryEngine:
     def _dedupe_observations(self, observations: Any) -> list[RequestObservation]:
         deduped: dict[tuple[str, str, str | None, tuple[str, ...]], RequestObservation] = {}
         for observation in observations:
-            content_type = (observation.request_headers or {}).get("content-type") or observation.response_content_type
+            content_type = (
+                observation.request_content_type
+                or (observation.request_headers or {}).get("content-type")
+                or observation.response_content_type
+            )
             key = (
                 observation.method.upper(),
                 self._template_url(observation.url),
                 content_type,
-                tuple(sorted(self._body_schema(observation.post_data))),
+                tuple(sorted(observation.body_schema or self._body_schema(observation.post_data))),
             )
             existing = deduped.get(key)
             if existing is None or (existing.response_status is None and observation.response_status is not None):
                 deduped[key] = observation
         return list(deduped.values())
+
+    async def _build_request_observation(self, request: Any) -> RequestObservation:
+        headers = await self._request_headers(request)
+        normalized_headers = self._normalize_request_headers(headers)
+        content_type = self._header_value(normalized_headers, "content-type")
+        cookies = self._parse_cookie_header(self._header_value(normalized_headers, "cookie") or "")
+        post_data = request.post_data
+        body_kind, body_schema, multipart_fields = self._request_body_metadata(post_data, content_type)
+        replayable = self._is_replayable(request.method, post_data, content_type, body_schema, multipart_fields)
+        return RequestObservation(
+            url=request.url,
+            method=request.method,
+            resource_type=request.resource_type,
+            request_headers=normalized_headers,
+            request_cookies=cookies,
+            request_content_type=content_type,
+            post_data=post_data,
+            body_kind=body_kind,
+            body_schema=body_schema,
+            multipart_fields=multipart_fields,
+            replayable=replayable,
+        )
+
+    async def _request_headers(self, request: Any) -> dict[str, str]:
+        try:
+            return dict(await request.all_headers())
+        except Exception:
+            return dict(getattr(request, "headers", {}) or {})
+
+    def _normalize_request_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for name, value in (headers or {}).items():
+            lowered = str(name).lower()
+            if lowered in VOLATILE_REQUEST_HEADERS:
+                continue
+            if value is None:
+                continue
+            normalized[lowered] = str(value)
+        return normalized
+
+    @staticmethod
+    def _header_value(headers: dict[str, str], name: str) -> str | None:
+        lowered = name.lower()
+        for header_name, value in (headers or {}).items():
+            if header_name.lower() == lowered:
+                return value
+        return None
+
+    @staticmethod
+    def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
+        cookies: dict[str, str] = {}
+        for part in cookie_header.split(";"):
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            if name:
+                cookies[name] = value.strip()
+        return cookies
+
+    def _request_body_metadata(
+        self,
+        body: Any,
+        content_type: str | None,
+    ) -> tuple[str | None, list[str], list[dict[str, Any]]]:
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", "ignore")
+        if not isinstance(body, str) or not body.strip():
+            return None, [], []
+
+        lowered = (content_type or "").lower()
+        if "json" in lowered:
+            return "json", sorted(self._body_schema(body)), []
+        if "application/x-www-form-urlencoded" in lowered:
+            names = sorted(name for name in parse_qs(body, keep_blank_values=True) if name)
+            return "form", names, [{"name": name, "type": "text"} for name in names]
+        if "multipart/form-data" in lowered:
+            fields = self._multipart_field_metadata(body)
+            return "multipart", sorted(field["name"] for field in fields if field.get("name")), fields
+        return None, [], []
+
+    def _multipart_field_metadata(self, body: str) -> list[dict[str, Any]]:
+        fields: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for match in re.finditer(
+            r'Content-Disposition:\s*form-data;\s*name="(?P<name>[^"]+)"(?P<rest>[^\r\n]*)',
+            body,
+            re.I,
+        ):
+            name = match.group("name")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            rest = match.group("rest") or ""
+            filename_match = re.search(r'filename="(?P<filename>[^"]*)"', rest, re.I)
+            fields.append(
+                {
+                    "name": name,
+                    "type": "file" if filename_match else "text",
+                    "filename": filename_match.group("filename") if filename_match else None,
+                }
+            )
+        return fields
+
+    @staticmethod
+    def _is_replayable(
+        method: str,
+        body: Any,
+        content_type: str | None,
+        body_schema: list[str],
+        multipart_fields: list[dict[str, Any]],
+    ) -> bool:
+        method = method.upper()
+        if method in {"GET", "HEAD", "OPTIONS"}:
+            return True
+        if not body:
+            return False
+        lowered = (content_type or "").lower()
+        if "json" in lowered:
+            return bool(body_schema)
+        if "application/x-www-form-urlencoded" in lowered:
+            return bool(body_schema)
+        if "multipart/form-data" in lowered:
+            return bool(multipart_fields)
+        return False
 
     def _template_url(self, url: str) -> str:
         parsed = urlparse(url)

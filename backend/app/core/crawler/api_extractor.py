@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlparse
 
 from app.core.crawler.models import ApiEndpoint, ParameterCandidate, ParameterLocation, RouteSource
 from app.core.crawler.url_parser import normalize_url
@@ -185,6 +185,24 @@ class ApiExtractor:
             except Exception:
                 body = None
         content_type = (endpoint.content_type or "").lower()
+        if body is None and "application/x-www-form-urlencoded" in content_type:
+            raw_body = endpoint.request_body
+            if isinstance(raw_body, bytes):
+                raw_body = raw_body.decode("utf-8", "ignore")
+            if isinstance(raw_body, str):
+                body = {
+                    name: values[0] if values else ""
+                    for name, values in parse_qs(raw_body, keep_blank_values=True).items()
+                    if name
+                }
+        if body is None and "multipart/form-data" in content_type:
+            multipart_fields = getattr(endpoint, "multipart_fields", []) or []
+            if multipart_fields:
+                body = {
+                    field.get("name"): cls._baseline_for_name(field.get("name", ""))
+                    for field in multipart_fields
+                    if field.get("name")
+                }
         if isinstance(body, dict) and (
             "application/x-www-form-urlencoded" in content_type
             or "multipart/form-data" in content_type

@@ -31,7 +31,11 @@ def test_attack_surface_extracts_browser_observed_json_request():
         url="http://example.com/api/products",
         method="POST",
         request_headers={"content-type": "application/json"},
+        request_content_type="application/json",
         post_data='{"name":"juice","url":"http://example.org"}',
+        body_kind="json",
+        body_schema=["name", "url"],
+        replayable=True,
     )
 
     targets = AttackSurface.build([], [], requests=[request], filter_fn=lambda name: name == "url")
@@ -40,6 +44,8 @@ def test_attack_surface_extracts_browser_observed_json_request():
     target = targets[0]
     assert target.location == ParameterLocation.json_body
     assert target.source == "browser_request"
+    assert target.replayable is True
+    assert target.body_schema == ["name", "url"]
     assert build_json_body(target.json_template, target, "http://127.0.0.1/")["url"] == "http://127.0.0.1/"
 
 
@@ -48,7 +54,11 @@ def test_attack_surface_extracts_browser_observed_form_encoded_request():
         url="http://example.com/login",
         method="POST",
         request_headers={"content-type": "application/x-www-form-urlencoded"},
+        request_content_type="application/x-www-form-urlencoded",
         post_data="email=alice%40example.test&password=Secret123%21&csrf=abc",
+        body_kind="form",
+        body_schema=["csrf", "email", "password"],
+        replayable=True,
     )
 
     targets = AttackSurface.build([], [], requests=[request], filter_fn=lambda name: name == "email")
@@ -57,6 +67,8 @@ def test_attack_surface_extracts_browser_observed_form_encoded_request():
     target = targets[0]
     assert target.location == ParameterLocation.form
     assert target.source == "browser_form_request"
+    assert target.replayable is True
+    assert target.body_schema == ["csrf", "email", "password"]
     prepared = target.build_request("' OR 1=1--")
     assert prepared.url == "http://example.com/login"
     assert prepared.data == {
@@ -111,8 +123,16 @@ def test_attack_surface_extracts_browser_observed_multipart_request():
         url="http://example.com/upload",
         method="POST",
         request_headers={"content-type": "multipart/form-data; boundary=abc"},
+        request_content_type="multipart/form-data; boundary=abc",
         post_data='--abc\r\nContent-Disposition: form-data; name="avatar"; filename="old.png"\r\n\r\nx'
         '\r\n--abc\r\nContent-Disposition: form-data; name="userId"\r\n\r\n1\r\n--abc--',
+        body_kind="multipart",
+        body_schema=["avatar", "userId"],
+        multipart_fields=[
+            {"name": "avatar", "type": "file", "filename": "old.png"},
+            {"name": "userId", "type": "text", "filename": None},
+        ],
+        replayable=True,
     )
 
     targets = AttackSurface.build([], [], requests=[request], filter_fn=lambda name: name == "avatar")

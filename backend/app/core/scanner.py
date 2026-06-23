@@ -1475,7 +1475,8 @@ class ScanOrchestrator:
                 request
                 for request in requests
                 if getattr(request, "post_data", None)
-                and "json" in str(getattr(request, "request_headers", {}).get("content-type", "")).lower()
+                and getattr(request, "replayable", True)
+                and "json" in self._request_content_type(request)
             ]
         )
         browser_available = getattr(crawl_result, "browser_available", None)
@@ -1518,15 +1519,18 @@ class ScanOrchestrator:
             request
             for request in requests
             if getattr(request, "post_data", None)
-            and "json" in str(getattr(request, "request_headers", {}).get("content-type", "")).lower()
+            and getattr(request, "replayable", True)
+            and "json" in self._request_content_type(request)
         ]
         replayable_form_bodies = [
             request
             for request in requests
             if getattr(request, "post_data", None)
-            and "application/x-www-form-urlencoded" in str(
-                getattr(request, "request_headers", {}).get("content-type", "")
-            ).lower()
+            and getattr(request, "replayable", True)
+            and (
+                "application/x-www-form-urlencoded" in self._request_content_type(request)
+                or "multipart/form-data" in self._request_content_type(request)
+            )
         ]
         if is_spa and not requests:
             warnings.append(
@@ -1546,6 +1550,15 @@ class ScanOrchestrator:
         if not settings.oast_callback_base_url:
             warnings.append("No OAST callback configured; blind SSRF was not tested.")
         return warnings
+
+    @staticmethod
+    def _request_content_type(request) -> str:
+        if getattr(request, "request_content_type", None):
+            return str(request.request_content_type).lower()
+        for name, value in (getattr(request, "request_headers", {}) or {}).items():
+            if str(name).lower() == "content-type":
+                return str(value).lower()
+        return ""
 
     def _evidence_strength_breakdown(self, vulnerabilities: list[Vulnerability]) -> EvidenceStrengthBreakdown:
         counts = EvidenceStrengthBreakdown()
