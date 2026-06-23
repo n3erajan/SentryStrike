@@ -78,6 +78,9 @@ class CrawlResult:
     auth_verification_evidence: str = ""
     browser_available: bool | None = None
     browser_error: str | None = None
+    workflow_states_visited: int = 0
+    browser_forms_discovered: int = 0
+    file_inputs_discovered: int = 0
 
 
 class WebSpider:
@@ -385,6 +388,9 @@ class WebSpider:
             auth_verification_evidence=self._auth_verification_evidence,
             browser_available=crawl_state.browser_available,
             browser_error=crawl_state.browser_error,
+            workflow_states_visited=crawl_state.workflow_states_visited,
+            browser_forms_discovered=crawl_state.browser_forms_discovered,
+            file_inputs_discovered=crawl_state.file_inputs_discovered,
         )
         self._log_crawl_inventory(root_url, result)
         return result
@@ -466,6 +472,9 @@ class WebSpider:
             target.add_parameter(parameter)
         target.requests.extend(source.requests)
         target.assets.update(source.assets)
+        target.workflow_states_visited += source.workflow_states_visited
+        target.browser_forms_discovered += source.browser_forms_discovered
+        target.file_inputs_discovered += source.file_inputs_discovered
         if source.browser_available is not None:
             target.browser_available = source.browser_available
         if source.browser_error:

@@ -98,6 +98,9 @@ class CrawlState:
     requests: list[RequestObservation] = field(default_factory=list)
     assets: set[str] = field(default_factory=set)
     technologies: set[str] = field(default_factory=set)
+    workflow_states_visited: int = 0
+    browser_forms_discovered: int = 0
+    file_inputs_discovered: int = 0
     browser_available: bool | None = None
     browser_error: str | None = None
 

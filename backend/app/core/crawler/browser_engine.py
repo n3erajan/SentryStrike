@@ -17,6 +17,15 @@ DESTRUCTIVE_LABEL_RE = re.compile(
     r"\b(delete|remove|destroy|purchase|checkout|pay|confirm|transfer|withdraw|subscribe|unsubscribe)\b",
     re.I,
 )
+COOKIE_BANNER_LABEL_RE = re.compile(r"\b(accept|agree|allow|ok|got it|continue|close|dismiss)\b", re.I)
+SAFE_SUBMIT_LABEL_RE = re.compile(
+    r"\b(login|log in|sign in|register|sign up|submit|send|save|search|reset|upload|continue|next)\b",
+    re.I,
+)
+INTERACTIVE_SELECTOR = (
+    "a[href], button, [role=button], input[type=submit], input[type=button], "
+    "input[type=checkbox], input[type=radio], [tabindex]:not([tabindex='-1'])"
+)
 SAFE_FIELD_VALUES = {
     "email": "scanner@example.com",
     "search": "test",
@@ -162,7 +171,10 @@ class BrowserDiscoveryEngine:
                                 evidence="browser_navigation",
                             )
                         )
-                        await self._exercise_page(page)
+                        workflow_stats = await self._exercise_page(page)
+                        state.workflow_states_visited += workflow_stats.get("states", 0)
+                        state.browser_forms_discovered += workflow_stats.get("forms", 0)
+                        state.file_inputs_discovered += workflow_stats.get("file_inputs", 0)
                     except Exception as exc:
                         logger.warning("browser discovery failed for %s: %s", target_url, exc)
             finally:
@@ -194,30 +206,44 @@ class BrowserDiscoveryEngine:
     def _observation_key(url: str, method: str, post_data: Any = None) -> tuple[str, str, str]:
         return (method.upper(), url, str(post_data or ""))
 
-    async def _exercise_page(self, page: Any) -> None:
-        await self._fill_safe_fields(page)
-        locators = page.locator("a[href], button, [role=button], input[type=submit], button[type=submit]")
-        count = min(await locators.count(), self.max_interactions)
-        for index in range(count):
+    async def _exercise_page(self, page: Any) -> dict[str, int]:
+        seen_states: set[str] = set()
+        attempted_controls: set[str] = set()
+        forms_seen = 0
+        file_inputs_seen = 0
+
+        await self._dismiss_common_dialogs(page)
+        for _ in range(self.max_interactions):
+            state_signature = await self._ui_state_signature(page)
+            if state_signature not in seen_states:
+                seen_states.add(state_signature)
+
+            forms_seen = max(forms_seen, await self._count_locator(page, "form"))
+            file_inputs_seen = max(file_inputs_seen, await self._count_locator(page, "input[type=file]"))
+            await self._prepare_interactive_inputs(page)
+
+            element, control_key = await self._next_interaction(page, attempted_controls)
+            if element is None or control_key is None:
+                break
+            attempted_controls.add(control_key)
+
             try:
-                element = locators.nth(index)
-                if not await element.is_visible():
-                    continue
-                label = " ".join(
-                    part
-                    for part in [
-                        await self._safe_inner_text(element),
-                        await element.get_attribute("aria-label") or "",
-                        await element.get_attribute("title") or "",
-                    ]
-                    if part
-                )
-                if DESTRUCTIVE_LABEL_RE.search(label):
-                    continue
-                await element.click(timeout=1000)
-                await page.wait_for_load_state("networkidle", timeout=3000)
+                await element.click(timeout=1200)
+                await self._wait_after_interaction(page)
+                await self._dismiss_common_dialogs(page)
             except Exception:
                 continue
+
+        return {
+            "states": len(seen_states),
+            "forms": forms_seen,
+            "file_inputs": file_inputs_seen,
+        }
+
+    async def _prepare_interactive_inputs(self, page: Any) -> None:
+        await self._fill_safe_fields(page)
+        await self._select_safe_options(page)
+        await self._fill_file_inputs(page)
 
     async def _fill_safe_fields(self, page: Any) -> None:
         input_selector = "input:not([type=hidden]):not([type=file])"
@@ -238,6 +264,178 @@ class BrowserDiscoveryEngine:
                     await page.wait_for_load_state("networkidle", timeout=3000)
             except Exception:
                 continue
+
+    async def _select_safe_options(self, page: Any) -> None:
+        selects = page.locator("select")
+        count = min(await selects.count(), self.max_interactions)
+        for index in range(count):
+            try:
+                select = selects.nth(index)
+                if not await select.is_visible():
+                    continue
+                options = select.locator("option")
+                option_count = await options.count()
+                for option_index in range(option_count):
+                    option = options.nth(option_index)
+                    value = await option.get_attribute("value")
+                    disabled = await option.get_attribute("disabled")
+                    if disabled is not None:
+                        continue
+                    if value:
+                        await select.select_option(value, timeout=1000)
+                        break
+            except Exception:
+                continue
+
+    async def _fill_file_inputs(self, page: Any) -> None:
+        file_inputs = page.locator("input[type=file]")
+        count = min(await file_inputs.count(), self.max_interactions)
+        for index in range(count):
+            try:
+                field = file_inputs.nth(index)
+                multiple = await field.get_attribute("multiple")
+                files = self._benign_upload_files()
+                await field.set_input_files(files if multiple is not None else files[0], timeout=1000)
+            except Exception:
+                continue
+
+    def _benign_upload_files(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "sentry-upload.txt",
+                "mimeType": "text/plain",
+                "buffer": b"SENTRY_UPLOAD_TEST_CANARY",
+            },
+            {
+                "name": "sentry-upload.json",
+                "mimeType": "application/json",
+                "buffer": b'{"canary":"SENTRY_UPLOAD_TEST_CANARY"}',
+            },
+            {
+                "name": "sentry-upload.png",
+                "mimeType": "image/png",
+                "buffer": b"\x89PNG\r\n\x1a\n",
+            },
+        ]
+
+    async def _next_interaction(self, page: Any, attempted: set[str]) -> tuple[Any | None, str | None]:
+        controls = page.locator(INTERACTIVE_SELECTOR)
+        count = min(await controls.count(), self.max_interactions * 2)
+        fallback: tuple[Any | None, str | None] = (None, None)
+        for index in range(count):
+            try:
+                element = controls.nth(index)
+                if not await element.is_visible():
+                    continue
+                label = await self._control_label(element)
+                control_key = await self._control_key(element, index, label)
+                if control_key in attempted:
+                    continue
+                if self._is_destructive_control(label):
+                    continue
+                if self._is_submit_like_control(label):
+                    return element, control_key
+                if fallback == (None, None):
+                    fallback = (element, control_key)
+            except Exception:
+                continue
+        return fallback
+
+    async def _control_label(self, element: Any) -> str:
+        return " ".join(
+            part
+            for part in [
+                await self._safe_inner_text(element),
+                await element.get_attribute("aria-label") or "",
+                await element.get_attribute("title") or "",
+                await element.get_attribute("name") or "",
+                await element.get_attribute("id") or "",
+                await element.get_attribute("type") or "",
+                await element.get_attribute("value") or "",
+                await element.get_attribute("href") or "",
+            ]
+            if part
+        )
+
+    async def _control_key(self, element: Any, index: int, label: str) -> str:
+        attrs = [
+            await element.get_attribute("href") or "",
+            await element.get_attribute("name") or "",
+            await element.get_attribute("id") or "",
+            await element.get_attribute("type") or "",
+            label,
+        ]
+        return f"{index}:{'|'.join(attrs).strip().lower()}"
+
+    def _is_destructive_control(self, label: str) -> bool:
+        if self.settings.scan_mode.lower() == "aggressive":
+            return False
+        return bool(DESTRUCTIVE_LABEL_RE.search(label or ""))
+
+    @staticmethod
+    def _is_submit_like_control(label: str) -> bool:
+        return bool(SAFE_SUBMIT_LABEL_RE.search(label or ""))
+
+    async def _dismiss_common_dialogs(self, page: Any) -> None:
+        controls = page.locator("button, [role=button], input[type=button]")
+        count = min(await controls.count(), 10)
+        for index in range(count):
+            try:
+                element = controls.nth(index)
+                if not await element.is_visible():
+                    continue
+                label = await self._control_label(element)
+                if COOKIE_BANNER_LABEL_RE.search(label) and not DESTRUCTIVE_LABEL_RE.search(label):
+                    await element.click(timeout=750)
+                    await self._wait_after_interaction(page)
+            except Exception:
+                continue
+
+    async def _ui_state_signature(self, page: Any) -> str:
+        try:
+            route = page.url
+        except Exception:
+            route = ""
+        try:
+            dom_signature = await page.evaluate(
+                """() => {
+                    const visible = (el) => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+                    };
+                    const controls = [...document.querySelectorAll('form,input,textarea,select,button,a[href],[role=button]')]
+                        .filter(visible)
+                        .slice(0, 80)
+                        .map((el) => [
+                            el.tagName.toLowerCase(),
+                            el.getAttribute('type') || '',
+                            el.getAttribute('name') || '',
+                            el.getAttribute('id') || '',
+                            el.getAttribute('href') || '',
+                            (el.innerText || el.value || '').trim().slice(0, 40)
+                        ].join(':'));
+                    return controls.join('|');
+                }"""
+            )
+        except Exception:
+            dom_signature = ""
+        return f"{route}|{dom_signature}"[:2000]
+
+    async def _count_locator(self, page: Any, selector: str) -> int:
+        try:
+            return await page.locator(selector).count()
+        except Exception:
+            return 0
+
+    async def _wait_after_interaction(self, page: Any) -> None:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=3000)
+        except Exception:
+            try:
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
 
     async def _value_for_field(self, field: Any) -> str:
         attrs = await self._field_attrs(field)

@@ -149,3 +149,101 @@ async def test_browser_field_values_use_configured_credentials():
     finally:
         engine.settings.authentication_username = original_username
         engine.settings.authentication_password = original_password
+
+
+@pytest.mark.asyncio
+async def test_workflow_explorer_exercises_multi_step_spa_and_file_inputs():
+    class FakeElement:
+        def __init__(self, page, attrs=None, text=""):
+            self.page = page
+            self.attrs = attrs or {}
+            self.text = text
+
+        async def is_visible(self):
+            return True
+
+        async def get_attribute(self, name):
+            return self.attrs.get(name)
+
+        async def inner_text(self, timeout=None):
+            return self.text
+
+        async def fill(self, value, timeout=None):
+            self.page.filled[self.attrs.get("name", "field")] = value
+
+        async def press(self, key, timeout=None):
+            self.page.pressed.append(key)
+
+        async def click(self, timeout=None):
+            self.page.clicked.append(self.text or self.attrs.get("value", ""))
+            self.page.step += 1
+            self.page.url = f"http://example.test/#step-{self.page.step}"
+
+        async def set_input_files(self, files, timeout=None):
+            self.page.files = files
+
+    class FakeLocator:
+        def __init__(self, elements):
+            self.elements = elements
+
+        async def count(self):
+            return len(self.elements)
+
+        def nth(self, index):
+            return self.elements[index]
+
+        def locator(self, selector):
+            return FakeLocator([])
+
+    class FakePage:
+        def __init__(self):
+            self.url = "http://example.test/"
+            self.step = 0
+            self.clicked = []
+            self.filled = {}
+            self.pressed = []
+            self.files = None
+
+        def locator(self, selector):
+            if selector == "form":
+                return FakeLocator([FakeElement(self)])
+            if selector == "input[type=file]":
+                return FakeLocator([FakeElement(self, {"name": "avatar", "type": "file"})])
+            if selector == "select":
+                return FakeLocator([])
+            if "input:not" in selector:
+                return FakeLocator([FakeElement(self, {"name": "email", "type": "email"})])
+            if selector.startswith("button"):
+                return FakeLocator([])
+            if "a[href]" in selector:
+                if self.step == 0:
+                    return FakeLocator([FakeElement(self, {"type": "button", "id": "next"}, "Next")])
+                if self.step == 1:
+                    return FakeLocator([FakeElement(self, {"type": "submit", "id": "submit"}, "Submit")])
+            return FakeLocator([])
+
+        async def evaluate(self, script):
+            return f"step={self.step};email={'email' in self.filled};files={self.files is not None}"
+
+        async def wait_for_load_state(self, state, timeout=None):
+            return None
+
+        async def wait_for_timeout(self, timeout):
+            return None
+
+    engine = BrowserDiscoveryEngine(max_interactions=5)
+    original_username = engine.settings.authentication_username
+    engine.settings.authentication_username = None
+    page = FakePage()
+
+    try:
+        stats = await engine._exercise_page(page)
+    finally:
+        engine.settings.authentication_username = original_username
+
+    assert page.clicked == ["Next", "Submit"]
+    assert page.filled["email"] == "scanner@example.com"
+    assert page.files["name"] == "sentry-upload.txt"
+    assert stats["states"] >= 2
+    assert stats["forms"] == 1
+    assert stats["file_inputs"] == 1

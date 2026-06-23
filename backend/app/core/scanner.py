@@ -1495,6 +1495,9 @@ class ScanOrchestrator:
             browser_available=browser_available,
             browser_error=browser_error,
             replayable_json_bodies=replayable_json_bodies,
+            workflow_states_visited=int(getattr(crawl_result, "workflow_states_visited", 0) or 0),
+            browser_forms_discovered=int(getattr(crawl_result, "browser_forms_discovered", 0) or 0),
+            file_inputs_discovered=int(getattr(crawl_result, "file_inputs_discovered", 0) or 0),
         )
         scan.report_metadata.auth_coverage = AuthCoverage(
             state=auth_state_value,
@@ -1515,6 +1518,8 @@ class ScanOrchestrator:
         session_cookies = getattr(crawl_result, "session_cookies", {}) or {}
         browser_available = getattr(crawl_result, "browser_available", None)
         browser_error = getattr(crawl_result, "browser_error", None)
+        browser_forms = int(getattr(crawl_result, "browser_forms_discovered", 0) or 0)
+        file_inputs = int(getattr(crawl_result, "file_inputs_discovered", 0) or 0)
         replayable_json_bodies = [
             request
             for request in requests
@@ -1538,12 +1543,14 @@ class ScanOrchestrator:
             )
         if browser_available is False:
             warnings.append(f"Browser crawling unavailable: {browser_error or 'Playwright could not run.'}")
-        if not forms:
+        if not forms and not browser_forms:
             warnings.append("No HTML forms were discovered; form-based detector coverage was limited.")
         if not replayable_json_bodies and not replayable_form_bodies:
             warnings.append("No replayable JSON or form request bodies were observed; API body testing was limited.")
         if auth_headers and not session_cookies:
             warnings.append("Authentication was represented by headers only; cookie/session checks were limited.")
+        if file_inputs == 0:
+            warnings.append("No browser-visible file inputs were discovered; upload candidate coverage was limited.")
         settings = get_settings()
         if not (settings.authentication_second_cookie or settings.authentication_second_header):
             warnings.append("No second-user account configured; horizontal IDOR comparison was not tested.")
