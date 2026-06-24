@@ -72,6 +72,8 @@ class CrawlResult:
     parameters: list[ParameterCandidate] = field(default_factory=list)
     requests: list[object] = field(default_factory=list)
     assets: list[str] = field(default_factory=list)
+    js_extractions: list[dict[str, object]] = field(default_factory=list)
+    api_docs: list[str] = field(default_factory=list)
     dead_routes: list[RouteCandidate] = field(default_factory=list)
     auth_state: AuthVerificationState = AuthVerificationState.unauthenticated
     auth_headers: dict[str, str] = field(default_factory=dict)
@@ -208,6 +210,8 @@ class WebSpider:
             for path in common_paths:
                 brute_url = normalize_url(root_url, path)
                 await safe_enqueue(brute_url, 0, RouteSource.brute_force, 20)
+
+            await self._inspect_api_documentation(client, root_url, crawl_state)
 
             # 3. Main crawling loop with concurrency
             import time
@@ -382,6 +386,8 @@ class WebSpider:
             parameters=crawl_state.parameters,
             requests=crawl_state.requests,
             assets=sorted(crawl_state.assets),
+            js_extractions=list(crawl_state.js_extractions),
+            api_docs=list(crawl_state.api_docs),
             dead_routes=dead_routes,
             auth_state=self._auth_state,
             auth_headers=dict(self._auth_headers),
@@ -455,12 +461,47 @@ class WebSpider:
         if response.status_code >= 400:
             return
         routes, endpoints = ApiExtractor.extract_from_javascript(script_url, response.text)
+        crawl_state.js_extractions.append(
+            {
+                "asset_url": script_url,
+                "script_size": len(response.text),
+                "routes_extracted": len(routes),
+                "api_endpoints_extracted": len(endpoints),
+                "body_templates_extracted": len([endpoint for endpoint in endpoints if endpoint.request_body is not None]),
+            }
+        )
         for route in routes:
             if same_domain(root_url, route):
                 await enqueue_fn(route, depth, RouteSource.javascript, 70)
         for endpoint in endpoints:
             if same_domain(root_url, endpoint.url):
                 crawl_state.add_api_endpoint(endpoint)
+
+    async def _inspect_api_documentation(self, client, root_url: str, crawl_state: CrawlState) -> None:
+        doc_paths = [
+            "/openapi.json",
+            "/swagger.json",
+            "/api-docs",
+            "/api-docs.json",
+            "/v3/api-docs",
+            "/swagger/v1/swagger.json",
+            "/docs/openapi.json",
+        ]
+        for path in doc_paths:
+            doc_url = normalize_url(root_url, path)
+            try:
+                response = await self._request_with_session_keeper(client, "GET", doc_url)
+            except Exception:
+                continue
+            if response.status_code >= 400:
+                continue
+            endpoints = ApiExtractor.extract_from_openapi(root_url, response.text)
+            if not endpoints:
+                continue
+            crawl_state.api_docs.append(doc_url)
+            for endpoint in endpoints:
+                if same_domain(root_url, endpoint.url):
+                    crawl_state.add_api_endpoint(endpoint)
 
     @staticmethod
     def _merge_crawl_state(target: CrawlState, source: CrawlState) -> None:
@@ -472,6 +513,8 @@ class WebSpider:
             target.add_parameter(parameter)
         target.requests.extend(source.requests)
         target.assets.update(source.assets)
+        target.js_extractions.extend(source.js_extractions)
+        target.api_docs.extend(source.api_docs)
         target.workflow_states_visited += source.workflow_states_visited
         target.browser_forms_discovered += source.browser_forms_discovered
         target.file_inputs_discovered += source.file_inputs_discovered

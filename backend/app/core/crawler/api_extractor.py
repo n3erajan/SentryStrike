@@ -21,7 +21,12 @@ class ApiExtractor:
         re.I,
     )
     FETCH_RE = re.compile(
-        r"""(?:fetch|axios\.(?:get|post|put|patch|delete)|\.(?:get|post|put|patch|delete))\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""",
+        r"""(?:(?P<axios>axios)\.(?P<axios_method>get|post|put|patch|delete)|fetch|\.(?P<chain_method>get|post|put|patch|delete))\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""",
+        re.I,
+    )
+    JQUERY_AJAX_RE = re.compile(r"""\$\.(?:ajax|get|post)\s*\(\s*(?P<args>\{.*?\}|["'`][^"'`]+["'`])""", re.I | re.S)
+    ANGULAR_HTTP_RE = re.compile(
+        r"""(?:http|HttpClient)\s*\.\s*(?P<method>get|post|put|patch|delete)\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""",
         re.I,
     )
     JS_TEMPLATE_RE = re.compile(r"\$\{\s*(?P<expr>[^}]+?)\s*\}")
@@ -61,13 +66,28 @@ class ApiExtractor:
             key = (absolute, method.upper(), operation or "")
             existing = endpoint_by_key.get(key)
             if existing is not None:
-                if request_body is not None and existing.request_body is None:
+                if request_body is not None and (
+                    existing.request_body is None
+                    or existing.evidence in {"", path}
+                    or evidence in {"fetch/xhr", "angular-http", "jquery-ajax"}
+                ):
                     existing.request_body = request_body
-                if content_type and not existing.content_type:
+                if content_type and (
+                    not existing.content_type
+                    or existing.evidence in {"", path}
+                    or evidence in {"fetch/xhr", "angular-http", "jquery-ajax"}
+                ):
                     existing.content_type = content_type
                 if evidence and existing.evidence != "fetch/xhr":
                     existing.evidence = evidence
-                return
+                if method and existing.method.upper() == "GET" and method.upper() != "GET":
+                    endpoints.remove(existing)
+                    seen_endpoints.discard(key)
+                    endpoint_by_key.pop(key, None)
+                    key = (absolute, method.upper(), operation or "")
+                    existing = None
+                else:
+                    return
 
             if evidence == "fetch/xhr":
                 for existing_key, existing_endpoint in list(endpoint_by_key.items()):
@@ -109,11 +129,48 @@ class ApiExtractor:
                 body, content_type = cls._infer_request_schema_near(script_text, match.start())
                 add_endpoint(
                     path,
-                    cls._infer_method_near(script_text, match.start()),
+                    (match.group("axios_method") or match.group("chain_method") or cls._infer_method_near(script_text, match.start())).upper(),
                     evidence="fetch/xhr",
                     request_body=body,
                     content_type=content_type,
                 )
+
+        for match in cls.ANGULAR_HTTP_RE.finditer(script_text):
+            path = match.group("path")
+            if cls._looks_api_path(path):
+                body, content_type = cls._infer_request_schema_near(script_text, match.start())
+                add_endpoint(
+                    path,
+                    match.group("method").upper(),
+                    evidence="angular-http",
+                    request_body=body,
+                    content_type=content_type,
+                )
+
+        for match in re.finditer(r"""\$\.ajax\s*\(\s*\{(?P<args>.*?)\}\s*\)""", script_text, re.I | re.S):
+            args = match.group("args")
+            path_match = re.search(r"""url\s*:\s*["'`](?P<path>[^"'`]+)["'`]""", args, re.I)
+            if not path_match:
+                continue
+            path = path_match.group("path")
+            if cls._looks_api_path(path):
+                body, content_type = cls._infer_request_schema_near(script_text, match.start())
+                data_match = re.search(r"""data\s*:\s*(?P<object>\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})""", args, re.S | re.I)
+                if data_match:
+                    body, content_type = cls._object_literal_template(data_match.group("object")), "application/json"
+                add_endpoint(
+                    path,
+                    cls._infer_method_from_ajax_args(args) or cls._infer_method_near(script_text, match.start()),
+                    evidence="jquery-ajax",
+                    request_body=body,
+                    content_type=content_type,
+                )
+
+        for match in re.finditer(r"""\$\.post\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""", script_text, re.I):
+            path = match.group("path")
+            if cls._looks_api_path(path):
+                body, content_type = cls._infer_request_schema_near(script_text, match.start())
+                add_endpoint(path, "POST", evidence="jquery-ajax", request_body=body, content_type=content_type)
 
         for regex in (cls.ROUTE_ARRAY_RE, cls.REACT_ROUTER_RE, cls.ANGULAR_ROUTE_RE):
             for match in regex.finditer(script_text):
@@ -129,6 +186,42 @@ class ApiExtractor:
                 add_endpoint(path, "POST", operation=operation, evidence="graphql", request_body=script_text)
 
         return routes, endpoints
+
+    @classmethod
+    def extract_from_openapi(cls, base_url: str, document: Any) -> list[ApiEndpoint]:
+        spec = cls._load_openapi_document(document)
+        if not isinstance(spec, dict) or not isinstance(spec.get("paths"), dict):
+            return []
+
+        endpoints: list[ApiEndpoint] = []
+        server_base = cls._openapi_server_base(base_url, spec)
+        for path, path_item in spec.get("paths", {}).items():
+            if not isinstance(path_item, dict):
+                continue
+            path_parameters = path_item.get("parameters", []) if isinstance(path_item.get("parameters"), list) else []
+            for method, operation in path_item.items():
+                method_upper = str(method).upper()
+                if method_upper not in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"}:
+                    continue
+                if not isinstance(operation, dict):
+                    continue
+                parameters = path_parameters + (
+                    operation.get("parameters", []) if isinstance(operation.get("parameters"), list) else []
+                )
+                url = cls._openapi_url_with_query(server_base, path, parameters)
+                content_type, request_body = cls._openapi_request_body(operation)
+                endpoints.append(
+                    ApiEndpoint(
+                        url=url,
+                        method=method_upper,
+                        source=RouteSource.api,
+                        content_type=content_type,
+                        operation=operation.get("operationId"),
+                        request_body=request_body,
+                        evidence="openapi",
+                    )
+                )
+        return endpoints
 
     @classmethod
     def parameters_from_endpoint(cls, endpoint: ApiEndpoint) -> list[ParameterCandidate]:
@@ -352,25 +445,154 @@ class ApiExtractor:
 
     @classmethod
     def _infer_request_schema_near(cls, script_text: str, start: int) -> tuple[Any, str | None]:
-        window = script_text[max(0, start - 800) : start + 1200]
+        prefix = script_text[max(0, start - 800) : start]
+        suffix = script_text[start : start + 1200]
+        terminator = suffix.find(";")
+        if 0 <= terminator < 600:
+            suffix = suffix[: terminator + 1]
+        window = prefix + suffix
+
+        body_var_match = re.search(r""",\s*(?P<var>[A-Za-z_$][\w$]*)\s*[\),]""", suffix)
+        if body_var_match:
+            body_var = body_var_match.group("var")
+            var_window = script_text[max(0, start - 1200) : start + 200]
+            var_kind_match = re.search(
+                rf"""{re.escape(body_var)}\s*=\s*new\s*(?P<kind>FormData|URLSearchParams)\s*\(""",
+                var_window,
+                re.I,
+            )
+            var_fields = re.findall(
+                rf"""{re.escape(body_var)}\.(?:set|append)\s*\(\s*["'](?P<name>[A-Za-z_][A-Za-z0-9_-]*)["']""",
+                var_window,
+            )
+            if var_kind_match and var_fields:
+                kind = var_kind_match.group("kind").lower()
+                content_type = "multipart/form-data" if kind == "formdata" else "application/x-www-form-urlencoded"
+                return {name: cls._baseline_for_name(name) for name in var_fields}, content_type
+
+        search_params = re.findall(r"\.(?:set|append)\s*\(\s*[\"'](?P<name>[A-Za-z_][A-Za-z0-9_-]*)[\"']", window)
+        suffix_lower = suffix.lower()
+        if "urlsearchparams" in window.lower() and search_params and (
+            "urlsearchparams" in suffix_lower or re.search(r"""\(\s*[A-Za-z_$][\w$]*\s*\)""", suffix)
+        ):
+            return {name: cls._baseline_for_name(name) for name in search_params}, "application/x-www-form-urlencoded"
 
         append_names = re.findall(r"\.append\s*\(\s*[\"'](?P<name>[A-Za-z_][A-Za-z0-9_-]*)[\"']", window)
         if "FormData" in window and append_names:
             return {name: cls._baseline_for_name(name) for name in append_names}, "multipart/form-data"
 
-        search_params = re.findall(r"\.(?:set|append)\s*\(\s*[\"'](?P<name>[A-Za-z_][A-Za-z0-9_-]*)[\"']", window)
-        if "URLSearchParams" in window and search_params:
-            return {name: cls._baseline_for_name(name) for name in search_params}, "application/x-www-form-urlencoded"
-
         json_match = re.search(r"JSON\.stringify\s*\(\s*(?P<object>\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})", window, re.S)
         if json_match:
             return cls._object_literal_template(json_match.group("object")), "application/json"
+
+        body_match = re.search(
+            r"""(?:body|data|params)\s*:\s*(?:JSON\.stringify\s*\()?(?P<object>\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})""",
+            window,
+            re.S | re.I,
+        )
+        if body_match:
+            content_type = "application/json"
+            if "urlsearchparams" in window.lower():
+                content_type = "application/x-www-form-urlencoded"
+            return cls._object_literal_template(body_match.group("object")), content_type
 
         object_match = re.search(r",\s*(?P<object>\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})\s*\)?", window, re.S)
         if object_match and any(token in object_match.group("object").lower() for token in ("email", "password", "id", "query", "url", "name", "body")):
             return cls._object_literal_template(object_match.group("object")), "application/json"
 
         return None, None
+
+    @staticmethod
+    def _infer_method_from_ajax_args(args: str) -> str | None:
+        match = re.search(r"""(?:method|type)\s*:\s*["'`](get|post|put|patch|delete)["'`]""", args, re.I)
+        return match.group(1).upper() if match else None
+
+    @classmethod
+    def _load_openapi_document(cls, document: Any) -> Any:
+        if isinstance(document, dict):
+            return document
+        if not isinstance(document, str) or not document.strip():
+            return None
+        try:
+            return json.loads(document)
+        except Exception:
+            pass
+        try:
+            import yaml
+
+            return yaml.safe_load(document)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _openapi_server_base(base_url: str, spec: dict[str, Any]) -> str:
+        servers = spec.get("servers")
+        if isinstance(servers, list) and servers:
+            first = servers[0]
+            if isinstance(first, dict) and isinstance(first.get("url"), str):
+                return normalize_url(base_url, first["url"])
+        return base_url
+
+    @classmethod
+    def _openapi_url_with_query(cls, base_url: str, path: str, parameters: list[Any]) -> str:
+        query_parts: list[str] = []
+        for parameter in parameters:
+            if not isinstance(parameter, dict):
+                continue
+            name = parameter.get("name")
+            if parameter.get("in") == "query" and isinstance(name, str):
+                query_parts.append(f"{name}={cls._baseline_for_schema(parameter.get('schema', {}), name)}")
+        query = "&".join(query_parts)
+        absolute = normalize_url(base_url, path)
+        return f"{absolute}?{query}" if query else absolute
+
+    @classmethod
+    def _openapi_request_body(cls, operation: dict[str, Any]) -> tuple[str | None, Any]:
+        request_body = operation.get("requestBody")
+        if not isinstance(request_body, dict):
+            return None, None
+        content = request_body.get("content")
+        if not isinstance(content, dict):
+            return None, None
+        preferred = [
+            "application/json",
+            "application/x-www-form-urlencoded",
+            "multipart/form-data",
+        ]
+        content_type = next((item for item in preferred if item in content), next(iter(content), None))
+        media = content.get(content_type) if content_type else None
+        schema = media.get("schema") if isinstance(media, dict) else None
+        return content_type, cls._template_from_schema(schema)
+
+    @classmethod
+    def _template_from_schema(cls, schema: Any, name_hint: str = "value") -> Any:
+        if not isinstance(schema, dict):
+            return cls._baseline_for_name(name_hint)
+        if "$ref" in schema:
+            return cls._baseline_for_name(name_hint)
+        schema_type = schema.get("type")
+        if schema_type == "object" or isinstance(schema.get("properties"), dict):
+            return {
+                name: cls._template_from_schema(child, name)
+                for name, child in schema.get("properties", {}).items()
+            }
+        if schema_type == "array":
+            return [cls._template_from_schema(schema.get("items", {}), name_hint)]
+        return cls._baseline_for_schema(schema, name_hint)
+
+    @classmethod
+    def _baseline_for_schema(cls, schema: Any, name_hint: str) -> Any:
+        if isinstance(schema, dict):
+            if "example" in schema:
+                return schema["example"]
+            if "default" in schema:
+                return schema["default"]
+            schema_type = schema.get("type")
+            if schema_type in {"integer", "number"}:
+                return 1
+            if schema_type == "boolean":
+                return True
+        return cls._baseline_for_name(name_hint)
 
     @classmethod
     def _object_literal_template(cls, literal: str) -> dict[str, Any]:
@@ -396,6 +618,12 @@ class ApiExtractor:
             return "https://example.com/"
         if lowered in {"q", "query", "search", "term"}:
             return "test"
+        if "message" in lowered:
+            return "Scanner test message"
+        if "comment" in lowered:
+            return "Scanner test comment"
+        if lowered in {"name", "title", "displayname", "display_name"}:
+            return "Scanner Test"
         if "file" in lowered:
             return "sample.txt"
         return "test"

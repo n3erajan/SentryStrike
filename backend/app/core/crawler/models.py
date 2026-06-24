@@ -97,6 +97,8 @@ class CrawlState:
     parameters: list[ParameterCandidate] = field(default_factory=list)
     requests: list[RequestObservation] = field(default_factory=list)
     assets: set[str] = field(default_factory=set)
+    js_extractions: list[dict[str, Any]] = field(default_factory=list)
+    api_docs: list[str] = field(default_factory=list)
     technologies: set[str] = field(default_factory=set)
     workflow_states_visited: int = 0
     browser_forms_discovered: int = 0
