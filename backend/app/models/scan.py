@@ -36,6 +36,28 @@ class CrawlMode(str, Enum):
     single = "single"
 
 
+class ScanAuthRole(str, Enum):
+    main = "main"
+    second = "second"
+    admin = "admin"
+
+
+class ScanAuthAccount(BaseModel):
+    """A test account supplied at scan submission for authenticated / IDOR testing.
+
+    This is an in-memory DTO only: it is passed to the orchestrator when a scan
+    is queued and is NEVER persisted, so no credentials are stored at rest. The
+    Scan document keeps only a non-secret ``auth_roles_provided`` marker.
+    """
+
+    role: ScanAuthRole
+    username: str | None = None
+    password: str | None = None
+    cookie: str | None = None
+    header: str | None = None
+    login_url: str | None = None
+
+
 class SeverityBreakdown(BaseModel):
     critical: int = 0
     high: int = 0
@@ -126,6 +148,9 @@ class Scan(Document):
     authorization_confirmed: bool = False
     authorization_text: str | None = None
     authorization_confirmed_at: datetime | None = None
+    # Non-secret marker only: which account roles were supplied for this scan
+    # (e.g. ["main", "admin"]). The credentials themselves are never persisted.
+    auth_roles_provided: list[ScanAuthRole] = Field(default_factory=list)
 
     started_at: datetime | None = None
     completed_at: datetime | None = None

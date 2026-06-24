@@ -3,8 +3,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.api.dependencies import get_current_user, get_scan_repository, json_response
 from app.core.scanner import ScanOrchestrator
 from app.database.repositories.scan_repository import ScanRepository
+from app.models.scan import ScanAuthAccount, ScanAuthRole
 from app.models.user import User
-from app.schemas.scan_schema import CreateScanRequest
+from app.schemas.scan_schema import CreateScanRequest, ScanCredentials
 
 router = APIRouter(prefix="/scans", tags=["scans"])
 
@@ -14,6 +15,30 @@ orchestrator: ScanOrchestrator | None = None
 def set_orchestrator(instance: ScanOrchestrator) -> None:
     global orchestrator
     orchestrator = instance
+
+
+def _auth_accounts_from_payload(credentials: ScanCredentials | None) -> list[ScanAuthAccount]:
+    if credentials is None:
+        return []
+    accounts: list[ScanAuthAccount] = []
+    for role, cred in (
+        (ScanAuthRole.main, credentials.main),
+        (ScanAuthRole.second, credentials.second),
+        (ScanAuthRole.admin, credentials.admin),
+    ):
+        if cred is None or not cred.is_populated:
+            continue
+        accounts.append(
+            ScanAuthAccount(
+                role=role,
+                username=cred.username,
+                password=cred.password,
+                cookie=cred.cookie,
+                header=cred.header,
+                login_url=cred.login_url,
+            )
+        )
+    return accounts
 
 
 def _scan_summary(scan) -> dict:
@@ -40,6 +65,9 @@ async def create_scan(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
+    # Credentials are held in memory only and handed to the orchestrator below;
+    # the Scan document persists just the non-secret list of roles supplied.
+    auth_accounts = _auth_accounts_from_payload(payload.credentials)
     scan = await repo.create(
         str(payload.target_url),
         owner_user_id=str(current_user.id),
@@ -47,10 +75,11 @@ async def create_scan(
         authorization_confirmed=payload.authorization_confirmed,
         authorization_text=payload.authorization_text,
         crawl_mode=payload.crawl_mode,
+        auth_roles_provided=[account.role for account in auth_accounts],
     )
     if orchestrator is None:
         raise HTTPException(status_code=500, detail="Scanner orchestrator not initialized")
-    await orchestrator.queue_scan(str(scan.id))
+    await orchestrator.queue_scan(str(scan.id), auth_accounts=auth_accounts)
     return json_response(
         {
             "scan_id": str(scan.id),
@@ -89,6 +118,8 @@ async def get_scan_details(
         raise HTTPException(status_code=404, detail="Scan not found")
     data = scan.model_dump()
     data["id"] = str(scan.id)
+    # Defensive: credentials are never persisted, but strip any legacy field.
+    data.pop("auth_accounts", None)
     return json_response(data)
 
 

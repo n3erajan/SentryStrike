@@ -95,6 +95,9 @@ class WebSpider:
         self._is_spa: bool = False
         self._auth_state: AuthVerificationState = AuthVerificationState.unauthenticated
         self._auth_verification_evidence: str = ""
+        # Per-scan main-account credentials submitted with the scan (overrides
+        # env-based SCAN_AUTH_* settings for this crawl). See ScanAuthAccount.
+        self._auth_override = None
 
     def _snapshot_cookies(self, cookies: httpx.Cookies) -> dict[str, str]:
         return ModernAuthManager.snapshot_cookies(cookies)
@@ -115,8 +118,9 @@ class WebSpider:
                 redacted[key] = f"{scheme} {redact_secret(token)}" if token else redact_secret(value)
         return redacted
 
-    async def crawl(self, root_url: str, max_depth: int | None = None) -> CrawlResult:
+    async def crawl(self, root_url: str, max_depth: int | None = None, auth_override=None) -> CrawlResult:
         self._reset_scan_auth_state()
+        self._auth_override = auth_override
         self._is_spa = False
         max_depth = max_depth if max_depth is not None else self.settings.crawl_depth
         visited: set[str] = set()
@@ -359,15 +363,24 @@ class WebSpider:
 
             if self.settings.crawl_browser_enabled:
                 browser_routes = [route.url for route in crawl_state.routes if route.source == RouteSource.javascript]
-                browser_state = await BrowserDiscoveryEngine(
-                    max_interactions=self.settings.crawl_browser_max_interactions
-                ).crawl(
-                    root_url,
-                    auth_cookies=self.session_cookies,
-                    auth_headers=self._auth_headers,
-                    routes=browser_routes,
-                )
-                self._merge_crawl_state(crawl_state, browser_state)
+                try:
+                    browser_state = await asyncio.wait_for(
+                        BrowserDiscoveryEngine(
+                            max_interactions=self.settings.crawl_browser_max_interactions
+                        ).crawl(
+                            root_url,
+                            auth_cookies=self.session_cookies,
+                            auth_headers=self._auth_headers,
+                            routes=browser_routes,
+                        ),
+                        timeout=self.settings.crawl_browser_budget_seconds,
+                    )
+                    self._merge_crawl_state(crawl_state, browser_state)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "browser discovery exceeded budget of %.0fs; skipping remaining browser targets",
+                        self.settings.crawl_browser_budget_seconds,
+                    )
 
         for endpoint in crawl_state.api_endpoints:
             for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
@@ -672,12 +685,24 @@ class WebSpider:
         return has_session_message or (has_login_form and has_session_message)
 
     async def _authenticate_session(self, client: httpx.AsyncClient, root_url: str, force: bool = False):
-        """Authenticate session using cookies or credentials."""
+        """Authenticate session using cookies or credentials.
+
+        Per-scan credentials submitted with the scan (``self._auth_override``)
+        take precedence over the env-based ``SCAN_AUTH_*`` settings so users can
+        authenticate the crawl without setting environment variables.
+        """
+        override = self._auth_override
+        auth_cookie = (getattr(override, "cookie", None) or self.settings.authentication_cookie)
+        auth_header_cfg = (getattr(override, "header", None) or self.settings.authentication_header)
+        username = (getattr(override, "username", None) or self.settings.authentication_username)
+        password = (getattr(override, "password", None) or self.settings.authentication_password)
+        login_url = (getattr(override, "login_url", None) or root_url)
+
         # 1. Parse cookie string if provided
-        if self.settings.authentication_cookie:
+        if auth_cookie:
             if not self._configured_auth_cookies or force:
                 cookies = {}
-                for cookie in self.settings.authentication_cookie.split(";"):
+                for cookie in auth_cookie.split(";"):
                     cookie = cookie.strip()
                     if "=" in cookie:
                         k, v = cookie.split("=", 1)
@@ -690,15 +715,15 @@ class WebSpider:
             self._auth_verification_evidence = "configured cookie supplied"
             logger.info("Session configured via provided cookie string")
 
-        if self.settings.authentication_header:
-            header_name, _, header_value = self.settings.authentication_header.partition(":")
+        if auth_header_cfg:
+            header_name, _, header_value = auth_header_cfg.partition(":")
             if header_name and header_value:
                 self._auth_headers[header_name.strip()] = header_value.strip()
                 client.headers[header_name.strip()] = header_value.strip()
                 self._auth_state = AuthVerificationState.authenticated_unverified
                 self._auth_verification_evidence = "configured authentication header supplied"
 
-        if self.settings.authentication_cookie or self.settings.authentication_header:
+        if auth_cookie or auth_header_cfg:
             result = await SmartAuthenticator(self.settings)._verify_auth(client)
             self._auth_state = result.state
             self._auth_verification_evidence = result.verification_evidence or self._auth_verification_evidence
@@ -736,12 +761,10 @@ class WebSpider:
                 self._auth_state = AuthVerificationState.expired
 
         # 2. Check if username and password are provided
-        username = self.settings.authentication_username
-        password = self.settings.authentication_password
         if username and password:
             try:
                 authenticator = SmartAuthenticator(self.settings)
-                result = await authenticator.authenticate(client, root_url, username, password)
+                result = await authenticator.authenticate(client, login_url, username, password)
                 self._is_spa = self._is_spa or result.is_spa
                 if result.authenticated:
                     self.session_cookies.update(result.cookies)

@@ -14,7 +14,7 @@ class FakeOrchestrator:
         self.queued: list[str] = []
         self.cancelled: list[str] = []
 
-    async def queue_scan(self, scan_id: str) -> None:
+    async def queue_scan(self, scan_id: str, auth_accounts: list | None = None) -> None:
         self.queued.append(scan_id)
 
     async def cancel_scan(self, scan_id: str) -> bool:

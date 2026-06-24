@@ -1,0 +1,105 @@
+"""Resolve scan-submitted account credentials into live sessions.
+
+Users may submit up to three optional accounts (main / second / admin) when
+creating a scan. Rather than relying on hand-pasted cookie strings via env
+vars (fragile when a session spans multiple cookies), we log each account in
+against the target and capture the resulting cookies/headers. Raw cookie /
+header strings are still supported as a fallback.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+
+from app.config import get_settings
+from app.core.crawler.auth_manager import SmartAuthenticator
+from app.models.scan import ScanAuthAccount
+from app.utils.scan_http import create_scan_client
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ResolvedSession:
+    """A resolved account session: cookies + headers ready for HTTP replay."""
+
+    cookies: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.cookies or self.headers)
+
+
+def _parse_cookie_string(value: str | None) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    if not value:
+        return cookies
+    for cookie in value.split(";"):
+        cookie = cookie.strip()
+        if "=" in cookie:
+            key, val = cookie.split("=", 1)
+            key = key.strip()
+            if key:
+                cookies[key] = val.strip()
+    return cookies
+
+
+def _parse_header_string(value: str | None) -> dict[str, str]:
+    if not value or ":" not in value:
+        return {}
+    key, val = value.split(":", 1)
+    key, val = key.strip(), val.strip()
+    return {key: val} if key and val else {}
+
+
+async def resolve_account_session(root_url: str, account: ScanAuthAccount) -> ResolvedSession:
+    """Log ``account`` in against ``root_url`` (or apply its raw cookies/headers).
+
+    Never raises: on failure it logs and returns an empty (unusable) session so a
+    single bad credential can't abort the scan.
+    """
+    session = ResolvedSession()
+
+    # 1. Raw cookie / header strings take effect regardless of login outcome.
+    session.cookies.update(_parse_cookie_string(account.cookie))
+    session.headers.update(_parse_header_string(account.header))
+
+    # 2. Credential login against the target to obtain a fresh, complete session.
+    if account.username and account.password:
+        settings = get_settings()
+        login_target = account.login_url or root_url
+        try:
+            async with create_scan_client(
+                timeout=settings.request_timeout_seconds,
+                follow_redirects=True,
+                headers={"User-Agent": "SentryStrikeScanner/1.0"},
+            ) as client:
+                result = await SmartAuthenticator(settings).authenticate(
+                    client, login_target, account.username, account.password
+                )
+                if result.authenticated:
+                    session.cookies.update(result.cookies or {})
+                    # Snapshot any cookies the client picked up during the flow.
+                    for cookie in client.cookies.jar:
+                        session.cookies.setdefault(cookie.name, cookie.value)
+                    if result.bearer_token:
+                        session.headers["Authorization"] = f"Bearer {result.bearer_token}"
+                    logger.info(
+                        "resolved session for %s account via login (cookies=%d, bearer=%s)",
+                        account.role.value,
+                        len(session.cookies),
+                        bool(result.bearer_token),
+                    )
+                else:
+                    logger.warning(
+                        "login failed for %s account (%s); "
+                        "falling back to any raw cookie/header supplied",
+                        account.role.value,
+                        result.verification_evidence or "no evidence",
+                    )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("session resolution errored for %s account: %s", account.role.value, exc)
+
+    return session

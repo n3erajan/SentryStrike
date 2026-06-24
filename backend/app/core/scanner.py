@@ -11,6 +11,7 @@ from app.config import get_settings
 
 from app.analyzers.ai_client import OllamaClient
 from app.analyzers.report_generator import AiReportGenerator
+from app.core.crawler.account_session import resolve_account_session
 from app.core.crawler.spider import WebSpider
 from app.core.detectors.access_control import AccessControlDetector
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
@@ -122,6 +123,9 @@ class ScanOrchestrator:
 
         self._tasks: dict[str, asyncio.Task] = {}
         self._cancel_flags: dict[str, bool] = {}
+        # In-memory only: submitted test-account credentials per scan. Never
+        # persisted; cleared when the scan finishes (see run_scan finally).
+        self._scan_credentials: dict[str, list] = {}
 
         self._remediation_fallbacks: dict[str, str] = {
             "Cross-Site Request Forgery (CSRF)": (
@@ -199,7 +203,9 @@ class ScanOrchestrator:
             ),
         }
 
-    async def queue_scan(self, scan_id: str) -> None:
+    async def queue_scan(self, scan_id: str, auth_accounts: list | None = None) -> None:
+        if auth_accounts:
+            self._scan_credentials[scan_id] = auth_accounts
         task = asyncio.create_task(self.run_scan(scan_id), name=f"scan-{scan_id}")
         self._tasks[scan_id] = task
         self._cancel_flags[scan_id] = False
@@ -212,6 +218,35 @@ class ScanOrchestrator:
             return True
         return False
 
+    async def _apply_submitted_account_sessions(self, scan, accounts_by_role: dict, crawl_context: dict) -> None:
+        """Resolve second/admin test accounts to live sessions and inject them.
+
+        The access-control detector reads ``second_user_cookies``/``_headers`` and
+        ``privileged_cookies``/``_headers`` from these kwargs (preferring them over
+        the env-based SCAN_AUTH_* settings), so IDOR / privilege-escalation checks
+        run against sessions minted from the user-submitted credentials.
+        """
+        role_to_kwargs = {
+            "second": ("second_user_cookies", "second_user_headers"),
+            "admin": ("privileged_cookies", "privileged_headers"),
+        }
+        for role, (cookie_key, header_key) in role_to_kwargs.items():
+            account = accounts_by_role.get(role)
+            if account is None:
+                continue
+            session = await resolve_account_session(scan.target_url, account)
+            if not session.usable:
+                logger.warning("no usable session resolved for %s account on %s", role, scan.target_url)
+                continue
+            crawl_context[cookie_key] = session.cookies
+            crawl_context[header_key] = session.headers
+            logger.info(
+                "injected %s account session for access-control testing (cookies=%d, headers=%d)",
+                role,
+                len(session.cookies),
+                len(session.headers),
+            )
+
     async def run_scan(self, scan_id: str) -> None:
         scan = await self.repository.get_by_id(scan_id)
         if scan is None:
@@ -222,12 +257,20 @@ class ScanOrchestrator:
             await self._set_progress(scan, 5, ScanPhase.initializing, "Starting scan")
             await self._check_cancelled(scan_id)
 
+            # Split any scan-submitted test accounts (main / second / admin) by role.
+            # These come from memory (never the DB) and the main account
+            # authenticates the crawl; second/admin sessions are resolved after
+            # the crawl and fed to the access-control detector.
+            submitted_accounts = self._scan_credentials.get(scan_id, [])
+            auth_accounts_by_role = {account.role.value: account for account in submitted_accounts}
+            main_account = auth_accounts_by_role.get("main")
+
             await self._set_progress(scan, 10, ScanPhase.crawling, "Crawling target and discovering attack surface")
             if scan.crawl_mode == CrawlMode.single:
                 logger.info("single-path scan: skipping spider discovery for %s", scan.target_url)
                 crawl_result = await self.spider.fetch_single(scan.target_url)
             else:
-                crawl_result = await self.spider.crawl(scan.target_url)
+                crawl_result = await self.spider.crawl(scan.target_url, auth_override=main_account)
             scan.statistics.total_urls_crawled = len(crawl_result.urls)
             await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {len(crawl_result.urls)} URL(s) discovered")
             await self._check_cancelled(scan_id)
@@ -282,6 +325,7 @@ class ScanOrchestrator:
                 "browser_available": getattr(crawl_result, "browser_available", None),
                 "browser_error": getattr(crawl_result, "browser_error", None),
             }
+            await self._apply_submitted_account_sessions(scan, auth_accounts_by_role, crawl_context)
             coverage_context = {
                 **crawl_context,
                 "urls": crawl_result.urls,
@@ -640,6 +684,7 @@ class ScanOrchestrator:
         finally:
             self._tasks.pop(scan_id, None)
             self._cancel_flags.pop(scan_id, None)
+            self._scan_credentials.pop(scan_id, None)
 
     def _detector_name(self, detector: object) -> str:
         return str(getattr(detector, "name", None) or detector.__class__.__name__)

@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     crawl_rate_limit_per_second: float = Field(default=8.0, alias="CRAWL_RATE_LIMIT_PER_SECOND")
     crawl_browser_enabled: bool = Field(default=False, alias="CRAWL_BROWSER_ENABLED")
     crawl_browser_max_interactions: int = Field(default=25, alias="CRAWL_BROWSER_MAX_INTERACTIONS")
+    crawl_browser_budget_seconds: float = Field(default=180.0, alias="CRAWL_BROWSER_BUDGET_SECONDS")
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     scanner_concurrency: int = Field(default=8, alias="SCANNER_CONCURRENCY")
 

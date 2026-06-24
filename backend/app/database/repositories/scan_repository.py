@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from beanie import PydanticObjectId
 
-from app.models.scan import CrawlMode, Scan, ScanPhase, ScanStatus
+from app.models.scan import CrawlMode, Scan, ScanAuthRole, ScanPhase, ScanStatus
 
 
 class ScanRepository:
@@ -15,6 +15,7 @@ class ScanRepository:
         authorization_confirmed: bool,
         authorization_text: str | None = None,
         crawl_mode: CrawlMode = CrawlMode.full,
+        auth_roles_provided: list[ScanAuthRole] | None = None,
     ) -> Scan:
         now = datetime.now(timezone.utc)
         scan = Scan(
@@ -26,6 +27,7 @@ class ScanRepository:
             authorization_confirmed=authorization_confirmed,
             authorization_text=authorization_text,
             authorization_confirmed_at=now if authorization_confirmed else None,
+            auth_roles_provided=auth_roles_provided or [],
         )
         await scan.insert()
         return scan

@@ -162,7 +162,8 @@ class BrowserDiscoveryEngine:
             try:
                 for target_url in self._browser_targets(root_url, routes or []):
                     try:
-                        await page.goto(target_url, wait_until="networkidle", timeout=15000)
+                        await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                        await self._settle(page)
                         state.add_route(
                             RouteCandidate(
                                 url=page.url,
@@ -261,7 +262,7 @@ class BrowserDiscoveryEngine:
                 await field.fill(await self._value_for_field(field), timeout=1000)
                 if await self._looks_like_search(field):
                     await field.press("Enter", timeout=1000)
-                    await page.wait_for_load_state("networkidle", timeout=3000)
+                    await self._settle(page)
             except Exception:
                 continue
 
@@ -429,13 +430,23 @@ class BrowserDiscoveryEngine:
             return 0
 
     async def _wait_after_interaction(self, page: Any) -> None:
+        await self._settle(page)
+
+    async def _settle(self, page: Any) -> None:
+        """Bounded settle for SPAs whose network never goes idle.
+
+        ``networkidle`` never fires on apps with persistent connections or
+        polling (e.g. Angular apps with a service worker), so we wait for the
+        DOM to be ready with a short cap and fall back to a fixed pause.
+        """
         try:
-            await page.wait_for_load_state("networkidle", timeout=3000)
+            await page.wait_for_load_state("domcontentloaded", timeout=1500)
         except Exception:
-            try:
-                await page.wait_for_timeout(500)
-            except Exception:
-                pass
+            pass
+        try:
+            await page.wait_for_timeout(400)
+        except Exception:
+            pass
 
     async def _value_for_field(self, field: Any) -> str:
         attrs = await self._field_attrs(field)
