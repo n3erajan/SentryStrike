@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -93,22 +94,76 @@ class BrowserDiscoveryEngine:
         auth_cookies: dict[str, str] | None = None,
         auth_headers: dict[str, str] | None = None,
         routes: list[str] | None = None,
+        deadline: float | None = None,
     ) -> CrawlState:
+        """Crawl into a fresh :class:`CrawlState` and return it.
+
+        Thin wrapper preserved for existing callers/tests. The heavy lifting
+        lives in :meth:`crawl_into`, which streams observations into the state
+        as they arrive so partial results survive truncation/errors.
+        """
+        state = CrawlState()
+        await self.crawl_into(
+            state,
+            root_url,
+            auth_cookies=auth_cookies,
+            auth_headers=auth_headers,
+            routes=routes,
+            deadline=deadline,
+        )
+        return state
+
+    async def crawl_into(
+        self,
+        state: CrawlState,
+        root_url: str,
+        auth_cookies: dict[str, str] | None = None,
+        auth_headers: dict[str, str] | None = None,
+        routes: list[str] | None = None,
+        deadline: float | None = None,
+    ) -> CrawlState:
+        """Stream browser observations into ``state`` as they arrive.
+
+        ``state`` is mutated in place so a caller holding a reference always
+        sees whatever was discovered before a timeout/exception truncated the
+        run (the RC-1 fix: partial results are never discarded).
+        ``browser_available`` is set ``True`` the moment Chromium launches;
+        ``deadline`` (a monotonic ``loop.time()`` value) bounds the overall run
+        and is checked before each navigation so truncation is a clean break
+        (no ``TargetClosedError``) rather than a hard cancellation.
+        """
         try:
             from playwright.async_api import async_playwright
         except Exception as exc:
             logger.warning("Playwright is unavailable; skipping browser discovery: %s", exc)
-            return CrawlState(browser_available=False, browser_error=f"Playwright import failed: {exc}")
+            state.browser_available = False
+            state.browser_error = f"Playwright import failed: {exc}"
+            return state
 
-        state = CrawlState(browser_available=True)
-        observed_by_key: dict[tuple[str, str, str], RequestObservation] = {}
+        loop = asyncio.get_running_loop()
+        by_key: dict[tuple[str, str, str], RequestObservation] = {}
+
+        def _register(observation: RequestObservation) -> RequestObservation:
+            key = self._observation_key(observation.url, observation.method, observation.post_data)
+            existing = by_key.get(key)
+            if existing is not None:
+                return existing
+            by_key[key] = observation
+            state.requests.append(observation)
+            return observation
 
         async with async_playwright() as pw:
             try:
                 browser = await pw.chromium.launch(headless=True)
             except Exception as exc:
                 logger.warning("Playwright browser launch failed; skipping browser discovery: %s", exc)
-                return CrawlState(browser_available=False, browser_error=f"Playwright browser launch failed: {exc}")
+                state.browser_available = False
+                state.browser_error = f"Playwright browser launch failed: {exc}"
+                return state
+
+            # The browser is live: record availability immediately so a later
+            # truncation still reports True rather than the None default.
+            state.browser_available = True
 
             context = await browser.new_context()
 
@@ -135,16 +190,18 @@ class BrowserDiscoveryEngine:
 
             async def on_request(request):
                 if request.resource_type in {"xhr", "fetch", "websocket"}:
-                    observed_by_key[self._observation_key(request.url, request.method, request.post_data)] = (
-                        await self._build_request_observation(request)
-                    )
+                    # Append to state.requests immediately (dedup by observation
+                    # key) so partial results are durable before any merge.
+                    _register(await self._build_request_observation(request))
 
             async def on_response(response):
                 request = response.request
                 if request.resource_type not in {"xhr", "fetch", "websocket"}:
                     return
                 observation_key = self._observation_key(request.url, request.method, request.post_data)
-                observed = observed_by_key.get(observation_key) or await self._build_request_observation(request)
+                observed = by_key.get(observation_key)
+                if observed is None:
+                    observed = _register(await self._build_request_observation(request))
                 headers = dict(response.headers)
                 observed.response_status = response.status
                 observed.response_headers = headers
@@ -154,13 +211,18 @@ class BrowserDiscoveryEngine:
                     observed.response_snippet = (await response.text())[:1000]
                 except Exception:
                     observed.response_snippet = None
-                observed_by_key[observation_key] = observed
 
             page.on("request", on_request)
             page.on("response", on_response)
 
             try:
                 for target_url in self._browser_targets(root_url, routes or []):
+                    if deadline is not None and loop.time() >= deadline:
+                        state.browser_error = (
+                            state.browser_error
+                            or "browser discovery truncated: overall budget reached before all routes were visited"
+                        )
+                        break
                     try:
                         await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
                         await self._settle(page)
@@ -179,29 +241,46 @@ class BrowserDiscoveryEngine:
                     except Exception as exc:
                         logger.warning("browser discovery failed for %s: %s", target_url, exc)
             finally:
-                for observation in self._dedupe_observations(observed_by_key.values()):
-                    state.requests.append(observation)
-                    endpoint = ApiEndpoint(
-                        url=observation.url,
-                        method=observation.method,
-                        source=RouteSource.browser,
-                        content_type=observation.request_content_type,
-                        request_body=observation.post_data,
-                        body_schema=list(observation.body_schema),
-                        multipart_fields=list(observation.multipart_fields),
-                        replayable=observation.replayable,
-                        headers=observation.request_headers,
-                        evidence=f"{observation.resource_type}:{observation.response_status or 'unknown'}",
-                    )
-                    state.add_api_endpoint(endpoint)
-                    for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
-                        parameter.source = "browser_request"
-                        parameter.context["replayable"] = observation.replayable
-                        parameter.context["cookies"] = dict(observation.request_cookies)
-                        state.add_parameter(parameter)
-                await context.close()
-                await browser.close()
+                # Derive endpoints/params from whatever streamed in — runs even
+                # on truncation so partial coverage yields testable surface.
+                self._derive_endpoints(state)
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
         return state
+
+    def _derive_endpoints(self, state: CrawlState) -> None:
+        """Build API endpoints/parameters from streamed observations.
+
+        ``state.requests`` is left untouched (already deduped by observation key
+        during streaming); endpoint derivation applies the coarser URL-template
+        dedup so equivalent REST calls collapse to one endpoint. ``add_*`` are
+        idempotent, so this is safe to call once in the crawl ``finally``.
+        """
+        for observation in self._dedupe_observations(state.requests):
+            endpoint = ApiEndpoint(
+                url=observation.url,
+                method=observation.method,
+                source=RouteSource.browser,
+                content_type=observation.request_content_type,
+                request_body=observation.post_data,
+                body_schema=list(observation.body_schema),
+                multipart_fields=list(observation.multipart_fields),
+                replayable=observation.replayable,
+                headers=observation.request_headers,
+                evidence=f"{observation.resource_type}:{observation.response_status or 'unknown'}",
+            )
+            state.add_api_endpoint(endpoint)
+            for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
+                parameter.source = "browser_request"
+                parameter.context["replayable"] = observation.replayable
+                parameter.context["cookies"] = dict(observation.request_cookies)
+                state.add_parameter(parameter)
 
     @staticmethod
     def _observation_key(url: str, method: str, post_data: Any = None) -> tuple[str, str, str]:

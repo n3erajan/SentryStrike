@@ -1,7 +1,218 @@
+import asyncio
+import sys
+import types
+
 import pytest
 
 from app.core.crawler.browser_engine import BrowserDiscoveryEngine
-from app.core.crawler.models import RequestObservation
+from app.core.crawler.models import CrawlState, RequestObservation
+
+
+# --- Fake Playwright scaffolding for streaming/truncation tests -------------
+
+
+class _FakeRequest:
+    def __init__(self, url, method="POST", resource_type="xhr", post_data=None, headers=None):
+        self.url = url
+        self.method = method
+        self.resource_type = resource_type
+        self.post_data = post_data
+        self._headers = headers or {"content-type": "application/json"}
+        self.redirected_from = None
+
+    async def all_headers(self):
+        return dict(self._headers)
+
+
+class _FakeResponse:
+    def __init__(self, request, status=200, text="{}"):
+        self.request = request
+        self.status = status
+        self.headers = {"content-type": "application/json"}
+        self._text = text
+
+    async def text(self):
+        return self._text
+
+
+class _FakeLocator:
+    def __init__(self, elements=None):
+        self._elements = elements or []
+
+    async def count(self):
+        return len(self._elements)
+
+    def nth(self, index):
+        return self._elements[index]
+
+    def locator(self, selector):
+        return _FakeLocator([])
+
+
+class _FakePage:
+    """Fires one XHR per navigation, and sleeps so a deadline can truncate."""
+
+    def __init__(self, goto_sleep=0.1):
+        self.url = "http://spa.test/"
+        self._handlers = {}
+        self.goto_sleep = goto_sleep
+        self.goto_calls = []
+
+    def on(self, event, handler):
+        self._handlers[event] = handler
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        self.goto_calls.append(url)
+        self.url = url
+        await asyncio.sleep(self.goto_sleep)
+        request = _FakeRequest(
+            url.rstrip("/") + "/xhr",
+            method="POST",
+            resource_type="xhr",
+            post_data='{"a":1}',
+        )
+        await self._handlers["request"](request)
+        await self._handlers["response"](_FakeResponse(request))
+
+    def locator(self, selector):
+        return _FakeLocator([])
+
+    async def evaluate(self, script):
+        return ""
+
+    async def wait_for_load_state(self, state, timeout=None):
+        return None
+
+    async def wait_for_timeout(self, timeout):
+        return None
+
+
+class _FakeContext:
+    def __init__(self, page):
+        self._page = page
+
+    async def add_cookies(self, cookies):
+        return None
+
+    async def set_extra_http_headers(self, headers):
+        return None
+
+    async def new_page(self):
+        return self._page
+
+    async def close(self):
+        return None
+
+
+class _FakeBrowser:
+    def __init__(self, page):
+        self._page = page
+
+    async def new_context(self):
+        return _FakeContext(self._page)
+
+    async def close(self):
+        return None
+
+
+class _FakeChromium:
+    def __init__(self, page):
+        self._page = page
+
+    async def launch(self, headless=True):
+        return _FakeBrowser(self._page)
+
+
+class _FakePlaywright:
+    def __init__(self, page):
+        self.chromium = _FakeChromium(page)
+
+
+class _FakePlaywrightCM:
+    def __init__(self, page):
+        self._page = page
+
+    async def __aenter__(self):
+        return _FakePlaywright(self._page)
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _install_fake_playwright(monkeypatch, page):
+    module = types.ModuleType("playwright.async_api")
+    module.async_playwright = lambda: _FakePlaywrightCM(page)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", module)
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_streams_partial_results_and_survives_deadline(monkeypatch):
+    page = _FakePage(goto_sleep=0.1)
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=2)
+    state = CrawlState()
+    loop = asyncio.get_running_loop()
+    # Budget only allows a couple of navigations before truncation.
+    deadline = loop.time() + 0.15
+
+    routes = [f"/route-{i}" for i in range(10)]
+    await engine.crawl_into(state, "http://spa.test/", routes=routes, deadline=deadline)
+
+    # Partial: some but not all routes were visited.
+    assert 0 < len(page.goto_calls) < len(routes) + 1
+    # Streamed observations survived the truncation.
+    assert len(state.requests) == len(page.goto_calls)
+    # Availability reflects reality; error explains the truncation.
+    assert state.browser_available is True
+    assert state.browser_error is not None
+    assert "truncat" in state.browser_error.lower()
+    # Endpoints/params were derived from the partial observations.
+    assert state.api_endpoints
+    assert state.parameters
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_reports_unavailable_when_launch_fails(monkeypatch):
+    class _FailingChromium:
+        async def launch(self, headless=True):
+            raise RuntimeError("browser binary missing")
+
+    class _FailingPlaywright:
+        def __init__(self):
+            self.chromium = _FailingChromium()
+
+    class _FailingCM:
+        async def __aenter__(self):
+            return _FailingPlaywright()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    module = types.ModuleType("playwright.async_api")
+    module.async_playwright = lambda: _FailingCM()
+    monkeypatch.setitem(sys.modules, "playwright.async_api", module)
+
+    engine = BrowserDiscoveryEngine()
+    state = CrawlState()
+    await engine.crawl_into(state, "http://spa.test/")
+
+    # Launch failure must not regress: availability False with a recorded error.
+    assert state.browser_available is False
+    assert state.browser_error
+
+
+@pytest.mark.asyncio
+async def test_crawl_wrapper_returns_populated_state(monkeypatch):
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    state = await engine.crawl("http://spa.test/", routes=["/a"])
+
+    assert isinstance(state, CrawlState)
+    assert state.browser_available is True
+    assert state.requests
 
 
 def test_browser_targets_visit_same_origin_routes_only():

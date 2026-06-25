@@ -6,8 +6,52 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 import httpx
 
+from app.core.crawler import spider as spider_module
+from app.core.crawler.models import CrawlState, RequestObservation
 from app.core.crawler.spider import AuthReplayState, WebSpider
 from app.core.detectors.sensitive_paths import SensitivePathsDetector
+
+
+@pytest.mark.asyncio
+async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch):
+    """RC-1 regression: a truncated/erroring browser run still merges its partial
+    observations into the crawl state (the merge runs in ``finally``)."""
+
+    class _StubEngine:
+        def __init__(self, max_interactions=25):
+            self.max_interactions = max_interactions
+
+        async def crawl_into(
+            self,
+            state,
+            root_url,
+            auth_cookies=None,
+            auth_headers=None,
+            routes=None,
+            deadline=None,
+        ):
+            # Stream a partial observation, mark availability, then blow up —
+            # simulating a timeout/exception mid-run.
+            state.browser_available = True
+            state.requests.append(
+                RequestObservation(url="http://spa.test/api/x", method="POST")
+            )
+            state.browser_forms_discovered += 1
+            state.browser_error = "truncated mid-run"
+            raise RuntimeError("simulated browser crash")
+
+    monkeypatch.setattr(spider_module, "BrowserDiscoveryEngine", _StubEngine)
+
+    spider = WebSpider()
+    crawl_state = CrawlState()
+    await spider._run_browser_discovery(crawl_state, "http://spa.test/", ["/a", "/b"])
+
+    # Partial observation survived the crash and was merged.
+    assert len(crawl_state.requests) == 1
+    assert crawl_state.requests[0].url == "http://spa.test/api/x"
+    assert crawl_state.browser_available is True
+    assert crawl_state.browser_forms_discovered == 1
+    assert crawl_state.browser_error == "truncated mid-run"
 
 
 class MultiPageHandler(BaseHTTPRequestHandler):

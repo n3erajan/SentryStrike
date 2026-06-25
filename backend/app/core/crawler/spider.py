@@ -363,24 +363,7 @@ class WebSpider:
 
             if self.settings.crawl_browser_enabled:
                 browser_routes = [route.url for route in crawl_state.routes if route.source == RouteSource.javascript]
-                try:
-                    browser_state = await asyncio.wait_for(
-                        BrowserDiscoveryEngine(
-                            max_interactions=self.settings.crawl_browser_max_interactions
-                        ).crawl(
-                            root_url,
-                            auth_cookies=self.session_cookies,
-                            auth_headers=self._auth_headers,
-                            routes=browser_routes,
-                        ),
-                        timeout=self.settings.crawl_browser_budget_seconds,
-                    )
-                    self._merge_crawl_state(crawl_state, browser_state)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "browser discovery exceeded budget of %.0fs; skipping remaining browser targets",
-                        self.settings.crawl_browser_budget_seconds,
-                    )
+                await self._run_browser_discovery(crawl_state, root_url, browser_routes)
 
         for endpoint in crawl_state.api_endpoints:
             for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
@@ -515,6 +498,59 @@ class WebSpider:
             for endpoint in endpoints:
                 if same_domain(root_url, endpoint.url):
                     crawl_state.add_api_endpoint(endpoint)
+
+    async def _run_browser_discovery(
+        self,
+        crawl_state: CrawlState,
+        root_url: str,
+        routes: list[str],
+    ) -> None:
+        """Run browser discovery, always merging partial results.
+
+        The engine streams observations into ``browser_state`` as they arrive
+        and honours ``deadline`` per-route, so a timeout/exception truncates
+        coverage but never discards it: the ``finally`` merge always runs and
+        ``browser_available`` (set True by the engine at launch) is preserved.
+
+        A hard safety timeout guards against a genuine hang (e.g. a wedged
+        Playwright call); it is deliberately larger than the per-route budget so
+        the clean in-engine deadline stop normally fires first. Partial results
+        already streamed into ``browser_state`` survive either path.
+        """
+        loop = asyncio.get_running_loop()
+        budget = self.settings.crawl_browser_budget_seconds
+        deadline = loop.time() + budget
+        browser_state = CrawlState()
+        engine = BrowserDiscoveryEngine(
+            max_interactions=self.settings.crawl_browser_max_interactions
+        )
+        task = asyncio.create_task(
+            engine.crawl_into(
+                browser_state,
+                root_url,
+                auth_cookies=self.session_cookies,
+                auth_headers=self._auth_headers,
+                routes=routes,
+                deadline=deadline,
+            )
+        )
+        safety_timeout = budget + max(30.0, budget * 0.5)
+        try:
+            await asyncio.wait_for(task, timeout=safety_timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "browser discovery exceeded hard safety budget of %.0fs; using partial results",
+                safety_timeout,
+            )
+            browser_state.browser_error = (
+                browser_state.browser_error
+                or "browser discovery aborted: hard safety timeout reached"
+            )
+        except Exception as exc:  # noqa: BLE001 - never let browser discovery fail the crawl
+            logger.warning("browser discovery errored: %s; using partial results", exc)
+            browser_state.browser_error = browser_state.browser_error or repr(exc)
+        finally:
+            self._merge_crawl_state(crawl_state, browser_state)
 
     @staticmethod
     def _merge_crawl_state(target: CrawlState, source: CrawlState) -> None:
