@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+from collections import deque
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -59,6 +60,99 @@ VOLATILE_REQUEST_HEADERS = {
     "te",
     "upgrade-insecure-requests",
 }
+
+# Sentinel returned by _bounded when an operation times out or errors, so a
+# successful call returning None (e.g. Playwright click) is distinguishable
+# from a skipped one.
+_BOUNDED_FAILED = object()
+
+# Injected at context creation so programmatic SPA route changes (pushState /
+# replaceState / hashchange / popstate) are captured into a global array the
+# engine polls. Framework-agnostic (React Router, Vue Router, Angular, Next).
+SPA_ROUTE_HOOK_SCRIPT = """
+() => {
+  try {
+    window.__sentry_routes = window.__sentry_routes || [];
+    const push = (u) => { try { window.__sentry_routes.push(String(u || location.href)); } catch (e) {} };
+    const wrap = (name) => {
+      const orig = history[name];
+      if (!orig || orig.__sentry_wrapped) return;
+      const fn = function () { const r = orig.apply(this, arguments); push(location.href); return r; };
+      fn.__sentry_wrapped = true;
+      history[name] = fn;
+    };
+    wrap('pushState');
+    wrap('replaceState');
+    window.addEventListener('hashchange', () => push(location.href));
+    window.addEventListener('popstate', () => push(location.href));
+  } catch (e) {}
+}
+"""
+
+# Returns strictly `true` when a blocking full-viewport overlay intercepts the
+# viewport centre. Generic: high z-index fixed/absolute cover, role=dialog /
+# aria-modal, or overlay/backdrop/modal class names.
+OVERLAY_DETECT_SCRIPT = """
+() => {
+  try {
+    const w = window.innerWidth, h = window.innerHeight;
+    const el = document.elementFromPoint(Math.floor(w / 2), Math.floor(h / 2));
+    if (!el) return false;
+    let node = el;
+    while (node && node !== document.body) {
+      const s = getComputedStyle(node);
+      const r = node.getBoundingClientRect();
+      const big = (r.width * r.height) > (0.6 * w * h);
+      const fixed = s.position === 'fixed' || s.position === 'absolute';
+      const zi = parseInt(s.zIndex || '0', 10) || 0;
+      const cls = (node.className && node.className.toString) ? node.className.toString() : '';
+      const modal = node.getAttribute && (node.getAttribute('role') === 'dialog' || node.getAttribute('aria-modal') === 'true');
+      if ((fixed && big && zi >= 1) || modal || /overlay|backdrop|modal/i.test(cls)) return true;
+      node = node.parentElement;
+    }
+    return false;
+  } catch (e) { return false; }
+}
+"""
+
+# Collect in-DOM navigation targets: anchors plus framework router directives.
+DOM_LINK_SCRIPT = """
+() => {
+  const out = [];
+  try {
+    document.querySelectorAll('a[href]').forEach((a) => { if (a.href) out.push(a.href); });
+    document.querySelectorAll('[routerLink],[data-href],[ng-reflect-router-link]').forEach((el) => {
+      const v = el.getAttribute('routerLink') || el.getAttribute('data-href') || el.getAttribute('ng-reflect-router-link');
+      if (v) out.push(v);
+    });
+  } catch (e) {}
+  return out;
+}
+"""
+
+# Extract structured forms after the DOM has settled and overlays are cleared.
+FORM_CAPTURE_SCRIPT = """
+() => {
+  const forms = [];
+  try {
+    document.querySelectorAll('form').forEach((f) => {
+      const inputs = [];
+      f.querySelectorAll('input,textarea,select').forEach((el) => {
+        inputs.push({
+          name: el.getAttribute('name') || el.getAttribute('id') || '',
+          type: (el.getAttribute('type') || el.tagName.toLowerCase() || 'text').toLowerCase(),
+        });
+      });
+      forms.push({
+        action: f.getAttribute('action') || location.href,
+        method: (f.getAttribute('method') || 'GET').toUpperCase(),
+        inputs: inputs,
+      });
+    });
+  } catch (e) {}
+  return forms;
+}
+"""
 
 
 class BrowserDiscoveryEngine:
@@ -167,6 +261,12 @@ class BrowserDiscoveryEngine:
 
             context = await browser.new_context()
 
+            # Capture programmatic SPA route changes across all pages.
+            try:
+                await context.add_init_script(SPA_ROUTE_HOOK_SCRIPT)
+            except Exception:
+                pass
+
             if auth_cookies:
                 parsed = urlparse(root_url)
                 domain = parsed.netloc.split(":")[0]
@@ -187,6 +287,15 @@ class BrowserDiscoveryEngine:
                 await context.set_extra_http_headers(auth_headers)
 
             page = await context.new_page()
+
+            # Inflight counter for deterministic, networkidle-free settling.
+            inflight = {"count": 0}
+
+            def _inc_inflight(_request):
+                inflight["count"] += 1
+
+            def _dec_inflight(_request):
+                inflight["count"] = max(0, inflight["count"] - 1)
 
             async def on_request(request):
                 if request.resource_type in {"xhr", "fetch", "websocket"}:
@@ -212,23 +321,61 @@ class BrowserDiscoveryEngine:
                 except Exception:
                     observed.response_snippet = None
 
+            def on_websocket(ws):
+                # Record WS endpoints even without a body so they surface in
+                # coverage and to detectors.
+                try:
+                    url = ws.url
+                except Exception:
+                    return
+                _register(
+                    RequestObservation(
+                        url=url,
+                        method="GET",
+                        resource_type="websocket",
+                        replayable=False,
+                    )
+                )
+
             page.on("request", on_request)
+            page.on("request", _inc_inflight)
+            page.on("requestfinished", _dec_inflight)
+            page.on("requestfailed", _dec_inflight)
             page.on("response", on_response)
+            try:
+                page.on("websocket", on_websocket)
+            except Exception:
+                pass
 
             try:
-                for target_url in self._browser_targets(root_url, routes or []):
+                route_budget = max(1, self.settings.crawl_max_urls)
+                queue: deque[str] = deque()
+                seen_routes: set[str] = set()
+                for target in self._browser_targets(root_url, routes or []):
+                    key = self._normalize_for_seen(target)
+                    if key not in seen_routes:
+                        seen_routes.add(key)
+                        queue.append(target)
+
+                first = True
+                while queue:
                     if deadline is not None and loop.time() >= deadline:
                         state.browser_error = (
                             state.browser_error
                             or "browser discovery truncated: overall budget reached before all routes were visited"
                         )
                         break
+                    target_url = queue.popleft()
                     try:
-                        await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
-                        await self._settle(page)
+                        # Root/first target always does a full load; later
+                        # same-origin routes prefer client-side navigation.
+                        await self._navigate(page, target_url, root_url, allow_spa=not first)
+                        first = False
+                        await self._settle_inflight(page, inflight)
+                        await self._clear_blocking_overlays(page)
                         state.add_route(
                             RouteCandidate(
-                                url=page.url,
+                                url=self._current_url(page, target_url),
                                 source=RouteSource.browser,
                                 priority=75,
                                 evidence="browser_navigation",
@@ -238,6 +385,15 @@ class BrowserDiscoveryEngine:
                         state.workflow_states_visited += workflow_stats.get("states", 0)
                         state.browser_forms_discovered += workflow_stats.get("forms", 0)
                         state.file_inputs_discovered += workflow_stats.get("file_inputs", 0)
+                        for form in await self._capture_forms(page, target_url):
+                            state.add_browser_form(form)
+                        # Enqueue newly-discovered same-origin routes (bounded).
+                        for new_route in await self._discover_routes(page, root_url):
+                            key = self._normalize_for_seen(new_route)
+                            if key in seen_routes or len(seen_routes) >= route_budget:
+                                continue
+                            seen_routes.add(key)
+                            queue.append(new_route)
                     except Exception as exc:
                         logger.warning("browser discovery failed for %s: %s", target_url, exc)
             finally:
@@ -286,13 +442,173 @@ class BrowserDiscoveryEngine:
     def _observation_key(url: str, method: str, post_data: Any = None) -> tuple[str, str, str]:
         return (method.upper(), url, str(post_data or ""))
 
+    async def _bounded(self, coro: Any, ms: float) -> Any:
+        """Await ``coro`` with a hard millisecond deadline.
+
+        Returns the coroutine result on success or :data:`_BOUNDED_FAILED` on
+        timeout/error, so a single hanging control can never consume the budget.
+        """
+        try:
+            return await asyncio.wait_for(coro, timeout=max(0.05, ms / 1000.0))
+        except Exception:
+            return _BOUNDED_FAILED
+
+    @staticmethod
+    def _current_url(page: Any, fallback: str) -> str:
+        try:
+            return page.url or fallback
+        except Exception:
+            return fallback
+
+    @staticmethod
+    async def _force_click(element: Any) -> None:
+        await element.click(timeout=800, force=True)
+
+    async def _navigate(self, page: Any, target_url: str, root_url: str, allow_spa: bool) -> None:
+        """Navigate to ``target_url``, preferring client-side routing for SPAs."""
+        if allow_spa and self._origin(target_url) == self._origin(root_url):
+            if await self._navigate_spa_route(page, target_url):
+                return
+        await self._bounded(
+            page.goto(target_url, wait_until="domcontentloaded", timeout=15000), 16000
+        )
+
+    async def _navigate_spa_route(self, page: Any, route: str) -> bool:
+        """Exercise the SPA router without a full reload.
+
+        Hash routes set ``location.hash``; path routes call ``history.pushState``
+        and dispatch ``popstate`` so the framework router reacts. Returns False
+        (caller falls back to ``page.goto``) if the programmatic change errors.
+        """
+        parsed = urlparse(route)
+        try:
+            if parsed.fragment:
+                script = "(h) => { location.hash = h; }"
+                result = await self._bounded(page.evaluate(script, parsed.fragment), 800)
+            else:
+                target = parsed.path or "/"
+                if parsed.query:
+                    target = f"{target}?{parsed.query}"
+                script = (
+                    "(p) => { history.pushState({}, '', p); "
+                    "window.dispatchEvent(new PopStateEvent('popstate')); }"
+                )
+                result = await self._bounded(page.evaluate(script, target), 800)
+        except Exception:
+            return False
+        if result is _BOUNDED_FAILED:
+            return False
+        # Bounded settle for the router to react before the caller proceeds.
+        await self._bounded(page.wait_for_timeout(200), 400)
+        return True
+
+    async def _settle_inflight(
+        self,
+        page: Any,
+        inflight: dict[str, int],
+        quiet_ms: float = 300.0,
+        cap_ms: float = 2500.0,
+    ) -> None:
+        """Wait until in-flight requests drain, with a hard cap.
+
+        ``networkidle`` never fires on apps with persistent sockets/polling, so
+        we watch an inflight counter and return once it stays at zero for
+        ``quiet_ms`` or ``cap_ms`` elapses — whichever comes first.
+        """
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        quiet_start: float | None = None
+        while True:
+            now = loop.time()
+            if (now - start) * 1000.0 >= cap_ms:
+                break
+            if inflight.get("count", 0) <= 0:
+                if quiet_start is None:
+                    quiet_start = now
+                elif (now - quiet_start) * 1000.0 >= quiet_ms:
+                    break
+            else:
+                quiet_start = None
+            await asyncio.sleep(0.05)
+        await self._bounded(page.wait_for_load_state("domcontentloaded"), 1000)
+
+    async def _clear_blocking_overlays(self, page: Any) -> None:
+        """Dismiss a blocking full-viewport overlay before interacting.
+
+        Detects interception generically (``elementFromPoint`` at the viewport
+        centre) and, if blocked, tries Escape then a generic dismiss control
+        (accept/close/got-it/…). Never clicks destructive controls.
+        """
+        blocking = await self._bounded(page.evaluate(OVERLAY_DETECT_SCRIPT), 800)
+        if blocking is not True:
+            return
+        keyboard = getattr(page, "keyboard", None)
+        if keyboard is not None:
+            await self._bounded(keyboard.press("Escape"), 500)
+        await self._dismiss_common_dialogs(page)
+
+    async def _capture_forms(self, page: Any, page_url: str) -> list[dict[str, Any]]:
+        """Return structured forms (action/method/inputs) rendered on the page."""
+        result = await self._bounded(page.evaluate(FORM_CAPTURE_SCRIPT), 1000)
+        if result is _BOUNDED_FAILED or not isinstance(result, list):
+            return []
+        forms: list[dict[str, Any]] = []
+        for entry in result:
+            if not isinstance(entry, dict):
+                continue
+            inputs = entry.get("inputs") if isinstance(entry.get("inputs"), list) else []
+            forms.append(
+                {
+                    "action": urljoin(page_url, str(entry.get("action") or page_url)),
+                    "method": str(entry.get("method") or "GET").upper(),
+                    "inputs": [
+                        {"name": str(i.get("name", "")), "type": str(i.get("type", "text"))}
+                        for i in inputs
+                        if isinstance(i, dict)
+                    ],
+                    "page_url": page_url,
+                }
+            )
+        return forms
+
+    async def _discover_routes(self, page: Any, root_url: str) -> list[str]:
+        """Collect same-origin routes from captured SPA nav + in-DOM links."""
+        found: list[str] = []
+        captured = await self._bounded(
+            page.evaluate("() => (window.__sentry_routes || []).splice(0)"), 1000
+        )
+        if isinstance(captured, list):
+            found.extend(str(item) for item in captured)
+        links = await self._bounded(page.evaluate(DOM_LINK_SCRIPT), 1000)
+        if isinstance(links, list):
+            found.extend(str(item) for item in links)
+        current = self._current_url(page, "")
+        if current:
+            found.append(current)
+
+        root_origin = self._origin(root_url)
+        result: list[str] = []
+        emitted: set[str] = set()
+        for item in found:
+            if not item:
+                continue
+            absolute = urljoin(root_url, item)
+            if self._origin(absolute) != root_origin:
+                continue
+            key = self._normalize_for_seen(absolute)
+            if key in emitted:
+                continue
+            emitted.add(key)
+            result.append(absolute)
+        return result
+
     async def _exercise_page(self, page: Any) -> dict[str, int]:
         seen_states: set[str] = set()
         attempted_controls: set[str] = set()
         forms_seen = 0
         file_inputs_seen = 0
 
-        await self._dismiss_common_dialogs(page)
+        await self._clear_blocking_overlays(page)
         for _ in range(self.max_interactions):
             state_signature = await self._ui_state_signature(page)
             if state_signature not in seen_states:
@@ -302,17 +618,22 @@ class BrowserDiscoveryEngine:
             file_inputs_seen = max(file_inputs_seen, await self._count_locator(page, "input[type=file]"))
             await self._prepare_interactive_inputs(page)
 
+            # Clear overlays right before selecting/clicking so a modal that
+            # appeared after the last action cannot intercept this one.
+            await self._clear_blocking_overlays(page)
             element, control_key = await self._next_interaction(page, attempted_controls)
             if element is None or control_key is None:
                 break
             attempted_controls.add(control_key)
 
-            try:
-                await element.click(timeout=1200)
-                await self._wait_after_interaction(page)
-                await self._dismiss_common_dialogs(page)
-            except Exception:
-                continue
+            # Hard-bounded click; on interception, clear overlays and try one
+            # forced click (still never a destructive control — filtered above).
+            result = await self._bounded(element.click(timeout=800), 900)
+            if result is _BOUNDED_FAILED:
+                await self._clear_blocking_overlays(page)
+                await self._bounded(self._force_click(element), 900)
+            await self._wait_after_interaction(page)
+            await self._clear_blocking_overlays(page)
 
         return {
             "states": len(seen_states),

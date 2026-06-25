@@ -83,6 +83,7 @@ class CrawlResult:
     workflow_states_visited: int = 0
     browser_forms_discovered: int = 0
     file_inputs_discovered: int = 0
+    browser_forms: list[dict[str, object]] = field(default_factory=list)
 
 
 class WebSpider:
@@ -393,6 +394,7 @@ class WebSpider:
             workflow_states_visited=crawl_state.workflow_states_visited,
             browser_forms_discovered=crawl_state.browser_forms_discovered,
             file_inputs_discovered=crawl_state.file_inputs_discovered,
+            browser_forms=list(crawl_state.browser_forms),
         )
         self._log_crawl_inventory(root_url, result)
         return result
@@ -567,6 +569,8 @@ class WebSpider:
         target.workflow_states_visited += source.workflow_states_visited
         target.browser_forms_discovered += source.browser_forms_discovered
         target.file_inputs_discovered += source.file_inputs_discovered
+        for form in source.browser_forms:
+            target.add_browser_form(form)
         if source.browser_available is not None:
             target.browser_available = source.browser_available
         if source.browser_error:

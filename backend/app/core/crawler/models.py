@@ -105,6 +105,7 @@ class CrawlState:
     file_inputs_discovered: int = 0
     browser_available: bool | None = None
     browser_error: str | None = None
+    browser_forms: list[dict[str, Any]] = field(default_factory=list)
 
     def add_route(self, candidate: RouteCandidate) -> None:
         if candidate.url not in {route.url for route in self.routes}:
@@ -130,3 +131,15 @@ class CrawlState:
         }
         if key not in existing:
             self.parameters.append(parameter)
+
+    @staticmethod
+    def _form_key(form: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+        inputs = form.get("inputs") or []
+        names = tuple(sorted(str(i.get("name", "")) for i in inputs))
+        return (str(form.get("action", "")), str(form.get("method", "GET")).upper(), names)
+
+    def add_browser_form(self, form: dict[str, Any]) -> None:
+        key = self._form_key(form)
+        existing = {self._form_key(f) for f in self.browser_forms}
+        if key not in existing:
+            self.browser_forms.append(form)

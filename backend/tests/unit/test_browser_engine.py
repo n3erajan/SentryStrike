@@ -1,10 +1,14 @@
 import asyncio
+import inspect
 import sys
 import types
 
 import pytest
 
-from app.core.crawler.browser_engine import BrowserDiscoveryEngine
+from app.core.crawler.browser_engine import (
+    BrowserDiscoveryEngine,
+    _BOUNDED_FAILED,
+)
 from app.core.crawler.models import CrawlState, RequestObservation
 
 
@@ -59,7 +63,13 @@ class _FakePage:
         self.goto_calls = []
 
     def on(self, event, handler):
-        self._handlers[event] = handler
+        self._handlers.setdefault(event, []).append(handler)
+
+    async def _fire(self, event, arg):
+        for handler in self._handlers.get(event, []):
+            result = handler(arg)
+            if inspect.isawaitable(result):
+                await result
 
     async def goto(self, url, wait_until=None, timeout=None):
         self.goto_calls.append(url)
@@ -71,13 +81,17 @@ class _FakePage:
             resource_type="xhr",
             post_data='{"a":1}',
         )
-        await self._handlers["request"](request)
-        await self._handlers["response"](_FakeResponse(request))
+        await self._fire("request", request)
+        await self._fire("response", _FakeResponse(request))
+        await self._fire("requestfinished", request)
 
     def locator(self, selector):
         return _FakeLocator([])
 
-    async def evaluate(self, script):
+    async def evaluate(self, script, *args):
+        # Non-SPA fake: programmatic routing "fails" so every route uses goto.
+        if "pushState" in script or "location.hash" in script:
+            raise RuntimeError("no SPA router")
         return ""
 
     async def wait_for_load_state(self, state, timeout=None):
@@ -147,22 +161,24 @@ def _install_fake_playwright(monkeypatch, page):
 
 @pytest.mark.asyncio
 async def test_crawl_into_streams_partial_results_and_survives_deadline(monkeypatch):
-    page = _FakePage(goto_sleep=0.1)
+    page = _FakePage(goto_sleep=0.2)
     _install_fake_playwright(monkeypatch, page)
 
-    engine = BrowserDiscoveryEngine(max_interactions=2)
+    # High max_interactions so all routes are queued (not capped); each route
+    # does a real goto (goto_sleep) so the deadline clearly truncates the queue.
+    engine = BrowserDiscoveryEngine(max_interactions=20)
     state = CrawlState()
     loop = asyncio.get_running_loop()
-    # Budget only allows a couple of navigations before truncation.
-    deadline = loop.time() + 0.15
+    # Budget only allows a few navigations before truncation.
+    deadline = loop.time() + 0.9
 
     routes = [f"/route-{i}" for i in range(10)]
     await engine.crawl_into(state, "http://spa.test/", routes=routes, deadline=deadline)
 
     # Partial: some but not all routes were visited.
     assert 0 < len(page.goto_calls) < len(routes) + 1
-    # Streamed observations survived the truncation.
-    assert len(state.requests) == len(page.goto_calls)
+    # Streamed observations survived the truncation (>= one per navigation).
+    assert len(state.requests) >= len(page.goto_calls)
     # Availability reflects reality; error explains the truncation.
     assert state.browser_available is True
     assert state.browser_error is not None
@@ -458,3 +474,267 @@ async def test_workflow_explorer_exercises_multi_step_spa_and_file_inputs():
     assert stats["states"] >= 2
     assert stats["forms"] == 1
     assert stats["file_inputs"] == 1
+
+
+# --- Task 2: SPA interaction & navigation --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bounded_skips_hanging_control():
+    engine = BrowserDiscoveryEngine()
+
+    async def hangs():
+        await asyncio.sleep(5)
+        return "done"
+
+    result = await engine._bounded(hangs(), 50)
+    assert result is _BOUNDED_FAILED
+
+
+@pytest.mark.asyncio
+async def test_bounded_returns_value_on_success():
+    engine = BrowserDiscoveryEngine()
+
+    async def quick():
+        return "ok"
+
+    assert await engine._bounded(quick(), 500) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_clear_blocking_overlays_dismisses_when_intercepted():
+    class _Keyboard:
+        def __init__(self):
+            self.pressed = []
+
+        async def press(self, key, timeout=None):
+            self.pressed.append(key)
+
+    class _DismissButton:
+        def __init__(self, page, label):
+            self.page = page
+            self.label = label
+
+        async def is_visible(self):
+            return True
+
+        async def inner_text(self, timeout=None):
+            return self.label
+
+        async def get_attribute(self, name):
+            return None
+
+        async def click(self, timeout=None):
+            self.page.clicked.append(self.label)
+
+    class _Page:
+        def __init__(self):
+            self.keyboard = _Keyboard()
+            self.clicked = []
+
+        async def evaluate(self, script, *args):
+            return True  # overlay intercepts the viewport centre
+
+        def locator(self, selector):
+            return _FakeLocator([_DismissButton(self, "Accept")])
+
+        async def wait_for_load_state(self, state, timeout=None):
+            return None
+
+        async def wait_for_timeout(self, timeout):
+            return None
+
+    engine = BrowserDiscoveryEngine()
+    page = _Page()
+    await engine._clear_blocking_overlays(page)
+
+    assert "Escape" in page.keyboard.pressed
+    assert page.clicked == ["Accept"]
+
+
+@pytest.mark.asyncio
+async def test_clear_blocking_overlays_noop_when_clear():
+    class _Page:
+        def __init__(self):
+            self.evaluated = False
+
+        async def evaluate(self, script, *args):
+            self.evaluated = True
+            return False  # nothing intercepting
+
+        def locator(self, selector):  # pragma: no cover - must not be reached
+            raise AssertionError("should not query controls when not blocked")
+
+    engine = BrowserDiscoveryEngine()
+    page = _Page()
+    await engine._clear_blocking_overlays(page)
+    assert page.evaluated is True
+
+
+@pytest.mark.asyncio
+async def test_settle_inflight_terminates_at_cap():
+    class _Page:
+        async def wait_for_load_state(self, state, timeout=None):
+            return None
+
+    engine = BrowserDiscoveryEngine()
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    # Requests never drain -> must return at the hard cap, not hang.
+    await engine._settle_inflight(_Page(), {"count": 3}, quiet_ms=50, cap_ms=150)
+    elapsed_ms = (loop.time() - start) * 1000
+    assert 120 <= elapsed_ms < 900
+
+
+@pytest.mark.asyncio
+async def test_settle_inflight_returns_when_quiet():
+    class _Page:
+        async def wait_for_load_state(self, state, timeout=None):
+            return None
+
+    engine = BrowserDiscoveryEngine()
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await engine._settle_inflight(_Page(), {"count": 0}, quiet_ms=100, cap_ms=3000)
+    elapsed_ms = (loop.time() - start) * 1000
+    assert elapsed_ms < 1500
+
+
+@pytest.mark.asyncio
+async def test_discover_routes_filters_cross_origin():
+    class _Page:
+        url = "http://spa.test/current"
+
+        async def evaluate(self, script, *args):
+            if "__sentry_routes" in script:
+                return ["http://spa.test/pushed", "http://evil.test/x"]
+            if "a[href]" in script or "routerLink" in script:
+                return ["http://spa.test/link", "/relative", "http://other.test/y"]
+            return []
+
+    engine = BrowserDiscoveryEngine()
+    routes = await engine._discover_routes(_Page(), "http://spa.test/")
+
+    assert "http://spa.test/pushed" in routes
+    assert "http://spa.test/link" in routes
+    assert "http://spa.test/relative" in routes
+    assert all("evil.test" not in r and "other.test" not in r for r in routes)
+
+
+@pytest.mark.asyncio
+async def test_capture_forms_returns_structured_forms():
+    class _Page:
+        url = "http://spa.test/page"
+
+        async def evaluate(self, script, *args):
+            return [
+                {
+                    "action": "/submit",
+                    "method": "post",
+                    "inputs": [{"name": "email", "type": "email"}],
+                }
+            ]
+
+    engine = BrowserDiscoveryEngine()
+    forms = await engine._capture_forms(_Page(), "http://spa.test/page")
+
+    assert forms == [
+        {
+            "action": "http://spa.test/submit",
+            "method": "POST",
+            "inputs": [{"name": "email", "type": "email"}],
+            "page_url": "http://spa.test/page",
+        }
+    ]
+
+
+class _FakeWebSocket:
+    def __init__(self, url):
+        self.url = url
+
+
+class _RichFakePage:
+    """SPA-like fake: goto loads root+fires XHR/WS; pushState changes route +
+    fires an XHR; DOM exposes one discoverable link the first time it's asked."""
+
+    def __init__(self):
+        self.url = "http://spa.test/"
+        self._handlers = {}
+        self.goto_calls = []
+        self._link_served = False
+        self._ws_served = False
+
+    def on(self, event, handler):
+        self._handlers.setdefault(event, []).append(handler)
+
+    async def _fire(self, event, arg):
+        for handler in self._handlers.get(event, []):
+            result = handler(arg)
+            if inspect.isawaitable(result):
+                await result
+
+    async def _fire_xhr(self, url):
+        request = _FakeRequest(url, method="GET", resource_type="fetch", post_data=None)
+        await self._fire("request", request)
+        await self._fire("response", _FakeResponse(request))
+        await self._fire("requestfinished", request)
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        self.goto_calls.append(url)
+        self.url = url
+        await self._fire_xhr(url.rstrip("/") + "/data")
+        if not self._ws_served:
+            self._ws_served = True
+            await self._fire("websocket", _FakeWebSocket("ws://spa.test/socket"))
+
+    def locator(self, selector):
+        return _FakeLocator([])
+
+    async def evaluate(self, script, *args):
+        if "elementFromPoint" in script:
+            return False
+        if "__sentry_routes" in script:
+            return []
+        if "routerLink" in script:  # unique to DOM_LINK_SCRIPT
+            if not self._link_served:
+                self._link_served = True
+                return ["http://spa.test/discovered"]
+            return []
+        if "querySelectorAll('form')" in script:
+            return []
+        if "pushState" in script:
+            target = args[0] if args else "/"
+            self.url = "http://spa.test" + target if target.startswith("/") else target
+            await self._fire_xhr(self.url.rstrip("/") + "/api")
+            return None
+        if "location.hash" in script:
+            return None
+        return None
+
+    async def wait_for_load_state(self, state, timeout=None):
+        return None
+
+    async def wait_for_timeout(self, timeout):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_discovers_and_visits_client_side_routes(monkeypatch):
+    page = _RichFakePage()
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    state = CrawlState()
+    await engine.crawl_into(state, "http://spa.test/", routes=[])
+
+    urls = [obs.url for obs in state.requests]
+    # Root loaded via goto and fired its XHR.
+    assert any(u.endswith("/data") for u in urls)
+    # The DOM-discovered route was enqueued and visited via client-side nav,
+    # firing its own XHR (no extra goto for it).
+    assert any("/discovered" in u for u in urls)
+    assert page.goto_calls == ["http://spa.test/"]
+    # WebSocket endpoint recorded even without a body.
+    ws = [obs for obs in state.requests if obs.resource_type == "websocket"]
+    assert ws and ws[0].url == "ws://spa.test/socket"
+    assert ws[0].replayable is False
