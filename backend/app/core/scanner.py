@@ -758,6 +758,18 @@ class ScanOrchestrator:
                 if getattr(request, "post_data", None)
             ]
         )
+        # Static body synthesis (Task 4) makes bodies testable even without an
+        # observed request body, so only report the coverage gap when nothing —
+        # observed or synthesizable — could feed a body-injection detector.
+        synthesizable_body_endpoints = 0
+        if not replayable_body_count and api_endpoints:
+            from app.core.crawler.api_extractor import ApiExtractor
+
+            synthesizable_body_endpoints = sum(
+                1
+                for endpoint in api_endpoints
+                if ApiExtractor.synthesize_body_schema(endpoint)[1]
+            )
         if detector_name in {
             "access_control",
             "authentication_failures",
@@ -777,7 +789,11 @@ class ScanOrchestrator:
             skipped["no_replayable_attack_targets"] = 1
         if detector_name in {"xss", "authentication_failures", "access_control"} and browser_available is False:
             skipped["browser_unavailable"] = 1
-        if detector_name in {"injection_sql_command", "xss", "file_inclusion"} and not replayable_body_count:
+        if (
+            detector_name in {"injection_sql_command", "xss", "file_inclusion"}
+            and not replayable_body_count
+            and not synthesizable_body_endpoints
+        ):
             skipped["no_replayable_request_bodies"] = 1
         if not findings and candidates_built > 0:
             skipped["no_findings_after_verification"] = 1

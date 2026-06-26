@@ -302,7 +302,110 @@ class AttackSurface:
                         )
                     )
 
+        cls._synthesize_body_targets(
+            api_endpoints or [],
+            requests or [],
+            targets,
+            seen,
+            filter_fn,
+        )
+
         return targets
+
+    # Maximum synthesized leaf targets per endpoint (bounds combinatorial growth).
+    _SYNTH_LEAF_CAP = 25
+
+    @classmethod
+    def _synthesize_body_targets(
+        cls,
+        api_endpoints: list[ApiEndpoint],
+        requests: list[RequestObservation],
+        targets: list[AttackTarget],
+        seen: set[tuple[str, str, str, str, str]],
+        filter_fn: Callable[[str], bool] | None,
+    ) -> None:
+        """Emit static-synthesis body targets for endpoints the browser never hit.
+
+        For each mutating endpoint without an observed body, synthesize a skeleton
+        JSON/form body and add one lower-confidence ``AttackTarget`` per leaf field
+        (``replayable=False``, ``source_confidence="static_synth"``). Observed and
+        already-emitted targets win via ``seen`` and the observed-body key set.
+        """
+        observed_body_keys = {
+            (request.url, request.method.upper())
+            for request in requests
+            if request.post_data
+        }
+        for endpoint in api_endpoints:
+            if (endpoint.url, endpoint.method.upper()) in observed_body_keys:
+                continue
+            content_type, template = ApiExtractor.synthesize_body_schema(endpoint)
+            if not template:
+                continue
+            synth_endpoint = ApiEndpoint(
+                url=endpoint.url,
+                method=endpoint.method,
+                content_type=content_type,
+                request_body=template,
+                multipart_fields=endpoint.multipart_fields,
+            )
+            is_multipart = _is_multipart_content_type(content_type)
+            is_form = is_multipart or "x-www-form-urlencoded" in (content_type or "").lower()
+            form_inputs = None
+            if is_form and isinstance(template, dict):
+                form_inputs = [
+                    _ObservedFormInput(
+                        name=name,
+                        input_type="file" if (is_multipart and _looks_like_file_field(name)) else "text",
+                        value=str(value),
+                    )
+                    for name, value in template.items()
+                    if name and not isinstance(value, (dict, list))
+                ]
+            emitted = 0
+            for parameter in ApiExtractor.parameters_from_endpoint(synth_endpoint):
+                if parameter.location not in {
+                    ParameterLocation.json_body,
+                    ParameterLocation.form,
+                    ParameterLocation.graphql_variable,
+                }:
+                    continue
+                if filter_fn and not filter_fn(parameter.name):
+                    continue
+                key = (
+                    parameter.url,
+                    parameter.method.upper(),
+                    parameter.name,
+                    parameter.location.value,
+                    parameter.parent_path or "",
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                is_body_json = parameter.location in {
+                    ParameterLocation.json_body,
+                    ParameterLocation.graphql_variable,
+                }
+                targets.append(
+                    AttackTarget(
+                        url=parameter.url,
+                        parameter=parameter.name,
+                        method=parameter.method.upper(),
+                        value=parameter.baseline_value,
+                        location=parameter.location,
+                        form_inputs=None if is_body_json else form_inputs,
+                        content_type=content_type,
+                        parent_path=parameter.parent_path,
+                        source="static_synth",
+                        json_template=template if is_body_json else None,
+                        security_relevance=set(parameter.security_relevance),
+                        replayable=False,
+                        source_confidence="static_synth",
+                    )
+                )
+                emitted += 1
+                if emitted >= cls._SYNTH_LEAF_CAP:
+                    break
 
     @staticmethod
     def _endpoint_templates(endpoints: list[ApiEndpoint]) -> dict[tuple[str, str], tuple[Any, dict[str, str]]]:

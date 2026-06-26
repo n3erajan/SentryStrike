@@ -580,6 +580,102 @@ class ApiExtractor:
             return [cls._template_from_schema(schema.get("items", {}), name_hint)]
         return cls._baseline_for_schema(schema, name_hint)
 
+    # Method families that carry a request body when injecting.
+    _BODY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+    _BODY_CONTENT_TYPES = (
+        "application/json",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+    )
+    # Generic REST verbs that imply a mutating body even without a declared schema.
+    _BODY_PATH_HINTS = (
+        "login",
+        "register",
+        "signup",
+        "signin",
+        "create",
+        "update",
+        "add",
+        "new",
+        "save",
+        "submit",
+        "post",
+        "checkout",
+        "order",
+        "comment",
+        "feedback",
+        "review",
+        "upload",
+        "token",
+    )
+
+    @classmethod
+    def synthesize_body_schema(cls, endpoint: ApiEndpoint) -> tuple[str | None, Any]:
+        """Synthesize a skeleton request body for body-injection detectors.
+
+        Returns ``(content_type, body_template)`` when a body can be inferred, or
+        ``(None, None)`` when the endpoint should not carry a synthesized body
+        (e.g. GET, or a mutating method with no usable signal). The template is
+        built from statically-known signals in priority order:
+
+        1. an already-declared/observed ``request_body`` (dict/list),
+        2. ``body_schema`` (a list of leaf field names),
+        3. ``multipart_fields`` metadata,
+        4. a single generic ``{"data": <placeholder>}`` when the method implies a
+           body *and* a body content-type or path hint is present.
+
+        Placeholders are inferred generically from field-name tokens; no
+        application-specific names or payloads are used.
+        """
+        method = (endpoint.method or "GET").upper()
+        content_type = (endpoint.content_type or "").lower()
+        is_body_ct = any(ct in content_type for ct in cls._BODY_CONTENT_TYPES)
+        implies_body = method in cls._BODY_METHODS
+        if method == "GET" or (not implies_body and not is_body_ct):
+            return None, None
+
+        # Priority 1: declared/observed body.
+        body = endpoint.request_body
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except Exception:
+                body = None
+        if isinstance(body, (dict, list)) and body:
+            return endpoint.content_type or "application/json", body
+
+        # Priority 2: a flat list of leaf field names.
+        schema = list(getattr(endpoint, "body_schema", None) or [])
+        if schema:
+            template = {name: cls._baseline_for_name(name) for name in schema if name}
+            if template:
+                return endpoint.content_type or "application/json", template
+
+        # Priority 3: multipart field metadata.
+        multipart = list(getattr(endpoint, "multipart_fields", None) or [])
+        if multipart:
+            template = {
+                field.get("name"): cls._baseline_for_name(field.get("name", ""))
+                for field in multipart
+                if isinstance(field, dict) and field.get("name")
+            }
+            if template:
+                return endpoint.content_type or "multipart/form-data", template
+
+        # Priority 4: generic fallback, only with an explicit body hint (avoid
+        # blindly spraying every mutating endpoint).
+        if is_body_ct or cls._path_hints_body(endpoint.url):
+            return endpoint.content_type or "application/json", {"data": cls._baseline_for_name("data")}
+        return None, None
+
+    @classmethod
+    def _path_hints_body(cls, url: str) -> bool:
+        try:
+            path = urlparse(url).path.lower()
+        except Exception:
+            return False
+        return any(hint in path for hint in cls._BODY_PATH_HINTS)
+
     @classmethod
     def _baseline_for_schema(cls, schema: Any, name_hint: str) -> Any:
         if isinstance(schema, dict):
