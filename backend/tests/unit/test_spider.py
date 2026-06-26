@@ -12,6 +12,15 @@ from app.core.crawler.spider import AuthReplayState, WebSpider
 from app.core.detectors.sensitive_paths import SensitivePathsDetector
 
 
+@pytest.fixture(autouse=True)
+def _disable_real_browser(monkeypatch):
+    """Unit tests must never launch a real browser (CI has no Chromium
+    guarantee). Dynamic-discovery behaviour is covered via mocks. Tests can
+    still opt in by overriding these env vars and clearing the settings cache."""
+    monkeypatch.setenv("CRAWL_BROWSER_ENABLED", "false")
+    monkeypatch.setenv("CRAWL_BROWSER_MODE", "never")
+
+
 @pytest.mark.asyncio
 async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch):
     """RC-1 regression: a truncated/erroring browser run still merges its partial
@@ -20,6 +29,10 @@ async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch
     class _StubEngine:
         def __init__(self, max_interactions=25):
             self.max_interactions = max_interactions
+
+        @staticmethod
+        async def check_readiness():
+            return True, None
 
         async def crawl_into(
             self,
@@ -52,6 +65,48 @@ async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch
     assert crawl_state.browser_available is True
     assert crawl_state.browser_forms_discovered == 1
     assert crawl_state.browser_error == "truncated mid-run"
+
+
+@pytest.mark.parametrize(
+    "enabled,mode,is_spa,expected",
+    [
+        (False, "auto", True, True),      # SPA in auto -> run
+        (False, "auto", False, False),    # non-SPA in auto -> skip
+        (False, "always", False, True),   # always -> run regardless
+        (False, "never", True, False),    # never -> skip even for SPA
+        (True, "never", False, True),     # legacy enabled overrides mode
+    ],
+)
+def test_should_run_browser_decision_matrix(monkeypatch, enabled, mode, is_spa, expected):
+    monkeypatch.setenv("CRAWL_BROWSER_ENABLED", "true" if enabled else "false")
+    monkeypatch.setenv("CRAWL_BROWSER_MODE", mode)
+    get_settings = __import__("app.config", fromlist=["get_settings"]).get_settings
+    get_settings.cache_clear()
+    try:
+        spider = WebSpider()
+        assert spider._should_run_browser(is_spa) is expected
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_run_browser_discovery_degrades_when_playwright_unavailable(monkeypatch):
+    class _UnreadyEngine:
+        def __init__(self, max_interactions=25):
+            raise AssertionError("engine must not be constructed when unavailable")
+
+        @staticmethod
+        async def check_readiness():
+            return False, "Playwright import failed: boom"
+
+    monkeypatch.setattr(spider_module, "BrowserDiscoveryEngine", _UnreadyEngine)
+
+    spider = WebSpider()
+    crawl_state = CrawlState()
+    await spider._run_browser_discovery(crawl_state, "http://spa.test/", ["/a"])
+
+    assert crawl_state.browser_available is False
+    assert "Playwright import failed" in crawl_state.browser_error
 
 
 class MultiPageHandler(BaseHTTPRequestHandler):

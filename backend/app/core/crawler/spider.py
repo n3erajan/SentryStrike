@@ -362,7 +362,7 @@ class WebSpider:
                     w.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
 
-            if self.settings.crawl_browser_enabled:
+            if self._should_run_browser(self._is_spa or spa_detector.root_looks_like_spa()):
                 browser_routes = [route.url for route in crawl_state.routes if route.source == RouteSource.javascript]
                 await self._run_browser_discovery(crawl_state, root_url, browser_routes)
 
@@ -501,6 +501,22 @@ class WebSpider:
                 if same_domain(root_url, endpoint.url):
                     crawl_state.add_api_endpoint(endpoint)
 
+    def _should_run_browser(self, is_spa: bool) -> bool:
+        """Decide whether dynamic browser discovery should run.
+
+        ``crawl_browser_enabled`` (legacy) forces it on. Otherwise honour
+        ``crawl_browser_mode``: ``always`` runs for any target, ``never`` is
+        static-only, and ``auto`` runs only when the target looks like an SPA.
+        """
+        if self.settings.crawl_browser_enabled:
+            return True
+        mode = (self.settings.crawl_browser_mode or "auto").strip().lower()
+        if mode == "never":
+            return False
+        if mode == "always":
+            return True
+        return bool(is_spa)  # auto
+
     async def _run_browser_discovery(
         self,
         crawl_state: CrawlState,
@@ -519,6 +535,15 @@ class WebSpider:
         the clean in-engine deadline stop normally fires first. Partial results
         already streamed into ``browser_state`` survive either path.
         """
+        # Probe Playwright once; on failure, degrade to static-only cleanly
+        # rather than crashing the crawl.
+        ready, reason = await BrowserDiscoveryEngine.check_readiness()
+        if not ready:
+            logger.warning("browser discovery unavailable; continuing static-only: %s", reason)
+            crawl_state.browser_available = False
+            crawl_state.browser_error = reason or "browser discovery unavailable"
+            return
+
         loop = asyncio.get_running_loop()
         budget = self.settings.crawl_browser_budget_seconds
         deadline = loop.time() + budget
