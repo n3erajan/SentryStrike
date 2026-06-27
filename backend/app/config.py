@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     crawl_browser_mode: str = Field(default="auto", alias="CRAWL_BROWSER_MODE")
     crawl_browser_max_interactions: int = Field(default=25, alias="CRAWL_BROWSER_MAX_INTERACTIONS")
     crawl_browser_budget_seconds: float = Field(default=300.0, alias="CRAWL_BROWSER_BUDGET_SECONDS")
+    # Bounds for the XSS browser-driven DOM reflection sweep (Task 5). Caps the
+    # number of route+param probes and the wall-clock spent so the phase can
+    # never dominate a scan.
+    xss_browser_dom_max_jobs: int = Field(default=12, alias="XSS_BROWSER_DOM_MAX_JOBS")
+    xss_browser_dom_budget_seconds: float = Field(default=60.0, alias="XSS_BROWSER_DOM_BUDGET_SECONDS")
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     scanner_concurrency: int = Field(default=8, alias="SCANNER_CONCURRENCY")
 

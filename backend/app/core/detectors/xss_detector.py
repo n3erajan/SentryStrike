@@ -2,10 +2,17 @@ import asyncio
 import logging
 
 from app.config import get_settings
+from app.core.crawler.models import ParameterLocation
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.base_detector import BaseDetector, Finding
-from app.core.verification.response_analyzer import ResponseData
-from app.core.verification.xss_verifier import PendingBrowserVerification, XSSVerifier
+from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
+from app.core.verification.xss_verifier import (
+    PLAYWRIGHT_AVAILABLE,
+    PendingBrowserVerification,
+    XSSVerifier,
+    async_playwright,
+)
+from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +90,9 @@ class XSSDetector(BaseDetector):
             )
 
         findings.extend(await self._static_dom_findings_with_browser_confirmation(kwargs, session_cookies))
+
+        browser_available = bool(kwargs.get("browser_available"))
+        routes = kwargs.get("routes") or []
 
         def xss_filter(param_name: str) -> bool:
             param_lower = param_name.lower()
@@ -215,7 +225,176 @@ class XSSDetector(BaseDetector):
             finally:
                 await browser_verifier.close()
 
+        # ── Phase 1.5: Browser-driven DOM reflection sweep ────────────────────────
+        # Detect XSS that only executes in the rendered DOM (the dominant SPA
+        # class), independent of HTTP-body reflection. Gated on a real browser
+        # and bounded in both job count and wall-clock.
+        findings.extend(
+            await self._browser_dom_reflection_sweep(
+                targets, routes, session_cookies, browser_available, findings,
+            )
+        )
+
         return findings
+
+    async def _browser_dom_reflection_sweep(
+        self,
+        targets: list[AttackTarget],
+        routes: list[object],
+        session_cookies: dict,
+        browser_available: bool,
+        existing_findings: list[Finding],
+    ) -> list[Finding]:
+        """Navigate SPA routes with an executing canary and confirm DOM execution.
+
+        Prioritises reflective params (and those the HTTP phase echoed), bounds
+        the number of probes and total time, and reuses one browser context for
+        the whole sweep. Skips silently when no browser is available.
+        """
+        if not browser_available:
+            logger.debug("XSSDetector: browser unavailable, skipping DOM reflection sweep.")
+            return []
+        if not PLAYWRIGHT_AVAILABLE:
+            return []
+
+        settings = get_settings()
+        max_jobs = max(0, int(getattr(settings, "xss_browser_dom_max_jobs", 12)))
+        budget = float(getattr(settings, "xss_browser_dom_budget_seconds", 60.0))
+        if max_jobs == 0 or budget <= 0:
+            return []
+
+        jobs = self._select_dom_reflection_jobs(targets, existing_findings, max_jobs)
+        if not jobs:
+            return []
+
+        # Routes discovered by the crawler are valid SPA navigation surfaces; any
+        # candidate whose URL is a known route (or carries a query param) qualifies.
+        route_urls = {getattr(route, "url", None) or str(route) for route in routes}
+
+        findings: list[Finding] = []
+        seen_hits: set[tuple[str, str]] = set()
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + budget
+
+        verifier = XSSVerifier()
+        verifier.http_verifier.cookies = session_cookies
+        context = None
+        p = None
+        try:
+            p = await async_playwright().start()
+            browser = await p.chromium.launch(headless=True)
+            for route_url, param, location in jobs:
+                if loop.time() >= deadline:
+                    logger.debug("XSSDetector: DOM reflection sweep hit time budget.")
+                    break
+                key = (route_url, param)
+                if key in seen_hits:
+                    continue
+                if context is None:
+                    context = await verifier._new_reflection_context(browser, route_url)
+                canary = ResponseAnalyzer.generate_probe_canary()
+                try:
+                    fired = await asyncio.wait_for(
+                        verifier.verify_reflected_dom(
+                            route_url, param, location, canary=canary, context=context,
+                        ),
+                        timeout=min(15.0, max(1.0, deadline - loop.time())),
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as exc:
+                    logger.debug("DOM reflection sweep failed for %s param=%s: %s", route_url, param, exc)
+                    continue
+                if not fired:
+                    continue
+                seen_hits.add(key)
+                findings.append(
+                    verifier._create_finding(
+                        category=OwaspCategory.a05,
+                        vuln_type="DOM-Based XSS",
+                        severity=SeverityLevel.high,
+                        url=route_url,
+                        parameter=param,
+                        payload=f"<img src=x onerror=window.sentry_hook('{canary}')>",
+                        evidence=(
+                            "Browser execution confirmed: a uniquely-hooked canary injected into "
+                            f"parameter '{param}' via {location} executed in the rendered DOM, with no "
+                            "dependency on HTTP-body reflection."
+                        ),
+                        confidence_score=90.0,
+                        detection_method="dom_xss_browser_execution",
+                        method="GET",
+                        detection_evidence={
+                            "parameter": param,
+                            "injection_location": location,
+                            "browser_execution_confirmed": True,
+                            "route_backed": route_url in route_urls,
+                        },
+                        reproducible=True,
+                        verified=True,
+                    )
+                )
+        except Exception as exc:
+            logger.debug("XSSDetector: DOM reflection sweep aborted: %s", exc)
+        finally:
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+            await verifier.close()
+            if p is not None:
+                try:
+                    await p.stop()
+                except Exception:
+                    pass
+        return findings
+
+    def _select_dom_reflection_jobs(
+        self,
+        targets: list[AttackTarget],
+        existing_findings: list[Finding],
+        max_jobs: int,
+    ) -> list[tuple[str, str, str]]:
+        """Pick a bounded, prioritised set of (route_url, param, location) probes.
+
+        Priority: params the HTTP phase already echoed (partial reflection), then
+        classic reflective names. Only query/fragment-reachable GET targets are
+        eligible — SPAs read these from location.search/hash.
+        """
+        echoed_params = {
+            f.parameter for f in existing_findings if getattr(f, "parameter", None)
+        }
+        prioritized: list[tuple[str, str, str]] = []
+        fallback: list[tuple[str, str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for target in targets:
+            if not isinstance(target, AttackTarget):
+                continue
+            if target.method.upper() != "GET":
+                continue
+            if target.location not in (ParameterLocation.query, ParameterLocation.path):
+                continue
+            param = target.parameter
+            key = (target.url, param)
+            if key in seen:
+                continue
+            seen.add(key)
+            # SPAs read from both search and hash; probe both.
+            entry = (target.url, param, "both")
+            param_lower = param.lower()
+            reflective = (
+                param_lower in self.reflective_param_names
+                or any(tok in param_lower for tok in self._reflective_tokens)
+            )
+            if param in echoed_params:
+                prioritized.insert(0, entry)
+            elif reflective:
+                prioritized.append(entry)
+            else:
+                fallback.append(entry)
+        ordered = prioritized + fallback
+        return ordered[:max_jobs]
 
     @staticmethod
     def _static_dom_findings(kwargs: dict[str, object]) -> list[Finding]:

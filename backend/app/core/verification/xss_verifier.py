@@ -22,6 +22,7 @@ try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
+    async_playwright = None
     PLAYWRIGHT_AVAILABLE = False
 
 from app.core.crawler.models import ParameterLocation
@@ -753,6 +754,132 @@ class XSSVerifier(BaseVerifier):
                 await context.close()
                 await browser.close()
 
+        return False
+
+    async def verify_reflected_dom(
+        self,
+        route_url: str,
+        parameter: str,
+        location: str,
+        *,
+        canary: Optional[str] = None,
+        context=None,
+    ) -> bool:
+        """Navigate an SPA route with an executing canary and assert on DOM execution.
+
+        Injects an ``onerror``/hook payload into ``parameter`` at ``location``
+        (``query`` or ``fragment``) and returns ``True`` when the hook actually
+        fires in the rendered DOM — independent of any HTTP-body reflection.
+
+        A caller-supplied ``context`` (Playwright BrowserContext) is reused when
+        provided so a whole sweep shares one browser launch; otherwise a
+        short-lived browser is launched for this single probe. Every navigation
+        is time-bounded so a single route cannot stall the sweep.
+        """
+        if not PLAYWRIGHT_AVAILABLE:
+            return False
+
+        canary = canary or ResponseAnalyzer.generate_probe_canary()
+        payload = f"<img src=x onerror=window.sentry_hook('{canary}')>"
+        probe_urls = self._build_reflection_probe_urls(route_url, parameter, location, payload)
+        if not probe_urls:
+            return False
+
+        if context is not None:
+            return await self._sweep_reflection_probes(context, probe_urls, canary)
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                ctx = await self._new_reflection_context(browser, route_url)
+                try:
+                    return await self._sweep_reflection_probes(ctx, probe_urls, canary)
+                finally:
+                    await ctx.close()
+            finally:
+                await browser.close()
+
+    def _build_reflection_probe_urls(
+        self, route_url: str, parameter: str, location: str, payload: str
+    ) -> list[str]:
+        """Build query and/or fragment injection URLs for a route+param.
+
+        SPAs read user input from both ``location.search`` and ``location.hash``,
+        so for SPA routes we try both delivery vectors unless the caller pins one.
+        """
+        parsed = urlparse(route_url)
+        probes: list[str] = []
+        want_query = location in ("query", "both", "")
+        want_fragment = location in ("fragment", "hash", "both", "")
+
+        if want_query:
+            parts = list(parsed)
+            query = dict(parse_qsl(parts[4], keep_blank_values=True))
+            query[parameter] = payload
+            parts[4] = urlencode(query)
+            probes.append(urlunparse(parts))
+        if want_fragment:
+            parts = list(parsed)
+            existing = parts[5]
+            fragment_query = f"{parameter}={quote(payload, safe='')}"
+            if existing and "=" in existing:
+                parts[5] = f"{existing}&{fragment_query}"
+            elif existing:
+                parts[5] = f"{existing}?{fragment_query}"
+            else:
+                parts[5] = fragment_query
+            probes.append(urlunparse(parts))
+        return list(dict.fromkeys(probes))
+
+    async def _new_reflection_context(self, browser, route_url: str):
+        context = await browser.new_context(
+            ignore_https_errors=True, user_agent="SentryStrikeScanner/1.0"
+        )
+        cookies = getattr(self.http_verifier, "cookies", None)
+        if cookies:
+            domain = urlparse(route_url).netloc.split(":")[0]
+            playwright_cookies = [
+                {"name": str(k), "value": str(v), "domain": domain, "path": "/"}
+                for k, v in cookies.items()
+            ]
+            if playwright_cookies:
+                try:
+                    await context.add_cookies(playwright_cookies)
+                except Exception:
+                    pass
+        return context
+
+    async def _sweep_reflection_probes(self, context, probe_urls: list[str], canary: str) -> bool:
+        for probe_url in probe_urls:
+            page = await context.new_page()
+            await self._install_xss_browser_hooks(page, canary)
+
+            async def handle_dialog(dialog):
+                try:
+                    if canary in (dialog.message or ""):
+                        setattr(page, "_fired", True)
+                    await dialog.dismiss()
+                except Exception:
+                    pass
+
+            page.on("dialog", lambda dialog: asyncio.create_task(handle_dialog(dialog)))
+            try:
+                await page.goto(probe_url, wait_until="domcontentloaded", timeout=5000)
+                # Some SPAs only re-read the hash on a hashchange event.
+                try:
+                    await page.evaluate(
+                        "() => window.dispatchEvent(new HashChangeEvent('hashchange'))"
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(0.35)
+                if bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page):
+                    return True
+            except Exception as exc:
+                logger.debug("Reflected DOM XSS probe failed for %s: %s", probe_url, exc)
+            finally:
+                if not page.is_closed():
+                    await page.close()
         return False
 
     async def run_browser_verification(self, job: PendingBrowserVerification) -> list[Finding]:
