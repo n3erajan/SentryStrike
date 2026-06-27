@@ -3,6 +3,7 @@ from urllib.parse import urlparse
 
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.detectors.param_selection import REDIRECT_NAME_TOKENS, redirect_candidate
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
@@ -10,11 +11,8 @@ from app.models.vulnerability import OwaspCategory, SeverityLevel
 class OpenRedirectDetector(BaseDetector):
     name = "open_redirect"
 
-    redirect_param_tokens = {
-        "next", "return", "return_to", "return_url", "redirect", "redirect_to",
-        "redirect_url", "redirect_uri", "callback", "callback_url", "continue",
-        "url", "target", "dest", "destination", "goto", "back",
-    }
+    # Name half of the name-OR-value selection (see param_selection).
+    redirect_param_tokens = REDIRECT_NAME_TOKENS
 
     payloads = (
         "https://sentrystrike.invalid/open-redirect",
@@ -25,20 +23,19 @@ class OpenRedirectDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         session_cookies = kwargs.get("session_cookies") or {}
 
-        def redirect_filter(param_name: str) -> bool:
-            lowered = param_name.lower()
-            return lowered in self.redirect_param_tokens or any(
-                token in lowered for token in ("redirect", "return", "callback", "next")
+        # Build the surface unfiltered, then select on name-OR-value so params
+        # whose name is generic but whose value looks like a URL/path qualify.
+        candidates = [
+            candidate
+            for candidate in AttackSurface.build(
+                urls,
+                forms,
+                parameters=kwargs.get("parameters") or [],
+                api_endpoints=kwargs.get("api_endpoints") or [],
+                requests=kwargs.get("requests") or [],
             )
-
-        candidates = AttackSurface.build(
-            urls,
-            forms,
-            parameters=kwargs.get("parameters") or [],
-            api_endpoints=kwargs.get("api_endpoints") or [],
-            requests=kwargs.get("requests") or [],
-            filter_fn=redirect_filter,
-        )
+            if redirect_candidate(candidate.parameter, candidate.value)
+        ]
         if not candidates:
             return []
 

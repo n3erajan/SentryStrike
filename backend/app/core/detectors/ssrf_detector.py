@@ -5,6 +5,7 @@ import re
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
+from app.core.detectors.param_selection import SSRF_NAME_TOKENS, ssrf_candidate
 from app.core.verification.oast import OastClient
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
@@ -15,9 +16,8 @@ logger = logging.getLogger(__name__)
 class SSRFDetector(BaseDetector):
     name = "ssrf"
 
-    ssrf_param_tokens = {
-        "url", "link", "src", "dest", "redirect", "fetch", "load", "uri", "path", "domain", "host", "proxy", "site"
-    }
+    # Name half of the name-OR-value selection (see param_selection).
+    ssrf_param_tokens = SSRF_NAME_TOKENS
 
     # SSRF verification payloads
     SSRF_PAYLOADS = [
@@ -37,20 +37,19 @@ class SSRFDetector(BaseDetector):
                 timeout_seconds=settings.request_timeout_seconds,
             )
 
-        def ssrf_filter(param_name: str) -> bool:
-            param_lower = param_name.lower()
-            return param_lower in self.ssrf_param_tokens or any(
-                tok in param_lower for tok in ["url", "link", "redirect"]
+        # Build the surface unfiltered, then select on name-OR-value so params
+        # whose value looks like a URL qualify even with a generic name.
+        candidates = [
+            candidate
+            for candidate in AttackSurface.build(
+                urls,
+                forms,
+                parameters=kwargs.get("parameters") or [],
+                api_endpoints=kwargs.get("api_endpoints") or [],
+                requests=kwargs.get("requests") or [],
             )
-
-        candidates = AttackSurface.build(
-            urls,
-            forms,
-            parameters=kwargs.get("parameters") or [],
-            api_endpoints=kwargs.get("api_endpoints") or [],
-            requests=kwargs.get("requests") or [],
-            filter_fn=ssrf_filter,
-        )
+            if ssrf_candidate(candidate.parameter, candidate.value)
+        ]
 
         if not candidates:
             return []

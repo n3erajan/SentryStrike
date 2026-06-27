@@ -9,6 +9,7 @@ import httpx
 from app.core.crawler.models import ParameterLocation
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.detectors.param_selection import FILE_NAME_TOKENS, file_candidate
 from app.core.payload_profile import PayloadProfile, build_payload_profile
 from app.core.verification.response_analyzer import ResponseAnalyzer
 from app.core.verification.verification_framework import HttpVerifier
@@ -20,9 +21,8 @@ logger = logging.getLogger(__name__)
 class FileInclusionDetector(BaseDetector):
     name = "file_inclusion"
 
-    fi_param_tokens = {
-        "page", "file", "path", "include", "template", "doc", "dir", "load", "url", "src", "dest", "view"
-    }
+    # Name half of the name-OR-value selection (see param_selection).
+    fi_param_tokens = FILE_NAME_TOKENS
 
     LFI_PAYLOADS = [
         ("../../../../etc/passwd", r"root:x:0:0:", "Linux /etc/passwd LFI"),
@@ -182,18 +182,19 @@ class FileInclusionDetector(BaseDetector):
         lfi_payloads = self._select_lfi_payloads(payload_profile)
         rfi_payloads = self._select_rfi_payloads(payload_profile)
 
-        def fi_filter(param_name: str) -> bool:
-            param_lower = param_name.lower()
-            return param_lower in self.fi_param_tokens or any(tok in param_lower for tok in ["file", "page", "path", "inc"])
-            
-        candidates = AttackSurface.build(
-            urls,
-            forms,
-            parameters=kwargs.get("parameters") or [],
-            api_endpoints=kwargs.get("api_endpoints") or [],
-            requests=kwargs.get("requests") or [],
-            filter_fn=fi_filter,
-        )
+        # Build the surface unfiltered, then select on name-OR-value so params
+        # whose value looks like a path/file qualify even with a generic name.
+        candidates = [
+            candidate
+            for candidate in AttackSurface.build(
+                urls,
+                forms,
+                parameters=kwargs.get("parameters") or [],
+                api_endpoints=kwargs.get("api_endpoints") or [],
+                requests=kwargs.get("requests") or [],
+            )
+            if file_candidate(candidate.parameter, candidate.value)
+        ]
 
         if not candidates:
             return []
