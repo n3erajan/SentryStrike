@@ -9,6 +9,29 @@ from app.models.vulnerability import OwaspCategory, SeverityLevel
 logger = logging.getLogger(__name__)
 
 
+class _FormInputView:
+    """Attribute view of a browser-discovered form input (dict → object)."""
+
+    __slots__ = ("name", "input_type", "value")
+
+    def __init__(self, name: str, input_type: str, value: object) -> None:
+        self.name = name
+        self.input_type = input_type
+        self.value = value
+
+
+class _FormView:
+    """Attribute view of a browser-discovered form so it reads like an HtmlForm."""
+
+    __slots__ = ("action", "page_url", "method", "inputs")
+
+    def __init__(self, action: str, page_url: str, method: str, inputs: list) -> None:
+        self.action = action
+        self.page_url = page_url
+        self.method = method
+        self.inputs = inputs
+
+
 class CSRFDetector(BaseDetector):
     name = "csrf"
 
@@ -16,27 +39,42 @@ class CSRFDetector(BaseDetector):
     state_changing_actions = {"password", "update", "change", "profile", "user", "admin", "delete", "add", "create", "settings", "save"}
     login_indicators = {"login", "signin", "sign-in", "authenticate", "auth", "session"}
 
-    async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
-        findings: list[Finding] = []
-        session_cookies = kwargs.get("session_cookies") or {}
+    @staticmethod
+    def _normalize_form(form: object) -> object:
+        """Coerce a browser-discovered form dict into an HtmlForm-like object.
 
-        if not session_cookies:
-            # CSRF active verification requires session state to determine if actions successfully change state
-            return []
+        Static crawler forms (``HtmlForm``/``FormInput``) already expose the
+        ``action``/``method``/``inputs`` attributes the detector reads, so they
+        pass through untouched. Browser forms (Task 2) arrive as plain dicts.
+        """
+        if not isinstance(form, dict):
+            return form
+        action = str(form.get("action") or form.get("page_url") or "")
+        page_url = str(form.get("page_url") or "")
+        method = str(form.get("method") or "POST")
+        inputs: list[object] = []
+        for item in form.get("inputs") or []:
+            if isinstance(item, dict):
+                inputs.append(
+                    _FormInputView(
+                        name=str(item.get("name", "")),
+                        input_type=str(item.get("type") or item.get("input_type") or "text"),
+                        value=item.get("value", ""),
+                    )
+                )
+            else:
+                inputs.append(item)
+        return _FormView(action=action, page_url=page_url, method=method, inputs=inputs)
 
-        # Authed client to perform actions
-        verifier = HttpVerifier(cookies=session_cookies)
-        verifier.set_request_context(module="csrf")
-        semaphore = asyncio.Semaphore(4)
-
-        # Detect candidate forms
-        form_candidates = []
+    def _select_candidate_forms(self, forms: list[object]) -> list[tuple]:
+        """Return state-changing, non-login form candidates for CSRF assessment."""
+        form_candidates: list[tuple] = []
         for form in forms:
-            form_url = getattr(form, "action", getattr(form, "page_url", ""))
-            form_method = getattr(form, "method", "POST").upper()
+            form_url = getattr(form, "action", "") or getattr(form, "page_url", "")
+            form_method = (getattr(form, "method", "POST") or "POST").upper()
             raw_inputs = list(getattr(form, "inputs", []))
             input_names_lower = {getattr(inp, "name", "").lower() for inp in raw_inputs}
-            
+
             # Check if form controls state-changing action
             url_path_lower = urlparse(form_url).path.lower()
             is_state_changing = any(kw in url_path_lower for kw in self.state_changing_actions)
@@ -48,14 +86,77 @@ class CSRFDetector(BaseDetector):
                 "username" in input_names_lower or "email" in input_names_lower
             ):
                 continue
-            
+
             # Phase 3: Setup routes
             setup_tokens = {"setup", "install", "wizard", "onboarding"}
             is_setup_route = any(tok in url_path_lower for tok in setup_tokens)
 
-            
             if form_method == "POST" or is_state_changing:
                 form_candidates.append((form_url, form_method, raw_inputs, is_setup_route))
+        return form_candidates
+
+    def _token_auth_posture(self, form_candidates: list[tuple]) -> list[Finding]:
+        """Informational posture note for header/bearer-token apps.
+
+        Ambient-cookie CSRF does not apply when the app authenticates with a
+        bearer token (browsers never attach it cross-site), so we never fabricate
+        a vulnerability here — only surface an informational note if
+        state-changing endpoints exist.
+        """
+        findings: list[Finding] = []
+        seen: set[tuple[str, str]] = set()
+        for form_url, method, _raw_inputs, _is_setup in form_candidates:
+            key = (form_url.split("?")[0], method)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(
+                Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Cross-Site Request Forgery (CSRF)",
+                    severity=SeverityLevel.info,
+                    url=form_url,
+                    parameter="missing_token",
+                    method=method,
+                    evidence=(
+                        "State-changing endpoint on a header/bearer-token application. "
+                        "Ambient-cookie CSRF is not applicable because bearer tokens are not "
+                        "attached to cross-site requests automatically. Confirm the token is "
+                        "never stored in a cookie and that no cookie-based session fallback exists."
+                    ),
+                    confidence_score=40.0,
+                    detection_method="csrf_posture_token_auth",
+                    reproducible=False,
+                    verified=False,
+                )
+            )
+        return findings
+
+    async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
+        findings: list[Finding] = []
+        session_cookies = kwargs.get("session_cookies") or {}
+        auth_headers = kwargs.get("auth_headers") or {}
+        browser_forms = kwargs.get("browser_forms") or []
+
+        # Merge static crawler forms with browser-discovered forms (Task 2/8):
+        # SPAs render their forms only in the DOM, so static discovery finds none.
+        all_forms = [self._normalize_form(f) for f in list(forms) + list(browser_forms)]
+        form_candidates = self._select_candidate_forms(all_forms)
+
+        # Auth-model-aware branching (Task 8): cookie-auth keeps the active
+        # token-tamper / Origin-bypass verification below; header/bearer-token
+        # auth is not exposed to ambient-cookie CSRF, so we only emit an
+        # informational posture note and never fabricate a finding.
+        if not session_cookies:
+            if auth_headers and form_candidates:
+                return self._token_auth_posture(form_candidates)
+            # No session state and no token auth: cannot verify state changes.
+            return []
+
+        # Authed client to perform actions
+        verifier = HttpVerifier(cookies=session_cookies)
+        verifier.set_request_context(module="csrf")
+        semaphore = asyncio.Semaphore(4)
 
         async def verify_csrf(candidate) -> list[Finding]:
             form_url, method, raw_inputs, is_setup_route = candidate

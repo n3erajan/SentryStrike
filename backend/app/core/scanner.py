@@ -344,6 +344,7 @@ class ScanOrchestrator:
                 "dead_routes": getattr(crawl_result, "dead_routes", []),
                 "browser_available": getattr(crawl_result, "browser_available", None),
                 "browser_error": getattr(crawl_result, "browser_error", None),
+                "browser_forms": getattr(crawl_result, "browser_forms", []),
             }
             await self._apply_submitted_account_sessions(scan, auth_accounts_by_role, crawl_context)
             coverage_context = {
@@ -769,6 +770,7 @@ class ScanOrchestrator:
         requests = crawl_context.get("requests") or []
         auth_headers = crawl_context.get("auth_headers") or {}
         session_cookies = crawl_context.get("session_cookies") or {}
+        browser_forms = crawl_context.get("browser_forms") or []
         browser_available = crawl_context.get("browser_available")
 
         replayable_body_count = len(
@@ -796,7 +798,7 @@ class ScanOrchestrator:
             "csrf",
         } and not (auth_headers or session_cookies):
             skipped["missing_auth_context"] = 1
-        if detector_name == "csrf" and not session_cookies:
+        if detector_name == "csrf" and not session_cookies and not auth_headers:
             skipped["missing_session_cookies"] = 1
         if detector_name in {
             "injection_sql_command",
@@ -848,7 +850,8 @@ class ScanOrchestrator:
             ]
             return max(len(forms) + len(multipart_requests), len(findings or []))
         if detector_name in {"csrf", "authentication_failures"}:
-            return max(len(forms) + len(requests), len(findings or []))
+            browser_forms = crawl_context.get("browser_forms") or []
+            return max(len(forms) + len(browser_forms) + len(requests), len(findings or []))
         if detector_name == "exception_handling":
             return max(len(parameters) + len(forms), len(findings or []))
 
