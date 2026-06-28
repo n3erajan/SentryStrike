@@ -11,7 +11,7 @@ from app.config import get_settings
 
 from app.analyzers.ai_client import OllamaClient
 from app.analyzers.report_generator import AiReportGenerator
-from app.core.crawler.account_session import resolve_account_session
+from app.core.crawler.account_session import provision_secondary_session, resolve_account_session
 from app.core.crawler.spider import WebSpider
 from app.core.detectors.access_control import AccessControlDetector
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
@@ -224,7 +224,9 @@ class ScanOrchestrator:
         The access-control detector reads ``second_user_cookies``/``_headers`` and
         ``privileged_cookies``/``_headers`` from these kwargs (preferring them over
         the env-based SCAN_AUTH_* settings), so IDOR / privilege-escalation checks
-        run against sessions minted from the user-submitted credentials.
+        run against sessions minted from the user-submitted credentials. When no
+        second identity is submitted, a throwaway one may be auto-provisioned
+        (gated by ``ALLOW_SECONDARY_PROVISIONING``).
         """
         role_to_kwargs = {
             "second": ("second_user_cookies", "second_user_headers"),
@@ -246,6 +248,24 @@ class ScanOrchestrator:
                 len(session.cookies),
                 len(session.headers),
             )
+
+        # When no second identity was submitted, optionally auto-provision a
+        # throwaway one (gated by ALLOW_SECONDARY_PROVISIONING) so cross-identity
+        # IDOR/BOLA differentials can run without operator-supplied accounts.
+        already_have_second = bool(
+            crawl_context.get("second_user_cookies") or crawl_context.get("second_user_headers")
+        )
+        if not already_have_second:
+            provisioned = await provision_secondary_session(scan.target_url)
+            if provisioned.usable:
+                crawl_context["second_user_cookies"] = provisioned.cookies
+                crawl_context["second_user_headers"] = provisioned.headers
+                logger.info(
+                    "injected auto-provisioned secondary identity for access-control testing "
+                    "(cookies=%d, headers=%d)",
+                    len(provisioned.cookies),
+                    len(provisioned.headers),
+                )
 
     async def run_scan(self, scan_id: str) -> None:
         scan = await self.repository.get_by_id(scan_id)

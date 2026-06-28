@@ -103,3 +103,43 @@ async def resolve_account_session(root_url: str, account: ScanAuthAccount) -> Re
             logger.warning("session resolution errored for %s account: %s", account.role.value, exc)
 
     return session
+
+
+async def provision_secondary_session(root_url: str) -> ResolvedSession:
+    """Auto-provision a throwaway second identity for differential IDOR/BOLA.
+
+    Gated by ``allow_secondary_provisioning``. Registers and logs in a random
+    throwaway user against ``root_url`` and returns its session. Never raises:
+    when provisioning is disabled or not possible, returns an empty (unusable)
+    session so IDOR simply falls back to whatever identities already exist.
+    """
+    session = ResolvedSession()
+    settings = get_settings()
+    if not getattr(settings, "allow_secondary_provisioning", False):
+        return session
+
+    try:
+        async with create_scan_client(
+            timeout=settings.request_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "SentryStrikeScanner/1.0"},
+        ) as client:
+            result = await SmartAuthenticator(settings).acquire_secondary_identity(client, root_url)
+            if result and result.authenticated:
+                session.cookies.update(result.cookies or {})
+                for cookie in client.cookies.jar:
+                    session.cookies.setdefault(cookie.name, cookie.value)
+                if result.bearer_token:
+                    session.headers["Authorization"] = f"Bearer {result.bearer_token}"
+                logger.info(
+                    "auto-provisioned secondary identity on %s (cookies=%d, bearer=%s)",
+                    root_url,
+                    len(session.cookies),
+                    bool(result.bearer_token),
+                )
+            else:
+                logger.info("secondary identity could not be auto-provisioned on %s", root_url)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("secondary identity provisioning errored on %s: %s", root_url, exc)
+
+    return session

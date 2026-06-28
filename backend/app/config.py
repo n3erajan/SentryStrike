@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     authentication_second_header: str | None = Field(default=None, alias="SCAN_AUTH_SECOND_HEADER")
     authentication_privileged_cookie: str | None = Field(default=None, alias="SCAN_AUTH_PRIVILEGED_COOKIE")
     authentication_privileged_header: str | None = Field(default=None, alias="SCAN_AUTH_PRIVILEGED_HEADER")
+    allow_secondary_provisioning: bool = Field(default=False, alias="ALLOW_SECONDARY_PROVISIONING")
     authentication_login_url: str | None = Field(default=None, alias="SCAN_AUTH_LOGIN_URL")
     authentication_success_url: str | None = Field(default=None, alias="SCAN_AUTH_SUCCESS_URL")
     authentication_success_text: str | None = Field(default=None, alias="SCAN_AUTH_SUCCESS_TEXT")

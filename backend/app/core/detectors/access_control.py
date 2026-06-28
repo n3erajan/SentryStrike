@@ -57,6 +57,28 @@ _NUMERIC_RE = re.compile(r"^\d+$")
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
+# Long hex identifiers (Mongo ObjectId = 24, SHA-1 = 40, etc.).
+_LONG_HEX_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
+# Opaque base64url/token identifiers: long, mixed, and containing a digit so
+# ordinary path words ("changelog", "dashboard") are not treated as ids.
+_OPAQUE_ID_SEGMENT_RE = re.compile(r"^(?=.*\d)[A-Za-z0-9_\-]{12,}$")
+
+
+def _looks_like_path_id_segment(segment: str) -> bool:
+    """True when a REST path segment looks like an object id.
+
+    Covers pure integers, UUIDs, long hex strings (ObjectId/SHA), and opaque
+    base64url-style tokens that mix letters and digits. Purely alphabetic
+    segments are never treated as ids so route words are not fuzzed.
+    """
+    if not segment:
+        return False
+    if _NUMERIC_RE.match(segment) or _UUID_RE.match(segment):
+        return True
+    if _LONG_HEX_RE.match(segment):
+        return True
+    return bool(_OPAQUE_ID_SEGMENT_RE.match(segment))
+
 
 # ---------------------------------------------------------------------------
 # IDOR value classification
@@ -1190,7 +1212,7 @@ class AccessControlDetector(BaseDetector):
             parsed = urlparse(url)
             segments = [s for s in parsed.path.split("/") if s]
             for i, segment in enumerate(segments):
-                if _NUMERIC_RE.match(segment) or _UUID_RE.match(segment):
+                if _looks_like_path_id_segment(segment):
                     targets.append(
                         AttackTarget(
                             url=url,
@@ -1211,7 +1233,12 @@ class AccessControlDetector(BaseDetector):
     ) -> list[str]:
         values: list[str] = []
         raw = str(target.value if target.value is not None else "")
-        if _is_valid_id_value(raw):
+        # Concrete path-segment ids are already vetted by
+        # ``_looks_like_path_id_segment`` and may exceed the opaque-token length
+        # cap (SHA/base64), so trust the discovered value directly.
+        if target.source == "path_segment" and raw:
+            values.append(raw)
+        elif _is_valid_id_value(raw):
             values.append(raw)
         elif raw in {"", "test", "sample.txt"} and self._target_has_access_control_relevance(target):
             values.append("1")

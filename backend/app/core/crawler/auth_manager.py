@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -893,3 +894,140 @@ class SmartAuthenticator:
         if 200 <= resp.status_code < 300:
             return f"protected validation target returned HTTP {resp.status_code}: {protected_url}"
         return ""
+
+    # ------------------------------------------------------------------
+    # Secondary identity provisioning (for differential IDOR/BOLA)
+    # ------------------------------------------------------------------
+
+    # Common registration endpoints tried when no register form is discovered.
+    _REGISTER_API_PATHS = (
+        "/api/register", "/api/auth/register", "/api/signup", "/api/auth/signup",
+        "/rest/user", "/api/users", "/api/v1/auth/register", "/register", "/signup",
+    )
+
+    @staticmethod
+    def _throwaway_credentials() -> tuple[str, str]:
+        """Generate a unique throwaway email + strong password."""
+        token = secrets.token_hex(8)
+        return f"sentry_secondary_{token}@sentrystrike.invalid", f"Sn!{secrets.token_urlsafe(12)}"
+
+    async def acquire_secondary_identity(
+        self, client: httpx.AsyncClient, root_url: str
+    ) -> AuthResult | None:
+        """Provision a throwaway second identity for cross-identity IDOR checks.
+
+        Attempts, in order, to register a fresh user (discovered HTML register
+        form, then common register API paths) and log it in via the existing
+        authentication cascade. Returns an authenticated :class:`AuthResult`
+        with the secondary session's cookies/bearer token, or ``None`` when a
+        second identity cannot be provisioned. Never raises — provisioning is
+        strictly best-effort and the caller degrades gracefully.
+        """
+        username, password = self._throwaway_credentials()
+        logger.info("[auth] Attempting to provision secondary identity on %s", root_url)
+
+        registered = await self._register_secondary(client, root_url, username, password)
+        if not registered:
+            logger.info("[auth] Secondary identity registration not possible; skipping")
+            return None
+
+        # A registration flow often returns a session directly; verify first.
+        verified = await self._verify_auth(client)
+        if verified.authenticated:
+            logger.info("[auth] Secondary identity active from registration response")
+            return verified
+
+        # Otherwise log the new user in via the normal cascade.
+        result = await self.authenticate(client, root_url, username, password)
+        if result and result.authenticated:
+            logger.info("[auth] Secondary identity logged in via cascade")
+            return result
+        logger.info("[auth] Secondary identity registered but login failed")
+        return None
+
+    async def _register_secondary(
+        self, client: httpx.AsyncClient, root_url: str, username: str, password: str
+    ) -> bool:
+        """Best-effort registration of a throwaway account. Returns success."""
+        # 1) Discovered HTML register form.
+        try:
+            resp = await client.get(root_url, follow_redirects=True)
+            if resp.status_code == 200 and "text/html" in resp.headers.get("content-type", "").lower():
+                if await self._submit_register_form(client, str(resp.url), resp.text, username, password):
+                    return True
+        except Exception as exc:
+            logger.debug("[auth] Secondary register form discovery failed: %s", exc)
+
+        # 2) Common register API endpoints with credential-shaped JSON bodies.
+        payload_templates = (
+            {"email": username, "password": password},
+            {"email": username, "password": password, "passwordRepeat": password},
+            {"username": username, "password": password},
+            {"user": username, "pass": password},
+        )
+        for path in self._REGISTER_API_PATHS:
+            url = normalize_url(root_url, path)
+            for payload in payload_templates:
+                try:
+                    resp = await client.post(
+                        url, json=payload, headers={"Content-Type": "application/json"}, follow_redirects=True
+                    )
+                except Exception as exc:
+                    logger.debug("[auth] Secondary register POST %s failed: %s", url, exc)
+                    continue
+                if resp.status_code in (200, 201):
+                    logger.info("[auth] Secondary account registered via %s", url)
+                    return True
+                # A 409/400 "already exists" means the endpoint works; retry a
+                # fresh credential set is unnecessary since ours is random.
+        return False
+
+    async def _submit_register_form(
+        self, client: httpx.AsyncClient, page_url: str, html: str, username: str, password: str
+    ) -> bool:
+        """Submit an HTML registration form if the page exposes one."""
+        soup = BeautifulSoup(self._normalize_malformed_forms(html), "html.parser")
+        for form in soup.find_all("form"):
+            has_password = bool(form.find("input", attrs={"type": re.compile("^password$", re.I)}))
+            form_text = " ".join(
+                [
+                    form.get("id", ""),
+                    form.get("class", [""])[0] if form.get("class") else "",
+                    form.get_text(" ", strip=True),
+                ]
+            ).lower()
+            register_hints = ("register", "signup", "sign up", "create account", "join")
+            if not has_password or not any(hint in form_text for hint in register_hints):
+                continue
+
+            action = normalize_url(page_url, form.get("action", ""))
+            method = form.get("method", "POST").upper()
+            payload: dict[str, str] = {}
+            for inp in form.find_all(["input", "select", "textarea"]):
+                name = inp.get("name")
+                if not name:
+                    continue
+                inp_type = inp.get("type", "text").lower()
+                classification = self._classify_field_name_and_attrs(
+                    name, inp_type, inp.get("autocomplete", ""), inp.get("placeholder", "")
+                )
+                if classification == "username":
+                    payload[name] = username
+                elif classification == "password":
+                    payload[name] = password
+                elif inp_type == "hidden":
+                    payload[name] = inp.get("value", "")
+            if password not in payload.values():
+                continue
+            try:
+                if method == "POST":
+                    resp = await client.post(action, data=payload, follow_redirects=True)
+                else:
+                    resp = await client.get(action, params=payload, follow_redirects=True)
+            except Exception as exc:
+                logger.debug("[auth] Secondary register form submit to %s failed: %s", action, exc)
+                continue
+            if resp.status_code in (200, 201, 302):
+                logger.info("[auth] Secondary account registered via HTML form %s", action)
+                return True
+        return False
