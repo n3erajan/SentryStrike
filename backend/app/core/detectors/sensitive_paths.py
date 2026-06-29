@@ -113,10 +113,37 @@ class SensitivePathsDetector(BaseDetector):
         re.compile(r"__schema|IntrospectionQuery|GraphQL", re.IGNORECASE),
     ]
 
+    # Generic autoindex/directory-listing signatures across common servers.
+    _AUTOINDEX_PATTERNS: list[re.Pattern] = [
+        re.compile(r"<title>\s*Index of /", re.IGNORECASE),        # Apache/nginx
+        re.compile(r"<h1>\s*Index of /", re.IGNORECASE),           # Apache/nginx
+        re.compile(r"Directory listing for ", re.IGNORECASE),      # Python http.server, Tornado
+        re.compile(r"\[To Parent Directory\]", re.IGNORECASE),     # IIS
+        re.compile(r'<a href="\?C=[NMSD];O=[AD]"', re.IGNORECASE), # Apache column-sort links
+    ]
+
+    # Backup/temp permutations appended to discovered files (Task 9).
+    _BACKUP_SUFFIXES: tuple[str, ...] = (".bak", ".old", ".orig", "~", ".swp", ".save", ".zip", ".tar.gz")
+
+    def _looks_like_autoindex(self, body: str, content_type: str = "") -> bool:
+        if content_type and not any(tok in content_type.lower() for tok in ("html", "text/plain")):
+            return False
+        if any(pattern.search(body) for pattern in self._AUTOINDEX_PATTERNS):
+            return True
+        # Generic heuristic: a page that is predominantly a list of anchor links
+        # including an explicit parent-directory link is almost certainly a
+        # directory index rather than an application page.
+        hrefs = re.findall(r'<a\s+[^>]*href=["\']?([^"\'>\s]+)', body, re.IGNORECASE)
+        if len(hrefs) >= 5 and any(h in ("../", "..") or h.rstrip("/").endswith("..") for h in hrefs):
+            return True
+        return False
+
     def _classify_content(self, path: str, body: str, content_type: str = "") -> tuple[bool, str, str, SeverityLevel]:
         body_lower = body.lower()
         path_lower = path.lower()
 
+        if self._looks_like_autoindex(body, content_type):
+            return True, "Directory Listing Exposed", "Directory listing/autoindex response exposes sibling file and directory names.", SeverityLevel.medium
         if ".git/config" in path_lower and "[core]" in body_lower:
             return True, "Sensitive File Exposure", "Git configuration file exposed.", SeverityLevel.high
         if ".env" in path_lower and (
@@ -130,7 +157,7 @@ class SensitivePathsDetector(BaseDetector):
             "insert into" in body_lower or "create table" in body_lower or "mysqldump" in body_lower
         ):
             return True, "Backup / Database Dump Exposed", "Database dump or backup content exposed.", SeverityLevel.high
-        if (path_lower.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".bak", ".old")) or "backup" in path_lower) and len(body) > 0:
+        if (path_lower.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".bak", ".old", ".orig", ".swp", ".save", "~")) or "backup" in path_lower) and len(body) > 0:
             if "application" in content_type.lower() or "octet-stream" in content_type.lower() or "<html" not in body_lower:
                 return True, "Backup / Archive File Exposed", "Backup/archive-like file content is reachable.", SeverityLevel.high
         if ("docker" in path_lower or path_lower.endswith((".yml", ".yaml"))) and (
@@ -279,23 +306,18 @@ class SensitivePathsDetector(BaseDetector):
             
             already_checked: set[str] = set()
 
-            # Helper to check a specific path under a given directory prefix
-            async def check_path(base_dir: str, path: str) -> Finding | None:
-                clean_path = path.lstrip('/')
-                # Join base_dir (e.g. /dvwa/) with the relative path
-                if base_dir == "/":
-                    target_url = root_url + clean_path
-                else:
-                    target_url = root_url.rstrip("/") + base_dir.rstrip("/") + "/" + clean_path
-
+            # Core probe: fetch an absolute URL, suppress SPA fallbacks/soft-404s,
+            # and classify by content. ``classify_path`` supplies the path hint used
+            # by content classification (its own path for permutations).
+            async def probe_url(target_url: str, classify_path: str) -> Finding | None:
                 if target_url in already_checked:
                     return None
                 already_checked.add(target_url)
-                
+
                 async with semaphore:
                     try:
                         response = await client.get(target_url)
-                        
+
                         # We only care about 200 OK responses
                         if response.status_code != 200:
                             return None
@@ -317,16 +339,16 @@ class SensitivePathsDetector(BaseDetector):
                                     fallback_signal.similarity,
                                 )
                                 return None
-                            
+
                         body_lower = response.text.lower()
-                        
-                        # Simple false positive reduction: 
+
+                        # Simple false positive reduction:
                         # Check if the response looks like a generic HTML 404/Soft 404 page
                         if "<html" in body_lower and ("404" in body_lower or "not found" in body_lower):
                             return None
-                            
+
                         matched, vuln_type, evidence, severity = self._classify_content(
-                            path,
+                            classify_path,
                             response.text,
                             content_type,
                         )
@@ -349,11 +371,82 @@ class SensitivePathsDetector(BaseDetector):
                         logger.debug("Error checking path %s: %s", target_url, e)
                 return None
 
+            # Helper to check a specific path under a given directory prefix
+            async def check_path(base_dir: str, path: str) -> Finding | None:
+                clean_path = path.lstrip('/')
+                # Join base_dir (e.g. /dvwa/) with the relative path
+                if base_dir == "/":
+                    target_url = root_url + clean_path
+                else:
+                    target_url = root_url.rstrip("/") + base_dir.rstrip("/") + "/" + clean_path
+                return await probe_url(target_url, path)
+
             tasks = [check_path(dir, path) for dir in dirs_to_check for path in self._common_sensitive_paths]
+
+            # Backup/temp permutations + directory probes derived from what was
+            # actually crawled (no hardcoded app paths), bounded per host.
+            for perm_url in self._permutation_targets(root_url, urls, kwargs):
+                classify_path = urlparse(perm_url).path
+                tasks.append(probe_url(perm_url, classify_path))
+
             results = await asyncio.gather(*tasks)
-            
+
             for res in results:
                 if res:
                     findings.append(res)
 
         return findings
+
+    def _permutation_targets(
+        self,
+        root_url: str,
+        urls: list[str],
+        kwargs: dict[str, object],
+    ) -> list[str]:
+        """Derive backup/temp permutations and directory probes from crawled URLs.
+
+        For every crawled file we probe ``<path>{.bak,.old,...}`` variants; for
+        every containing directory we probe a trailing-slash listing. Everything
+        is same-origin and bounded by ``sensitive_paths_permutation_cap``.
+        """
+        root_parsed = urlparse(root_url)
+        root_origin = f"{root_parsed.scheme}://{root_parsed.netloc}"
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add(candidate_url: str) -> None:
+            if candidate_url in seen:
+                return
+            seen.add(candidate_url)
+            candidates.append(candidate_url)
+
+        # Gather crawled paths from urls + assets (both may hold reachable files).
+        raw_paths: list[str] = list(urls)
+        assets = kwargs.get("assets") or []
+        raw_paths.extend(str(a) for a in assets)
+
+        dirs: set[str] = set()
+        for raw in raw_paths:
+            parsed = urlparse(raw)
+            if parsed.scheme and parsed.netloc and f"{parsed.scheme}://{parsed.netloc}" != root_origin:
+                continue  # same-origin only
+            path = parsed.path
+            if not path or path == "/":
+                continue
+            base = f"{root_origin}{path}"
+            last_slash = path.rfind("/")
+            filename = path[last_slash + 1:] if last_slash >= 0 else path
+            # File → backup/temp permutations (only for actual files, not dirs).
+            if filename and "." in filename:
+                for suffix in self._BACKUP_SUFFIXES:
+                    add(base + suffix)
+            # Containing directory → trailing-slash listing probe.
+            if last_slash > 0:
+                dirs.add(path[: last_slash + 1])
+
+        for directory in dirs:
+            add(f"{root_origin}{directory}")
+
+        cap = int(getattr(get_settings(), "sensitive_paths_permutation_cap", 200) or 200)
+        return candidates[:cap]

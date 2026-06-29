@@ -5,6 +5,7 @@ import pytest
 
 from app.core.crawler.models import RequestObservation, RouteCandidate, RouteSource
 from app.core.detectors.sensitive_paths import SensitivePathsDetector
+from app.models.vulnerability import SeverityLevel
 
 
 def test_observed_response_finds_source_map_api_docs_stack_trace_and_secret_values():
@@ -127,3 +128,127 @@ async def test_sensitive_path_detector_reports_openapi_with_content_proof(monkey
         finding.detection_evidence["proof_type"] == "content_verified_path_probe"
         for finding in findings
     )
+
+
+def test_classify_content_detects_apache_autoindex():
+    detector = SensitivePathsDetector()
+    body = (
+        "<html><head><title>Index of /uploads</title></head><body>"
+        "<h1>Index of /uploads</h1><pre>"
+        '<a href="../">../</a>'
+        '<a href="report.pdf">report.pdf</a>'
+        '<a href="notes.txt">notes.txt</a>'
+        "</pre></body></html>"
+    )
+
+    matched, vuln_type, _evidence, severity = detector._classify_content(
+        "/uploads/", body, "text/html"
+    )
+
+    assert matched is True
+    assert vuln_type == "Directory Listing Exposed"
+    assert severity == SeverityLevel.medium
+
+
+def test_classify_content_does_not_flag_regular_html_as_autoindex():
+    detector = SensitivePathsDetector()
+    body = "<html><body><h1>Welcome</h1><p>Nothing to list here.</p></body></html>"
+
+    matched, *_ = detector._classify_content("/home", body, "text/html")
+
+    assert matched is False
+
+
+def test_permutation_targets_derive_backup_and_dir_probes_from_crawl():
+    detector = SensitivePathsDetector()
+
+    targets = detector._permutation_targets(
+        "https://example.test/",
+        ["https://example.test/js/config.js", "https://other.test/evil.js"],
+        {"assets": ["https://example.test/static/app.js"]},
+    )
+
+    # Backup permutation of a crawled file.
+    assert "https://example.test/js/config.js.bak" in targets
+    assert "https://example.test/static/app.js.old" in targets
+    # Trailing-slash directory listing probe.
+    assert "https://example.test/js/" in targets
+    # Cross-origin URLs are excluded.
+    assert not any("other.test" in t for t in targets)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_path_detector_reports_autoindex_via_permutation(monkeypatch):
+    detector = SensitivePathsDetector()
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url):
+            if url == "https://example.test/uploads/":
+                return httpx.Response(
+                    200,
+                    text=(
+                        "<html><head><title>Index of /uploads</title></head><body>"
+                        "<h1>Index of /uploads</h1><pre>"
+                        '<a href="../">../</a>'
+                        '<a href="a.txt">a.txt</a>'
+                        "</pre></body></html>"
+                    ),
+                    headers={"content-type": "text/html"},
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(404, text="not found", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr("app.core.detectors.sensitive_paths.create_scan_client", lambda **kwargs: FakeClient())
+
+    findings = await detector.detect(
+        urls=["https://example.test/uploads/report.pdf"],
+        forms=[],
+        root_url="https://example.test/",
+    )
+
+    assert any(finding.vuln_type == "Directory Listing Exposed" for finding in findings)
+    assert any(finding.url == "https://example.test/uploads/" for finding in findings)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_path_detector_suppresses_spa_shell_200(monkeypatch):
+    detector = SensitivePathsDetector()
+
+    spa_shell = (
+        "<!doctype html><html><head><title>My SPA</title></head>"
+        "<body><div id='root'></div><script src='/main.js'></script></body></html>"
+    )
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url):
+            # SPA catch-all: every path returns the same 200 HTML shell.
+            return httpx.Response(
+                200,
+                text=spa_shell,
+                headers={"content-type": "text/html"},
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr("app.core.detectors.sensitive_paths.create_scan_client", lambda **kwargs: FakeClient())
+
+    findings = await detector.detect(
+        urls=["https://example.test/"],
+        forms=[],
+        root_url="https://example.test/",
+        is_spa=True,
+        spa_root_html=spa_shell,
+    )
+
+    assert findings == []

@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     xss_browser_dom_budget_seconds: float = Field(default=60.0, alias="XSS_BROWSER_DOM_BUDGET_SECONDS")
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     scanner_concurrency: int = Field(default=8, alias="SCANNER_CONCURRENCY")
+    sensitive_paths_permutation_cap: int = Field(default=200, alias="SENSITIVE_PATHS_PERMUTATION_CAP")
 
     # Verification / Scanning Settings
     scan_mode: str = Field(default="verified", alias="SCAN_MODE")  # verified / heuristic / aggressive
