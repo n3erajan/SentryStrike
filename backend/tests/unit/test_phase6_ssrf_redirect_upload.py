@@ -63,6 +63,94 @@ async def test_ssrf_detector_reports_blind_oast_callback_for_json_body_target():
 
 
 @pytest.mark.asyncio
+async def test_ssrf_inband_fallback_reports_probable_when_oast_unset():
+    """No OAST configured + internal target behaves differently from the external
+    control → a PROBABLE (unverified) in-band finding."""
+    detector = SSRFDetector()
+    parameter = ParameterCandidate(
+        name="url",
+        location=ParameterLocation.json_body,
+        url="https://example.test/api/fetch",
+        method="POST",
+        baseline_value="https://example.test/image.png",
+        parent_path="url",
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        payload = kwargs.get("payload") or ""
+        # Internal targets hang (slow); external control is fast. Body content
+        # never matches the reflection signatures, so only the in-band path fires.
+        if "127.0.0.1" in payload or "169.254.169.254" in payload:
+            return ResponseData(200, {}, "blocked", 3000.0, request_snippet=f"{method} {url}", response_snippet="RESP")
+        return ResponseData(200, {}, "external ok", 100.0, request_snippet=f"{method} {url}", response_snippet="RESP")
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[],
+            forms=[],
+            parameters=[parameter],
+            api_endpoints=[],
+            # no oast_client → OastClient built from (unset) settings, disabled
+        )
+
+    probable = [f for f in findings if f.vuln_type == "Server-Side Request Forgery (SSRF) - Probable"]
+    assert probable, "expected a probable in-band SSRF finding"
+    assert probable[0].verified is False
+    assert probable[0].detection_method == "ssrf_inband_differential"
+
+
+@pytest.mark.asyncio
+async def test_ssrf_inband_fallback_silent_when_no_differential():
+    """Internal and external targets behave identically → no in-band finding."""
+    detector = SSRFDetector()
+    parameter = ParameterCandidate(
+        name="url",
+        location=ParameterLocation.json_body,
+        url="https://example.test/api/fetch",
+        method="POST",
+        baseline_value="https://example.test/image.png",
+        parent_path="url",
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        # Uniform response regardless of target: a well-behaved app.
+        return ResponseData(200, {}, "same body", 100.0, request_snippet=f"{method} {url}", response_snippet="RESP")
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[],
+            forms=[],
+            parameters=[parameter],
+            api_endpoints=[],
+        )
+
+    assert findings == []
+
+
+def test_ssrf_inband_differential_evaluator_truth_cases():
+    detector = SSRFDetector()
+    delta = 1500.0
+    # Consistent status divergence.
+    assert detector._inband_differential(
+        [(200, 10, 100.0), (200, 10, 110.0)],
+        [(500, 5, 120.0), (500, 5, 130.0)],
+        delta,
+    )
+    # Consistent large timing delta.
+    assert detector._inband_differential(
+        [(200, 10, 100.0), (200, 10, 100.0)],
+        [(200, 10, 2000.0), (200, 10, 2000.0)],
+        delta,
+    )
+    # Indistinguishable → None.
+    assert detector._inband_differential(
+        [(200, 10, 100.0), (200, 10, 105.0)],
+        [(200, 10, 110.0), (200, 10, 108.0)],
+        delta,
+    ) is None
+
+
+@pytest.mark.asyncio
 async def test_open_redirect_detector_verifies_external_location_header():
     detector = OpenRedirectDetector()
     observed_urls: list[str] = []

@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     )
     oast_callback_base_url: str | None = Field(default=None, alias="OAST_CALLBACK_BASE_URL")
     oast_poll_url: str | None = Field(default=None, alias="OAST_POLL_URL")
+    # In-band SSRF fallback: minimum consistent response-time delta (ms) between an
+    # internal target and the external control before a probable (unverified) SSRF
+    # is reported when no OAST callback is configured.
+    ssrf_inband_timing_delta_ms: float = Field(default=1500.0, alias="SSRF_INBAND_TIMING_DELTA_MS")
 
     cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
 

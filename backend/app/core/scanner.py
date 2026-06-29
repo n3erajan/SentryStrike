@@ -745,7 +745,10 @@ class ScanOrchestrator:
         ):
             skipped_reasons["second_user_account_missing"] = 1
         if detector_name == "ssrf" and not settings.oast_callback_base_url:
-            skipped_reasons["oast_callback_missing"] = 1
+            # OAST-verified blind SSRF is unavailable, but the in-band differential
+            # fallback still runs (probable/unverified findings). Flag it as a
+            # confidence-limiting gap rather than a hard skip.
+            skipped_reasons["oast_callback_missing_inband_only"] = 1
 
         return DetectorCoverageMetric(
             detector=detector_name,
@@ -1639,7 +1642,11 @@ class ScanOrchestrator:
         if not (settings.authentication_second_cookie or settings.authentication_second_header):
             warnings.append("No second-user account configured; horizontal IDOR comparison was not tested.")
         if not settings.oast_callback_base_url:
-            warnings.append("No OAST callback configured; blind SSRF was not tested.")
+            warnings.append(
+                "No OAST callback configured (OAST_CALLBACK_BASE_URL); blind SSRF was "
+                "assessed with the in-band differential fallback only, so SSRF findings "
+                "are probable/unverified. Configure OAST for confirmed blind SSRF."
+            )
         return warnings
 
     @staticmethod

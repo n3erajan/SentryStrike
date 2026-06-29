@@ -25,6 +25,141 @@ class SSRFDetector(BaseDetector):
         ("http://169.254.169.254/latest/meta-data/", r"ami-id|instance-id|security-groups", "AWS/Cloud Metadata fetch"),
     ]
 
+    # In-band fallback probes (used only when OAST is not configured and content
+    # reflection did not fire). Internal targets are expected to behave
+    # differently from the external control if the server actually fetches them.
+    # Ports are varied to reduce coincidental collisions; no app-specific values.
+    INBAND_INTERNAL_TARGETS = [
+        ("http://127.0.0.1:9/", "loopback discard port"),
+        ("http://169.254.169.254/latest/meta-data/", "link-local cloud metadata"),
+    ]
+    # Routable external control host that should resolve but is dedicated to this
+    # scanner (never a real service), so a well-behaved app treats it uniformly.
+    INBAND_CONTROL_TARGET = "http://control.sentrystrike.invalid/"
+    # Number of repetitions per target to average out timing noise.
+    INBAND_REPETITIONS = 2
+
+    @staticmethod
+    def _inband_differential(
+        control_samples: list[tuple[int, int, float]],
+        internal_samples: list[tuple[int, int, float]],
+        timing_delta_ms: float,
+    ) -> str | None:
+        """Return a human-readable reason if internal vs control differ robustly.
+
+        Each sample is ``(status_code, body_length, response_time_ms)``. A
+        difference is only reported when it is *consistent* across repetitions,
+        to keep noisy in-band signals from producing false positives. Returns
+        ``None`` when the two target classes are indistinguishable.
+        """
+        if not control_samples or not internal_samples:
+            return None
+
+        def avg(samples: list[tuple[int, int, float]], idx: int) -> float:
+            return sum(s[idx] for s in samples) / len(samples)
+
+        control_status = {s[0] for s in control_samples}
+        internal_status = {s[0] for s in internal_samples}
+        # Consistent status divergence (each side agrees with itself, disagree cross).
+        if (
+            len(control_status) == 1
+            and len(internal_status) == 1
+            and control_status != internal_status
+        ):
+            return (
+                f"internal target consistently returned HTTP {internal_status.pop()} "
+                f"vs external control HTTP {control_status.pop()}"
+            )
+
+        # Consistent, substantial timing delta (e.g. internal target hangs/refuses).
+        control_time = avg(control_samples, 2)
+        internal_time = avg(internal_samples, 2)
+        if abs(internal_time - control_time) >= timing_delta_ms:
+            direction = "slower" if internal_time > control_time else "faster"
+            return (
+                f"internal target responded {abs(internal_time - control_time):.0f}ms "
+                f"{direction} than the external control (avg {internal_time:.0f}ms vs {control_time:.0f}ms)"
+            )
+
+        # Consistent, large body-length divergence.
+        control_len = avg(control_samples, 1)
+        internal_len = avg(internal_samples, 1)
+        if control_len and internal_len and abs(internal_len - control_len) / max(control_len, internal_len) >= 0.5:
+            return (
+                f"internal target response body length ({internal_len:.0f}) diverged "
+                f"substantially from the external control ({control_len:.0f})"
+            )
+        return None
+
+    async def _probe_inband(self, cand: AttackTarget, verifier, build_request, settings) -> Finding | None:
+        """In-band SSRF heuristic: internal targets vs external control differential.
+
+        Sends the candidate's sink pointed at internal targets and an external
+        control host, repeated to smooth timing noise, then reports a PROBABLE
+        (unverified) finding when a robust, consistent differential appears.
+        """
+        async def sample(value: str):
+            url, params, data, json_body, headers, cookies = build_request(cand, value)
+            resp = await verifier.send_request(
+                url,
+                cand.method,
+                params,
+                data,
+                headers=headers,
+                cookies=cookies,
+                json_body=json_body,
+                test_phase="ssrf_inband",
+                payload=value,
+            )
+            triple = (
+                resp.status_code,
+                len(resp.body or ""),
+                float(getattr(resp, "response_time_ms", 0.0) or 0.0),
+            )
+            return triple, resp
+
+        control_samples: list[tuple[int, int, float]] = []
+        for _ in range(self.INBAND_REPETITIONS):
+            triple, _resp = await sample(self.INBAND_CONTROL_TARGET)
+            control_samples.append(triple)
+
+        for target, desc in self.INBAND_INTERNAL_TARGETS:
+            internal_samples: list[tuple[int, int, float]] = []
+            last_resp = None
+            for _ in range(self.INBAND_REPETITIONS):
+                triple, last_resp = await sample(target)
+                internal_samples.append(triple)
+
+            reason = self._inband_differential(
+                control_samples, internal_samples, settings.ssrf_inband_timing_delta_ms
+            )
+            if reason:
+                return Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Server-Side Request Forgery (SSRF) - Probable",
+                    severity=SeverityLevel.medium,
+                    url=cand.url,
+                    parameter=cand.parameter,
+                    method=cand.method,
+                    payload=target,
+                    evidence=(
+                        f"Probable SSRF via in-band differential ({desc}): {reason}. "
+                        "Unverified heuristic — configure an OAST callback "
+                        "(OAST_CALLBACK_BASE_URL) to confirm blind SSRF."
+                    ),
+                    confidence_score=50.0,
+                    detection_method="ssrf_inband_differential",
+                    reproducible=False,
+                    verified=False,
+                    verification_request_snippet=getattr(last_resp, "request_snippet", None),
+                    verification_response_snippet=getattr(last_resp, "response_snippet", None),
+                    detection_evidence={
+                        "proof_type": "inband_differential",
+                        "control_target": self.INBAND_CONTROL_TARGET,
+                    },
+                )
+        return None
+
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
@@ -181,6 +316,15 @@ class SSRFDetector(BaseDetector):
                                     },
                                 )
                             )
+
+                    # In-band fallback: when OAST is unavailable and nothing was
+                    # confirmed, look for a robust differential between internal
+                    # targets and an external control. Reported as PROBABLE only —
+                    # never verified — because in-band signals are inherently noisy.
+                    if not cand_findings and not oast.enabled:
+                        inband = await self._probe_inband(cand, verifier, build_request, settings)
+                        if inband:
+                            cand_findings.append(inband)
                 except Exception as e:
                     logger.error("SSRF verification failed for %s param %s: %s", cand.url, cand.parameter, e)
             return cand_findings
