@@ -10,7 +10,7 @@
 // backend (see vite.config.js) — same-origin, no CORS. For a hosted build set
 // VITE_API_URL to the backend origin, e.g. https://api.example.com/api/v1.
 
-const API_BASE = import.meta.env.VITE_API_URL || "/api/v1";
+export const API_BASE = import.meta.env.VITE_API_URL || "/api/v1";
 const TOKEN_KEY = "sentrystrike_token";
 
 export function getToken() {

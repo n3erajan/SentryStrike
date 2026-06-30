@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import "./App.css";
 import Navbar from "./components/Navbar.jsx";
 import ScanPage from "./pages/ScanPage.jsx";
@@ -14,10 +14,11 @@ function App() {
 
   // const [user, setUser] = useState({ email: "dev@sentrystrike.local" });
   const [user, setUser] = useState(getCurrentUser);
+
   const [authView, setAuthView] = useState("login");
   const [page, setPage] = useState("scan");
   const [target, setTarget] = useState("");
-  const [scanId, setScanId] = useState("mock-scan-1");
+  const [scanId, setScanId] = useState(null);
 
   function handleScanComplete({ scanId: id, target: url }) {
     setScanId(id);
@@ -35,6 +36,7 @@ function App() {
     setUser(null);
     setAuthView("login");
     setTarget("");
+    setScanId(null);
     setPage("scan");
   }
 

@@ -1,21 +1,37 @@
-import React, { useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 
-function ScoreRing({ score }) {
-  const r = 46,
-    circ = 2 * Math.PI * r,
-    offset = circ - (score / 100) * circ;
-  const color =
-    score >= 80
-      ? "#22c55e"
-      : score >= 60
-        ? "#eab308"
-        : score >= 40
-          ? "#f97316"
-          : "#ef4444";
+function ringColor(score, higherIsWorse) {
+  const good = "#22c55e";
+  const warn = "#eab308";
+  const bad = "#f97316";
+  const crit = "#ef4444";
+  if (higherIsWorse) {
+    if (score >= 75) return crit;
+    if (score >= 50) return bad;
+    if (score >= 25) return warn;
+    return good;
+  }
+  if (score >= 80) return good;
+  if (score >= 60) return warn;
+  if (score >= 40) return bad;
+  return crit;
+}
+
+// A circular gauge. `higherIsWorse` flips the color scale so a risk score
+// (0 = safe, 100 = maximum risk) reads red at the top end.
+function ScoreRing({ score = 0, caption = "/ 100", higherIsWorse = false }) {
+  const value = Math.max(0, Math.min(100, Math.round(score)));
+  const r = 46;
+  const circ = 2 * Math.PI * r;
+  const offset = circ - (value / 100) * circ;
+  const color = ringColor(value, higherIsWorse);
+
   const [animated, setAnimated] = useState(false);
   useEffect(() => {
-    setTimeout(() => setAnimated(true), 100);
+    const id = setTimeout(() => setAnimated(true), 100);
+    return () => clearTimeout(id);
   }, []);
+
   return (
     <div className='score-ring-wrap'>
       <div style={{ position: "relative", width: 120, height: 120 }}>
@@ -59,9 +75,9 @@ function ScoreRing({ score }) {
           }}
         >
           <div className='score-num' style={{ color }}>
-            {score}
+            {value}
           </div>
-          <div className='score-sub'>/ 100</div>
+          <div className='score-sub'>{caption}</div>
         </div>
       </div>
     </div>

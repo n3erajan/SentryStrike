@@ -1,4 +1,4 @@
-const SEVERITIES = ["critical", "high", "medium", "low"];
+const SEVERITIES = ["critical", "high", "medium", "low", "info"];
 
 const SEVERITY_META = {
   critical: {
@@ -29,6 +29,13 @@ const SEVERITY_META = {
     label: "LOW",
     icon: "●",
   },
+  info: {
+    color: "#64748b",
+    bg: "rgba(100,116,139,0.12)",
+    border: "rgba(100,116,139,0.35)",
+    label: "INFO",
+    icon: "ℹ",
+  },
   safe: {
     color: "#22c55e",
     bg: "rgba(34,197,94,0.12)",
@@ -48,18 +55,4 @@ const SCAN_STAGES = [
   "Scan complete",
 ];
 
-const LOG_LINES = [
-  { kind: "ok", text: "[✓] Resolving DNS records" },
-  { kind: "ok", text: "[✓] TLS handshake completed (TLS 1.2)" },
-  { kind: "ok", text: "[✓] Crawled 24 endpoints" },
-  { kind: "ok", text: "[✓] Security headers analyzed" },
-  { kind: "warn", text: "[!] Missing Content-Security-Policy" },
-  { kind: "warn", text: "[!] Potential SQL injection on /api/users" },
-  { kind: "ok", text: "[✓] Reflected XSS confirmed on /search" },
-  { kind: "ok", text: "[✓] Cookie attributes inspected" },
-  { kind: "ok", text: "[✓] TLS configuration checked" },
-  { kind: "ok", text: "[✓] AI cross-validation completed" },
-  { kind: "ok", text: "[✓] Report compiled" },
-];
-
-export { SEVERITIES, SEVERITY_META, SCAN_STAGES, LOG_LINES };
+export { SEVERITIES, SEVERITY_META, SCAN_STAGES };

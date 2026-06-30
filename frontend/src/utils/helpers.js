@@ -26,7 +26,10 @@ function isValidUrl(value) {
 }
 
 function downloadFile(content, filename, mimeType) {
-  const blob = new Blob([content], { type: mimeType });
+  saveBlob(new Blob([content], { type: mimeType }), filename);
+}
+
+function saveBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -35,8 +38,4 @@ function downloadFile(content, filename, mimeType) {
   URL.revokeObjectURL(url);
 }
 
-function buildHtmlReport(report, dateStr) {
-  return `<!DOCTYPE html><html><head><title>SentryStrike Report</title><style>body{font-family:sans-serif;padding:2rem;max-width:900px;margin:auto}pre{background:#f5f5f5;padding:1rem;border-radius:6px;overflow-x:auto}</style></head><body><h1>🛡 SentryStrike Report</h1><p><strong>Target:</strong> ${report.target}</p><p><strong>Scan Date:</strong> ${dateStr}</p><p><strong>Duration:</strong> ${report.durationSec}s</p><p><strong>Security Score:</strong> ${report.score}/100</p><pre>${JSON.stringify(report, null, 2)}</pre></body></html>`;
-}
-
-export { isValidUrl, buildHtmlReport };
+export { isValidUrl, downloadFile, saveBlob };
