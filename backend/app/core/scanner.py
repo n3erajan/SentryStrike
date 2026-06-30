@@ -1570,6 +1570,15 @@ class ScanOrchestrator:
         browser_error = getattr(crawl_result, "browser_error", None)
         static_spa_only = is_spa and len(requests) == 0
 
+        # Dynamic-discovery health classification (Task 11): never present a
+        # dynamically-degraded SPA scan as a clean full scan.
+        dynamic_status = self._classify_dynamic_status(
+            is_spa=is_spa,
+            browser_available=browser_available,
+            browser_error=browser_error,
+            browser_requests_observed=len(requests),
+        )
+
         scan.report_metadata.spa_api_coverage = SpaApiCoverage(
             spa_detected=is_spa,
             js_assets_inspected=len(getattr(crawl_result, "assets", []) or []),
@@ -1585,6 +1594,7 @@ class ScanOrchestrator:
             workflow_states_visited=int(getattr(crawl_result, "workflow_states_visited", 0) or 0),
             browser_forms_discovered=int(getattr(crawl_result, "browser_forms_discovered", 0) or 0),
             file_inputs_discovered=int(getattr(crawl_result, "file_inputs_discovered", 0) or 0),
+            dynamic_status=dynamic_status,
         )
         scan.report_metadata.auth_coverage = AuthCoverage(
             state=auth_state_value,
@@ -1594,10 +1604,49 @@ class ScanOrchestrator:
             auth_headers_present=has_headers,
             session_cookies_present=has_session,
         )
-        scan.report_metadata.coverage_warnings = self._coverage_warnings(crawl_result)
+        scan.report_metadata.coverage_warnings = self._coverage_warnings(crawl_result, dynamic_status)
 
-    def _coverage_warnings(self, crawl_result) -> list[str]:
+    @staticmethod
+    def _classify_dynamic_status(
+        *,
+        is_spa: bool,
+        browser_available: bool | None,
+        browser_error: str | None,
+        browser_requests_observed: int,
+    ) -> str:
+        """Classify dynamic-discovery health for honest reporting.
+
+        Only SPA targets can be "degraded" — a static site never needed the
+        browser. ``dynamic_failed`` when the browser could not run at all;
+        ``dynamic_partial`` when it launched but yielded nothing usable or was
+        truncated; ``dynamic_ok`` otherwise.
+        """
+        if not is_spa:
+            return "dynamic_ok"
+        if not browser_available:
+            return "dynamic_failed"
+        if browser_requests_observed == 0 or browser_error:
+            return "dynamic_partial"
+        return "dynamic_ok"
+
+    def _coverage_warnings(self, crawl_result, dynamic_status: str = "dynamic_ok") -> list[str]:
         warnings: list[str] = []
+        # Prominent, top-level honesty banner when dynamic discovery degraded, so
+        # a browser-dependent scan is never presented as a clean full scan. The
+        # browser-dependent classes (XSS/CSRF/file-upload/SSRF/IDOR) have limited
+        # confidence in this state.
+        if dynamic_status == "dynamic_failed":
+            warnings.append(
+                "DYNAMIC DISCOVERY FAILED: the target is a SPA but the browser crawl did not run, "
+                "so testing fell back to static extraction only. Coverage of DOM XSS, CSRF, file "
+                "upload, SSRF, and IDOR is limited and their absence is not conclusive."
+            )
+        elif dynamic_status == "dynamic_partial":
+            warnings.append(
+                "DYNAMIC DISCOVERY PARTIAL: the browser crawl launched but was truncated or observed "
+                "no runtime requests, so dynamic coverage is incomplete. Findings for DOM XSS, CSRF, "
+                "file upload, SSRF, and IDOR have reduced confidence."
+            )
         is_spa = bool(getattr(crawl_result, "is_spa", False))
         requests = getattr(crawl_result, "requests", []) or []
         forms = getattr(crawl_result, "forms", []) or []

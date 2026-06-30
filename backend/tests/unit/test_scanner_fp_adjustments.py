@@ -90,10 +90,96 @@ def test_static_spa_coverage_warning_is_deterministic() -> None:
     assert coverage.static_spa_only is True
     assert coverage.browser_available is False
     assert coverage.replayable_json_bodies == 0
-    assert scan.report_metadata.coverage_warnings[0] == (
-        "SPA detected, but no browser runtime requests were observed. API coverage is static extraction only."
+    assert coverage.dynamic_status == "dynamic_failed"
+    # The prominent honesty banner leads the warnings when dynamic discovery failed.
+    assert scan.report_metadata.coverage_warnings[0].startswith("DYNAMIC DISCOVERY FAILED")
+    assert any(
+        warning
+        == "SPA detected, but no browser runtime requests were observed. API coverage is static extraction only."
+        for warning in scan.report_metadata.coverage_warnings
     )
     assert any("Browser crawling unavailable" in warning for warning in scan.report_metadata.coverage_warnings)
+
+
+def test_dynamic_status_partial_when_browser_launched_but_no_requests() -> None:
+    class CrawlResult:
+        is_spa = True
+        assets = ["http://target.test/app.js"]
+        routes = []
+        api_endpoints = []
+        parameters = []
+        requests = []
+        dead_routes = []
+        forms = []
+        session_cookies = {}
+        auth_headers = {"Authorization": "Bearer token"}
+        auth_state = "authenticated_verified"
+        browser_available = True
+        browser_error = "deadline exceeded after 2/10 routes"
+
+    scan = SimpleNamespace(
+        target_url="http://target.test/",
+        statistics=ScanStatistics(),
+        report_metadata=ReportMetadata(
+            spa_api_coverage=SpaApiCoverage(),
+            auth_coverage=AuthCoverage(),
+            evidence_strength_breakdown=EvidenceStrengthBreakdown(),
+        ),
+    )
+    _orchestrator()._update_crawl_metadata(scan, CrawlResult())
+
+    assert scan.report_metadata.spa_api_coverage.dynamic_status == "dynamic_partial"
+    assert scan.report_metadata.coverage_warnings[0].startswith("DYNAMIC DISCOVERY PARTIAL")
+
+
+def test_dynamic_status_ok_when_browser_observed_requests() -> None:
+    class CrawlResult:
+        is_spa = True
+        assets = ["http://target.test/app.js"]
+        routes = []
+        api_endpoints = []
+        parameters = []
+        requests = [
+            RequestObservation(url="http://target.test/api/me", method="GET"),
+        ]
+        dead_routes = []
+        forms = []
+        session_cookies = {}
+        auth_headers = {"Authorization": "Bearer token"}
+        auth_state = "authenticated_verified"
+        browser_available = True
+        browser_error = None
+
+    scan = SimpleNamespace(
+        target_url="http://target.test/",
+        statistics=ScanStatistics(),
+        report_metadata=ReportMetadata(
+            spa_api_coverage=SpaApiCoverage(),
+            auth_coverage=AuthCoverage(),
+            evidence_strength_breakdown=EvidenceStrengthBreakdown(),
+        ),
+    )
+    _orchestrator()._update_crawl_metadata(scan, CrawlResult())
+
+    assert scan.report_metadata.spa_api_coverage.dynamic_status == "dynamic_ok"
+    assert not any(
+        warning.startswith(("DYNAMIC DISCOVERY FAILED", "DYNAMIC DISCOVERY PARTIAL"))
+        for warning in scan.report_metadata.coverage_warnings
+    )
+
+
+def test_classify_dynamic_status_matrix() -> None:
+    classify = ScanOrchestrator._classify_dynamic_status
+    # Non-SPA is always ok, regardless of browser state.
+    assert classify(is_spa=False, browser_available=None, browser_error=None, browser_requests_observed=0) == "dynamic_ok"
+    # SPA + no browser → failed.
+    assert classify(is_spa=True, browser_available=False, browser_error="x", browser_requests_observed=0) == "dynamic_failed"
+    assert classify(is_spa=True, browser_available=None, browser_error=None, browser_requests_observed=0) == "dynamic_failed"
+    # SPA + browser up but zero requests or an error → partial.
+    assert classify(is_spa=True, browser_available=True, browser_error=None, browser_requests_observed=0) == "dynamic_partial"
+    assert classify(is_spa=True, browser_available=True, browser_error="truncated", browser_requests_observed=5) == "dynamic_partial"
+    # SPA + browser up + requests + no error → ok.
+    assert classify(is_spa=True, browser_available=True, browser_error=None, browser_requests_observed=5) == "dynamic_ok"
 
 
 def test_replayable_json_body_suppresses_json_body_warning() -> None:

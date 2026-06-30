@@ -87,6 +87,9 @@ class SpaApiCoverage(BaseModel):
     workflow_states_visited: int = 0
     browser_forms_discovered: int = 0
     file_inputs_discovered: int = 0
+    # Overall dynamic-discovery health for honest reporting (Task 11):
+    # dynamic_ok | dynamic_partial | dynamic_failed.
+    dynamic_status: str = "dynamic_ok"
 
 
 class AuthCoverage(BaseModel):
