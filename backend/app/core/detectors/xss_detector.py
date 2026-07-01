@@ -93,6 +93,9 @@ class XSSDetector(BaseDetector):
 
         browser_available = bool(kwargs.get("browser_available"))
         routes = kwargs.get("routes") or []
+        # Full authenticated storage_state (Task A): seed the DOM-sweep browser
+        # so authed-only routes render during confirmation. Opaque per-origin blob.
+        storage_state = kwargs.get("auth_storage_state")
 
         def xss_filter(param_name: str) -> bool:
             param_lower = param_name.lower()
@@ -232,6 +235,7 @@ class XSSDetector(BaseDetector):
         findings.extend(
             await self._browser_dom_reflection_sweep(
                 targets, routes, session_cookies, browser_available, findings,
+                storage_state=storage_state,
             )
         )
 
@@ -244,6 +248,7 @@ class XSSDetector(BaseDetector):
         session_cookies: dict,
         browser_available: bool,
         existing_findings: list[Finding],
+        storage_state: dict | None = None,
     ) -> list[Finding]:
         """Navigate SPA routes with an executing canary and confirm DOM execution.
 
@@ -291,7 +296,9 @@ class XSSDetector(BaseDetector):
                 if key in seen_hits:
                     continue
                 if context is None:
-                    context = await verifier._new_reflection_context(browser, route_url)
+                    context = await verifier._new_reflection_context(
+                        browser, route_url, storage_state=storage_state,
+                    )
                 canary = ResponseAnalyzer.generate_probe_canary()
                 try:
                     fired = await asyncio.wait_for(

@@ -100,6 +100,11 @@ class _FakePage:
     async def wait_for_timeout(self, timeout):
         return None
 
+    async def content(self):
+        # Authenticated shell by default (no login form) so the liveness probe
+        # does not flag a regression in storage_state tests.
+        return "<html><body><app-root>dashboard</app-root></body></html>"
+
 
 class _FakeContext:
     def __init__(self, page):
@@ -121,8 +126,10 @@ class _FakeContext:
 class _FakeBrowser:
     def __init__(self, page):
         self._page = page
+        self.new_context_kwargs = []
 
-    async def new_context(self):
+    async def new_context(self, **kwargs):
+        self.new_context_kwargs.append(kwargs)
         return _FakeContext(self._page)
 
     async def close(self):
@@ -132,9 +139,11 @@ class _FakeBrowser:
 class _FakeChromium:
     def __init__(self, page):
         self._page = page
+        self.last_browser = None
 
     async def launch(self, headless=True):
-        return _FakeBrowser(self._page)
+        self.last_browser = _FakeBrowser(self._page)
+        return self.last_browser
 
 
 class _FakePlaywright:
@@ -738,3 +747,92 @@ async def test_crawl_into_discovers_and_visits_client_side_routes(monkeypatch):
     ws = [obs for obs in state.requests if obs.resource_type == "websocket"]
     assert ws and ws[0].url == "ws://spa.test/socket"
     assert ws[0].replayable is False
+
+
+# --- Task A: full authenticated storage_state propagation -------------------
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_seeds_context_from_storage_state(monkeypatch):
+    """When a storage_state blob is supplied it must be passed straight into
+    ``browser.new_context(storage_state=...)`` so the SPA's own JS finds its
+    token (cookies + per-origin localStorage/sessionStorage restored)."""
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    storage_blob = {"cookies": [{"name": "s", "value": "1"}], "origins": []}
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    state = CrawlState()
+
+    captured = {}
+    orig_launch = _FakeChromium.launch
+
+    async def _spy_launch(self, headless=True):
+        browser = await orig_launch(self, headless=headless)
+        captured["browser"] = browser
+        return browser
+
+    monkeypatch.setattr(_FakeChromium, "launch", _spy_launch)
+
+    await engine.crawl_into(
+        state, "http://spa.test/", routes=[], storage_state=storage_blob,
+    )
+
+    kwargs_seen = captured["browser"].new_context_kwargs
+    assert any(kw.get("storage_state") == storage_blob for kw in kwargs_seen)
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_falls_back_to_bare_context_without_storage_state(monkeypatch):
+    """No storage_state → plain ``new_context()`` (cookie/header injection path),
+    preserving the pre-Task-A behavior for cookie-auth and static-auth apps."""
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    state = CrawlState()
+
+    captured = {}
+    orig_launch = _FakeChromium.launch
+
+    async def _spy_launch(self, headless=True):
+        browser = await orig_launch(self, headless=headless)
+        captured["browser"] = browser
+        return browser
+
+    monkeypatch.setattr(_FakeChromium, "launch", _spy_launch)
+
+    await engine.crawl_into(
+        state, "http://spa.test/", auth_cookies={"sid": "x"}, routes=[],
+    )
+
+    kwargs_seen = captured["browser"].new_context_kwargs
+    assert all("storage_state" not in kw for kw in kwargs_seen)
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_flags_lost_session_when_still_logged_out(monkeypatch):
+    """Liveness re-check: seeding storage_state but rendering a logged-out shell
+    (login form + SPA markers) must record the RC-A regression error."""
+
+    class _LoggedOutPage(_FakePage):
+        async def content(self):
+            return (
+                "<html><body><app-root>"
+                "<form><input type='password' name='pw'></form>"
+                "</app-root></body></html>"
+            )
+
+    page = _LoggedOutPage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    state = CrawlState()
+    await engine.crawl_into(
+        state, "http://spa.test/", routes=[],
+        storage_state={"cookies": [], "origins": []},
+    )
+
+    assert state.browser_error == (
+        "authenticated session did not persist into browser context"
+    )

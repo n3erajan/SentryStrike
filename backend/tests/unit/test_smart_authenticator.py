@@ -2,11 +2,27 @@ import pytest
 import httpx
 
 from app.core.crawler.auth_manager import (
+    AuthResult,
     AuthVerificationState,
     SmartAuthenticator,
     redact_secret,
 )
 from app.core.crawler.models import ApiEndpoint
+
+
+def test_auth_result_carries_full_storage_state():
+    """Task A: AuthResult exposes an optional storage_state blob captured whole
+    from the Playwright context (opaque; never key-inspected)."""
+    blob = {
+        "cookies": [{"name": "sid", "value": "abc"}],
+        "origins": [
+            {"origin": "http://spa.test", "localStorage": [{"name": "jwt", "value": "t"}]}
+        ],
+    }
+    result = AuthResult(authenticated=True, storage_state=blob)
+    assert result.storage_state == blob
+    # Default stays None so cookie/static-auth paths are unaffected.
+    assert AuthResult().storage_state is None
 
 
 class MockSettings:

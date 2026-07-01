@@ -42,6 +42,7 @@ async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch
             auth_headers=None,
             routes=None,
             deadline=None,
+            storage_state=None,
         ):
             # Stream a partial observation, mark availability, then blow up —
             # simulating a timeout/exception mid-run.

@@ -110,7 +110,7 @@ def test_sweep_invokes_verify_reflected_dom_and_builds_finding(monkeypatch):
     monkeypatch.setattr("app.core.detectors.xss_detector.async_playwright", lambda: _FakePlaywrightCM())
     monkeypatch.setattr("app.core.detectors.xss_detector.PLAYWRIGHT_AVAILABLE", True)
 
-    async def fake_new_ctx(self, browser, route_url):
+    async def fake_new_ctx(self, browser, route_url, storage_state=None):
         return _FakeContext()
 
     async def fake_verify(self, route_url, parameter, location, *, canary=None, context=None):

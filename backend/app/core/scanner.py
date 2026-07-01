@@ -333,6 +333,7 @@ class ScanOrchestrator:
                 "root_url": scan.target_url,
                 "session_cookies": session_cookies,
                 "auth_headers": getattr(crawl_result, "auth_headers", {}),
+                "auth_storage_state": getattr(crawl_result, "auth_storage_state", None),
                 "auth_state": getattr(crawl_result, "auth_state", "unauthenticated"),
                 "is_spa": getattr(crawl_result, "is_spa", False),
                 "spa_root_html": getattr(crawl_result, "spa_root_html", ""),

@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 from app.config import get_settings
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ApiEndpoint, CrawlState, RequestObservation, RouteCandidate, RouteSource
+from app.core.crawler.spa import SpaFallbackDetector
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,7 @@ class BrowserDiscoveryEngine:
         auth_headers: dict[str, str] | None = None,
         routes: list[str] | None = None,
         deadline: float | None = None,
+        storage_state: dict | None = None,
     ) -> CrawlState:
         """Crawl into a fresh :class:`CrawlState` and return it.
 
@@ -204,6 +206,7 @@ class BrowserDiscoveryEngine:
             auth_headers=auth_headers,
             routes=routes,
             deadline=deadline,
+            storage_state=storage_state,
         )
         return state
 
@@ -215,6 +218,7 @@ class BrowserDiscoveryEngine:
         auth_headers: dict[str, str] | None = None,
         routes: list[str] | None = None,
         deadline: float | None = None,
+        storage_state: dict | None = None,
     ) -> CrawlState:
         """Stream browser observations into ``state`` as they arrive.
 
@@ -259,7 +263,24 @@ class BrowserDiscoveryEngine:
             # truncation still reports True rather than the None default.
             state.browser_available = True
 
-            context = await browser.new_context()
+            # Seed the context from a full authenticated storage_state when one
+            # was captured by a browser_spa login: this restores cookies AND the
+            # per-origin localStorage/sessionStorage the SPA reads its token from,
+            # so its own bootstrap JS renders the logged-in shell. Falls back to
+            # bare cookie/header injection when absent (cookie-auth apps, static
+            # auth only). Generic: storage_state is an opaque per-origin blob.
+            if storage_state:
+                try:
+                    context = await browser.new_context(storage_state=storage_state)
+                except Exception as exc:
+                    logger.warning(
+                        "failed to seed browser context from storage_state; "
+                        "falling back to cookie injection: %s",
+                        exc,
+                    )
+                    context = await browser.new_context()
+            else:
+                context = await browser.new_context()
 
             # Capture programmatic SPA route changes across all pages.
             try:
@@ -369,10 +390,21 @@ class BrowserDiscoveryEngine:
                     try:
                         # Root/first target always does a full load; later
                         # same-origin routes prefer client-side navigation.
+                        was_first = first
                         await self._navigate(page, target_url, root_url, allow_spa=not first)
                         first = False
                         await self._settle_inflight(page, inflight)
                         await self._clear_blocking_overlays(page)
+                        # Post-auth liveness re-check (generic): if we seeded an
+                        # authenticated storage_state but the root still renders the
+                        # logged-out shell, the session did not persist into the
+                        # browser context. Surface it (RC-A regression) rather than
+                        # silently crawling an unauthenticated surface.
+                        if was_first and storage_state and not state.browser_error:
+                            if await self._looks_logged_out(page):
+                                state.browser_error = (
+                                    "authenticated session did not persist into browser context"
+                                )
                         state.add_route(
                             RouteCandidate(
                                 url=self._current_url(page, target_url),
@@ -452,6 +484,25 @@ class BrowserDiscoveryEngine:
             return await asyncio.wait_for(coro, timeout=max(0.05, ms / 1000.0))
         except Exception:
             return _BOUNDED_FAILED
+
+    async def _looks_logged_out(self, page: Any) -> bool:
+        """Generic post-auth liveness heuristic.
+
+        Reuses :meth:`SpaFallbackDetector.looks_like_spa_shell` on the rendered
+        DOM: a still-logged-out SPA renders its bare shell (login markers, no
+        authenticated content). Returns ``False`` on any error so a flaky probe
+        never fabricates a regression. No app-specific strings.
+        """
+        html = await self._bounded(page.content(), 3000)
+        if html is _BOUNDED_FAILED or not isinstance(html, str):
+            return False
+        url = self._current_url(page, "")
+        # A login form on the root is the strongest generic "logged-out" signal.
+        lowered = html.lower()
+        has_login_form = "<form" in lowered and any(
+            token in lowered for token in ("password", "type=\"password\"", "type='password'")
+        )
+        return has_login_form and SpaFallbackDetector.looks_like_spa_shell(url, html)
 
     @staticmethod
     def _current_url(page: Any, fallback: str) -> str:

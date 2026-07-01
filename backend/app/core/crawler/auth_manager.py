@@ -64,6 +64,7 @@ class AuthResult:
     is_spa: bool = False
     state: AuthVerificationState = AuthVerificationState.unauthenticated
     verification_evidence: str = ""
+    storage_state: dict | None = None
 
 
 @dataclass
@@ -655,6 +656,16 @@ class SmartAuthenticator:
                 cookies = await context.cookies()
                 cookies_dict = {c["name"]: c["value"] for c in cookies}
 
+                # Capture the entire authenticated session (cookies + per-origin
+                # localStorage/sessionStorage) so downstream browser contexts render as
+                # the logged-in user regardless of where the app stores its token.
+                # Generic: never inspect or special-case any key name here.
+                storage_state = None
+                try:
+                    storage_state = await context.storage_state()
+                except Exception as e:
+                    logger.debug("[auth] Failed to capture storage_state: %s", e)
+
                 local_storage = await page.evaluate("() => JSON.stringify(localStorage)")
                 bearer_token = None
                 if local_storage:
@@ -678,6 +689,7 @@ class SmartAuthenticator:
                     auth_result.strategy = AuthStrategy.browser_spa
                     auth_result.cookies = cookies_dict
                     auth_result.bearer_token = bearer_token
+                    auth_result.storage_state = storage_state
                     auth_result.replay_state = None
                     logger.info("[auth] Strategy 4 succeeded!")
                     await context.close()

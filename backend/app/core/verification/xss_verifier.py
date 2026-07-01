@@ -831,10 +831,25 @@ class XSSVerifier(BaseVerifier):
             probes.append(urlunparse(parts))
         return list(dict.fromkeys(probes))
 
-    async def _new_reflection_context(self, browser, route_url: str):
-        context = await browser.new_context(
-            ignore_https_errors=True, user_agent="SentryStrikeScanner/1.0"
-        )
+    async def _new_reflection_context(self, browser, route_url: str, storage_state: dict | None = None):
+        # Seed from the full authenticated storage_state when available (Task A)
+        # so authenticated-only SPA routes render during DOM confirmation. Falls
+        # back to cookie injection when absent. Opaque per-origin blob — generic.
+        context = None
+        if storage_state:
+            try:
+                context = await browser.new_context(
+                    ignore_https_errors=True,
+                    user_agent="SentryStrikeScanner/1.0",
+                    storage_state=storage_state,
+                )
+            except Exception as exc:
+                logger.debug("failed to seed reflection context from storage_state: %s", exc)
+                context = None
+        if context is None:
+            context = await browser.new_context(
+                ignore_https_errors=True, user_agent="SentryStrikeScanner/1.0"
+            )
         cookies = getattr(self.http_verifier, "cookies", None)
         if cookies:
             domain = urlparse(route_url).netloc.split(":")[0]

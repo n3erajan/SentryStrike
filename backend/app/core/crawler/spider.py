@@ -78,6 +78,7 @@ class CrawlResult:
     auth_state: AuthVerificationState = AuthVerificationState.unauthenticated
     auth_headers: dict[str, str] = field(default_factory=dict)
     auth_verification_evidence: str = ""
+    auth_storage_state: dict | None = None
     browser_available: bool | None = None
     browser_error: str | None = None
     workflow_states_visited: int = 0
@@ -96,6 +97,10 @@ class WebSpider:
         self._is_spa: bool = False
         self._auth_state: AuthVerificationState = AuthVerificationState.unauthenticated
         self._auth_verification_evidence: str = ""
+        # Full Playwright storage_state captured by a browser_spa login (cookies +
+        # per-origin localStorage/sessionStorage). Replayed into the discovery and
+        # XSS browser contexts so the app's own JS finds its token. Generic: opaque blob.
+        self._auth_storage_state: dict | None = None
         # Per-scan main-account credentials submitted with the scan (overrides
         # env-based SCAN_AUTH_* settings for this crawl). See ScanAuthAccount.
         self._auth_override = None
@@ -109,6 +114,7 @@ class WebSpider:
         self._auth_replay_state = None
         self._auth_state = AuthVerificationState.unauthenticated
         self._auth_verification_evidence = ""
+        self._auth_storage_state = None
 
     @staticmethod
     def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -389,6 +395,7 @@ class WebSpider:
             auth_state=self._auth_state,
             auth_headers=dict(self._auth_headers),
             auth_verification_evidence=self._auth_verification_evidence,
+            auth_storage_state=self._auth_storage_state,
             browser_available=crawl_state.browser_available,
             browser_error=crawl_state.browser_error,
             workflow_states_visited=crawl_state.workflow_states_visited,
@@ -559,6 +566,7 @@ class WebSpider:
                 auth_headers=self._auth_headers,
                 routes=routes,
                 deadline=deadline,
+                storage_state=self._auth_storage_state,
             )
         )
         safety_timeout = budget + max(30.0, budget * 0.5)
@@ -836,6 +844,8 @@ class WebSpider:
                     if result.bearer_token:
                         self._auth_headers["Authorization"] = f"Bearer {result.bearer_token}"
                         client.headers["Authorization"] = f"Bearer {result.bearer_token}"
+                    if result.storage_state:
+                        self._auth_storage_state = result.storage_state
                     if result.replay_state:
                         self._auth_replay_state = result.replay_state
                     self._auth_state = result.state
