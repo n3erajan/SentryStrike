@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     crawl_browser_mode: str = Field(default="auto", alias="CRAWL_BROWSER_MODE")
     crawl_browser_max_interactions: int = Field(default=25, alias="CRAWL_BROWSER_MAX_INTERACTIONS")
     crawl_browser_budget_seconds: float = Field(default=300.0, alias="CRAWL_BROWSER_BUDGET_SECONDS")
+    # Task B (value-ordered crawl): the effective browser budget scales with the
+    # number of routes to visit — small apps finish fast, large apps get more —
+    # bounded by ``crawl_browser_budget_seconds`` as a hard ceiling. Per-route
+    # deadline checks still guarantee a clean truncation.
+    crawl_browser_per_route_seconds: float = Field(default=6.0, alias="CRAWL_BROWSER_PER_ROUTE_SECONDS")
+    crawl_browser_base_seconds: float = Field(default=30.0, alias="CRAWL_BROWSER_BASE_SECONDS")
+    # Hard cap on how many routes the browser crawl will visit in one run
+    # (the priority queue drops the low-score tail when this is hit).
+    crawl_browser_route_cap: int = Field(default=120, alias="CRAWL_BROWSER_ROUTE_CAP")
     # Bounds for the XSS browser-driven DOM reflection sweep (Task 5). Caps the
     # number of route+param probes and the wall-clock spent so the phase can
     # never dominate a scan.

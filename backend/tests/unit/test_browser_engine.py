@@ -241,13 +241,15 @@ async def test_crawl_wrapper_returns_populated_state(monkeypatch):
 
 
 def test_browser_targets_visit_same_origin_routes_only():
+    # Seed set is bounded by the route cap (Task B), not the per-page interaction
+    # budget, so all same-origin routes are enqueued regardless of max_interactions.
     engine = BrowserDiscoveryEngine(max_interactions=3)
 
     targets = engine._browser_targets(
         "http://example.com/",
         [
             "http://example.com/admin",
-            "http://evil.example/api",
+            "http://evil.example/api",  # cross-origin -> dropped
             "/products",
             "/orders",
             "/ignored",
@@ -259,7 +261,10 @@ def test_browser_targets_visit_same_origin_routes_only():
         "http://example.com/admin",
         "http://example.com/products",
         "http://example.com/orders",
+        "http://example.com/ignored",
     ]
+    # The cross-origin route is never a target.
+    assert "http://evil.example/api" not in targets
 
 
 def test_browser_request_dedupe_uses_url_template_and_body_schema():
@@ -836,3 +841,191 @@ async def test_crawl_into_flags_lost_session_when_still_logged_out(monkeypatch):
     assert state.browser_error == (
         "authenticated session did not persist into browser context"
     )
+
+
+# --- Task B: value-ordered, submission-driven crawl -------------------------
+
+
+def test_effective_deadline_scales_with_route_count_and_is_capped():
+    engine = BrowserDiscoveryEngine()
+    engine.settings.crawl_browser_base_seconds = 10.0
+    engine.settings.crawl_browser_per_route_seconds = 5.0
+    engine.settings.crawl_browser_route_cap = 100
+    engine.settings.crawl_browser_budget_seconds = 300.0
+
+    class _Loop:
+        def time(self):
+            return 1000.0
+
+    loop = _Loop()
+    # 2 routes -> base + 5*2 = 20s window.
+    d2 = engine._effective_deadline(2000.0, loop, 2)
+    assert d2 == 1000.0 + 20.0
+    # Many routes -> scaled window would exceed configured budget -> capped.
+    dbig = engine._effective_deadline(9999.0, loop, 1000)
+    assert dbig == 1000.0 + 300.0
+    # Never exceeds the caller's hard deadline.
+    dclamped = engine._effective_deadline(1005.0, loop, 1000)
+    assert dclamped == 1005.0
+    # No deadline supplied -> no bound.
+    assert engine._effective_deadline(None, loop, 5) is None
+
+
+def test_budget_allows_interaction_gates_when_little_time_left():
+    engine = BrowserDiscoveryEngine()
+    engine.settings.crawl_browser_budget_seconds = 100.0
+
+    class _Loop:
+        def __init__(self, now):
+            self._now = now
+
+        def time(self):
+            return self._now
+
+    # Plenty of budget left -> interaction allowed.
+    assert engine._budget_allows_interaction(1000.0, _Loop(950.0)) is True
+    # Almost no budget left -> interaction gated off.
+    assert engine._budget_allows_interaction(1000.0, _Loop(999.0)) is False
+    # None deadline -> always allowed.
+    assert engine._budget_allows_interaction(None, _Loop(0.0)) is True
+
+
+class _SubmitFakePage:
+    """Records fills/clicks and fires a POST XHR with a body when submitted."""
+
+    def __init__(self):
+        self.url = "http://spa.test/login"
+        self._handlers = {}
+        self.fills = []
+        self.checks = []
+        self.submit_clicks = 0
+
+    def on(self, event, handler):
+        self._handlers.setdefault(event, []).append(handler)
+
+    async def _fire(self, event, arg):
+        for handler in self._handlers.get(event, []):
+            result = handler(arg)
+            if inspect.isawaitable(result):
+                await result
+
+    async def fill(self, selector, value, timeout=None):
+        self.fills.append((selector, value))
+
+    async def check(self, selector, timeout=None):
+        self.checks.append(selector)
+
+    def locator(self, selector):
+        page = self
+
+        class _L:
+            def __init__(self, sel):
+                self._sel = sel
+                self.first = self
+
+            async def count(self):
+                return 1 if "submit" in self._sel else 0
+
+            async def click(self, timeout=None):
+                page.submit_clicks += 1
+                # Submitting fires the app's real POST XHR with a body.
+                request = _FakeRequest(
+                    "http://spa.test/rest/user/login",
+                    method="POST",
+                    resource_type="xhr",
+                    post_data='{"email":"scanner@example.com","password":"Password123!"}',
+                )
+                await page._fire("request", request)
+                await page._fire("requestfinished", request)
+
+        return _L(selector)
+
+    async def evaluate(self, script, *args):
+        return None
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        self.url = url
+
+
+@pytest.mark.asyncio
+async def test_submit_discovered_forms_fills_submits_and_captures_body():
+    engine = BrowserDiscoveryEngine()
+    page = _SubmitFakePage()
+    captured = []
+    page.on("request", lambda r: captured.append(r))
+
+    form = {
+        "action": "http://spa.test/rest/user/login",
+        "method": "POST",
+        "inputs": [
+            {"name": "email", "type": "email"},
+            {"name": "password", "type": "password"},
+        ],
+    }
+    submitted: set = set()
+    await engine._submit_discovered_forms(
+        page, [form], "http://spa.test/", "http://spa.test/login", submitted,
+    )
+
+    # Both fields were filled with typed placeholders.
+    assert any("email" in sel for sel, _ in page.fills)
+    assert any("password" in sel for sel, _ in page.fills)
+    assert page.submit_clicks == 1
+    # The submission fired a POST XHR carrying a real body.
+    posts = [r for r in captured if r.method == "POST" and r.post_data]
+    assert posts and "password" in posts[0].post_data
+    # Form key recorded for dedup.
+    assert submitted
+
+
+@pytest.mark.asyncio
+async def test_submit_discovered_forms_skips_destructive_and_dedups():
+    engine = BrowserDiscoveryEngine()
+    page = _SubmitFakePage()
+
+    destructive = {
+        "action": "http://spa.test/account/delete",
+        "method": "POST",
+        "inputs": [{"name": "confirm", "type": "text"}],
+    }
+    submitted: set = set()
+    await engine._submit_discovered_forms(
+        page, [destructive], "http://spa.test/", "http://spa.test/account", submitted,
+    )
+    # Destructive form never submitted, but keyed so it is not retried.
+    assert page.submit_clicks == 0
+    assert submitted
+
+    # Re-submitting an already-seen form key is a no-op.
+    prev = len(page.fills)
+    await engine._submit_discovered_forms(
+        page, [destructive], "http://spa.test/", "http://spa.test/account", submitted,
+    )
+    assert len(page.fills) == prev
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_visits_high_value_routes_first(monkeypatch):
+    """A short budget must still reach high-surface routes: the priority queue
+    orders auth/search/api routes ahead of generic content pages."""
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    state = CrawlState()
+    routes = [
+        "/about",
+        "/blog",
+        "/rest/user/login",
+        "/search?q=test",
+        "/contact",
+    ]
+    await engine.crawl_into(state, "http://spa.test/", routes=routes)
+
+    # Root is visited first (seeded), then high-value routes precede generic
+    # ones in goto order. Find positions of a high-value vs a generic route.
+    order = page.goto_calls
+    login_idx = next((i for i, u in enumerate(order) if "login" in u), None)
+    about_idx = next((i for i, u in enumerate(order) if "about" in u), None)
+    assert login_idx is not None and about_idx is not None
+    assert login_idx < about_idx

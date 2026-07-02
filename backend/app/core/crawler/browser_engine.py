@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import re
-from collections import deque
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from app.config import get_settings
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ApiEndpoint, CrawlState, RequestObservation, RouteCandidate, RouteSource
+from app.core.crawler.route_priority import score_route_surface
 from app.core.crawler.spa import SpaFallbackDetector
 
 logger = logging.getLogger(__name__)
@@ -369,24 +370,54 @@ class BrowserDiscoveryEngine:
                 pass
 
             try:
-                route_budget = max(1, self.settings.crawl_max_urls)
-                queue: deque[str] = deque()
+                route_budget = max(1, min(self.settings.crawl_max_urls, self.settings.crawl_browser_route_cap))
+                # Value-ordered priority queue (Task B): a max-heap keyed by
+                # descending surface score, tie-broken by insertion order for
+                # determinism. High-surface routes (auth/forms/API-bearing) are
+                # popped first so meaningful coverage lands before truncation.
+                heap: list[tuple[int, int, str]] = []
                 seen_routes: set[str] = set()
+                submitted_form_keys: set[tuple[str, str, tuple[str, ...]]] = set()
+                counter = 0
+
+                def _enqueue(url: str, evidence: str = "") -> None:
+                    nonlocal counter
+                    key = self._normalize_for_seen(url)
+                    if key in seen_routes or len(seen_routes) >= route_budget:
+                        return
+                    seen_routes.add(key)
+                    # Negate score so heapq (a min-heap) pops highest score first;
+                    # the monotonic counter preserves FIFO among equal scores.
+                    heapq.heappush(heap, (-score_route_surface(url, evidence), counter, url))
+                    counter += 1
+
+                # Seed known static routes (already carry auth/forms/API surface)
+                # with their score before the crawl starts so even a short budget
+                # reaches them. The root target is always included.
                 for target in self._browser_targets(root_url, routes or []):
-                    key = self._normalize_for_seen(target)
-                    if key not in seen_routes:
-                        seen_routes.add(key)
-                        queue.append(target)
+                    _enqueue(target, evidence="seed")
+
+                # Effective budget scaled to route count: small apps finish fast,
+                # large apps get proportionally more, always capped by the
+                # configured overall budget. The per-route deadline checks below
+                # still guarantee a clean truncation regardless.
+                effective_deadline = self._effective_deadline(deadline, loop, len(seen_routes))
 
                 first = True
-                while queue:
-                    if deadline is not None and loop.time() >= deadline:
+                while heap:
+                    now = loop.time()
+                    if effective_deadline is not None and now >= effective_deadline:
                         state.browser_error = (
                             state.browser_error
                             or "browser discovery truncated: overall budget reached before all routes were visited"
                         )
                         break
-                    target_url = queue.popleft()
+                    _, _, target_url = heapq.heappop(heap)
+                    # Per-route interaction gating: once little of the overall
+                    # budget remains, stop blind clicking (expensive, low-yield)
+                    # but always still navigate + settle + capture/submit forms
+                    # (cheap, high-yield). Derived from remaining fraction.
+                    allow_interaction = self._budget_allows_interaction(effective_deadline, loop)
                     try:
                         # Root/first target always does a full load; later
                         # same-origin routes prefer client-side navigation.
@@ -413,19 +444,23 @@ class BrowserDiscoveryEngine:
                                 evidence="browser_navigation",
                             )
                         )
-                        workflow_stats = await self._exercise_page(page)
-                        state.workflow_states_visited += workflow_stats.get("states", 0)
-                        state.browser_forms_discovered += workflow_stats.get("forms", 0)
-                        state.file_inputs_discovered += workflow_stats.get("file_inputs", 0)
-                        for form in await self._capture_forms(page, target_url):
+                        if allow_interaction:
+                            workflow_stats = await self._exercise_page(page)
+                            state.workflow_states_visited += workflow_stats.get("states", 0)
+                            state.browser_forms_discovered += workflow_stats.get("forms", 0)
+                            state.file_inputs_discovered += workflow_stats.get("file_inputs", 0)
+                        captured_forms = await self._capture_forms(page, target_url)
+                        for form in captured_forms:
                             state.add_browser_form(form)
-                        # Enqueue newly-discovered same-origin routes (bounded).
+                        # Active form submission (Task B): fire the app's real
+                        # POST/PUT/PATCH XHR with a real body shape so on_request
+                        # captures a replayable observation. Skips destructive forms.
+                        await self._submit_discovered_forms(
+                            page, captured_forms, root_url, target_url, submitted_form_keys,
+                        )
+                        # Enqueue newly-discovered same-origin routes (scored).
                         for new_route in await self._discover_routes(page, root_url):
-                            key = self._normalize_for_seen(new_route)
-                            if key in seen_routes or len(seen_routes) >= route_budget:
-                                continue
-                            seen_routes.add(key)
-                            queue.append(new_route)
+                            _enqueue(new_route, evidence="browser_discovered")
                     except Exception as exc:
                         logger.warning("browser discovery failed for %s: %s", target_url, exc)
             finally:
@@ -621,6 +656,134 @@ class BrowserDiscoveryEngine:
                 }
             )
         return forms
+
+    def _effective_deadline(self, deadline: float | None, loop: Any, route_count: int) -> float | None:
+        """Scale the browser budget to the number of routes to visit (Task B).
+
+        ``base + per_route * min(routes, cap)`` clamped by the configured overall
+        budget, so small apps finish fast and large apps get proportionally more.
+        Returns ``None`` (no bound) only when the caller supplied no ``deadline``.
+        The per-route deadline checks in the crawl loop still guarantee a clean
+        truncation regardless of this value.
+        """
+        if deadline is None:
+            return None
+        base = float(getattr(self.settings, "crawl_browser_base_seconds", 30.0))
+        per_route = float(getattr(self.settings, "crawl_browser_per_route_seconds", 6.0))
+        cap = max(1, int(getattr(self.settings, "crawl_browser_route_cap", 120)))
+        configured = float(getattr(self.settings, "crawl_browser_budget_seconds", 300.0))
+        scaled = base + per_route * min(max(route_count, 1), cap)
+        effective = min(configured, scaled)
+        # Never exceed the caller's hard deadline; only ever shrink it.
+        return min(deadline, loop.time() + effective)
+
+    def _budget_allows_interaction(self, effective_deadline: float | None, loop: Any) -> bool:
+        """Gate expensive blind clicking behind remaining-budget fraction.
+
+        Navigation + settle + form capture/submit are always performed (cheap,
+        high-yield). Blind ``_exercise_page`` clicking is skipped once less than
+        ~25% of the effective budget remains, so the tail of the run spends its
+        time reaching more high-value routes rather than exercising one.
+        """
+        if effective_deadline is None:
+            return True
+        remaining = effective_deadline - loop.time()
+        total = float(getattr(self.settings, "crawl_browser_budget_seconds", 300.0))
+        # Skip interaction only when comfortably little time is left in absolute
+        # AND relative terms; early in the crawl interaction always runs.
+        return remaining > max(0.0, 0.25 * total) or remaining > 45.0
+
+    async def _submit_discovered_forms(
+        self,
+        page: Any,
+        forms: list[dict[str, Any]],
+        root_url: str,
+        route_url: str,
+        submitted_keys: set[tuple[str, str, tuple[str, ...]]],
+    ) -> None:
+        """Actively submit non-destructive forms to generate real request bodies.
+
+        For each captured form, fill inputs with type-appropriate synthetic
+        values (reusing the generic typed-placeholder logic) and submit it, so
+        the app fires its real ``POST/PUT/PATCH`` XHR with a real body shape that
+        ``on_request`` captures as a replayable observation. Destructive forms
+        (delete/pay/logout/…) are never submitted. Auth forms are submitted with
+        synthetic creds — capturing the request body is the goal even when the
+        credentials are invalid. Each form key is submitted at most once across
+        the whole crawl (dedup via :meth:`CrawlState._form_key`).
+        """
+        from app.core.crawler.models import CrawlState
+
+        for form in forms:
+            key = CrawlState._form_key(form)
+            if key in submitted_keys:
+                continue
+            inputs = form.get("inputs") or []
+            # Skip destructive forms: check action + input names generically.
+            haystack = " ".join(
+                [str(form.get("action", ""))] + [str(i.get("name", "")) for i in inputs]
+            )
+            if DESTRUCTIVE_LABEL_RE.search(haystack):
+                submitted_keys.add(key)
+                continue
+            submitted_keys.add(key)
+            try:
+                filled = await self._fill_form_fields(page, inputs)
+                if not filled:
+                    continue
+                await self._submit_form(page, form)
+                await self._settle_inflight(page, {"count": 0})
+                # A submit can navigate away; return to the route so the queue's
+                # subsequent captures stay meaningful. Bounded.
+                if self._current_url(page, route_url) != route_url:
+                    await self._bounded(
+                        page.goto(route_url, wait_until="domcontentloaded", timeout=8000),
+                        9000,
+                    )
+            except Exception as exc:
+                logger.debug("form submission failed on %s: %s", route_url, exc)
+
+    async def _fill_form_fields(self, page: Any, inputs: list[dict[str, Any]]) -> bool:
+        """Fill a form's inputs with generic typed placeholders. Returns True if
+        at least one field was filled (so an empty/hidden-only form is skipped)."""
+        filled = False
+        for entry in inputs:
+            name = str(entry.get("name", "") or "")
+            itype = str(entry.get("type", "text") or "text").lower()
+            if not name or itype in ("hidden", "submit", "button", "file", "image", "reset"):
+                continue
+            value = ApiExtractor._baseline_for_name(name)
+            selector = f"[name='{name}']"
+            if itype in ("checkbox", "radio"):
+                res = await self._bounded(page.check(selector, timeout=800), 1000)
+                filled = filled or res is not _BOUNDED_FAILED
+                continue
+            res = await self._bounded(page.fill(selector, str(value), timeout=800), 1000)
+            filled = filled or res is not _BOUNDED_FAILED
+        return filled
+
+    async def _submit_form(self, page: Any, form: dict[str, Any]) -> None:
+        """Submit a form by clicking its submit control or pressing Enter."""
+        # Prefer an explicit submit control scoped to the form's action.
+        for selector in (
+            "button[type=submit]",
+            "input[type=submit]",
+            "button:not([type])",
+        ):
+            loc = page.locator(selector)
+            res = await self._bounded(loc.count(), 500)
+            if isinstance(res, int) and res > 0:
+                clicked = await self._bounded(loc.first.click(timeout=800), 1000)
+                if clicked is not _BOUNDED_FAILED:
+                    return
+        # Fallback: submit the form element directly via requestSubmit/submit.
+        await self._bounded(
+            page.evaluate(
+                "() => { const f = document.querySelector('form'); "
+                "if (f) { (f.requestSubmit ? f.requestSubmit() : f.submit()); } }"
+            ),
+            1000,
+        )
 
     async def _discover_routes(self, page: Any, root_url: str) -> list[str]:
         """Collect same-origin routes from captured SPA nav + in-DOM links."""
@@ -936,6 +1099,12 @@ class BrowserDiscoveryEngine:
         root_origin = self._origin(root_url)
         targets = [root_url]
         seen = {self._normalize_for_seen(root_url)}
+        # Seed all known static routes up to the route cap (Task B): high-value
+        # auth/form/API routes must be enqueued with their score before the
+        # crawl starts so even a short budget reaches them. Bounding the seed set
+        # by the per-run route cap (not the per-page interaction budget) keeps
+        # that guarantee decoupled from how much clicking each page gets.
+        seed_cap = max(1, min(self.settings.crawl_max_urls, self.settings.crawl_browser_route_cap))
         for route in routes:
             absolute = urljoin(root_url, route)
             if self._origin(absolute) != root_origin:
@@ -945,7 +1114,7 @@ class BrowserDiscoveryEngine:
                 continue
             seen.add(key)
             targets.append(absolute)
-            if len(targets) >= self.max_interactions + 1:
+            if len(targets) >= seed_cap:
                 break
         return targets
 
