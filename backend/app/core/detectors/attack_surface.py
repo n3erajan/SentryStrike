@@ -339,6 +339,14 @@ class AttackSurface:
         for endpoint in api_endpoints:
             if (endpoint.url, endpoint.method.upper()) in observed_body_keys:
                 continue
+            # Task C (RC-C): only synthesize bodies for genuine API/JSON/form
+            # endpoints. SPA HTML navigation routes (e.g. a POST /login route
+            # returning the 200 HTML shell) exercise no vulnerable code, so
+            # placeholder bodies aimed at them waste the injection budget.
+            # Observed bodies always win (deduped out above), so this gate only
+            # affects static synthesis.
+            if not ApiExtractor.is_api_endpoint(endpoint):
+                continue
             content_type, template = ApiExtractor.synthesize_body_schema(endpoint)
             if not template:
                 continue

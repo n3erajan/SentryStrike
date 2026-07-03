@@ -1,8 +1,51 @@
 from __future__ import annotations
 
 from app.core.crawler.api_extractor import ApiExtractor
-from app.core.crawler.models import ApiEndpoint, ParameterLocation, RequestObservation
+from app.core.crawler.models import ApiEndpoint, ParameterLocation, RequestObservation, RouteSource
 from app.core.detectors.attack_surface import AttackSurface, build_json_body
+
+
+# --- Task C: is_api_endpoint predicate (generic) ---------------------------------------
+
+
+def test_is_api_endpoint_true_on_body_schema():
+    ep = ApiEndpoint(url="http://x/rest/user/login", method="POST", body_schema=["email", "password"])
+    assert ApiExtractor.is_api_endpoint(ep) is True
+
+
+def test_is_api_endpoint_true_on_json_content_type():
+    ep = ApiEndpoint(url="http://x/submit", method="POST", content_type="application/json")
+    assert ApiExtractor.is_api_endpoint(ep) is True
+
+
+def test_is_api_endpoint_true_on_api_path_token():
+    for url in ("http://x/api/basket", "http://x/rest/products", "http://x/graphql", "http://x/v1/orders"):
+        assert ApiExtractor.is_api_endpoint(ApiEndpoint(url=url, method="POST")) is True
+
+
+def test_is_api_endpoint_true_on_xhr_provenance():
+    ep = ApiEndpoint(url="http://x/basket", method="POST", source=RouteSource.browser, evidence="xhr:200")
+    assert ApiExtractor.is_api_endpoint(ep) is True
+    js = ApiEndpoint(url="http://x/basket", method="POST", source=RouteSource.javascript, evidence="fetch/xhr")
+    assert ApiExtractor.is_api_endpoint(js) is True
+
+
+def test_is_api_endpoint_false_on_html_navigation_route():
+    # An SPA route (e.g. the Angular /login route) mined as a bare endpoint with
+    # no body, no api token, and no XHR provenance is NOT an API endpoint.
+    ep = ApiEndpoint(url="http://x/login", method="POST", source=RouteSource.html, evidence="")
+    assert ApiExtractor.is_api_endpoint(ep) is False
+
+
+def test_is_api_endpoint_false_on_text_html_content_type():
+    ep = ApiEndpoint(url="http://x/rest/user/login", method="POST", content_type="text/html")
+    assert ApiExtractor.is_api_endpoint(ep) is False
+
+
+def test_is_api_endpoint_false_on_ambiguous_endpoint():
+    # No content-type, no schema, no api token, static source -> default to not API.
+    ep = ApiEndpoint(url="http://x/dashboard", method="POST", source=RouteSource.html)
+    assert ApiExtractor.is_api_endpoint(ep) is False
 
 
 # --- synthesize_body_schema unit cases -------------------------------------------------
@@ -125,3 +168,68 @@ def test_build_synthesizes_form_targets_for_form_content_type():
     assert target.replayable is False
     prepared = target.build_request("' OR 1=1--")
     assert prepared.data["email"] == "' OR 1=1--"
+
+
+# --- Task C: synthesis targets real API endpoints only ---------------------------------
+
+
+def test_build_synthesis_excludes_html_navigation_route():
+    """A JS-mined API endpoint gets body targets; a sibling HTML route does not."""
+    api = ApiEndpoint(
+        url="http://x/rest/user/login",
+        method="POST",
+        source=RouteSource.javascript,
+        evidence="fetch/xhr",
+        body_schema=["email", "password"],
+    )
+    html_route = ApiEndpoint(
+        url="http://x/login",
+        method="POST",
+        source=RouteSource.html,
+        evidence="",
+    )
+    targets = AttackSurface.build([], [], api_endpoints=[api, html_route])
+
+    synth = [t for t in targets if t.source_confidence == "static_synth"]
+    # Body targets exist for the real API endpoint...
+    assert {t.parameter for t in synth} == {"email", "password"}
+    # ...and none point at the HTML route.
+    assert all("/login" not in t.url or "/rest/" in t.url for t in synth)
+    assert all(t.url == "http://x/rest/user/login" for t in synth)
+
+
+def test_build_synthesis_includes_api_signal_endpoint():
+    ep = ApiEndpoint(
+        url="http://x/api/orders",
+        method="POST",
+        source=RouteSource.browser,
+        evidence="xhr:200",
+        content_type="application/json",
+        body_schema=["item", "qty"],
+    )
+    targets = AttackSurface.build([], [], api_endpoints=[ep])
+    synth = [t for t in targets if t.source_confidence == "static_synth"]
+    assert {t.parameter for t in synth} == {"item", "qty"}
+
+
+def test_build_synthesis_prefers_observed_body_over_synth_for_api():
+    ep = ApiEndpoint(
+        url="http://x/rest/user/login",
+        method="POST",
+        source=RouteSource.javascript,
+        evidence="fetch/xhr",
+        body_schema=["email", "password"],
+    )
+    observed = RequestObservation(
+        url="http://x/rest/user/login",
+        method="POST",
+        request_headers={"content-type": "application/json"},
+        request_content_type="application/json",
+        post_data='{"email":"a@b.test","password":"pw"}',
+        body_kind="json",
+        replayable=True,
+    )
+    targets = AttackSurface.build([], [], api_endpoints=[ep], requests=[observed])
+    # Observed body wins; nothing static_synth for this endpoint.
+    assert all(t.source_confidence != "static_synth" for t in targets)
+    assert any(t.replayable for t in targets)

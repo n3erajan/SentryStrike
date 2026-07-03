@@ -609,6 +609,76 @@ class ApiExtractor:
         "token",
     )
 
+    # Generic API path-token families (matched as whole path tokens, never as a
+    # full path) that mark an endpoint as a genuine JSON/RPC API surface rather
+    # than an SPA HTML navigation route. No application-specific literal.
+    _API_PATH_TOKENS = frozenset(
+        {"api", "rest", "graphql", "gql", "rpc", "trpc", "v1", "v2", "v3", "json"}
+    )
+    _API_CONTENT_TYPES = ("json", "x-www-form-urlencoded", "multipart", "graphql")
+    _PATH_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+    @classmethod
+    def is_api_endpoint(cls, endpoint: ApiEndpoint) -> bool:
+        """Return True when ``endpoint`` is a genuine API/JSON/form endpoint.
+
+        Task C (RC-C): body-injection synthesis must target real API endpoints,
+        never SPA HTML navigation routes (a ``POST /login`` Angular *route* that
+        returns the 200 HTML shell exercises no vulnerable code). An endpoint is
+        API-like when **any** generic signal holds — all key on structure/token
+        families, never a full path:
+
+        * declared/observed content-type is JSON/form/multipart/graphql,
+        * it carries a ``body_schema`` / ``multipart_fields`` / ``request_body``,
+        * a path token belongs to the generic API family (api/rest/graphql/v1…),
+        * it was sourced from XHR/fetch/JS mining rather than an ``<a href>`` link.
+
+        Endpoints whose only evidence is an HTML navigation route (static
+        html/sitemap/robots source with no body signal) — or whose observed
+        response content-type is ``text/html`` — are **not** API-like. Ambiguous
+        endpoints (no content-type, no schema, no api token) default to False so
+        placeholder bodies are never sprayed at HTML routes.
+        """
+        content_type = (endpoint.content_type or "").lower()
+
+        # Strong structural body signals.
+        if endpoint.body_schema or endpoint.multipart_fields:
+            return True
+        if endpoint.request_body not in (None, "", {}, []):
+            return True
+
+        # Content-type signals (declared or observed request body type).
+        if any(ct in content_type for ct in cls._API_CONTENT_TYPES):
+            return True
+
+        # Explicit HTML exclusion: a navigation route that returns/declares HTML
+        # is never an API endpoint regardless of other weak signals.
+        evidence = (endpoint.evidence or "").lower()
+        if "text/html" in content_type or "text/html" in evidence:
+            return False
+
+        # Generic API path token family.
+        try:
+            path = urlparse(endpoint.url).path.lower()
+        except Exception:
+            path = ""
+        tokens = {tok for tok in cls._PATH_TOKEN_SPLIT_RE.split(path) if tok}
+        if tokens & cls._API_PATH_TOKENS:
+            return True
+
+        # Provenance: mined from XHR/fetch/JS rather than a static <a href> link.
+        # Browser-derived endpoints come from real XHR/fetch observations; JS/api
+        # sources come from fetch/axios/HttpClient mining. Static html/sitemap/
+        # robots sources are navigation routes and do not qualify on their own.
+        if endpoint.source in {RouteSource.browser, RouteSource.api}:
+            return True
+        if endpoint.source == RouteSource.javascript and any(
+            tok in evidence for tok in ("xhr", "fetch", "axios", "http", "graphql", "ajax")
+        ):
+            return True
+
+        return False
+
     @classmethod
     def synthesize_body_schema(cls, endpoint: ApiEndpoint) -> tuple[str | None, Any]:
         """Synthesize a skeleton request body for body-injection detectors.
