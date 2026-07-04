@@ -56,6 +56,12 @@ class ScanAuthAccount(BaseModel):
     cookie: str | None = None
     header: str | None = None
     login_url: str | None = None
+    success_url: str | None = None
+    success_text: str | None = None
+    success_regex: str | None = None
+    failure_text: str | None = None
+    failure_regex: str | None = None
+    validation_url: str | None = None
 
 
 class SeverityBreakdown(BaseModel):

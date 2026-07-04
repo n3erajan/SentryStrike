@@ -36,6 +36,12 @@ def _auth_accounts_from_payload(credentials: ScanCredentials | None) -> list[Sca
                 cookie=cred.cookie,
                 header=cred.header,
                 login_url=cred.login_url,
+                success_url=cred.success_url,
+                success_text=cred.success_text,
+                success_regex=cred.success_regex,
+                failure_text=cred.failure_text,
+                failure_regex=cred.failure_regex,
+                validation_url=cred.validation_url,
             )
         )
     return accounts
@@ -79,7 +85,7 @@ async def create_scan(
     )
     if orchestrator is None:
         raise HTTPException(status_code=500, detail="Scanner orchestrator not initialized")
-    await orchestrator.queue_scan(str(scan.id), auth_accounts=auth_accounts)
+    await orchestrator.queue_scan(str(scan.id), auth_accounts=auth_accounts, scan_config=payload.config)
     return json_response(
         {
             "scan_id": str(scan.id),

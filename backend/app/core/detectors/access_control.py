@@ -365,6 +365,7 @@ class AccessControlDetector(BaseDetector):
         self, urls: list[str], forms: list[object], **kwargs: object
     ) -> list[Finding]:
         findings: list[Finding] = []
+        self._scan_config = kwargs.get("scan_config")
         settings = get_settings()
         session_cookies: dict[str, str] = dict(kwargs.get("session_cookies") or {})
         auth_headers: dict[str, str] = dict(kwargs.get("auth_headers") or {})
@@ -1489,7 +1490,8 @@ class AccessControlDetector(BaseDetector):
         path = urlparse(request.url).path.lower()
         destructive_tokens = ("delete", "remove", "purchase", "checkout", "pay", "transfer", "withdraw")
         settings = get_settings()
-        if getattr(settings, "scan_mode", "verified") != "aggressive" and any(token in path for token in destructive_tokens):
+        scan_mode = self._scan_config.get_val("scan_mode", getattr(settings, "scan_mode", "verified")) if getattr(self, "_scan_config", None) else getattr(settings, "scan_mode", "verified")
+        if scan_mode != "aggressive" and any(token in path for token in destructive_tokens):
             return False
         return True
 

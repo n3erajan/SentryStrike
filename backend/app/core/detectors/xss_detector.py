@@ -80,8 +80,12 @@ class XSSDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        # auth_headers carries the Bearer token for apps that use header-based auth
+        # (JWT in localStorage) rather than cookies. Applied to all HTTP verifier
+        # instances so authenticated endpoints receive valid credentials.
+        auth_headers: dict[str, str] = kwargs.get("auth_headers") or {}
 
-        if not session_cookies:
+        if not session_cookies and not auth_headers:
             logger.warning(
                 "XSSDetector: no session_cookies provided. Requests to "
                 "authenticated endpoints will be redirected to login and "
@@ -132,8 +136,10 @@ class XSSDetector(BaseDetector):
 
         logger.debug("XSSDetector: testing %d candidates.", len(candidates))
 
+        scan_config = kwargs.get("scan_config")
         settings = get_settings()
-        worker_count = max(1, min(4, settings.scanner_concurrency // 2 or 1))
+        effective_concurrency = scan_config.scanner_concurrency if scan_config else settings.scanner_concurrency
+        worker_count = max(1, min(4, effective_concurrency // 2 or 1))
         stored_probe_urls = XSSVerifier.select_stored_probe_urls(
             list(dict.fromkeys([*urls, *(target.url for target in targets)]))
         )
@@ -162,6 +168,8 @@ class XSSDetector(BaseDetector):
 
             verifier = XSSVerifier()
             verifier.http_verifier.cookies = session_cookies
+            if auth_headers:
+                verifier.http_verifier.headers = {**verifier.http_verifier.headers, **auth_headers}
             try:
                 result = await verifier.verify(
                     cand_url, param, method, val,
@@ -221,6 +229,8 @@ class XSSDetector(BaseDetector):
             )
             browser_verifier = XSSVerifier()
             browser_verifier.http_verifier.cookies = session_cookies
+            if auth_headers:
+                browser_verifier.http_verifier.headers = {**browser_verifier.http_verifier.headers, **auth_headers}
             try:
                 for job in pending_browser_jobs:
                     browser_findings = await browser_verifier.run_browser_verification(job)
@@ -235,7 +245,8 @@ class XSSDetector(BaseDetector):
         findings.extend(
             await self._browser_dom_reflection_sweep(
                 targets, routes, session_cookies, browser_available, findings,
-                storage_state=storage_state,
+                storage_state=storage_state, scan_config=scan_config,
+                auth_headers=auth_headers,
             )
         )
 
@@ -249,6 +260,8 @@ class XSSDetector(BaseDetector):
         browser_available: bool,
         existing_findings: list[Finding],
         storage_state: dict | None = None,
+        scan_config=None,
+        auth_headers: dict | None = None,
     ) -> list[Finding]:
         """Navigate SPA routes with an executing canary and confirm DOM execution.
 
@@ -263,8 +276,8 @@ class XSSDetector(BaseDetector):
             return []
 
         settings = get_settings()
-        max_jobs = max(0, int(getattr(settings, "xss_browser_dom_max_jobs", 12)))
-        budget = float(getattr(settings, "xss_browser_dom_budget_seconds", 60.0))
+        max_jobs = max(0, scan_config.xss_browser_dom_max_jobs if scan_config else int(getattr(settings, "xss_browser_dom_max_jobs", 12)))
+        budget = float(scan_config.xss_browser_dom_budget_seconds if scan_config else getattr(settings, "xss_browser_dom_budget_seconds", 60.0))
         if max_jobs == 0 or budget <= 0:
             return []
 
@@ -283,6 +296,8 @@ class XSSDetector(BaseDetector):
 
         verifier = XSSVerifier()
         verifier.http_verifier.cookies = session_cookies
+        if auth_headers:
+            verifier.http_verifier.headers = {**verifier.http_verifier.headers, **auth_headers}
         context = None
         p = None
         try:

@@ -320,7 +320,6 @@ class XSSVerifier(BaseVerifier):
                     browser_findings = await self.run_browser_verification(job)
                     if browser_findings:
                         findings.extend(browser_findings)
-
             if findings:
                 # Reapply your original stored deduplication consolidation routine
                 has_stored = any(f.vuln_type == "Stored XSS" for f in findings)

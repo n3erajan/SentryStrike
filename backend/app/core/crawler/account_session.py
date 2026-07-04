@@ -105,17 +105,19 @@ async def resolve_account_session(root_url: str, account: ScanAuthAccount) -> Re
     return session
 
 
-async def provision_secondary_session(root_url: str) -> ResolvedSession:
+async def provision_secondary_session(root_url: str, allow_override: bool | None = None) -> ResolvedSession:
     """Auto-provision a throwaway second identity for differential IDOR/BOLA.
 
-    Gated by ``allow_secondary_provisioning``. Registers and logs in a random
-    throwaway user against ``root_url`` and returns its session. Never raises:
-    when provisioning is disabled or not possible, returns an empty (unusable)
-    session so IDOR simply falls back to whatever identities already exist.
+    Gated by ``allow_secondary_provisioning`` (or ``allow_override`` when set).
+    Registers and logs in a random throwaway user against ``root_url`` and returns
+    its session. Never raises: when provisioning is disabled or not possible, returns
+    an empty (unusable) session so IDOR simply falls back to whatever identities
+    already exist.
     """
     session = ResolvedSession()
     settings = get_settings()
-    if not getattr(settings, "allow_secondary_provisioning", False):
+    allowed = allow_override if allow_override is not None else getattr(settings, "allow_secondary_provisioning", False)
+    if not allowed:
         return session
 
     try:

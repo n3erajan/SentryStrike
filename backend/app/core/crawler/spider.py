@@ -3,6 +3,7 @@ import logging
 import pathlib
 import re
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from urllib import robotparser
 from urllib.parse import urlparse
 
@@ -10,6 +11,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.config import get_settings
+from app.schemas.scan_schema import ScanConfig
 from app.core.crawler.auth_manager import (
     ModernAuthManager,
     SmartAuthenticator,
@@ -104,6 +106,8 @@ class WebSpider:
         # Per-scan main-account credentials submitted with the scan (overrides
         # env-based SCAN_AUTH_* settings for this crawl). See ScanAuthAccount.
         self._auth_override = None
+        # Per-scan configuration overrides.
+        self._scan_config: ScanConfig | None = None
 
     def _snapshot_cookies(self, cookies: httpx.Cookies) -> dict[str, str]:
         return ModernAuthManager.snapshot_cookies(cookies)
@@ -125,11 +129,16 @@ class WebSpider:
                 redacted[key] = f"{scheme} {redact_secret(token)}" if token else redact_secret(value)
         return redacted
 
-    async def crawl(self, root_url: str, max_depth: int | None = None, auth_override=None) -> CrawlResult:
+    async def crawl(self, root_url: str, max_depth: int | None = None, auth_override=None, scan_config: ScanConfig | None = None) -> CrawlResult:
         self._reset_scan_auth_state()
         self._auth_override = auth_override
+        self._scan_config = scan_config
         self._is_spa = False
-        max_depth = max_depth if max_depth is not None else self.settings.crawl_depth
+        max_depth = max_depth if max_depth is not None else (
+            scan_config.get_val("crawl_depth", self.settings.crawl_depth) if scan_config 
+            else self.settings.crawl_depth
+        )
+        effective_max_urls = self._scan_config.get_val("crawl_max_urls", self.settings.crawl_max_urls) if self._scan_config else self.settings.crawl_max_urls
         visited: set[str] = set()
         queue = asyncio.Queue()
         forms: list[HtmlForm] = []
@@ -168,8 +177,9 @@ class WebSpider:
 
         robots = await self._load_robots(root_url)
 
+        effective_timeout = self._scan_config.get_val("request_timeout_seconds", self.settings.request_timeout_seconds) if self._scan_config else self.settings.request_timeout_seconds
         async with create_scan_client(
-            timeout=self.settings.request_timeout_seconds,
+            timeout=effective_timeout,
             follow_redirects=True,
             headers={"User-Agent": "SentryStrikeScanner/1.0"},
             event_hooks={"response": [make_httpx_response_logger("crawler", "crawl")]},
@@ -226,7 +236,7 @@ class WebSpider:
 
             # 3. Main crawling loop with concurrency
             import time
-            rate_limit = self.settings.crawl_rate_limit_per_second
+            rate_limit = self._scan_config.get_val("crawl_rate_limit_per_second", self.settings.crawl_rate_limit_per_second) if self._scan_config else self.settings.crawl_rate_limit_per_second
             request_interval = 1.0 / rate_limit if rate_limit > 0 else 0
             last_request_time = time.time()
 
@@ -255,7 +265,7 @@ class WebSpider:
                 while True:
                     try:
                         async with lock:
-                            if len(discovered_urls) >= self.settings.crawl_max_urls:
+                            if len(discovered_urls) >= effective_max_urls:
                                 break
                         
                         item = await queue.get()
@@ -281,7 +291,7 @@ class WebSpider:
                         continue
 
                     async with lock:
-                        if len(discovered_urls) >= self.settings.crawl_max_urls:
+                        if len(discovered_urls) >= effective_max_urls:
                             queue.task_done()
                             break
 
@@ -346,15 +356,15 @@ class WebSpider:
                     queue.task_done()
 
             # Spawn concurrent workers
-            concurrency = self.settings.scanner_concurrency
-            workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
+            effective_concurrency = self._scan_config.get_val("scanner_concurrency", self.settings.scanner_concurrency) if self._scan_config else self.settings.scanner_concurrency
+            workers = [asyncio.create_task(worker()) for _ in range(effective_concurrency)]
 
             try:
                 # Wait until queue is empty and all tasks are done, OR we reached max URLs
                 join_task = asyncio.create_task(queue.join())
                 while not join_task.done():
                     async with lock:
-                        if len(discovered_urls) >= self.settings.crawl_max_urls:
+                        if len(discovered_urls) >= effective_max_urls:
                             break
                     await asyncio.sleep(0.1)
                 
@@ -371,6 +381,25 @@ class WebSpider:
             if self._should_run_browser(self._is_spa or spa_detector.root_looks_like_spa()):
                 browser_routes = [route.url for route in crawl_state.routes if route.source == RouteSource.javascript]
                 await self._run_browser_discovery(crawl_state, root_url, browser_routes)
+
+        # P4: browser-navigated routes with query strings hold real parameter
+        # values (e.g. /redirect?to=https://...) that the HTTP worker never saw
+        # because they redirect externally or were visited browser-only. Extend
+        # discovered_urls so ParamDiscovery parses their query parameters and all
+        # detectors (open_redirect, file_inclusion, ssrf, …) receive them.
+        if crawl_state.browser_available:
+            _seen_for_p4 = {normalize_for_dedupe(u) for u in discovered_urls}
+            for _route in crawl_state.routes:
+                if getattr(_route, "is_dead", False):
+                    continue
+                if _route.source not in (RouteSource.browser,):
+                    continue
+                if "?" not in _route.url:
+                    continue
+                _norm = normalize_for_dedupe(_route.url)
+                if _norm not in _seen_for_p4:
+                    _seen_for_p4.add(_norm)
+                    discovered_urls.append(_route.url)
 
         for endpoint in crawl_state.api_endpoints:
             for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
@@ -517,7 +546,8 @@ class WebSpider:
         """
         if self.settings.crawl_browser_enabled:
             return True
-        mode = (self.settings.crawl_browser_mode or "auto").strip().lower()
+        mode = (self._scan_config.get_val("crawl_browser_mode", self.settings.crawl_browser_mode) if self._scan_config else self.settings.crawl_browser_mode or "auto")
+        mode = mode.strip().lower()
         if mode == "never":
             return False
         if mode == "always":
@@ -552,11 +582,11 @@ class WebSpider:
             return
 
         loop = asyncio.get_running_loop()
-        budget = self.settings.crawl_browser_budget_seconds
+        budget = self._scan_config.get_val("crawl_browser_budget_seconds", self.settings.crawl_browser_budget_seconds) if self._scan_config else self.settings.crawl_browser_budget_seconds
         deadline = loop.time() + budget
         browser_state = CrawlState()
         engine = BrowserDiscoveryEngine(
-            max_interactions=self.settings.crawl_browser_max_interactions
+            max_interactions=self._scan_config.get_val("crawl_browser_max_interactions", self.settings.crawl_browser_max_interactions) if self._scan_config else self.settings.crawl_browser_max_interactions
         )
         task = asyncio.create_task(
             engine.crawl_into(
@@ -757,6 +787,32 @@ class WebSpider:
         )
         return has_session_message or (has_login_form and has_session_message)
 
+    @staticmethod
+    def _merged_auth_settings(global_settings, override) -> SimpleNamespace:
+        """Merge global auth settings with per-account overrides.
+
+        ``SmartAuthenticator`` reads attributes via ``getattr(self.settings, name, None)``
+        so a ``SimpleNamespace`` works as a drop-in. Per-account values take precedence.
+        """
+        merged = {
+            "authentication_login_url": None,
+            "authentication_success_url": None,
+            "authentication_success_text": None,
+            "authentication_success_regex": None,
+            "authentication_failure_text": None,
+            "authentication_failure_regex": None,
+            "authentication_validation_url": None,
+        }
+        for key in merged:
+            # Prefer per-account override, fall back to global setting.
+            override_val = getattr(override, key.replace("authentication_", ""), None) if override else None
+            merged[key] = override_val or getattr(global_settings, key, None)
+        # Carry over all other settings the authenticator may access.
+        for attr in dir(global_settings):
+            if attr not in merged and not attr.startswith("_"):
+                merged[attr] = getattr(global_settings, attr)
+        return SimpleNamespace(**merged)
+
     async def _authenticate_session(self, client: httpx.AsyncClient, root_url: str, force: bool = False):
         """Authenticate session using cookies or credentials.
 
@@ -797,7 +853,8 @@ class WebSpider:
                 self._auth_verification_evidence = "configured authentication header supplied"
 
         if auth_cookie or auth_header_cfg:
-            result = await SmartAuthenticator(self.settings)._verify_auth(client)
+            auth_settings = self._merged_auth_settings(self.settings, override)
+            result = await SmartAuthenticator(auth_settings)._verify_auth(client)
             self._auth_state = result.state
             self._auth_verification_evidence = result.verification_evidence or self._auth_verification_evidence
             if result.bearer_token:
@@ -824,7 +881,8 @@ class WebSpider:
                 auth_header = client.headers.get("Authorization")
                 if auth_header:
                     self._auth_headers["Authorization"] = auth_header
-                result = await SmartAuthenticator(self.settings)._verify_auth(client)
+                auth_settings = self._merged_auth_settings(self.settings, override)
+                result = await SmartAuthenticator(auth_settings)._verify_auth(client)
                 self._auth_state = result.state
                 self._auth_verification_evidence = result.verification_evidence
                 logger.info("Session refreshed via stored login replay state")
@@ -836,7 +894,8 @@ class WebSpider:
         # 2. Check if username and password are provided
         if username and password:
             try:
-                authenticator = SmartAuthenticator(self.settings)
+                auth_settings = self._merged_auth_settings(self.settings, override)
+                authenticator = SmartAuthenticator(auth_settings)
                 result = await authenticator.authenticate(client, login_url, username, password)
                 self._is_spa = self._is_spa or result.is_spa
                 if result.authenticated:

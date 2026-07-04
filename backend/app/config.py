@@ -73,7 +73,6 @@ class Settings(BaseSettings):
     authentication_failure_text: str | None = Field(default=None, alias="SCAN_AUTH_FAILURE_TEXT")
     authentication_failure_regex: str | None = Field(default=None, alias="SCAN_AUTH_FAILURE_REGEX")
     authentication_validation_url: str | None = Field(default=None, alias="SCAN_AUTH_VALIDATION_URL")
-    max_verification_requests_per_param: int = Field(default=10, alias="MAX_VERIFICATION_REQUESTS")
     blind_injection_timing_threshold: float = Field(
         default=0.7,
         alias="BLIND_INJECTION_TIMING_THRESHOLD",

@@ -43,3 +43,5 @@ async def test_send_request_preserves_url_query_when_params_empty():
     assert "Submit=Submit" in captured_urls[0]
 
     await verifier.close()
+
+

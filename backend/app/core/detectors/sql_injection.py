@@ -17,6 +17,7 @@ Architecture:
 import asyncio
 import logging
 
+from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.verification.sqli_verifier import SQLiVerifier
@@ -67,7 +68,12 @@ class SQLInjectionDetector(BaseDetector):
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
         self.verifier.http_verifier.cookies = session_cookies
-
+        scan_config = kwargs.get("scan_config")
+        settings = get_settings()
+        self.verifier.blind_timing_threshold = (
+            scan_config.get_val("blind_injection_timing_threshold", settings.blind_injection_timing_threshold)
+            if scan_config else settings.blind_injection_timing_threshold
+        )
         # Phase 1: Reconnaissance - Extract candidates
         candidates = self._extract_candidates(
             urls,

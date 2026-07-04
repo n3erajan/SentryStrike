@@ -539,6 +539,31 @@ class SmartAuthenticator:
                 logger.info("[auth] Browser launched, navigating to %s", root_url)
                 await page.goto(root_url, wait_until="networkidle", timeout=15000)
 
+                # Dismiss blocking overlays (cookie consent, Material CDK backdrops,
+                # welcome modals) before searching for form inputs. Without this,
+                # Angular Material overlays intercept pointer events and the password
+                # field is never found, causing Strategy 4 to bail prematurely.
+                try:
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(400)
+                except Exception:
+                    pass
+                for _dismiss_sel in [
+                    "button:has-text('Got it')", "button:has-text('Accept')",
+                    "button:has-text('Accept All')", "button:has-text('OK')",
+                    "button:has-text('Dismiss')", "button:has-text('Close')",
+                    "button:has-text('Agree')", "[aria-label='Close']",
+                    ".cdk-overlay-backdrop", ".mat-dialog-container button",
+                ]:
+                    try:
+                        _loc = page.locator(_dismiss_sel)
+                        if await _loc.count() > 0 and await _loc.first.is_visible():
+                            await _loc.first.click(force=True, timeout=800)
+                            await page.wait_for_timeout(300)
+                            break
+                    except Exception:
+                        pass
+
                 login_btn_selectors = [
                     "a[href*='login']", "a[href*='signin']", "a[href*='sign-in']",
                     "button:has-text('login')", "button:has-text('log in')",
@@ -563,6 +588,13 @@ class SmartAuthenticator:
                                     break
                         except Exception as e:
                             logger.debug("[auth] Failed to click selector %s: %s", selector, e)
+
+                # Wait up to 3 s for the password field to appear after navigation
+                # and any overlay dismissal; SPAs may lazy-render the login form.
+                try:
+                    await page.wait_for_selector("input[type='password']", timeout=3000)
+                except Exception:
+                    pass
 
                 password_inputs = page.locator("input[type='password']")
                 if await password_inputs.count() == 0:

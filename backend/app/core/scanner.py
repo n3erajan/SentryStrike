@@ -13,6 +13,7 @@ from app.analyzers.ai_client import OllamaClient
 from app.analyzers.report_generator import AiReportGenerator
 from app.core.crawler.account_session import provision_secondary_session, resolve_account_session
 from app.core.crawler.spider import WebSpider
+from app.schemas.scan_schema import ScanConfig
 from app.core.detectors.access_control import AccessControlDetector
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
 from app.core.detectors.base_detector import Finding
@@ -126,6 +127,8 @@ class ScanOrchestrator:
         # In-memory only: submitted test-account credentials per scan. Never
         # persisted; cleared when the scan finishes (see run_scan finally).
         self._scan_credentials: dict[str, list] = {}
+        # In-memory only: per-scan configuration overrides. Never persisted.
+        self._scan_configs: dict[str, ScanConfig | None] = {}
 
         self._remediation_fallbacks: dict[str, str] = {
             "Cross-Site Request Forgery (CSRF)": (
@@ -203,9 +206,11 @@ class ScanOrchestrator:
             ),
         }
 
-    async def queue_scan(self, scan_id: str, auth_accounts: list | None = None) -> None:
+    async def queue_scan(self, scan_id: str, auth_accounts: list | None = None, scan_config: ScanConfig | None = None) -> None:
         if auth_accounts:
             self._scan_credentials[scan_id] = auth_accounts
+        if scan_config is not None:
+            self._scan_configs[scan_id] = scan_config
         task = asyncio.create_task(self.run_scan(scan_id), name=f"scan-{scan_id}")
         self._tasks[scan_id] = task
         self._cancel_flags[scan_id] = False
@@ -218,7 +223,7 @@ class ScanOrchestrator:
             return True
         return False
 
-    async def _apply_submitted_account_sessions(self, scan, accounts_by_role: dict, crawl_context: dict) -> None:
+    async def _apply_submitted_account_sessions(self, scan, accounts_by_role: dict, crawl_context: dict, scan_config: ScanConfig | None = None) -> None:
         """Resolve second/admin test accounts to live sessions and inject them.
 
         The access-control detector reads ``second_user_cookies``/``_headers`` and
@@ -255,8 +260,9 @@ class ScanOrchestrator:
         already_have_second = bool(
             crawl_context.get("second_user_cookies") or crawl_context.get("second_user_headers")
         )
+        allow = scan_config.get_val("allow_secondary_provisioning", None) if scan_config else None
         if not already_have_second:
-            provisioned = await provision_secondary_session(scan.target_url)
+            provisioned = await provision_secondary_session(scan.target_url, allow_override=allow)
             if provisioned.usable:
                 crawl_context["second_user_cookies"] = provisioned.cookies
                 crawl_context["second_user_headers"] = provisioned.headers
@@ -285,12 +291,15 @@ class ScanOrchestrator:
             auth_accounts_by_role = {account.role.value: account for account in submitted_accounts}
             main_account = auth_accounts_by_role.get("main")
 
+            # Per-scan config override (in-memory, never persisted).
+            scan_config = self._scan_configs.get(scan_id)
+
             await self._set_progress(scan, 10, ScanPhase.crawling, "Crawling target and discovering attack surface")
             if scan.crawl_mode == CrawlMode.single:
                 logger.info("single-path scan: skipping spider discovery for %s", scan.target_url)
                 crawl_result = await self.spider.fetch_single(scan.target_url)
             else:
-                crawl_result = await self.spider.crawl(scan.target_url, auth_override=main_account)
+                crawl_result = await self.spider.crawl(scan.target_url, auth_override=main_account, scan_config=scan_config)
             scan.statistics.total_urls_crawled = len(crawl_result.urls)
             await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {len(crawl_result.urls)} URL(s) discovered")
             await self._check_cancelled(scan_id)
@@ -326,7 +335,8 @@ class ScanOrchestrator:
                 if not isinstance(detector, (CryptoFailuresDetector, SecurityHeadersDetector))
                 and not (scan.crawl_mode == CrawlMode.single and isinstance(detector, skip_in_single_path))
             ]
-            detector_parallelism = max(2, get_settings().scanner_concurrency // 3)
+            effective_concurrency = scan_config.get_val("scanner_concurrency", get_settings().scanner_concurrency) if scan_config else get_settings().scanner_concurrency
+            detector_parallelism = max(2, effective_concurrency // 3)
             detector_semaphore = asyncio.Semaphore(detector_parallelism)
             session_cookies = getattr(crawl_result, "session_cookies", {})
             crawl_context = {
@@ -346,14 +356,15 @@ class ScanOrchestrator:
                 "browser_available": getattr(crawl_result, "browser_available", None),
                 "browser_error": getattr(crawl_result, "browser_error", None),
                 "browser_forms": getattr(crawl_result, "browser_forms", []),
+                "scan_config": scan_config,
             }
-            await self._apply_submitted_account_sessions(scan, auth_accounts_by_role, crawl_context)
+            await self._apply_submitted_account_sessions(scan, auth_accounts_by_role, crawl_context, scan_config=scan_config)
             coverage_context = {
                 **crawl_context,
                 "urls": crawl_result.urls,
                 "forms": crawl_result.forms,
             }
-            self._update_crawl_metadata(scan, crawl_result)
+            self._update_crawl_metadata(scan, crawl_result, crawl_context)
 
             await self._set_progress(scan, 45, ScanPhase.vulnerability_detection, f"Running {len(active_detectors)} active detector(s)")
             detector_metrics: list[DetectorCoverageMetric] = []
@@ -568,7 +579,7 @@ class ScanOrchestrator:
             )
 
             settings = get_settings()
-            scan_mode = getattr(settings, "scan_mode", "verified")
+            scan_mode = scan_config.get_val("scan_mode", getattr(settings, "scan_mode", "verified")) if scan_config else getattr(settings, "scan_mode", "verified")
             if scan_mode == "verified":
                 dropped_by_detector: dict[str, int] = {}
                 kept, dropped = [], []
@@ -707,6 +718,7 @@ class ScanOrchestrator:
             self._tasks.pop(scan_id, None)
             self._cancel_flags.pop(scan_id, None)
             self._scan_credentials.pop(scan_id, None)
+            self._scan_configs.pop(scan_id, None)
 
     def _detector_name(self, detector: object) -> str:
         return str(getattr(detector, "name", None) or detector.__class__.__name__)
@@ -740,16 +752,19 @@ class ScanOrchestrator:
         if candidates_built == 0 and not findings:
             skipped_reasons["no_candidates_built"] = 1
 
+        scan_config: ScanConfig | None = crawl_context.get("scan_config")
         settings = get_settings()
         if detector_name == "access_control" and not (
             settings.authentication_second_cookie or settings.authentication_second_header
         ):
             skipped_reasons["second_user_account_missing"] = 1
-        if detector_name == "ssrf" and not settings.oast_callback_base_url:
-            # OAST-verified blind SSRF is unavailable, but the in-band differential
-            # fallback still runs (probable/unverified findings). Flag it as a
-            # confidence-limiting gap rather than a hard skip.
-            skipped_reasons["oast_callback_missing_inband_only"] = 1
+        if detector_name == "ssrf":
+            oast_url = scan_config.oast_callback_base_url if scan_config else settings.oast_callback_base_url
+            if not oast_url:
+                # OAST-verified blind SSRF is unavailable, but the in-band differential
+                # fallback still runs (probable/unverified findings). Flag it as a
+                # confidence-limiting gap rather than a hard skip.
+                skipped_reasons["oast_callback_missing_inband_only"] = 1
 
         return DetectorCoverageMetric(
             detector=detector_name,
@@ -1550,7 +1565,7 @@ class ScanOrchestrator:
             detected_at=datetime.now(timezone.utc),
         )
 
-    def _update_crawl_metadata(self, scan: 'Scan', crawl_result) -> None:
+    def _update_crawl_metadata(self, scan: 'Scan', crawl_result, crawl_context: dict | None = None) -> None:
         auth_state = getattr(crawl_result, "auth_state", "unauthenticated")
         auth_state_value = auth_state.value if hasattr(auth_state, "value") else str(auth_state)
         has_session = bool(getattr(crawl_result, "session_cookies", {}) or {})
@@ -1605,7 +1620,7 @@ class ScanOrchestrator:
             auth_headers_present=has_headers,
             session_cookies_present=has_session,
         )
-        scan.report_metadata.coverage_warnings = self._coverage_warnings(crawl_result, dynamic_status)
+        scan.report_metadata.coverage_warnings = self._coverage_warnings(crawl_result, dynamic_status, crawl_context)
 
     @staticmethod
     def _classify_dynamic_status(
@@ -1630,7 +1645,7 @@ class ScanOrchestrator:
             return "dynamic_partial"
         return "dynamic_ok"
 
-    def _coverage_warnings(self, crawl_result, dynamic_status: str = "dynamic_ok") -> list[str]:
+    def _coverage_warnings(self, crawl_result, dynamic_status: str = "dynamic_ok", crawl_context: dict | None = None) -> list[str]:
         warnings: list[str] = []
         # Prominent, top-level honesty banner when dynamic discovery degraded, so
         # a browser-dependent scan is never presented as a clean full scan. The
@@ -1691,7 +1706,9 @@ class ScanOrchestrator:
         settings = get_settings()
         if not (settings.authentication_second_cookie or settings.authentication_second_header):
             warnings.append("No second-user account configured; horizontal IDOR comparison was not tested.")
-        if not settings.oast_callback_base_url:
+        scan_config = (crawl_context or {}).get("scan_config")
+        oast_url = scan_config.oast_callback_base_url if scan_config else settings.oast_callback_base_url
+        if not oast_url:
             warnings.append(
                 "No OAST callback configured (OAST_CALLBACK_BASE_URL); blind SSRF was "
                 "assessed with the in-band differential fallback only, so SSRF findings "

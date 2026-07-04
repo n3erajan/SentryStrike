@@ -29,7 +29,7 @@ class FakeRepo:
 
 
 class FakeSpider:
-    async def crawl(self, _: str):
+    async def crawl(self, _: str, **kwargs):
         class Result:
             urls = ["https://example.com/search?q=1"]
             forms = []
@@ -172,7 +172,7 @@ async def test_single_path_scan_uses_fetch_single(monkeypatch):
             used_fetch_single = True
             return await super().fetch_single(url)
 
-        async def crawl(self, url: str):
+        async def crawl(self, url: str, **kwargs):
             raise AssertionError("crawl() should not be called in single-path mode")
 
     orchestrator = ScanOrchestrator(FakeRepo(scan))
@@ -265,7 +265,7 @@ async def test_full_scan_against_mock_server(monkeypatch):
         # Avoid tech detector slowing things down or making external calls
         orchestrator.technology_detector = FakeTechDetector()
         orchestrator.cve_service = FakeCveService()
-        
+
         await orchestrator.run_scan("mock-id")
         
         assert scan.status == ScanStatus.completed

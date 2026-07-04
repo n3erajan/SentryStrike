@@ -166,6 +166,8 @@ class AttackSurface:
         seen: set[tuple[str, str, str, str, str]] = set()
 
         for candidate in candidates:
+            if cls._is_transport_layer_url(candidate.url):
+                continue
             template = None
             form_inputs = candidate.context.get("form_inputs")
             headers: dict[str, str] = {}
@@ -311,6 +313,28 @@ class AttackSurface:
         )
 
         return targets
+
+    @staticmethod
+    def _is_transport_layer_url(url: str) -> bool:
+        """True for WebSocket/long-poll transport-library URLs that are not application APIs.
+
+        Socket.IO, SockJS, and SignalR expose polling URLs whose query parameters
+        (EIO, transport, sid, t) are wire-protocol identifiers, not application data.
+        Injecting into them wastes the verification budget and never yields findings.
+        Filtered by well-known library path tokens and protocol-level query signatures.
+        """
+        try:
+            parsed = urlparse(url)
+            path = parsed.path.lower()
+            for lib_segment in ("/socket.io", "/engine.io", "/sockjs", "/signalr/hubs"):
+                if lib_segment in path:
+                    return True
+            qs = parse_qs(parsed.query)
+            if "EIO" in qs and "transport" in qs:
+                return True
+        except Exception:
+            pass
+        return False
 
     # Maximum synthesized leaf targets per endpoint (bounds combinatorial growth).
     _SYNTH_LEAF_CAP = 25

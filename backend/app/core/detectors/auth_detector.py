@@ -1385,7 +1385,9 @@ class AuthenticationFailuresDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
-        scan_mode = getattr(get_settings(), "scan_mode", "verified")
+        scan_config = kwargs.get("scan_config")
+        settings = get_settings()
+        scan_mode = scan_config.get_val("scan_mode", getattr(settings, "scan_mode", "verified")) if scan_config else getattr(settings, "scan_mode", "verified")
         verified_mode = scan_mode == "verified"
         is_spa = bool(kwargs.get("is_spa", False))
 

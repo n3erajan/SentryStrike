@@ -2,6 +2,7 @@ import asyncio
 import logging
 from urllib.parse import urlparse
 
+from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.verification.command_verifier import CommandInjectionVerifier
@@ -28,6 +29,7 @@ class CommandInjectionDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        scan_config = kwargs.get("scan_config")
 
         def cmd_filter(param_name: str) -> bool:
             return self._name_may_be_command_input(param_name)
@@ -49,7 +51,11 @@ class CommandInjectionDetector(BaseDetector):
         semaphore = asyncio.Semaphore(4)
         verifier = CommandInjectionVerifier(timeout_seconds=10.0)
         verifier.http_verifier.cookies = session_cookies
-
+        settings = get_settings()
+        verifier.blind_timing_threshold = (
+            scan_config.get_val("blind_injection_timing_threshold", settings.blind_injection_timing_threshold)
+            if scan_config else settings.blind_injection_timing_threshold
+        )
         async def verify_candidate(cand: AttackTarget) -> list[Finding]:
             async with semaphore:
                 try:

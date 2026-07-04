@@ -281,14 +281,16 @@ class SensitivePathsDetector(BaseDetector):
             if last_slash > 0:
                 dirs_to_check.add(p[:last_slash + 1])
 
+        scan_config = kwargs.get("scan_config")
         settings = get_settings()
         semaphore = asyncio.Semaphore(5)
         is_spa = bool(kwargs.get("is_spa", False))
         spa_root_html = str(kwargs.get("spa_root_html") or "")
         spa_detector = SpaFallbackDetector()
 
+        effective_timeout = scan_config.get_val("request_timeout_seconds", settings.request_timeout_seconds) if scan_config else settings.request_timeout_seconds
         async with create_scan_client(
-            timeout=settings.request_timeout_seconds,
+            timeout=effective_timeout,
             follow_redirects=True,
             verify=False,  # Similar to other detectors, allow self-signed for scanning
             event_hooks={"response": [make_httpx_response_logger("sensitive_paths", "path_probe")]},
@@ -448,5 +450,6 @@ class SensitivePathsDetector(BaseDetector):
         for directory in dirs:
             add(f"{root_origin}{directory}")
 
-        cap = int(getattr(get_settings(), "sensitive_paths_permutation_cap", 200) or 200)
+        sc = kwargs.get("scan_config") if kwargs else None
+        cap = sc.get_val("sensitive_paths_permutation_cap", int(getattr(get_settings(), "sensitive_paths_permutation_cap", 200) or 200)) if sc else int(getattr(get_settings(), "sensitive_paths_permutation_cap", 200) or 200)
         return candidates[:cap]

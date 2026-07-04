@@ -102,13 +102,7 @@ class CommandInjectionVerifier(BaseVerifier):
         1. Output-based detection (Unix/Windows)
         2. Time-based blind
         3. Error-based
-
-        Args:
-            form_inputs: Full list of form input objects from the crawler. Required for
-                POST forms with non-injectable required fields (e.g. Submit buttons,
-                hidden CSRF tokens). Without this, forms gated on isset($_POST['Submit'])
-                will silently skip execution - all responses return in ~3ms because
-                nothing runs.
+        Verify command injection vulnerability safely.
         """
         self._begin_verification(parameter)
         findings = []
@@ -129,8 +123,8 @@ class CommandInjectionVerifier(BaseVerifier):
             is_vulnerable=False,
             confidence_score=0.0,
             detection_method="none",
-            findings=[],
-            evidence={},
+            findings=findings,
+            evidence={"budget_exceeded": True},
         )
 
     async def _verify_output_based(
@@ -490,7 +484,7 @@ class CommandInjectionVerifier(BaseVerifier):
 
                 # Analyze timing
                 settings = get_settings()
-                threshold_fraction = settings.blind_injection_timing_threshold
+                threshold_fraction = getattr(self, "blind_timing_threshold", None) or settings.blind_injection_timing_threshold
                 is_significant, timing_analysis = ResponseAnalyzer.is_timing_significant(
                     baseline_times, injected_times, threshold_ms=expected_delay_ms * threshold_fraction
                 )

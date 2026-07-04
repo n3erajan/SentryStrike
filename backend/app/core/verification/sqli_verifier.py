@@ -1251,8 +1251,7 @@ class SQLiVerifier(BaseVerifier):
                     evidence={"skipped": "baseline_too_slow", "baseline_mean_ms": baseline_mean},
                 )
 
-            settings = get_settings()
-            threshold_fraction = settings.blind_injection_timing_threshold
+            threshold_fraction = getattr(self, "blind_timing_threshold", None) or get_settings().blind_injection_timing_threshold
 
             for payload, expected_ms in sleep_payloads:
 

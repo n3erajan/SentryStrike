@@ -91,7 +91,7 @@ class SSRFDetector(BaseDetector):
             )
         return None
 
-    async def _probe_inband(self, cand: AttackTarget, verifier, build_request, settings) -> Finding | None:
+    async def _probe_inband(self, cand: AttackTarget, verifier, build_request, timing_delta_ms: float) -> Finding | None:
         """In-band SSRF heuristic: internal targets vs external control differential.
 
         Sends the candidate's sink pointed at internal targets and an external
@@ -131,7 +131,7 @@ class SSRFDetector(BaseDetector):
                 internal_samples.append(triple)
 
             reason = self._inband_differential(
-                control_samples, internal_samples, settings.ssrf_inband_timing_delta_ms
+                control_samples, internal_samples, timing_delta_ms
             )
             if reason:
                 return Finding(
@@ -163,12 +163,16 @@ class SSRFDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        scan_config = kwargs.get("scan_config")
         settings = get_settings()
+        oast_callback = scan_config.get_val("oast_callback_base_url", settings.oast_callback_base_url) if scan_config else settings.oast_callback_base_url
+        oast_poll = scan_config.get_val("oast_poll_url", settings.oast_poll_url) if scan_config else settings.oast_poll_url
+        ssrf_timing_delta = scan_config.get_val("ssrf_inband_timing_delta_ms", settings.ssrf_inband_timing_delta_ms) if scan_config else settings.ssrf_inband_timing_delta_ms
         oast = kwargs.get("oast_client")
         if not isinstance(oast, OastClient):
             oast = OastClient(
-                settings.oast_callback_base_url,
-                settings.oast_poll_url,
+                oast_callback,
+                oast_poll,
                 timeout_seconds=settings.request_timeout_seconds,
             )
 
@@ -322,7 +326,7 @@ class SSRFDetector(BaseDetector):
                     # targets and an external control. Reported as PROBABLE only —
                     # never verified — because in-band signals are inherently noisy.
                     if not cand_findings and not oast.enabled:
-                        inband = await self._probe_inband(cand, verifier, build_request, settings)
+                        inband = await self._probe_inband(cand, verifier, build_request, ssrf_timing_delta)
                         if inband:
                             cand_findings.append(inband)
                 except Exception as e:
