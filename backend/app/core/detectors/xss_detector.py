@@ -301,7 +301,7 @@ class XSSDetector(BaseDetector):
                     )
                 canary = ResponseAnalyzer.generate_probe_canary()
                 try:
-                    fired = await asyncio.wait_for(
+                    result = await asyncio.wait_for(
                         verifier.verify_reflected_dom(
                             route_url, param, location, canary=canary, context=context,
                         ),
@@ -312,9 +312,14 @@ class XSSDetector(BaseDetector):
                 except Exception as exc:
                     logger.debug("DOM reflection sweep failed for %s param=%s: %s", route_url, param, exc)
                     continue
-                if not fired:
+                if not (result and result.get("fired")):
                     continue
                 seen_hits.add(key)
+                winning_vector = result.get("vector")
+                winning_surface = result.get("surface")
+                winning_payload = result.get("payload") or (
+                    f"<img src=x onerror=window.sentry_hook('{canary}')>"
+                )
                 findings.append(
                     verifier._create_finding(
                         category=OwaspCategory.a05,
@@ -322,18 +327,21 @@ class XSSDetector(BaseDetector):
                         severity=SeverityLevel.high,
                         url=route_url,
                         parameter=param,
-                        payload=f"<img src=x onerror=window.sentry_hook('{canary}')>",
+                        payload=winning_payload,
                         evidence=(
                             "Browser execution confirmed: a uniquely-hooked canary injected into "
-                            f"parameter '{param}' via {location} executed in the rendered DOM, with no "
-                            "dependency on HTTP-body reflection."
+                            f"parameter '{param}' via the {winning_surface or location} surface "
+                            f"(vector: {winning_vector or 'img_onerror'}) executed in the rendered "
+                            "DOM, with no dependency on HTTP-body reflection."
                         ),
                         confidence_score=90.0,
                         detection_method="dom_xss_browser_execution",
                         method="GET",
                         detection_evidence={
                             "parameter": param,
-                            "injection_location": location,
+                            "injection_location": winning_surface or location,
+                            "winning_vector": winning_vector,
+                            "winning_surface": winning_surface,
                             "browser_execution_confirmed": True,
                             "route_backed": route_url in route_urls,
                         },

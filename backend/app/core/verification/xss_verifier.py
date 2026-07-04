@@ -756,6 +756,26 @@ class XSSVerifier(BaseVerifier):
 
         return False
 
+    # Task D: an ordered, generic set of hook-executing DOM XSS vectors. Each is
+    # parameterised by the per-probe canary via ``window.sentry_hook``; framework
+    # sinks sanitise some vectors but execute others, so a single-vector sweep
+    # yields incomplete negatives. Ordered cheap → specific. No app-specific payload.
+    _DOM_XSS_VECTOR_TEMPLATES: tuple[tuple[str, str], ...] = (
+        ("img_onerror", "<img src=x onerror={hook}>"),
+        ("svg_onload", "<svg onload={hook}>"),
+        ("iframe_js", '<iframe src="javascript:{hook}">'),
+        ("attr_breakout", '"><img src=x onerror={hook}>'),
+        ("script", "<script>{hook}</script>"),
+    )
+    # Hard cap on navigations per candidate so the vector × surface loop stays
+    # inside a single job's timeout rather than multiplying the job count.
+    _DOM_MAX_ATTEMPTS_PER_CANDIDATE = 12
+
+    def _dom_xss_vectors(self, canary: str) -> list[tuple[str, str]]:
+        """Return ordered ``(vector_name, payload)`` pairs bound to ``canary``."""
+        hook = f"window.sentry_hook('{canary}')"
+        return [(name, tmpl.format(hook=hook)) for name, tmpl in self._DOM_XSS_VECTOR_TEMPLATES]
+
     async def verify_reflected_dom(
         self,
         route_url: str,
@@ -764,72 +784,118 @@ class XSSVerifier(BaseVerifier):
         *,
         canary: Optional[str] = None,
         context=None,
-    ) -> bool:
-        """Navigate an SPA route with an executing canary and assert on DOM execution.
+    ) -> dict:
+        """Navigate an SPA route with executing canaries and assert on DOM execution.
 
-        Injects an ``onerror``/hook payload into ``parameter`` at ``location``
-        (``query`` or ``fragment``) and returns ``True`` when the hook actually
-        fires in the rendered DOM — independent of any HTTP-body reflection.
+        Tries a small ordered set of generic execution vectors (Task D) across
+        the query, hash-route query, and fragment surfaces — SPAs read user input
+        from both ``location.search`` and ``location.hash`` — stopping at the
+        first vector/surface that fires the hooked canary. Independent of any
+        HTTP-body reflection.
 
-        A caller-supplied ``context`` (Playwright BrowserContext) is reused when
-        provided so a whole sweep shares one browser launch; otherwise a
-        short-lived browser is launched for this single probe. Every navigation
-        is time-bounded so a single route cannot stall the sweep.
+        Returns a dict: ``{"fired": True, "vector": ..., "surface": ...,
+        "payload": ...}`` on success, or ``{"fired": False, "csp": bool}`` when
+        nothing executed (a strict CSP is noted but never fabricated into a
+        finding). The dict is falsy-checkable via ``result["fired"]``.
+
+        A caller-supplied ``context`` is reused when provided so a whole sweep
+        shares one browser launch; otherwise a short-lived browser is launched.
+        Every navigation is time-bounded so a single route cannot stall the sweep.
         """
         if not PLAYWRIGHT_AVAILABLE:
-            return False
+            return {"fired": False}
 
         canary = canary or ResponseAnalyzer.generate_probe_canary()
-        payload = f"<img src=x onerror=window.sentry_hook('{canary}')>"
-        probe_urls = self._build_reflection_probe_urls(route_url, parameter, location, payload)
-        if not probe_urls:
-            return False
 
         if context is not None:
-            return await self._sweep_reflection_probes(context, probe_urls, canary)
+            return await self._sweep_vectors_and_surfaces(context, route_url, parameter, canary)
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             try:
                 ctx = await self._new_reflection_context(browser, route_url)
                 try:
-                    return await self._sweep_reflection_probes(ctx, probe_urls, canary)
+                    return await self._sweep_vectors_and_surfaces(ctx, route_url, parameter, canary)
                 finally:
                     await ctx.close()
             finally:
                 await browser.close()
 
-    def _build_reflection_probe_urls(
-        self, route_url: str, parameter: str, location: str, payload: str
-    ) -> list[str]:
-        """Build query and/or fragment injection URLs for a route+param.
+    async def _sweep_vectors_and_surfaces(
+        self, context, route_url: str, parameter: str, canary: str
+    ) -> dict:
+        """Try each vector across each surface, stopping on the first fire.
 
-        SPAs read user input from both ``location.search`` and ``location.hash``,
-        so for SPA routes we try both delivery vectors unless the caller pins one.
+        Bounded by :data:`_DOM_MAX_ATTEMPTS_PER_CANDIDATE`. Records the winning
+        vector/surface, or notes CSP presence on a clean negative.
+        """
+        attempts = 0
+        csp_seen = False
+        for vector_name, payload in self._dom_xss_vectors(canary):
+            for surface_name, probe_url in self._reflection_surface_probes(route_url, parameter, payload):
+                if attempts >= self._DOM_MAX_ATTEMPTS_PER_CANDIDATE:
+                    return {"fired": False, "csp": csp_seen}
+                attempts += 1
+                result = await self._probe_reflection_url(context, probe_url, canary)
+                csp_seen = csp_seen or result.get("csp", False)
+                if result.get("fired"):
+                    return {
+                        "fired": True,
+                        "vector": vector_name,
+                        "surface": surface_name,
+                        "payload": payload,
+                    }
+        return {"fired": False, "csp": csp_seen}
+
+    def _reflection_surface_probes(
+        self, route_url: str, parameter: str, payload: str
+    ) -> list[tuple[str, str]]:
+        """Build ``(surface, url)`` probes for the query, hash-route query, and
+        fragment surfaces. SPAs read from ``location.search`` **and**
+        ``location.hash``; the hash may itself carry a route-scoped query.
         """
         parsed = urlparse(route_url)
-        probes: list[str] = []
-        want_query = location in ("query", "both", "")
-        want_fragment = location in ("fragment", "hash", "both", "")
+        enc = quote(payload, safe="")
+        surfaces: list[tuple[str, str]] = []
 
-        if want_query:
-            parts = list(parsed)
-            query = dict(parse_qsl(parts[4], keep_blank_values=True))
-            query[parameter] = payload
-            parts[4] = urlencode(query)
-            probes.append(urlunparse(parts))
-        if want_fragment:
-            parts = list(parsed)
-            existing = parts[5]
-            fragment_query = f"{parameter}={quote(payload, safe='')}"
-            if existing and "=" in existing:
-                parts[5] = f"{existing}&{fragment_query}"
-            elif existing:
-                parts[5] = f"{existing}?{fragment_query}"
-            else:
-                parts[5] = fragment_query
-            probes.append(urlunparse(parts))
-        return list(dict.fromkeys(probes))
+        # 1. Query string (location.search).
+        parts = list(parsed)
+        query = dict(parse_qsl(parts[4], keep_blank_values=True))
+        query[parameter] = payload
+        parts[4] = urlencode(query)
+        surfaces.append(("query", urlunparse(parts)))
+
+        # 2. Hash-route query: a query scoped to the hash path (``/#/route?p=``).
+        parts = list(parsed)
+        frag = parts[5]
+        if frag and "?" in frag:
+            base, _, existing_q = frag.partition("?")
+            joiner = "&" if existing_q else ""
+            parts[5] = f"{base}?{existing_q}{joiner}{parameter}={enc}"
+        elif frag:
+            parts[5] = f"{frag}?{parameter}={enc}"
+        else:
+            parts[5] = f"/?{parameter}={enc}"
+        surfaces.append(("hash_query", urlunparse(parts)))
+
+        # 3. Raw fragment (``#p=``).
+        parts = list(parsed)
+        frag = parts[5]
+        if frag and "=" in frag and "?" not in frag:
+            parts[5] = f"{frag}&{parameter}={enc}"
+        else:
+            parts[5] = f"{parameter}={enc}"
+        surfaces.append(("fragment", urlunparse(parts)))
+
+        # Dedup by URL, preserving order.
+        seen: set[str] = set()
+        out: list[tuple[str, str]] = []
+        for name, url in surfaces:
+            if url in seen:
+                continue
+            seen.add(url)
+            out.append((name, url))
+        return out
 
     async def _new_reflection_context(self, browser, route_url: str, storage_state: dict | None = None):
         # Seed from the full authenticated storage_state when available (Task A)
@@ -864,38 +930,50 @@ class XSSVerifier(BaseVerifier):
                     pass
         return context
 
-    async def _sweep_reflection_probes(self, context, probe_urls: list[str], canary: str) -> bool:
-        for probe_url in probe_urls:
-            page = await context.new_page()
-            await self._install_xss_browser_hooks(page, canary)
+    async def _probe_reflection_url(self, context, probe_url: str, canary: str) -> dict:
+        """Navigate a single probe URL and report whether the canary fired.
 
-            async def handle_dialog(dialog):
-                try:
-                    if canary in (dialog.message or ""):
-                        setattr(page, "_fired", True)
-                    await dialog.dismiss()
-                except Exception:
-                    pass
+        Returns ``{"fired": bool, "csp": bool}``; ``csp`` flags a
+        Content-Security-Policy on the navigation response so a clean negative
+        can be attributed to CSP rather than a missing sink (honest negatives).
+        """
+        page = await context.new_page()
+        await self._install_xss_browser_hooks(page, canary)
+        csp_seen = False
 
-            page.on("dialog", lambda dialog: asyncio.create_task(handle_dialog(dialog)))
+        async def handle_dialog(dialog):
             try:
-                await page.goto(probe_url, wait_until="domcontentloaded", timeout=5000)
-                # Some SPAs only re-read the hash on a hashchange event.
-                try:
-                    await page.evaluate(
-                        "() => window.dispatchEvent(new HashChangeEvent('hashchange'))"
-                    )
-                except Exception:
-                    pass
-                await asyncio.sleep(0.35)
-                if bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page):
-                    return True
-            except Exception as exc:
-                logger.debug("Reflected DOM XSS probe failed for %s: %s", probe_url, exc)
-            finally:
-                if not page.is_closed():
-                    await page.close()
-        return False
+                if canary in (dialog.message or ""):
+                    setattr(page, "_fired", True)
+                await dialog.dismiss()
+            except Exception:
+                pass
+
+        page.on("dialog", lambda dialog: asyncio.create_task(handle_dialog(dialog)))
+        try:
+            response = await page.goto(probe_url, wait_until="domcontentloaded", timeout=5000)
+            try:
+                headers = response.headers if response is not None else {}
+                if any(h.lower() == "content-security-policy" for h in (headers or {})):
+                    csp_seen = True
+            except Exception:
+                pass
+            # Some SPAs only re-read the hash on a hashchange event.
+            try:
+                await page.evaluate(
+                    "() => window.dispatchEvent(new HashChangeEvent('hashchange'))"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.35)
+            if bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page):
+                return {"fired": True, "csp": csp_seen}
+        except Exception as exc:
+            logger.debug("Reflected DOM XSS probe failed for %s: %s", probe_url, exc)
+        finally:
+            if not page.is_closed():
+                await page.close()
+        return {"fired": False, "csp": csp_seen}
 
     async def run_browser_verification(self, job: PendingBrowserVerification) -> list[Finding]:
         """

@@ -40,11 +40,15 @@ def test_select_dom_reflection_jobs_prioritises_and_caps():
     assert capped == [("http://x/#/post", "comment", "both")]
 
 
-def test_build_reflection_probe_urls_query_and_fragment():
+def test_reflection_surface_probes_covers_query_hash_and_fragment():
     verifier = XSSVerifier()
     payload = "<img src=x onerror=1>"
-    urls = verifier._build_reflection_probe_urls("http://x/#/search", "q", "both", payload)
-    assert len(urls) == 2
+    surfaces = verifier._reflection_surface_probes("http://x/#/search", "q", payload)
+    names = [name for name, _ in surfaces]
+    # All three generic surfaces are produced for a hash-router route.
+    assert "query" in names
+    assert "hash_query" in names
+    assert "fragment" in names
 
     def before_hash(u: str) -> str:
         return u.split("#", 1)[0]
@@ -52,19 +56,23 @@ def test_build_reflection_probe_urls_query_and_fragment():
     def after_hash(u: str) -> str:
         return u.split("#", 1)[1] if "#" in u else ""
 
-    # exactly one probe delivers q in the query string, one in the hash fragment
-    query_delivery = [u for u in urls if "q=" in before_hash(u)]
-    frag_delivery = [u for u in urls if "q=" in after_hash(u)]
-    assert len(query_delivery) == 1
-    assert len(frag_delivery) == 1
+    urls = {name: url for name, url in surfaces}
+    # Query surface delivers q in location.search (before the hash).
+    assert "q=" in before_hash(urls["query"])
+    # Hash-route query and raw fragment deliver q after the hash.
+    assert "q=" in after_hash(urls["hash_query"])
+    assert "q=" in after_hash(urls["fragment"])
 
 
-def test_build_reflection_probe_urls_respects_pinned_location():
+def test_reflection_surface_probes_for_plain_path_route():
     verifier = XSSVerifier()
-    only_query = verifier._build_reflection_probe_urls("http://x/p", "q", "query", "PAY")
-    assert len(only_query) == 1 and "#" not in only_query[0]
-    only_frag = verifier._build_reflection_probe_urls("http://x/p", "q", "fragment", "PAY")
-    assert len(only_frag) == 1 and "#" in only_frag[0]
+    surfaces = verifier._reflection_surface_probes("http://x/p", "q", "PAY")
+    names = [name for name, _ in surfaces]
+    assert "query" in names and "fragment" in names
+    # The query surface carries no fragment; the fragment surface does.
+    urls = {name: url for name, url in surfaces}
+    assert "#" not in urls["query"]
+    assert "#" in urls["fragment"]
 
 
 # --- sweep gating ----------------------------------------------------------------------
@@ -115,7 +123,10 @@ def test_sweep_invokes_verify_reflected_dom_and_builds_finding(monkeypatch):
 
     async def fake_verify(self, route_url, parameter, location, *, canary=None, context=None):
         calls.append((route_url, parameter, location))
-        return parameter == "q"
+        if parameter == "q":
+            return {"fired": True, "vector": "svg_onload", "surface": "hash_query",
+                    "payload": "<svg onload=window.sentry_hook('c')>"}
+        return {"fired": False}
 
     monkeypatch.setattr(XSSVerifier, "_new_reflection_context", fake_new_ctx)
     monkeypatch.setattr(XSSVerifier, "verify_reflected_dom", fake_verify)
@@ -130,6 +141,65 @@ def test_sweep_invokes_verify_reflected_dom_and_builds_finding(monkeypatch):
     assert finding.verified is True
     assert finding.detection_method == "dom_xss_browser_execution"
     assert finding.parameter == "q"
+    # The winning vector/surface is threaded through to the finding.
+    assert finding.detection_evidence.get("winning_vector") == "svg_onload"
+    assert finding.detection_evidence.get("winning_surface") == "hash_query"
+
+
+# --- Task D: multi-vector / multi-surface loop -----------------------------------------
+
+
+def test_dom_xss_vectors_are_ordered_and_hook_bound():
+    verifier = XSSVerifier()
+    vectors = verifier._dom_xss_vectors("CANARY")
+    names = [n for n, _ in vectors]
+    # A small, ordered, generic set (cheap -> specific); every vector executes
+    # the hooked canary and no app-specific payload appears.
+    assert names[0] == "img_onerror"
+    assert "svg_onload" in names and "iframe_js" in names and "script" in names
+    for _, payload in vectors:
+        assert "window.sentry_hook('CANARY')" in payload
+
+
+def test_sweep_vectors_stops_on_first_fire(monkeypatch):
+    """The vector/surface loop stops at the first firing probe and records it,
+    without probing every remaining vector/surface combination."""
+    verifier = XSSVerifier()
+    probed: list[str] = []
+
+    async def fake_probe(self, context, probe_url, canary):
+        probed.append(probe_url)
+        # Fire only on the second probe (first vector, second surface).
+        return {"fired": len(probed) == 2, "csp": False}
+
+    monkeypatch.setattr(XSSVerifier, "_probe_reflection_url", fake_probe)
+
+    result = asyncio.run(
+        verifier._sweep_vectors_and_surfaces(object(), "http://x/#/search", "q", "canary")
+    )
+    assert result["fired"] is True
+    # Stopped immediately after the firing probe.
+    assert len(probed) == 2
+
+
+def test_sweep_vectors_respects_attempt_cap(monkeypatch):
+    verifier = XSSVerifier()
+    monkeypatch.setattr(XSSVerifier, "_DOM_MAX_ATTEMPTS_PER_CANDIDATE", 3)
+    probed: list[str] = []
+
+    async def fake_probe(self, context, probe_url, canary):
+        probed.append(probe_url)
+        return {"fired": False, "csp": True}
+
+    monkeypatch.setattr(XSSVerifier, "_probe_reflection_url", fake_probe)
+
+    result = asyncio.run(
+        verifier._sweep_vectors_and_surfaces(object(), "http://x/#/search", "q", "canary")
+    )
+    assert result["fired"] is False
+    # Never exceeds the per-candidate cap, and CSP is noted on the negative.
+    assert len(probed) <= 3
+    assert result.get("csp") is True
 
 
 def test_detect_runs_http_only_when_browser_unavailable(monkeypatch):
