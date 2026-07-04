@@ -3,7 +3,7 @@ import { isValidUrl } from "../utils/helpers.js";
 import { SCAN_STAGES } from "../data/constants.js";
 import { createScan, getScanStatus, cancelScan } from "../services/scan.js";
 
-const POLL_INTERVAL_MS = 1500;
+const POLL_INTERVAL_MS = 5000;
 
 // The backend reports numeric progress + a status string; it does not stream
 // per-stage labels. We derive a stage from progress so the UI stays in step

@@ -25,9 +25,6 @@ function ScanPage({ onComplete }) {
     status,
     progress,
     stageIdx,
-    eta,
-    logs,
-    logRef,
     error,
     valid,
     canStart,
@@ -61,7 +58,6 @@ function ScanPage({ onComplete }) {
         <div
           className={`input-group ${touched && url && !valid ? "error" : valid ? "valid" : ""}`}
         >
-          <span className='input-icon'>🌐</span>
           <input
             id='target-url'
             type='url'
@@ -112,10 +108,10 @@ function ScanPage({ onComplete }) {
           htmlFor='auth-text'
           style={{ marginTop: 20 }}
         >
-          Authorization reference <span className='label-optional'>optional</span>
+          Authorization reference{" "}
+          <span className='label-optional'>optional</span>
         </label>
         <div className='input-group'>
-          <span className='input-icon'>📝</span>
           <input
             id='auth-text'
             type='text'
@@ -164,7 +160,6 @@ function ScanPage({ onComplete }) {
               <span className={`status-pill status-${status || "queued"}`}>
                 {STATUS_LABEL[status] || "Queued"}
               </span>
-              {eta != null && eta > 0 && <span>~{eta}s left</span>}
               <span className='progress-pct'>{Math.round(progress)}%</span>
             </div>
           </div>
@@ -180,23 +175,6 @@ function ScanPage({ onComplete }) {
                 {stage.replace("...", "")}
               </div>
             ))}
-          </div>
-          <div className='terminal'>
-            <div className='terminal-bar'>
-              <span style={{ color: "var(--accent)", fontSize: 14 }}>▶</span> Live
-              Log
-            </div>
-            <div className='terminal-body' ref={logRef}>
-              {logs.map((line, index) => (
-                <div
-                  key={index}
-                  className={line.kind === "ok" ? "log-ok" : "log-warn"}
-                >
-                  {line.text}
-                </div>
-              ))}
-              <div className='log-cursor'>▮</div>
-            </div>
           </div>
           <button type='button' className='btn-ghost' onClick={cancel}>
             Cancel scan

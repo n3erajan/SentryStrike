@@ -3,7 +3,7 @@ import SeverityBadge from "../components/SeverityBadge.jsx";
 import ScoreRing from "../components/ScoringRing.jsx";
 import VulnerabilityCard from "../components/VulnerabilityCard.jsx";
 import { SEVERITIES, SEVERITY_META } from "../data/constants.js";
-import { getReport, generateAiReport, downloadReportPdf } from "../services/reports.js";
+import { getReport, downloadReportPdf } from "../services/reports.js";
 import { downloadFile, saveBlob } from "../utils/helpers.js";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
@@ -31,7 +31,7 @@ function ReportPage({ scanId, target, onBack }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [filter, setFilter] = useState("all");
-  const [busy, setBusy] = useState(""); // "" | "pdf" | "ai"
+  const [busy, setBusy] = useState(""); // "" | "pdf"
   const [notice, setNotice] = useState("");
 
   const load = useCallback(
@@ -79,20 +79,6 @@ function ReportPage({ scanId, target, onBack }) {
       setBusy("");
     }
   }, [scanId]);
-
-  const handleRegenerate = useCallback(async () => {
-    setBusy("ai");
-    setNotice("");
-    try {
-      await generateAiReport(scanId);
-      await load();
-      setNotice("AI analysis regenerated.");
-    } catch (err) {
-      setNotice(err.message || "Could not regenerate the AI analysis.");
-    } finally {
-      setBusy("");
-    }
-  }, [scanId, load]);
 
   if (loading) {
     return (
@@ -352,13 +338,6 @@ function ReportPage({ scanId, target, onBack }) {
           </button>
           <button className='btn-dl btn-dl-secondary' onClick={handleDownloadJson}>
             📄 Download JSON Data
-          </button>
-          <button
-            className='btn-dl btn-dl-secondary'
-            onClick={handleRegenerate}
-            disabled={busy === "ai"}
-          >
-            {busy === "ai" ? "Regenerating…" : "🤖 Regenerate AI Analysis"}
           </button>
         </div>
       </div>
