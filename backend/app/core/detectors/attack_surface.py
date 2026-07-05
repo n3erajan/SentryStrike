@@ -371,7 +371,14 @@ class AttackSurface:
             # affects static synthesis.
             if not ApiExtractor.is_api_endpoint(endpoint):
                 continue
-            content_type, template = ApiExtractor.synthesize_body_schema(endpoint)
+            # The endpoint is a confirmed API surface (gate above), so opt in to
+            # the generic single-leaf body: a mutating API endpoint with no
+            # observed body and no static schema still gets one low-confidence
+            # (``replayable=False``/``static_synth``) body-injection target
+            # instead of zero coverage (RC3).
+            content_type, template = ApiExtractor.synthesize_body_schema(
+                endpoint, allow_generic_body=True
+            )
             if not template:
                 continue
             synth_endpoint = ApiEndpoint(

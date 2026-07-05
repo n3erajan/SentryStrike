@@ -124,7 +124,11 @@ class XSSDetector(BaseDetector):
         # These are 4-tuples like URL candidates but carry the header name in
         # the ``param`` slot; XSSVerifier.verify() recognises them via the
         # ``header_injection=True`` flag encoded in the method field.
-        header_candidates = self._build_header_candidates(urls)
+        header_candidates = self._build_header_candidates(
+            urls,
+            is_spa=bool(kwargs.get("is_spa", False)),
+            root_url=kwargs.get("root_url"),
+        )
         candidates = list(candidates) + header_candidates
 
         if not candidates:
@@ -520,7 +524,12 @@ class XSSDetector(BaseDetector):
     # Header-injection candidate builder
     # ---------------------------------------------------------------------- #
 
-    def _build_header_candidates(self, urls: list[str]) -> list[tuple]:
+    def _build_header_candidates(
+        self,
+        urls: list[str],
+        is_spa: bool = False,
+        root_url: str | None = None,
+    ) -> list[tuple]:
         """
         Build 4-tuple candidates for header-based XSS testing.
 
@@ -530,11 +539,32 @@ class XSSDetector(BaseDetector):
         """
         seen: set[str] = set()
         candidates: list[tuple] = []
+        
+        normalized_root = None
+        if root_url:
+            try:
+                parsed = urlparse(root_url)
+                normalized_root = parsed.path.rstrip("/") or "/"
+            except Exception:
+                pass
+
+        from urllib.parse import urlparse
+
         for url in urls:
             base = url.split("?")[0]
             if base in seen:
                 continue
             seen.add(base)
+            
+            if is_spa and normalized_root:
+                try:
+                    parsed_base = urlparse(base)
+                    path = parsed_base.path.rstrip("/") or "/"
+                    if path != normalized_root:
+                        continue
+                except Exception:
+                    pass
+
             for header in self._injectable_headers:
                 candidates.append((base, header, f"HEADER:{header}", ""))
         return candidates

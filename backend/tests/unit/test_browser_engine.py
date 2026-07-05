@@ -369,6 +369,56 @@ def test_browser_multipart_observation_metadata_extracts_file_fields():
 
 
 @pytest.mark.asyncio
+async def test_build_observation_survives_binary_post_data():
+    """A binary/gzip request body must not crash the on_request handler.
+
+    Playwright's ``post_data`` raises UnicodeDecodeError on non-UTF-8 bodies;
+    the engine falls back to ``post_data_buffer`` decoded leniently.
+    """
+    class _BinaryRequest:
+        url = "http://spa.test/upload"
+        method = "POST"
+        resource_type = "xhr"
+        redirected_from = None
+
+        @property
+        def post_data(self):
+            raise UnicodeDecodeError("utf-8", b"\x1f\x8b", 1, 2, "invalid start byte")
+
+        @property
+        def post_data_buffer(self):
+            return b"\x1f\x8b\x08rawgzip"
+
+        async def all_headers(self):
+            return {"content-type": "application/octet-stream"}
+
+    engine = BrowserDiscoveryEngine()
+    request = _BinaryRequest()
+
+    # Safe accessor returns a lenient decode instead of raising.
+    assert engine._safe_post_data(request) is not None
+    # Full observation build does not propagate the decode error.
+    observation = await engine._build_request_observation(request)
+    assert observation.url == "http://spa.test/upload"
+    assert observation.method == "POST"
+
+
+@pytest.mark.asyncio
+async def test_safe_post_data_returns_none_when_unavailable():
+    class _NoBodyRequest:
+        @property
+        def post_data(self):
+            raise UnicodeDecodeError("utf-8", b"\x8b", 0, 1, "invalid start byte")
+
+        @property
+        def post_data_buffer(self):
+            return None
+
+    engine = BrowserDiscoveryEngine()
+    assert engine._safe_post_data(_NoBodyRequest()) is None
+
+
+@pytest.mark.asyncio
 async def test_browser_field_values_use_configured_credentials():
     class Field:
         def __init__(self, attrs):
@@ -488,6 +538,48 @@ async def test_workflow_explorer_exercises_multi_step_spa_and_file_inputs():
     assert stats["states"] >= 2
     assert stats["forms"] == 1
     assert stats["file_inputs"] == 1
+
+
+@pytest.mark.asyncio
+async def test_exercise_page_stops_at_time_budget(monkeypatch):
+    """RC2: blind clicking must yield to a per-route time budget so one deep
+    page cannot consume the budget owed to unvisited routes. ``max_seconds=0``
+    stops before any interaction; ``None`` keeps the legacy count-only bound."""
+    engine = BrowserDiscoveryEngine(max_interactions=50)
+    interactions = {"n": 0}
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    async def _sig(*args, **kwargs):
+        return f"state-{interactions['n']}"
+
+    async def _count(*args, **kwargs):
+        return 0
+
+    class _El:
+        async def click(self, timeout=None):
+            interactions["n"] += 1
+
+    async def _next(_page, _attempted):
+        # A fresh control key each time so nothing is deduped away.
+        return _El(), f"ctrl-{interactions['n']}"
+
+    monkeypatch.setattr(engine, "_clear_blocking_overlays", _noop)
+    monkeypatch.setattr(engine, "_ui_state_signature", _sig)
+    monkeypatch.setattr(engine, "_count_locator", _count)
+    monkeypatch.setattr(engine, "_prepare_interactive_inputs", _noop)
+    monkeypatch.setattr(engine, "_next_interaction", _next)
+    monkeypatch.setattr(engine, "_wait_after_interaction", _noop)
+
+    # Zero budget: the loop breaks before the first interaction.
+    await engine._exercise_page(object(), max_seconds=0)
+    assert interactions["n"] == 0
+
+    # No budget: the full count-based bound applies.
+    interactions["n"] = 0
+    await engine._exercise_page(object(), max_seconds=None)
+    assert interactions["n"] == 50
 
 
 # --- Task 2: SPA interaction & navigation --------------------------------
@@ -641,12 +733,28 @@ async def test_capture_forms_returns_structured_forms():
         url = "http://spa.test/page"
 
         async def evaluate(self, script, *args):
+            # One literal <form> cluster and one <form>-less orphan cluster with
+            # a file input — the pattern RC-1 previously missed entirely.
             return [
                 {
+                    "cluster_id": 0,
                     "action": "/submit",
                     "method": "post",
-                    "inputs": [{"name": "email", "type": "email"}],
-                }
+                    "inputs": [{"name": "email", "type": "email", "field_id": "0:0"}],
+                    "has_form": True,
+                    "file_inputs": 0,
+                },
+                {
+                    "cluster_id": 1,
+                    "action": "/upload",
+                    "method": "POST",
+                    "inputs": [
+                        {"name": "avatar", "type": "file", "field_id": "1:0"},
+                        {"name": "bio", "type": "text", "field_id": "1:1"},
+                    ],
+                    "has_form": False,
+                    "file_inputs": 1,
+                },
             ]
 
     engine = BrowserDiscoveryEngine()
@@ -656,9 +764,24 @@ async def test_capture_forms_returns_structured_forms():
         {
             "action": "http://spa.test/submit",
             "method": "POST",
-            "inputs": [{"name": "email", "type": "email"}],
+            "inputs": [{"name": "email", "type": "email", "field_id": "0:0"}],
+            "cluster_id": 0,
+            "has_form": True,
+            "file_inputs": 0,
             "page_url": "http://spa.test/page",
-        }
+        },
+        {
+            "action": "http://spa.test/upload",
+            "method": "POST",
+            "inputs": [
+                {"name": "avatar", "type": "file", "field_id": "1:0"},
+                {"name": "bio", "type": "text", "field_id": "1:1"},
+            ],
+            "cluster_id": 1,
+            "has_form": False,
+            "file_inputs": 1,
+            "page_url": "http://spa.test/page",
+        },
     ]
 
 
@@ -954,12 +1077,17 @@ async def test_submit_discovered_forms_fills_submits_and_captures_body():
     captured = []
     page.on("request", lambda r: captured.append(r))
 
+    # A <form>-less orphan cluster (has_form=False): fields are targeted by their
+    # data-sentry-field ids and submission clicks the cluster-scoped control —
+    # the exact path that was previously impossible without a literal <form>.
     form = {
         "action": "http://spa.test/rest/user/login",
         "method": "POST",
+        "cluster_id": 0,
+        "has_form": False,
         "inputs": [
-            {"name": "email", "type": "email"},
-            {"name": "password", "type": "password"},
+            {"name": "email", "type": "email", "field_id": "0:0"},
+            {"name": "password", "type": "password", "field_id": "0:1"},
         ],
     }
     submitted: set = set()
@@ -967,15 +1095,49 @@ async def test_submit_discovered_forms_fills_submits_and_captures_body():
         page, [form], "http://spa.test/", "http://spa.test/login", submitted,
     )
 
-    # Both fields were filled with typed placeholders.
-    assert any("email" in sel for sel, _ in page.fills)
-    assert any("password" in sel for sel, _ in page.fills)
+    # Both fields were filled, targeted precisely by data-sentry-field id.
+    assert any("data-sentry-field='0:0'" in sel for sel, _ in page.fills)
+    assert any("data-sentry-field='0:1'" in sel for sel, _ in page.fills)
     assert page.submit_clicks == 1
     # The submission fired a POST XHR carrying a real body.
     posts = [r for r in captured if r.method == "POST" and r.post_data]
     assert posts and "password" in posts[0].post_data
     # Form key recorded for dedup.
     assert submitted
+
+
+@pytest.mark.asyncio
+async def test_submit_discovered_forms_threads_live_inflight_counter():
+    """RC1: the crawl loop's live in-flight counter must be forwarded to the
+    post-submit settle, so it waits for the submit-triggered XHR to finish
+    before navigating back. Passing a throwaway ``{"count": 0}`` (the old bug)
+    let the settle return early and the goto tore the frame down mid-capture,
+    losing the POST body — hence ``replayable_json_bodies == 0``."""
+    engine = BrowserDiscoveryEngine()
+    page = _SubmitFakePage()
+
+    seen_inflight = []
+
+    async def _spy_settle(_page, inflight, *args, **kwargs):
+        seen_inflight.append(inflight)
+
+    engine._settle_inflight = _spy_settle
+
+    live_inflight = {"count": 0}
+    form = {
+        "action": "http://spa.test/rest/user/login",
+        "method": "POST",
+        "cluster_id": 0,
+        "has_form": False,
+        "inputs": [{"name": "email", "type": "email", "field_id": "0:0"}],
+    }
+    await engine._submit_discovered_forms(
+        page, [form], "http://spa.test/", "http://spa.test/login", set(),
+        inflight=live_inflight,
+    )
+
+    # The *same* counter object is forwarded — not a fresh throwaway.
+    assert seen_inflight and seen_inflight[0] is live_inflight
 
 
 @pytest.mark.asyncio
@@ -1002,6 +1164,99 @@ async def test_submit_discovered_forms_skips_destructive_and_dedups():
         page, [destructive], "http://spa.test/", "http://spa.test/account", submitted,
     )
     assert len(page.fills) == prev
+
+
+@pytest.mark.parametrize("label", ["logout", "Log out", "Sign Out", "sign off", "LOGOUT"])
+def test_destructive_label_matches_signout_variants(label):
+    # RC-4b: blind clicking / submission must never drop the authenticated
+    # session by hitting a sign-out control mid-crawl.
+    from app.core.crawler.browser_engine import DESTRUCTIVE_LABEL_RE
+
+    assert DESTRUCTIVE_LABEL_RE.search(label)
+
+
+@pytest.mark.asyncio
+async def test_submit_discovered_forms_skips_logout_cluster():
+    engine = BrowserDiscoveryEngine()
+    page = _SubmitFakePage()
+
+    logout_cluster = {
+        "action": "http://spa.test/rest/user/logout",
+        "method": "POST",
+        "cluster_id": 0,
+        "has_form": False,
+        "inputs": [{"name": "confirm", "type": "text", "field_id": "0:0"}],
+    }
+    submitted: set = set()
+    await engine._submit_discovered_forms(
+        page, [logout_cluster], "http://spa.test/", "http://spa.test/", submitted,
+    )
+    # A logout cluster is treated as destructive: never submitted, but keyed.
+    assert page.submit_clicks == 0
+    assert submitted
+
+
+@pytest.mark.asyncio
+async def test_crawl_counts_formless_clusters_and_file_inputs(monkeypatch):
+    """RC-1: forms/file inputs are counted from structural clusters, so a
+    <form>-less SPA route (has_form=False) still reports discovered surface."""
+
+    class _ClusterPage:
+        """Serves one <form>-less cluster (with a file input) via the capture
+        script; a bare shell otherwise so nothing else fires."""
+
+        def __init__(self):
+            self.url = "http://spa.test/"
+            self._handlers = {}
+
+        def on(self, event, handler):
+            self._handlers.setdefault(event, []).append(handler)
+
+        async def goto(self, url, wait_until=None, timeout=None):
+            self.url = url
+
+        def locator(self, selector):
+            return _FakeLocator([])
+
+        async def evaluate(self, script, *args):
+            if "pushState" in script or "location.hash" in script:
+                raise RuntimeError("no SPA router")
+            if "clusters" in script:  # FORM_CAPTURE_SCRIPT
+                return [
+                    {
+                        "cluster_id": 0,
+                        "action": "/rest/user/registration",
+                        "method": "POST",
+                        "inputs": [
+                            {"name": "email", "type": "email", "field_id": "0:0"},
+                            {"name": "avatar", "type": "file", "field_id": "0:1"},
+                        ],
+                        "has_form": False,
+                        "file_inputs": 1,
+                    }
+                ]
+            return ""
+
+        async def wait_for_load_state(self, state, timeout=None):
+            return None
+
+        async def wait_for_timeout(self, timeout):
+            return None
+
+        async def content(self):
+            return "<html><body><app-root>dashboard</app-root></body></html>"
+
+    page = _ClusterPage()
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    state = CrawlState()
+    await engine.crawl_into(state, "http://spa.test/")
+
+    # The <form>-less cluster and its file input were counted and captured.
+    assert state.browser_forms_discovered >= 1
+    assert state.file_inputs_discovered >= 1
+    assert state.browser_forms and state.browser_forms[0]["has_form"] is False
 
 
 @pytest.mark.asyncio

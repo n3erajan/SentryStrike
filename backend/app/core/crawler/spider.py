@@ -85,6 +85,7 @@ class CrawlResult:
     browser_error: str | None = None
     workflow_states_visited: int = 0
     browser_forms_discovered: int = 0
+    browser_forms_submitted: int = 0
     file_inputs_discovered: int = 0
     browser_forms: list[dict[str, object]] = field(default_factory=list)
 
@@ -108,6 +109,7 @@ class WebSpider:
         self._auth_override = None
         # Per-scan configuration overrides.
         self._scan_config: ScanConfig | None = None
+        self._reauth_attempts: int = 0
 
     def _snapshot_cookies(self, cookies: httpx.Cookies) -> dict[str, str]:
         return ModernAuthManager.snapshot_cookies(cookies)
@@ -119,6 +121,7 @@ class WebSpider:
         self._auth_state = AuthVerificationState.unauthenticated
         self._auth_verification_evidence = ""
         self._auth_storage_state = None
+        self._reauth_attempts = 0
 
     @staticmethod
     def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -153,7 +156,16 @@ class WebSpider:
         def should_enqueue(url_candidate: str, depth: int) -> bool:
             if max_depth is not None and depth > max_depth:
                 return False
-            
+
+            # Scope guard: never crawl or test off-origin URLs. Every enqueue
+            # source (HTML links, JS-mined URLs, form actions, browser routes,
+            # sitemap, brute paths) funnels through here, so this is the single
+            # chokepoint that keeps the scan strictly same-origin with the target
+            # and prevents payloads/requests reaching third-party hosts.
+            if not same_domain(root_url, url_candidate):
+                logger.debug("skipping off-origin URL (out of scope): %s", url_candidate)
+                return False
+
             p = urlparse(url_candidate)
             ext = pathlib.PurePosixPath(p.path).suffix.lower()
             if ext in STATIC_EXTENSIONS:
@@ -330,6 +342,12 @@ class WebSpider:
                         queue.task_done()
                         continue
                     
+                    if fallback_signal.is_fallback and url != root_url:
+                        # Skip parsing the HTML of fallback/shell pages again to avoid duplicate links/forms,
+                        # but we still kept the URL in discovered_urls/routes for the browser crawl.
+                        queue.task_done()
+                        continue
+                    
                     async with lock:
                         # Update cookies in case session updated
                         self.session_cookies.update(self._snapshot_cookies(client.cookies))
@@ -396,6 +414,11 @@ class WebSpider:
                     continue
                 if "?" not in _route.url:
                     continue
+                # Scope guard: a browser route may have followed a redirect to a
+                # third-party host (e.g. /redirect?to=https://github.com/...).
+                # Never back-feed off-origin URLs into the tested URL set.
+                if not same_domain(root_url, _route.url):
+                    continue
                 _norm = normalize_for_dedupe(_route.url)
                 if _norm not in _seen_for_p4:
                     _seen_for_p4.add(_norm)
@@ -429,6 +452,7 @@ class WebSpider:
             browser_error=crawl_state.browser_error,
             workflow_states_visited=crawl_state.workflow_states_visited,
             browser_forms_discovered=crawl_state.browser_forms_discovered,
+            browser_forms_submitted=crawl_state.browser_forms_submitted,
             file_inputs_discovered=crawl_state.file_inputs_discovered,
             browser_forms=list(crawl_state.browser_forms),
         )
@@ -631,6 +655,7 @@ class WebSpider:
         target.api_docs.extend(source.api_docs)
         target.workflow_states_visited += source.workflow_states_visited
         target.browser_forms_discovered += source.browser_forms_discovered
+        target.browser_forms_submitted += source.browser_forms_submitted
         target.file_inputs_discovered += source.file_inputs_discovered
         for form in source.browser_forms:
             target.add_browser_form(form)
@@ -662,8 +687,21 @@ class WebSpider:
                 route_urls.append(endpoint.url)
                 seen_urls.add(endpoint.url)
 
+        # Dynamic-discovery body-surface counters: a SPA reports forms=0 (no
+        # static <form>s) even when the browser captured/submitted clusters, so
+        # the static forms count alone hides whether dynamic discovery yielded
+        # testable POST-body surface. These make it visible on one line.
+        requests = getattr(result, "requests", []) or []
+        post_bodies = [r for r in requests if getattr(r, "post_data", None)]
+        json_bodies = [
+            r for r in post_bodies
+            if "json" in (getattr(r, "request_content_type", "") or "").lower()
+        ]
         logger.info(
-            "crawler finished for %s: urls=%d routes=%d api_endpoints=%d parameters=%d forms=%d dead_routes=%d assets=%d",
+            "crawler finished for %s: urls=%d routes=%d api_endpoints=%d parameters=%d "
+            "forms=%d dead_routes=%d assets=%d | browser_available=%s "
+            "browser_forms_captured=%d browser_forms_submitted=%d file_inputs=%d "
+            "requests=%d post_bodies=%d json_bodies=%d browser_error=%s",
             root_url,
             len(result.urls),
             len(result.routes),
@@ -672,6 +710,14 @@ class WebSpider:
             len(result.forms),
             len(result.dead_routes),
             len(result.assets),
+            getattr(result, "browser_available", None),
+            getattr(result, "browser_forms_discovered", 0),
+            getattr(result, "browser_forms_submitted", 0),
+            getattr(result, "file_inputs_discovered", 0),
+            len(requests),
+            len(post_bodies),
+            len(json_bodies),
+            getattr(result, "browser_error", None),
         )
 
         for url in route_urls:
@@ -763,6 +809,11 @@ class WebSpider:
     def _looks_like_session_loss(self, response: httpx.Response, requested_url: str = "") -> bool:
         final_path = response.url.path.lower()
         requested_path = urlparse(requested_url).path.lower()
+        
+        # Exclude known login/auth/registration paths from session loss logic
+        if any(token in requested_path for token in ("/login", "/signin", "/register", "/signup", "/auth")):
+            return False
+
         if response.status_code in {401, 403, 419, 440}:
             return True
         if final_path != requested_path and any(token in final_path for token in ("/login", "/signin", "/auth", "/session")):
@@ -820,6 +871,18 @@ class WebSpider:
         take precedence over the env-based ``SCAN_AUTH_*`` settings so users can
         authenticate the crawl without setting environment variables.
         """
+        if self._auth_state in {AuthVerificationState.authenticated_unverified, AuthVerificationState.authenticated_verified} and not force:
+            return
+
+        if force:
+            self._reauth_attempts += 1
+            if self._reauth_attempts >= 3:
+                logger.warning(
+                    "[auth] Maximum re-authentication attempts reached (%d); skipping re-auth cascade to save budget.",
+                    self._reauth_attempts
+                )
+                return
+
         override = self._auth_override
         auth_cookie = (getattr(override, "cookie", None) or self.settings.authentication_cookie)
         auth_header_cfg = (getattr(override, "header", None) or self.settings.authentication_header)

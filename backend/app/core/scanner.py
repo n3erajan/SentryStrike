@@ -300,6 +300,30 @@ class ScanOrchestrator:
                 crawl_result = await self.spider.fetch_single(scan.target_url)
             else:
                 crawl_result = await self.spider.crawl(scan.target_url, auth_override=main_account, scan_config=scan_config)
+
+            # Filter all crawl results to strictly enforce same-origin target isolation (Issue 2)
+            target_url = scan.target_url
+            
+            def is_same_origin(url_a: str, url_b: str) -> bool:
+                try:
+                    p_a = urlparse(url_a)
+                    p_b = urlparse(url_b)
+                    port_a = p_a.port or (80 if p_a.scheme == "http" else 443 if p_a.scheme == "https" else None)
+                    port_b = p_b.port or (80 if p_b.scheme == "http" else 443 if p_b.scheme == "https" else None)
+                    return (p_a.scheme == p_b.scheme and p_a.hostname == p_b.hostname and port_a == port_b)
+                except Exception:
+                    return False
+
+            crawl_result.urls = [u for u in crawl_result.urls if is_same_origin(target_url, u)]
+            crawl_result.routes = [r for r in crawl_result.routes if is_same_origin(target_url, getattr(r, "url", ""))]
+            crawl_result.api_endpoints = [e for e in crawl_result.api_endpoints if is_same_origin(target_url, getattr(e, "url", ""))]
+            crawl_result.requests = [req for req in crawl_result.requests if is_same_origin(target_url, getattr(req, "url", ""))]
+            crawl_result.parameters = [p for p in crawl_result.parameters if is_same_origin(target_url, getattr(p, "url", ""))]
+            crawl_result.forms = [
+                f for f in crawl_result.forms 
+                if is_same_origin(target_url, getattr(f, "action", "")) or is_same_origin(target_url, getattr(f, "page_url", ""))
+            ]
+
             scan.statistics.total_urls_crawled = len(crawl_result.urls)
             await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {len(crawl_result.urls)} URL(s) discovered")
             await self._check_cancelled(scan_id)

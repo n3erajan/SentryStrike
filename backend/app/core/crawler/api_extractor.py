@@ -680,7 +680,9 @@ class ApiExtractor:
         return False
 
     @classmethod
-    def synthesize_body_schema(cls, endpoint: ApiEndpoint) -> tuple[str | None, Any]:
+    def synthesize_body_schema(
+        cls, endpoint: ApiEndpoint, *, allow_generic_body: bool = False
+    ) -> tuple[str | None, Any]:
         """Synthesize a skeleton request body for body-injection detectors.
 
         Returns ``(content_type, body_template)`` when a body can be inferred, or
@@ -693,6 +695,14 @@ class ApiExtractor:
         3. ``multipart_fields`` metadata,
         4. a single generic ``{"data": <placeholder>}`` when the method implies a
            body *and* a body content-type or path hint is present.
+
+        ``allow_generic_body`` widens step 4 to fire for any body-implying method
+        even without a content-type/path hint. It is opt-in for callers that have
+        *already* confirmed the endpoint is a genuine API surface (via
+        :meth:`is_api_endpoint`); without it, a mutating API endpoint carrying no
+        static schema at all gets zero body-injection coverage whenever the
+        browser observed no request body (RC3). Default stays conservative so
+        placeholder bodies are never sprayed at unconfirmed/HTML routes.
 
         Placeholders are inferred generically from field-name tokens; no
         application-specific names or payloads are used.
@@ -732,9 +742,13 @@ class ApiExtractor:
             if template:
                 return endpoint.content_type or "multipart/form-data", template
 
-        # Priority 4: generic fallback, only with an explicit body hint (avoid
-        # blindly spraying every mutating endpoint).
-        if is_body_ct or cls._path_hints_body(endpoint.url):
+        # Priority 4: generic single-leaf fallback. By default this fires only
+        # with an explicit body hint (declared body content-type or a mutating
+        # path verb) so we never spray placeholder bodies at every endpoint.
+        # ``allow_generic_body`` opts a caller-confirmed API endpoint in even
+        # without such a hint, so a genuine mutating API surface with no static
+        # schema still gets one low-confidence body target (RC3).
+        if is_body_ct or cls._path_hints_body(endpoint.url) or allow_generic_body:
             return endpoint.content_type or "application/json", {"data": cls._baseline_for_name("data")}
         return None, None
 
@@ -810,3 +824,42 @@ class ApiExtractor:
             if f".{method}" in prefix:
                 return method.upper()
         return "GET"
+
+    @classmethod
+    def extract_storage_keys(cls, script_text: str) -> set[str]:
+        keys = set()
+        # 1. Direct string literals in setItem/getItem/removeItem
+        pattern_direct = re.compile(
+            r"""(?:localStorage|sessionStorage)\s*\.\s*(?:setItem|getItem|removeItem)\s*\(\s*["'`](?P<key>[a-zA-Z0-9_$_\-]+)["'`]""",
+            re.I
+        )
+        for match in pattern_direct.finditer(script_text):
+            keys.add(match.group("key"))
+
+        # 2. Variable references in setItem/getItem/removeItem
+        pattern_var = re.compile(
+            r"""(?:localStorage|sessionStorage)\s*\.\s*(?:setItem|getItem|removeItem)\s*\(\s*(?P<var>[A-Za-z_$][A-Za-z0-9_$]*)\b""",
+            re.I
+        )
+        for match in pattern_var.finditer(script_text):
+            var_name = match.group("var")
+            # Search for variable definition, e.g. const USER_KEY = "sentrystrike_user";
+            var_def_pattern = re.compile(
+                r"""\b(?:const|let|var)\s+""" + re.escape(var_name) + r"""\s*=\s*["'`](?P<val>[a-zA-Z0-9_$_\-]+)["'`]""",
+                re.I
+            )
+            for def_match in var_def_pattern.finditer(script_text):
+                keys.add(def_match.group("val"))
+
+        # 3. Generic setItem/getItem with literals
+        pattern_generic = re.compile(
+            r"""\b(?:setItem|getItem|removeItem)\s*\(\s*["'`](?P<key>[a-zA-Z0-9_$_\-]+)["'`]""",
+            re.I
+        )
+        for match in pattern_generic.finditer(script_text):
+            key = match.group("key")
+            if any(hint in key.lower() for hint in ("token", "jwt", "auth", "session", "user", "id_token", "access_token")):
+                keys.add(key)
+
+        return keys
+

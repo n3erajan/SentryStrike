@@ -102,6 +102,7 @@ class CrawlState:
     technologies: set[str] = field(default_factory=set)
     workflow_states_visited: int = 0
     browser_forms_discovered: int = 0
+    browser_forms_submitted: int = 0
     file_inputs_discovered: int = 0
     browser_available: bool | None = None
     browser_error: str | None = None

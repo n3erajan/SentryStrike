@@ -91,6 +91,13 @@ def test_synthesize_generic_fallback_requires_hint():
     # POST with no schema and no body content-type and no path hint => no spraying.
     bare = ApiEndpoint(url="http://x/rest/basket", method="POST")
     assert ApiExtractor.synthesize_body_schema(bare) == (None, None)
+    # RC3: an opt-in caller (already gated on is_api_endpoint) gets one generic
+    # low-confidence leaf for the same bare mutating endpoint.
+    _, opt_in = ApiExtractor.synthesize_body_schema(bare, allow_generic_body=True)
+    assert list(opt_in) == ["data"]
+    # allow_generic_body must never override the GET guard.
+    get_ep = ApiEndpoint(url="http://x/rest/basket", method="GET")
+    assert ApiExtractor.synthesize_body_schema(get_ep, allow_generic_body=True) == (None, None)
     # POST whose path hints a mutating body => single generic leaf.
     hinted = ApiEndpoint(url="http://x/rest/user/login", method="POST")
     content_type, template = ApiExtractor.synthesize_body_schema(hinted)
