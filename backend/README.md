@@ -63,16 +63,13 @@ Open API docs:
 - GET /api/v1/scans: list scans
 - GET /api/v1/scans/{scan_id}: scan details
 - GET /api/v1/scans/{scan_id}/status: scan status
-- DELETE /api/v1/scans/{scan_id}: delete scan
 - POST /api/v1/scans/{scan_id}/cancel: cancel scan
 - GET /api/v1/analysis/scans/{scan_id}/vulnerabilities: list vulnerabilities
 - GET /api/v1/analysis/scans/{scan_id}/vulnerabilities/{vulnerability_id}: vulnerability detail
-- PATCH /api/v1/analysis/scans/{scan_id}/vulnerabilities/{vulnerability_id}/false-positive: mark false positive
 - GET /api/v1/reports/{scan_id}: report data
 - POST /api/v1/reports/{scan_id}/generate: generate AI report
 - GET /api/v1/reports/{scan_id}/pdf: download PDF report
 - GET /api/v1/health
-- GET /api/v1/health/owasp-categories
 
 ## Scan Workflow
 

@@ -56,13 +56,6 @@ class ScanRepository:
         await scan.delete()
         return True
 
-    async def delete_owned(self, scan_id: str, owner_user_id: str) -> bool:
-        scan = await self.get_owned_by_id(scan_id, owner_user_id)
-        if not scan:
-            return False
-        await scan.delete()
-        return True
-
     async def update_status(
         self,
         scan: Scan,

@@ -149,18 +149,6 @@ async def get_scan_status(
     })
 
 
-@router.delete("/{scan_id}", status_code=status.HTTP_200_OK)
-async def delete_scan(
-    scan_id: str,
-    repo: ScanRepository = Depends(get_scan_repository),
-    current_user: User = Depends(get_current_user),
-) -> dict:
-    deleted = await repo.delete_owned(scan_id, str(current_user.id))
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Scan not found")
-    return json_response({"deleted": True})
-
-
 @router.post("/{scan_id}/cancel", status_code=status.HTTP_200_OK)
 async def cancel_scan(
     scan_id: str,

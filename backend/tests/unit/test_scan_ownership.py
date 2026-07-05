@@ -103,14 +103,6 @@ class FakeScanRepository:
             return None
         return item
 
-    async def delete_owned(self, scan_id: str, owner_user_id: str) -> bool:
-        item = await self.get_owned_by_id(scan_id, owner_user_id)
-        if item is None:
-            return False
-        await item.delete()
-        return True
-
-
 def _client(repo: FakeScanRepository, user_id: str = "user-1") -> TestClient:
     app = FastAPI()
     app.include_router(scan.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
