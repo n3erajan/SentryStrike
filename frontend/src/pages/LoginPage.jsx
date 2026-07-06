@@ -1,5 +1,13 @@
 import { useState } from "react";
+import {
+  EnvelopeSimple,
+  Lock,
+  CheckCircle,
+  WarningCircle,
+  CircleNotch,
+} from "@phosphor-icons/react";
 import { login } from "../services/auth.js";
+import AuthBrand from "../components/AuthBrand.jsx";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -31,87 +39,95 @@ function LoginPage({ onAuthed, onGoRegister }) {
   }
 
   return (
-    <div className='auth-page'>
-      <div className='card card-elevated auth-card'>
-        <div className='auth-head'>
-          <div className='auth-icon'>
-            <img
-              src='/shield.png'
-              alt='SentryStrike'
-              className='auth-icon-img'
-            />
+    <div className='auth-split'>
+      <AuthBrand />
+
+      <div className='auth-form-panel'>
+        <div className='auth-form-inner'>
+          <div className='auth-head'>
+            <h1 className='auth-title'>Welcome back</h1>
+            <p className='auth-sub'>Sign in to continue to SentryStrike</p>
           </div>
-          <h1 className='auth-title'>Welcome back</h1>
-          <p className='auth-sub'>Sign in to continue to SentryStrike</p>
-        </div>
 
-        <form onSubmit={handleSubmit} noValidate>
-          {error && <div className='auth-error'>{error}</div>}
-
-          <label className='form-label' htmlFor='login-email'>
-            Email
-          </label>
-          <div
-            className={`input-group ${touched.email && !emailValid ? "error" : emailValid ? "valid" : ""}`}
-          >
-            <input
-              id='login-email'
-              type='email'
-              autoComplete='email'
-              placeholder='you@example.com'
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              onBlur={() => setTouched((t) => ({ ...t, email: true }))}
-              disabled={submitting}
-            />
-          </div>
-          {touched.email && !emailValid && (
-            <p className='field-error'>Enter a valid email address</p>
-          )}
-
-          <label
-            className='form-label'
-            htmlFor='login-password'
-            style={{ marginTop: 16 }}
-          >
-            Password
-          </label>
-          <div
-            className={`input-group ${touched.password && !passwordValid ? "error" : passwordValid ? "valid" : ""}`}
-          >
-            <input
-              id='login-password'
-              type='password'
-              autoComplete='current-password'
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              onBlur={() => setTouched((t) => ({ ...t, password: true }))}
-              disabled={submitting}
-            />
-          </div>
-          {touched.password && !passwordValid && (
-            <p className='field-error'>
-              Password must be at least 8 characters
-            </p>
-          )}
-
-          <button className='btn-scan' type='submit' disabled={!canSubmit}>
-            {submitting ? (
-              <>
-                <span className='spin'>⟳</span> Signing in…
-              </>
-            ) : (
-              <>Sign In</>
+          <form onSubmit={handleSubmit} noValidate>
+            {error && (
+              <div className='auth-error'>
+                <WarningCircle size={16} weight='fill' /> {error}
+              </div>
             )}
-          </button>
-        </form>
 
-        <p className='auth-switch'>
-          Don&apos;t have an account?{" "}
-          <button type='button' className='auth-link' onClick={onGoRegister}>
-            Create one
-          </button>
-        </p>
+            <label className='form-label' htmlFor='login-email'>
+              Email
+            </label>
+            <div
+              className={`input-group ${touched.email && !emailValid ? "error" : emailValid ? "valid" : ""}`}
+            >
+              <EnvelopeSimple className='field-icon' size={17} />
+              <input
+                id='login-email'
+                type='email'
+                autoComplete='email'
+                placeholder='Email'
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                onBlur={() => setTouched((t) => ({ ...t, email: true }))}
+                disabled={submitting}
+              />
+              {emailValid && (
+                <CheckCircle className='input-ok' size={17} weight='fill' />
+              )}
+            </div>
+            {touched.email && !emailValid && (
+              <p className='field-error'>Enter a valid email address</p>
+            )}
+
+            <label
+              className='form-label'
+              htmlFor='login-password'
+              style={{ marginTop: 16 }}
+            >
+              Password
+            </label>
+            <div
+              className={`input-group ${touched.password && !passwordValid ? "error" : passwordValid ? "valid" : ""}`}
+            >
+              <Lock className='field-icon' size={17} />
+              <input
+                id='login-password'
+                type='password'
+                autoComplete='current-password'
+                value={password}
+                placeholder='Password'
+                onChange={(e) => setPassword(e.target.value)}
+                onBlur={() => setTouched((t) => ({ ...t, password: true }))}
+                disabled={submitting}
+              />
+            </div>
+            {touched.password && !passwordValid && (
+              <p className='field-error'>
+                Password must be at least 8 characters
+              </p>
+            )}
+
+            <button className='btn-primary' type='submit' disabled={!canSubmit}>
+              {submitting ? (
+                <>
+                  <CircleNotch className='spin' size={17} weight='bold' />{" "}
+                  Signing in
+                </>
+              ) : (
+                <>Sign In</>
+              )}
+            </button>
+          </form>
+
+          <p className='auth-switch'>
+            Don&apos;t have an account?{" "}
+            <button type='button' className='auth-link' onClick={onGoRegister}>
+              Create one
+            </button>
+          </p>
+        </div>
       </div>
     </div>
   );

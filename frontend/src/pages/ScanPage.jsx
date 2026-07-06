@@ -1,5 +1,28 @@
+import {
+  Globe,
+  CheckCircle,
+  WarningCircle,
+  CircleNotch,
+  TreeStructure,
+  File as FileIcon,
+  Check,
+  ShieldCheck,
+  SealCheck,
+  FileArrowDown,
+  CaretDown,
+  Sliders,
+  User,
+  Lock,
+} from "@phosphor-icons/react";
+import { useState } from "react";
 import { useScan } from "../hooks/useScan.js";
 import { SCAN_STAGES } from "../data/constants.js";
+
+const SCAN_MODES = [
+  ["verified", "Verified", "Only evidence-verified findings"],
+  ["heuristic", "Heuristic", "Adds strong heuristic matches"],
+  ["aggressive", "Aggressive", "Widest checks, more noise"],
+];
 
 const STATUS_LABEL = {
   queued: "Queued",
@@ -9,7 +32,26 @@ const STATUS_LABEL = {
   cancelled: "Cancelled",
 };
 
+const NOTES = [
+  {
+    icon: ShieldCheck,
+    title: "OWASP Top 10 detectors",
+    desc: "Injection, XSS, access control, SSRF, misconfiguration and more. A06, A08 and A09 are out of automated scope.",
+  },
+  {
+    icon: SealCheck,
+    title: "Evidence-based",
+    desc: "Findings are verified against real request and response evidence to cut down false positives.",
+  },
+  {
+    icon: FileArrowDown,
+    title: "Export ready",
+    desc: "Hand results to your team as a formatted PDF or raw JSON.",
+  },
+];
+
 function ScanPage({ onComplete }) {
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const {
     url,
     setUrl,
@@ -21,6 +63,12 @@ function ScanPage({ onComplete }) {
     setConsent,
     touched,
     setTouched,
+    scanMode,
+    setScanMode,
+    authUsername,
+    setAuthUsername,
+    authPassword,
+    setAuthPassword,
     scanning,
     status,
     progress,
@@ -39,18 +87,23 @@ function ScanPage({ onComplete }) {
           <span className='pulse-dot' /> Live Scanner
         </div>
         <h1 className='scan-title'>
-          Audit any web target
+          Audit any web target,
           <br />
-          in <span className='gtext'>seconds</span>
+          <span>end to end.</span>
         </h1>
         <p className='scan-sub'>
-          SentryStrike crawls your target, runs OWASP Top 10 checks, and
-          validates findings with AI.
+          SentryStrike crawls your target, runs OWASP Top 10 detectors, and
+          verifies findings against real evidence. A full scan runs in the
+          background and can take a while.
         </p>
       </div>
 
-      <div className='card card-elevated scan-form'>
-        {error && <div className='auth-error'>{error}</div>}
+      <div className='card scan-form'>
+        {error && (
+          <div className='auth-error'>
+            <WarningCircle size={16} weight='fill' /> {error}
+          </div>
+        )}
 
         <label className='form-label' htmlFor='target-url'>
           Target URL
@@ -58,6 +111,7 @@ function ScanPage({ onComplete }) {
         <div
           className={`input-group ${touched && url && !valid ? "error" : valid ? "valid" : ""}`}
         >
+          <Globe className='field-icon' size={17} />
           <input
             id='target-url'
             type='url'
@@ -67,9 +121,7 @@ function ScanPage({ onComplete }) {
             onBlur={() => setTouched(true)}
             disabled={scanning}
           />
-          {valid && (
-            <span style={{ color: "var(--accent)", fontSize: 16 }}>✓</span>
-          )}
+          {valid && <CheckCircle className='input-ok' size={17} weight='fill' />}
         </div>
         {touched && url && !valid && (
           <p className='field-error'>
@@ -87,7 +139,9 @@ function ScanPage({ onComplete }) {
             onClick={() => setCrawlMode("full")}
             disabled={scanning}
           >
-            <span className='segmented-title'>Full site</span>
+            <span className='segmented-title'>
+              <TreeStructure size={16} weight='bold' /> Full site
+            </span>
             <span className='segmented-desc'>
               Crawl and test every reachable page
             </span>
@@ -98,7 +152,9 @@ function ScanPage({ onComplete }) {
             onClick={() => setCrawlMode("single")}
             disabled={scanning}
           >
-            <span className='segmented-title'>Single page</span>
+            <span className='segmented-title'>
+              <FileIcon size={16} weight='bold' /> Single page
+            </span>
             <span className='segmented-desc'>Test only the URL above</span>
           </button>
         </div>
@@ -123,6 +179,77 @@ function ScanPage({ onComplete }) {
           />
         </div>
 
+        <button
+          type='button'
+          className='advanced-toggle'
+          onClick={() => setAdvancedOpen((o) => !o)}
+          aria-expanded={advancedOpen}
+        >
+          <Sliders size={15} weight='bold' /> Advanced options
+          <CaretDown
+            className={`chevron ${advancedOpen ? "open" : ""}`}
+            size={14}
+            weight='bold'
+          />
+        </button>
+        {advancedOpen && (
+          <div className='advanced-panel'>
+            <label className='form-label'>
+              Scan mode <span className='label-optional'>optional</span>
+            </label>
+            <div
+              className='segmented segmented-3'
+              role='group'
+              aria-label='Scan mode'
+            >
+              {SCAN_MODES.map(([val, title, desc]) => (
+                <button
+                  key={val}
+                  type='button'
+                  className={`segmented-btn ${scanMode === val ? "active" : ""}`}
+                  onClick={() => setScanMode(scanMode === val ? "" : val)}
+                  disabled={scanning}
+                >
+                  <span className='segmented-title'>{title}</span>
+                  <span className='segmented-desc'>{desc}</span>
+                </button>
+              ))}
+            </div>
+
+            <label className='form-label' style={{ marginTop: 20 }}>
+              Authenticated testing{" "}
+              <span className='label-optional'>optional</span>
+            </label>
+            <p className='advanced-hint'>
+              Add a test account to crawl authenticated pages and check for
+              access-control and IDOR issues. Used for this scan only, never
+              stored.
+            </p>
+            <div className='input-group'>
+              <User className='field-icon' size={17} />
+              <input
+                type='text'
+                autoComplete='off'
+                placeholder='Username or email'
+                value={authUsername}
+                onChange={(event) => setAuthUsername(event.target.value)}
+                disabled={scanning}
+              />
+            </div>
+            <div className='input-group' style={{ marginTop: 10 }}>
+              <Lock className='field-icon' size={17} />
+              <input
+                type='password'
+                autoComplete='off'
+                placeholder='Password'
+                value={authPassword}
+                onChange={(event) => setAuthPassword(event.target.value)}
+                disabled={scanning}
+              />
+            </div>
+          </div>
+        )}
+
         <label className='consent-label'>
           <input
             type='checkbox'
@@ -136,24 +263,24 @@ function ScanPage({ onComplete }) {
           </span>
         </label>
 
-        <button className='btn-scan' disabled={!canStart} onClick={startScan}>
+        <button className='btn-primary' disabled={!canStart} onClick={startScan}>
           {scanning ? (
             <>
-              <span className='spin'>⟳</span> Scanning…
+              <CircleNotch className='spin' size={17} weight='bold' /> Scanning
             </>
           ) : (
-            <>Start Security Scan</>
+            <>
+              <ShieldCheck size={17} weight='bold' /> Start Security Scan
+            </>
           )}
         </button>
       </div>
 
       {scanning && (
-        <div className='card card-elevated scan-progress'>
+        <div className='card scan-progress'>
           <div className='progress-header'>
             <div className='progress-stage'>
-              <span className='spin' style={{ color: "var(--accent)" }}>
-                ⟳
-              </span>
+              <CircleNotch className='spin' size={16} weight='bold' />
               {SCAN_STAGES[stageIdx]}
             </div>
             <div className='progress-meta'>
@@ -172,6 +299,7 @@ function ScanPage({ onComplete }) {
                 key={stage}
                 className={`stage-chip ${index <= stageIdx ? "done" : "pending"}`}
               >
+                {index <= stageIdx && <Check size={12} weight='bold' />}
                 {stage.replace("...", "")}
               </div>
             ))}
@@ -179,6 +307,18 @@ function ScanPage({ onComplete }) {
           <button type='button' className='btn-ghost' onClick={cancel}>
             Cancel scan
           </button>
+        </div>
+      )}
+
+      {!scanning && (
+        <div className='scan-notes'>
+          {NOTES.map(({ icon: Icon, title, desc }) => (
+            <div key={title} className='scan-note'>
+              <Icon className='scan-note-icon' size={24} weight='bold' />
+              <div className='scan-note-title'>{title}</div>
+              <div className='scan-note-desc'>{desc}</div>
+            </div>
+          ))}
         </div>
       )}
     </div>

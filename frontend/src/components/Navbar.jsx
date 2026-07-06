@@ -1,4 +1,14 @@
-function Navbar({ page, onGoScan, onGoReport, hasReport, user, onLogout }) {
+import { SignOut, UserCircle } from "@phosphor-icons/react";
+
+function Navbar({
+  page,
+  onGoScan,
+  onGoHistory,
+  onGoReport,
+  hasReport,
+  user,
+  onLogout,
+}) {
   return (
     <nav className='navbar'>
       <div
@@ -15,7 +25,7 @@ function Navbar({ page, onGoScan, onGoReport, hasReport, user, onLogout }) {
           <div className='brand'>
             Sentry<span>Strike</span>
           </div>
-          <div className='tagline'>AI-Powered Web Vulnerability Scanner</div>
+          <div className='tagline'>Web Vulnerability Scanner</div>
         </div>
       </div>
       <div className='nav-links'>
@@ -26,6 +36,12 @@ function Navbar({ page, onGoScan, onGoReport, hasReport, user, onLogout }) {
           Scan
         </button>
         <button
+          className={`nav-link ${page === "history" ? "active" : ""}`}
+          onClick={onGoHistory}
+        >
+          History
+        </button>
+        <button
           className={`nav-link ${page === "report" ? "active" : ""}`}
           onClick={onGoReport}
           disabled={!hasReport}
@@ -33,9 +49,14 @@ function Navbar({ page, onGoScan, onGoReport, hasReport, user, onLogout }) {
         >
           Report
         </button>
-        {user?.email && <span className='nav-user'>{user.email}</span>}
+        {user?.email && (
+          <span className='nav-profile' title={user.email}>
+            <UserCircle size={20} weight='fill' />
+            <span className='nav-user'>{user.email}</span>
+          </span>
+        )}
         <button className='nav-logout' onClick={onLogout}>
-          Logout
+          <SignOut size={15} weight='bold' /> Logout
         </button>
       </div>
     </nav>

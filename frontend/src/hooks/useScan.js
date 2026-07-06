@@ -23,6 +23,12 @@ function useScan(onComplete) {
   const [consent, setConsent] = useState(false);
   const [touched, setTouched] = useState(false);
 
+  // Optional advanced overrides (all map to CreateScanRequest.config /
+  // .credentials; unset values fall back to the backend defaults).
+  const [scanMode, setScanMode] = useState(""); // "" | verified | heuristic | aggressive
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+
   // Live scan state.
   const [scanning, setScanning] = useState(false);
   const [scanId, setScanId] = useState(null);
@@ -67,6 +73,9 @@ function useScan(onComplete) {
         crawlMode,
         authorizationConfirmed: consent,
         authorizationText: authText,
+        scanMode,
+        authUsername,
+        authPassword,
       });
       setScanId(res.scan_id);
       setStatus(res.status || "queued");
@@ -78,7 +87,18 @@ function useScan(onComplete) {
       setScanning(false);
       setStatus("failed");
     }
-  }, [valid, consent, scanning, url, crawlMode, authText, pushLog]);
+  }, [
+    valid,
+    consent,
+    scanning,
+    url,
+    crawlMode,
+    authText,
+    scanMode,
+    authUsername,
+    authPassword,
+    pushLog,
+  ]);
 
   const cancel = useCallback(async () => {
     if (!scanId) {
@@ -175,6 +195,13 @@ function useScan(onComplete) {
     setConsent,
     touched,
     setTouched,
+    // advanced overrides
+    scanMode,
+    setScanMode,
+    authUsername,
+    setAuthUsername,
+    authPassword,
+    setAuthPassword,
     // live state
     scanning,
     status,

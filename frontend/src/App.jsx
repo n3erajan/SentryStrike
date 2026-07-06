@@ -3,26 +3,37 @@ import "./App.css";
 import Navbar from "./components/Navbar.jsx";
 import ScanPage from "./pages/ScanPage.jsx";
 import ReportPage from "./pages/ReportPage.jsx";
+import HistoryPage from "./pages/HistoryPage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import RegisterPage from "./pages/RegisterPage.jsx";
-import AuthHeader from "./components/AuthHeader.jsx";
+// eslint-disable-next-line no-unused-vars -- getCurrentUser is used once the dev auth bypass below is reverted
 import { getCurrentUser, logout } from "./services/auth.js";
 
 function App() {
   // DEV: skip login while developing scan/report pages.
   // Revert to `useState(getCurrentUser)` before shipping.
 
-  // const [user, setUser] = useState({ email: "dev@sentrystrike.local" });
-  const [user, setUser] = useState(getCurrentUser);
+  const [user, setUser] = useState({ email: "dev@sentrystrike.local" });
+  // const [user, setUser] = useState(getCurrentUser);
 
   const [authView, setAuthView] = useState("login");
   const [page, setPage] = useState("scan");
   const [target, setTarget] = useState("");
   const [scanId, setScanId] = useState(null);
+  // Where the report was opened from, so its back button returns there.
+  const [reportOrigin, setReportOrigin] = useState("scan");
 
   function handleScanComplete({ scanId: id, target: url }) {
     setScanId(id);
     setTarget(url);
+    setReportOrigin("scan");
+    setPage("report");
+  }
+
+  function handleOpenReport({ scanId: id, target: url }) {
+    setScanId(id);
+    setTarget(url);
+    setReportOrigin("history");
     setPage("report");
   }
 
@@ -41,22 +52,16 @@ function App() {
   }
 
   if (!user) {
-    return (
-      <>
-        <div />
-        <AuthHeader />
-        {authView === "login" ? (
-          <LoginPage
-            onAuthed={handleAuthed}
-            onGoRegister={() => setAuthView("register")}
-          />
-        ) : (
-          <RegisterPage
-            onAuthed={handleAuthed}
-            onGoLogin={() => setAuthView("login")}
-          />
-        )}
-      </>
+    return authView === "login" ? (
+      <LoginPage
+        onAuthed={handleAuthed}
+        onGoRegister={() => setAuthView("register")}
+      />
+    ) : (
+      <RegisterPage
+        onAuthed={handleAuthed}
+        onGoLogin={() => setAuthView("login")}
+      />
     );
   }
 
@@ -66,6 +71,7 @@ function App() {
       <Navbar
         page={page}
         onGoScan={() => setPage("scan")}
+        onGoHistory={() => setPage("history")}
         onGoReport={() => {
           if (scanId) setPage("report");
         }}
@@ -73,13 +79,18 @@ function App() {
         user={user}
         onLogout={handleLogout}
       />
-      {page === "scan" ? (
-        <ScanPage onComplete={handleScanComplete} />
-      ) : (
+      {page === "scan" && <ScanPage onComplete={handleScanComplete} />}
+      {page === "history" && (
+        <HistoryPage
+          onOpenReport={handleOpenReport}
+          onNewScan={() => setPage("scan")}
+        />
+      )}
+      {page === "report" && (
         <ReportPage
           scanId={scanId}
           target={target}
-          onBack={() => setPage("scan")}
+          onBack={() => setPage(reportOrigin)}
         />
       )}
     </>
