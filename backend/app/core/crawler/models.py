@@ -78,10 +78,13 @@ class RequestObservation:
     request_cookies: dict[str, str] = field(default_factory=dict)
     request_content_type: str | None = None
     post_data: Any = None
+    body_source: str | None = None
+    body_capture_status: str = "not_applicable"
     body_kind: str | None = None
     body_schema: list[str] = field(default_factory=list)
     multipart_fields: list[dict[str, Any]] = field(default_factory=list)
     replayable: bool = True
+    capture_error: str | None = None
     response_status: int | None = None
     response_headers: dict[str, str] = field(default_factory=dict)
     response_content_type: str | None = None

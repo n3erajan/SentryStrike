@@ -301,6 +301,40 @@ async def test_file_upload_detector_passes_auth_headers_to_scan_client(monkeypat
     assert captured_client_kwargs["headers"]["User-Agent"] == "SentryStrikeScanner/1.0"
 
 
+@pytest.mark.asyncio
+async def test_file_upload_detector_does_not_verify_plain_200_without_file_evidence(monkeypatch):
+    detector = FileUploadDetector()
+    form = SimpleNamespace(
+        page_url="https://example.test/profile",
+        action="/api/profile/upload",
+        method="POST",
+        inputs=[SimpleNamespace(name="avatar", input_type="file")],
+    )
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, **kwargs):
+            return httpx.Response(
+                200,
+                text='{"ok":true}',
+                request=httpx.Request(kwargs["method"], kwargs["url"]),
+            )
+
+        async def get(self, url):
+            return httpx.Response(404, text="missing", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr("app.core.detectors.file_upload.create_scan_client", lambda **kwargs: FakeClient())
+
+    findings = await detector.detect(urls=[], forms=[form])
+
+    assert findings == []
+
+
 def test_file_upload_static_formdata_candidate_extraction():
     detector = FileUploadDetector()
     candidates = detector._api_upload_candidates(

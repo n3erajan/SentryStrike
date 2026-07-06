@@ -94,8 +94,10 @@ class SpaApiCoverage(BaseModel):
     observed_form_body_targets: int = 0
     static_synth_body_targets: int = 0
     skipped_unresolved_body_targets: int = 0
+    post_bodies: int = 0
     workflow_states_visited: int = 0
     browser_forms_discovered: int = 0
+    browser_forms_submitted: int = 0
     file_inputs_discovered: int = 0
     # Overall dynamic-discovery health for honest reporting (Task 11):
     # dynamic_ok | dynamic_partial | dynamic_failed.
@@ -127,6 +129,11 @@ class DetectorCoverageMetric(BaseModel):
     verified_findings: int = 0
     unverified_findings: int = 0
     dropped_findings_verified_mode: int = 0
+    replayable_targets_seen: int = 0
+    replayable_targets_tested: int = 0
+    validated_synth_targets_tested: int = 0
+    body_targets_skipped: int = 0
+    skip_reason_by_risk: dict[str, int] = Field(default_factory=dict)
     skipped_reasons: dict[str, int] = Field(default_factory=dict)
 
 

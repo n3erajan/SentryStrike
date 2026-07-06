@@ -186,15 +186,20 @@ class FileInclusionDetector(BaseDetector):
 
         # Build the surface unfiltered, then select on name-OR-value so params
         # whose value looks like a path/file qualify even with a generic name.
-        candidates = [
-            candidate
-            for candidate in AttackSurface.build(
+        planner = kwargs.get("attack_planner")
+        surface = (
+            planner.targets_for(self.name)
+            if planner is not None and hasattr(planner, "targets_for")
+            else AttackSurface.build(
                 urls,
                 forms,
                 parameters=kwargs.get("parameters") or [],
                 api_endpoints=kwargs.get("api_endpoints") or [],
                 requests=kwargs.get("requests") or [],
             )
+        )
+        candidates = [
+            candidate for candidate in surface
             if file_candidate(candidate.parameter, candidate.value)
         ]
 

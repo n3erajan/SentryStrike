@@ -178,6 +178,14 @@ def test_classify_dynamic_status_matrix() -> None:
     # SPA + browser up but zero requests or an error → partial.
     assert classify(is_spa=True, browser_available=True, browser_error=None, browser_requests_observed=0) == "dynamic_partial"
     assert classify(is_spa=True, browser_available=True, browser_error="truncated", browser_requests_observed=5) == "dynamic_partial"
+    assert classify(
+        is_spa=True,
+        browser_available=True,
+        browser_error=None,
+        browser_requests_observed=5,
+        browser_forms_submitted=1,
+        post_bodies=0,
+    ) == "dynamic_partial"
     # SPA + browser up + requests + no error → ok.
     assert classify(is_spa=True, browser_available=True, browser_error=None, browser_requests_observed=5) == "dynamic_ok"
 

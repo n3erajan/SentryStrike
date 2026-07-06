@@ -34,14 +34,21 @@ class CommandInjectionDetector(BaseDetector):
         def cmd_filter(param_name: str) -> bool:
             return self._name_may_be_command_input(param_name)
 
-        candidates = AttackSurface.build(
-            urls,
-            forms,
-            parameters=kwargs.get("parameters") or [],
-            api_endpoints=kwargs.get("api_endpoints") or [],
-            requests=kwargs.get("requests") or [],
-            filter_fn=cmd_filter,
-        )
+        planner = kwargs.get("attack_planner")
+        if planner is not None and hasattr(planner, "targets_for"):
+            candidates = [
+                cand for cand in planner.targets_for(self.name)
+                if cmd_filter(cand.parameter)
+            ]
+        else:
+            candidates = AttackSurface.build(
+                urls,
+                forms,
+                parameters=kwargs.get("parameters") or [],
+                api_endpoints=kwargs.get("api_endpoints") or [],
+                requests=kwargs.get("requests") or [],
+                filter_fn=cmd_filter,
+            )
         candidates = [cand for cand in candidates if self._is_command_candidate(cand)]
 
         if not candidates:

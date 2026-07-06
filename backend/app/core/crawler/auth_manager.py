@@ -340,9 +340,18 @@ class SmartAuthenticator:
                 await settle_page(page)
                 await page.fill(username_selector, username)
                 await page.fill(password_selector, password)
+                # Bounded click with an Enter fallback: a disabled reactive-form
+                # submit button would otherwise block on Playwright's 30s
+                # actionability wait. Pressing Enter submits via keydown regardless
+                # of button state.
+                submitted_click = False
                 if submit_selector:
-                    await page.click(submit_selector)
-                else:
+                    try:
+                        await page.click(submit_selector, timeout=3000)
+                        submitted_click = True
+                    except Exception as exc:
+                        logger.debug("[auth] replay submit click failed (%s); using Enter", exc)
+                if not submitted_click:
                     await page.press(password_selector, "Enter")
                 await settle_page(page)
                 cookies = await context.cookies()
@@ -886,12 +895,28 @@ class SmartAuthenticator:
                         if await loc.count() > 0:
                             for i in range(await loc.count()):
                                 el = loc.nth(i)
-                                if await el.is_visible():
-                                    logger.info("[auth] Clicking submit button: %s", sel)
-                                    await el.click()
-                                    clicked = True
-                                    clicked_selector = sel
-                                    break
+                                # Skip hidden or still-disabled controls fast. A
+                                # reactive-form submit button (Angular/React/Vue)
+                                # stays ``[disabled]`` until the framework marks the
+                                # form valid; clicking it would block on Playwright's
+                                # 30s actionability wait, then throw — two such
+                                # buttons burned ~60s per login. Skipping lets the
+                                # Enter fallback (which submits via keydown
+                                # regardless of button state) fire immediately.
+                                if not await el.is_visible():
+                                    continue
+                                if not await el.is_enabled():
+                                    logger.info(
+                                        "[auth] Submit button disabled, skipping: %s", sel
+                                    )
+                                    continue
+                                logger.info("[auth] Clicking submit button: %s", sel)
+                                # Bounded timeout: never spend the default 30s on a
+                                # single control that turns non-actionable.
+                                await el.click(timeout=3000)
+                                clicked = True
+                                clicked_selector = sel
+                                break
                             if clicked:
                                 break
                     except Exception as e:

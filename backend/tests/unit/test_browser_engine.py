@@ -411,6 +411,28 @@ def test_browser_json_body_not_replayable_when_unparseable():
     assert not engine._is_replayable("POST", "{not valid json", "application/json", [], [])
 
 
+@pytest.mark.asyncio
+async def test_build_observation_marks_large_body_truncated_and_not_replayable():
+    class _LargeRequest:
+        url = "http://spa.test/api/bulk"
+        method = "POST"
+        resource_type = "xhr"
+        redirected_from = None
+        post_data = '{"blob":"' + ("x" * 70000) + '"}'
+
+        async def all_headers(self):
+            return {"content-type": "application/json"}
+
+    engine = BrowserDiscoveryEngine()
+    observation = await engine._build_request_observation(_LargeRequest())
+
+    assert observation.body_source == "playwright_post_data"
+    assert observation.body_capture_status == "truncated"
+    assert observation.capture_error
+    assert len(observation.post_data) == 64000
+    assert observation.replayable is False
+
+
 def test_auth_cookie_entries_targets_origin():
     """P1-3: auth cookies are turned into origin-scoped Playwright cookie dicts."""
     engine = BrowserDiscoveryEngine()
@@ -1396,6 +1418,72 @@ async def test_submit_discovered_forms_skips_logout_cluster():
 
 
 @pytest.mark.asyncio
+async def test_reacquire_cluster_fast_path_skips_navigation_when_page_stayed():
+    """Perf: when the page never left the route, ``_reacquire_cluster`` must not
+    navigate/settle/retry — the cluster's capture-time anchors are still bound to
+    the live DOM. Paying navigate+settle per form is what exhausted the crawl
+    budget once discovery breadth grew. The passed form is returned as-is when a
+    cheap re-capture finds no in-place re-tag."""
+    engine = BrowserDiscoveryEngine()
+    page = _SubmitFakePage()  # url stays at the route; evaluate() -> no forms
+    navigated_calls = []
+
+    async def _spy_navigate(_p, target, root, allow_spa):
+        navigated_calls.append(target)
+
+    engine._navigate = _spy_navigate
+
+    form = {
+        "action": "http://spa.test/rest/user/login",
+        "method": "POST",
+        "cluster_id": 0,
+        "has_form": False,
+        "inputs": [{"name": "email", "type": "email", "field_id": "0:0"}],
+    }
+    target = await engine._reacquire_cluster(
+        page, "http://spa.test/", page.url, form, {"count": 0},
+    )
+    # No navigation happened, and the original form is returned for filling.
+    assert navigated_calls == []
+    assert target is form
+
+
+@pytest.mark.asyncio
+async def test_reacquire_cluster_navigates_back_when_prior_submit_left_route():
+    """When a prior submit navigated off the route, the stale anchors are gone,
+    so ``_reacquire_cluster`` must navigate back and re-capture. With no match on
+    the re-mounted DOM it returns ``None`` (cluster genuinely gone)."""
+    engine = BrowserDiscoveryEngine()
+    page = _SubmitFakePage()
+    page.url = "http://spa.test/somewhere-else"  # a prior submit moved us
+    navigated_calls = []
+
+    async def _spy_navigate(_p, target, root, allow_spa):
+        navigated_calls.append(target)
+
+    async def _noop_settle(*a, **k):
+        return None
+
+    engine._navigate = _spy_navigate
+    engine._settle_inflight = _noop_settle
+    engine._clear_blocking_overlays = _noop_settle
+
+    form = {
+        "action": "http://spa.test/rest/user/login",
+        "method": "POST",
+        "cluster_id": 0,
+        "has_form": False,
+        "inputs": [{"name": "email", "type": "email", "field_id": "0:0"}],
+    }
+    target = await engine._reacquire_cluster(
+        page, "http://spa.test/", "http://spa.test/login", form, {"count": 0},
+    )
+    # Navigated back to the route; cluster never reappeared -> None.
+    assert navigated_calls == ["http://spa.test/login"]
+    assert target is None
+
+
+@pytest.mark.asyncio
 async def test_crawl_counts_formless_clusters_and_file_inputs(monkeypatch):
     """RC-1: forms/file inputs are counted from structural clusters, so a
     <form>-less SPA route (has_form=False) still reports discovered surface."""
@@ -1483,3 +1571,115 @@ async def test_crawl_into_visits_high_value_routes_first(monkeypatch):
     about_idx = next((i for i, u in enumerate(order) if "about" in u), None)
     assert login_idx is not None and about_idx is not None
     assert login_idx < about_idx
+
+
+# --- Regression: replayable-body capture root causes ------------------------
+# These lock in three defects that jointly collapsed ``replayable_json_bodies``
+# to 0 on real <form>-less SPAs (validated live against a hash-routed Angular
+# app): (1) hash routes were deduped onto the origin so form pages were never
+# reached; (2) fields whose synthetic ``data-sentry-field`` tag was dropped by a
+# framework re-render never filled, leaving the submit control disabled so no
+# app POST fired; (3) after the first cluster's submit navigated/re-rendered the
+# page, every remaining cluster's capture-time anchor was stale.
+
+
+def test_normalize_for_seen_keeps_spa_hash_routes_distinct():
+    engine = BrowserDiscoveryEngine()
+    root = engine._normalize_for_seen("http://spa.test/")
+    login = engine._normalize_for_seen("http://spa.test/#/login")
+    register = engine._normalize_for_seen("http://spa.test/#/register")
+    # Hash routes are distinct application pages, not the bare origin.
+    assert login != root
+    assert register != root
+    assert login != register
+    # Trailing slash / case are normalized; a plain in-page anchor is ignored.
+    assert engine._normalize_for_seen("http://spa.test/#/login/") == login
+    assert engine._normalize_for_seen("http://spa.test/#section") == root
+
+
+def test_browser_targets_seeds_hash_routes():
+    """A hash-routed SPA's seeded routes must all survive into the work queue —
+    the bug collapsed them onto the origin so only the root was ever crawled."""
+    engine = BrowserDiscoveryEngine()
+    targets = engine._browser_targets(
+        "http://spa.test/", ["/#/login", "/#/register", "/#/contact"]
+    )
+    assert "http://spa.test/#/login" in targets
+    assert "http://spa.test/#/register" in targets
+    assert "http://spa.test/#/contact" in targets
+
+
+def test_type_selector_maps_captured_types():
+    ts = BrowserDiscoveryEngine._type_selector
+    assert ts("password") == "input[type=password]"
+    assert ts("email") == "input[type=email]"
+    assert ts("textarea") == "textarea"
+    assert ts("select") == "select"
+    # Unknown/absent type (a bare <input> captured by tagName) matches any input
+    # so positional resolution still reaches it.
+    assert ts("input") == "input"
+
+
+def test_candidate_field_selectors_fast_path_then_scoped_fallbacks():
+    entry = {"name": "password", "type": "password", "field_id": "1:1"}
+    candidates = BrowserDiscoveryEngine._candidate_field_selectors(
+        entry, "[data-sentry-cluster='1'] ", "password", "password", 0
+    )
+    selectors = [sel for sel, _ in candidates]
+    # Fast path (synthetic field tag) is tried first.
+    assert selectors[0] == "[data-sentry-field='1:1']"
+    # Positional-by-type within the cluster is the next (reliable) fallback.
+    assert "[data-sentry-cluster='1'] input[type=password] >> nth=0" in selectors
+    assert selectors.index("[data-sentry-cluster='1'] input[type=password] >> nth=0") == 1
+    # Identifier-attribute fallbacks are cluster-scoped (never global).
+    assert any("[data-sentry-cluster='1'] [name='password']" == s for s in selectors)
+    assert all(s.startswith("[data-sentry-") for s in selectors)
+
+
+def test_candidate_field_selectors_skips_unsafe_name_but_keeps_positional():
+    # A captured "name" containing a quote must not break selector construction;
+    # positional-by-type still provides a resolver.
+    entry = {"name": "a' or 1", "type": "text", "field_id": ""}
+    candidates = BrowserDiscoveryEngine._candidate_field_selectors(
+        entry, "[data-sentry-cluster='2'] ", "a' or 1", "text", 3
+    )
+    selectors = [sel for sel, _ in candidates]
+    assert selectors == ["[data-sentry-cluster='2'] input[type=text] >> nth=3"]
+
+
+class _FallbackFillPage:
+    """Fake page whose ``data-sentry-field`` selectors are 'gone' (raise, like a
+    re-rendered node) but whose cluster-scoped positional selectors fill — models
+    the framework-re-render case that left password fields empty."""
+
+    def __init__(self):
+        self.filled = {}
+
+    async def fill(self, selector, value, timeout=None):
+        if "data-sentry-field" in selector:
+            raise RuntimeError("element not found (re-rendered)")
+        self.filled[selector] = value
+
+    async def check(self, selector, timeout=None):
+        if "data-sentry-field" in selector:
+            raise RuntimeError("element not found (re-rendered)")
+        self.filled[selector] = "checked"
+
+
+@pytest.mark.asyncio
+async def test_fill_form_fields_falls_back_when_field_tag_is_stripped():
+    engine = BrowserDiscoveryEngine()
+    page = _FallbackFillPage()
+    form = {
+        "cluster_id": 1,
+        "inputs": [
+            {"name": "email", "type": "email", "field_id": "1:0"},
+            {"name": "password", "type": "password", "field_id": "1:1"},
+        ],
+    }
+    filled = await engine._fill_form_fields(page, form)
+    assert filled is True
+    # Both fields were reached via the cluster-scoped positional fallback, even
+    # though their data-sentry-field selectors were gone.
+    assert "[data-sentry-cluster='1'] input[type=email] >> nth=0" in page.filled
+    assert "[data-sentry-cluster='1'] input[type=password] >> nth=0" in page.filled

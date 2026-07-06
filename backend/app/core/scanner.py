@@ -15,6 +15,7 @@ from app.core.crawler.account_session import provision_secondary_session, resolv
 from app.core.crawler.spider import WebSpider
 from app.schemas.scan_schema import ScanConfig
 from app.core.detectors.access_control import AccessControlDetector
+from app.core.detectors.attack_planner import AttackPlanner
 from app.core.detectors.attack_surface import AttackSurface
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
 from app.core.detectors.base_detector import Finding
@@ -409,6 +410,15 @@ class ScanOrchestrator:
                 preferred_replay=main_replay,
                 primary_credentials=main_credentials,
             )
+            attack_planner = AttackPlanner.from_context(
+                urls=crawl_result.urls,
+                forms=crawl_result.forms,
+                parameters=getattr(crawl_result, "parameters", []),
+                api_endpoints=getattr(crawl_result, "api_endpoints", []),
+                requests=getattr(crawl_result, "requests", []),
+            )
+            crawl_context["attack_planner"] = attack_planner
+            crawl_context["attack_targets"] = attack_planner.targets
             coverage_context = {
                 **crawl_context,
                 "urls": crawl_result.urls,
@@ -806,6 +816,17 @@ class ScanOrchestrator:
             crawl_context,
             technology_stack=technology_stack,
         )
+        planner = crawl_context.get("attack_planner")
+        planner_summary: dict[str, object] = {}
+        if isinstance(planner, AttackPlanner):
+            planner_summary = planner.coverage_summary(
+                detector_name,
+                tested_count=self._request_snippet_count(findings),
+            )
+            candidates_built = max(
+                candidates_built,
+                int(planner_summary.get("targets_seen", 0) or 0),
+            )
         skipped_reasons = self._detector_skip_reasons(detector_name, candidates_built, findings, crawl_context)
         if candidates_built == 0 and not findings:
             skipped_reasons["no_candidates_built"] = 1
@@ -830,6 +851,11 @@ class ScanOrchestrator:
             requests_sent=self._request_snippet_count(findings),
             verified_findings=len([finding for finding in findings or [] if getattr(finding, "verified", False)]),
             unverified_findings=len([finding for finding in findings or [] if not getattr(finding, "verified", False)]),
+            replayable_targets_seen=int(planner_summary.get("replayable_targets_seen", 0) or 0),
+            replayable_targets_tested=int(planner_summary.get("replayable_targets_tested", 0) or 0),
+            validated_synth_targets_tested=int(planner_summary.get("validated_synth_targets_tested", 0) or 0),
+            body_targets_skipped=int(planner_summary.get("body_targets_skipped", 0) or 0),
+            skip_reason_by_risk=dict(planner_summary.get("skip_reason_by_risk", {}) or {}),
             skipped_reasons=skipped_reasons,
         )
 
@@ -961,6 +987,10 @@ class ScanOrchestrator:
             request_total = sum(request_counts.get(alias, 0) for alias in aliases)
             if request_total:
                 metric.requests_sent = max(metric.requests_sent, request_total)
+                metric.replayable_targets_tested = max(
+                    metric.replayable_targets_tested,
+                    min(metric.replayable_targets_seen, request_total),
+                )
                 matched_modules.update(aliases)
 
         for module, count in request_counts.items():
@@ -978,13 +1008,17 @@ class ScanOrchestrator:
         for metric in detector_metrics:
             logger.info(
                 "detector coverage: detector=%s candidates_built=%d requests_sent=%d "
-                "verified_findings=%d unverified_findings=%d dropped_verified_mode=%d skipped_reasons=%s",
+                "verified_findings=%d unverified_findings=%d dropped_verified_mode=%d "
+                "replayable_seen=%d replayable_tested=%d body_skipped=%d skipped_reasons=%s",
                 metric.detector,
                 metric.candidates_built,
                 metric.requests_sent,
                 metric.verified_findings,
                 metric.unverified_findings,
                 metric.dropped_findings_verified_mode,
+                metric.replayable_targets_seen,
+                metric.replayable_targets_tested,
+                metric.body_targets_skipped,
                 metric.skipped_reasons,
             )
 
@@ -1631,6 +1665,8 @@ class ScanOrchestrator:
         verified = auth_state_value == "authenticated_verified"
         is_spa = bool(getattr(crawl_result, "is_spa", False))
         requests = getattr(crawl_result, "requests", []) or []
+        post_bodies = len([request for request in requests if getattr(request, "post_data", None)])
+        browser_forms_submitted = int(getattr(crawl_result, "browser_forms_submitted", 0) or 0)
         replayable_json_bodies = len(
             [
                 request
@@ -1655,6 +1691,8 @@ class ScanOrchestrator:
             browser_available=browser_available,
             browser_error=browser_error,
             browser_requests_observed=len(requests),
+            browser_forms_submitted=browser_forms_submitted,
+            post_bodies=post_bodies,
         )
 
         scan.report_metadata.spa_api_coverage = SpaApiCoverage(
@@ -1673,8 +1711,10 @@ class ScanOrchestrator:
             observed_form_body_targets=body_target_telemetry["observed_form_body_targets"],
             static_synth_body_targets=body_target_telemetry["static_synth_body_targets"],
             skipped_unresolved_body_targets=body_target_telemetry["skipped_unresolved_body_targets"],
+            post_bodies=post_bodies,
             workflow_states_visited=int(getattr(crawl_result, "workflow_states_visited", 0) or 0),
             browser_forms_discovered=int(getattr(crawl_result, "browser_forms_discovered", 0) or 0),
+            browser_forms_submitted=browser_forms_submitted,
             file_inputs_discovered=int(getattr(crawl_result, "file_inputs_discovered", 0) or 0),
             dynamic_status=dynamic_status,
         )
@@ -1695,6 +1735,8 @@ class ScanOrchestrator:
         browser_available: bool | None,
         browser_error: str | None,
         browser_requests_observed: int,
+        browser_forms_submitted: int = 0,
+        post_bodies: int = 0,
     ) -> str:
         """Classify dynamic-discovery health for honest reporting.
 
@@ -1708,6 +1750,8 @@ class ScanOrchestrator:
         if not browser_available:
             return "dynamic_failed"
         if browser_requests_observed == 0 or browser_error:
+            return "dynamic_partial"
+        if browser_forms_submitted > 0 and post_bodies == 0:
             return "dynamic_partial"
         return "dynamic_ok"
 
@@ -1737,6 +1781,7 @@ class ScanOrchestrator:
         browser_available = getattr(crawl_result, "browser_available", None)
         browser_error = getattr(crawl_result, "browser_error", None)
         browser_forms = int(getattr(crawl_result, "browser_forms_discovered", 0) or 0)
+        browser_forms_submitted = int(getattr(crawl_result, "browser_forms_submitted", 0) or 0)
         file_inputs = int(getattr(crawl_result, "file_inputs_discovered", 0) or 0)
         replayable_json_bodies = [
             request
@@ -1776,6 +1821,11 @@ class ScanOrchestrator:
                 )
             else:
                 warnings.append("No replayable JSON or form request bodies were observed; API body testing was limited.")
+        if browser_forms_submitted > 0 and not any(getattr(request, "post_data", None) for request in requests):
+            warnings.append(
+                "Browser submitted form/workflow actions, but no replayable POST bodies were captured; "
+                "dynamic request-body coverage is degraded."
+            )
         skipped_unresolved = body_target_telemetry["skipped_unresolved_body_targets"]
         if skipped_unresolved:
             warnings.append(

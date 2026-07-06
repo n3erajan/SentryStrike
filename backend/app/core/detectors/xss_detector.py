@@ -111,14 +111,21 @@ class XSSDetector(BaseDetector):
             has_xss_prefix = param_lower[:3] in self._form_input_prefixes
             return is_reflective or has_xss_prefix
 
-        targets = AttackSurface.build(
-            urls,
-            forms,
-            parameters=kwargs.get("parameters") or [],
-            api_endpoints=kwargs.get("api_endpoints") or [],
-            requests=kwargs.get("requests") or [],
-            filter_fn=xss_filter,
-        )
+        planner = kwargs.get("attack_planner")
+        if planner is not None and hasattr(planner, "targets_for"):
+            targets = [
+                target for target in planner.targets_for(self.name)
+                if xss_filter(target.parameter)
+            ]
+        else:
+            targets = AttackSurface.build(
+                urls,
+                forms,
+                parameters=kwargs.get("parameters") or [],
+                api_endpoints=kwargs.get("api_endpoints") or [],
+                requests=kwargs.get("requests") or [],
+                filter_fn=xss_filter,
+            )
         candidates: list[AttackTarget | tuple] = list(targets)
 
         # Supplement with header-injection candidates for every discovered URL.

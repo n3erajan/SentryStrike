@@ -197,6 +197,9 @@ async def test_browser_spa_login_records_replay_state(monkeypatch):
         async def is_visible(self):
             return True
 
+        async def is_enabled(self):
+            return True
+
         async def get_attribute(self, name):
             return self.attrs.get(name)
 
@@ -353,7 +356,7 @@ async def test_authenticate_with_replay_uses_browser_recipe(monkeypatch):
         async def fill(self, selector, value):
             fills.append((selector, value))
 
-        async def click(self, selector):
+        async def click(self, selector, **_kwargs):
             calls.append(("click", selector))
 
         async def press(self, selector, key):
