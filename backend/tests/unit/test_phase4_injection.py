@@ -241,6 +241,21 @@ async def test_base_verifier_baseline_uses_full_attack_target_request_shape(monk
 
 
 @pytest.mark.asyncio
+async def test_http_verifier_configure_auth_resets_stale_client() -> None:
+    verifier = HttpVerifier()
+    original_client = await verifier.get_client()
+
+    await verifier.configure_auth(auth_headers={"Authorization": "Bearer fresh"})
+
+    assert verifier._client is None
+    assert verifier.headers["Authorization"] == "Bearer fresh"
+    assert verifier.headers["User-Agent"] == "SentryStrikeScanner/1.0"
+    assert original_client.is_closed
+
+    await verifier.close()
+
+
+@pytest.mark.asyncio
 async def test_static_dom_findings_are_upgraded_when_browser_execution_confirms(monkeypatch) -> None:
     async def confirm_dom_execution(self, url: str) -> bool:
         return url == "https://example.com/"

@@ -14,7 +14,11 @@ from bs4 import BeautifulSoup
 
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ApiEndpoint
-from app.core.crawler.spa import SpaFallbackDetector
+from app.core.crawler.spa import (
+    SpaFallbackDetector,
+    install_resource_blocking,
+    settle_page,
+)
 from app.core.crawler.url_parser import normalize_url, same_domain
 
 logger = logging.getLogger(__name__)
@@ -52,6 +56,7 @@ class AuthReplayState:
     payload: dict[str, str]
     is_json: bool = False
     headers: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -152,6 +157,7 @@ class SmartAuthenticator:
 
     def __init__(self, settings: Any) -> None:
         self.settings = settings
+        self._discovered_storage_keys: set[str] = set()
 
     async def authenticate(
         self, client: httpx.AsyncClient, root_url: str, username: str, password: str
@@ -164,6 +170,10 @@ class SmartAuthenticator:
         if result and result.authenticated:
             result.is_spa = is_spa
             logger.info("[auth] Strategy 1 (Redirect Detection) succeeded")
+            if is_spa and not result.storage_state:
+                result.storage_state = await self._capture_browser_storage_state(
+                    root_url, result.cookies, result.bearer_token
+                )
             return result
 
         # Strategy 2: HTML Form Extraction
@@ -171,6 +181,10 @@ class SmartAuthenticator:
         if result and result.authenticated:
             result.is_spa = is_spa
             logger.info("[auth] Strategy 2 (HTML Form Extraction) succeeded")
+            if is_spa and not result.storage_state:
+                result.storage_state = await self._capture_browser_storage_state(
+                    root_url, result.cookies, result.bearer_token
+                )
             return result
 
         # Strategy 3: JS API Discovery + Param Extraction
@@ -178,6 +192,10 @@ class SmartAuthenticator:
         if result and result.authenticated:
             result.is_spa = is_spa
             logger.info("[auth] Strategy 3 (JS API Discovery) succeeded")
+            if is_spa and not result.storage_state:
+                result.storage_state = await self._capture_browser_storage_state(
+                    root_url, result.cookies, result.bearer_token
+                )
             return result
 
         # Strategy 4: Playwright Browser Login
@@ -192,10 +210,191 @@ class SmartAuthenticator:
         if result and result.authenticated:
             result.is_spa = is_spa
             logger.info("[auth] Strategy 5 (Brute-Force Endpoints) succeeded")
+            if is_spa and not result.storage_state:
+                result.storage_state = await self._capture_browser_storage_state(
+                    root_url, result.cookies, result.bearer_token
+                )
             return result
 
         logger.warning("[auth] All authentication strategies failed")
         return AuthResult(authenticated=False, is_spa=is_spa)
+
+    @staticmethod
+    def _substitute_replay_credentials(
+        payload: dict[str, str],
+        prior_username: str | None,
+        prior_password: str | None,
+        username: str,
+        password: str,
+    ) -> dict[str, str]:
+        """Return a copy of ``payload`` with the prior account's credentials
+        swapped for a new account's.
+
+        Prefer exact value replacement when the primary credentials are known,
+        then fall back to credential-field names. The fallback is important for
+        recipes captured from browser/forms where the stored body can contain
+        placeholders/defaults instead of the literal first-account secret.
+        """
+        new_payload: dict[str, str] = {}
+        for key, value in payload.items():
+            key_lower = str(key).lower()
+            if prior_username and value == prior_username:
+                new_payload[key] = username
+            elif prior_password and value == prior_password:
+                new_payload[key] = password
+            elif any(token in key_lower for token in ("email", "username", "user", "login")):
+                new_payload[key] = username
+            elif any(token in key_lower for token in ("password", "passwd", "pass")):
+                new_payload[key] = password
+            else:
+                new_payload[key] = value
+        return new_payload
+
+    async def authenticate_with_replay(
+        self,
+        client: httpx.AsyncClient,
+        replay_state: AuthReplayState,
+        username: str,
+        password: str,
+        *,
+        prior_username: str | None = None,
+        prior_password: str | None = None,
+    ) -> AuthResult:
+        """Log a *different* account in by replaying the winning login recipe.
+
+        Reuses the exact endpoint/method/body that already authenticated the main
+        account (``replay_state``), swapping in this account's credentials, so the
+        second/admin login skips the full strategy cascade (which otherwise
+        restarts from Strategy 1 for every account). Returns an unauthenticated
+        result on any failure so the caller can fall back to the cascade.
+        """
+        payload = self._substitute_replay_credentials(
+            replay_state.payload, prior_username, prior_password, username, password
+        )
+        logger.info(
+            "[auth] Replaying winning login recipe (%s %s) for a secondary account",
+            replay_state.method, replay_state.action,
+        )
+        try:
+            if replay_state.login_url:
+                await client.get(replay_state.login_url, follow_redirects=True)
+            if replay_state.headers:
+                client.headers.update(replay_state.headers)
+            if replay_state.method.upper() == "BROWSER":
+                return await self._authenticate_browser_replay(
+                    client,
+                    replay_state,
+                    username,
+                    password,
+                )
+            if replay_state.method.upper() == "POST":
+                if replay_state.is_json:
+                    resp = await client.post(replay_state.action, json=payload, follow_redirects=True)
+                else:
+                    resp = await client.post(replay_state.action, data=payload, follow_redirects=True)
+            else:
+                resp = await client.get(replay_state.action, params=payload, follow_redirects=True)
+            result = await self._verify_auth(client, resp)
+            if result.authenticated:
+                result.replay_state = AuthReplayState(
+                    login_url=replay_state.login_url,
+                    action=replay_state.action,
+                    method=replay_state.method,
+                    payload=payload,
+                    is_json=replay_state.is_json,
+                    headers=dict(replay_state.headers),
+                )
+            return result
+        except Exception as exc:
+            logger.warning("[auth] Login-recipe replay failed for secondary account: %s", exc)
+            return AuthResult(authenticated=False)
+
+    async def _authenticate_browser_replay(
+        self,
+        client: httpx.AsyncClient,
+        replay_state: AuthReplayState,
+        username: str,
+        password: str,
+    ) -> AuthResult:
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning("[auth] Playwright unavailable for browser replay: %s", exc)
+            return AuthResult(authenticated=False)
+
+        username_selector = replay_state.payload.get("username_selector") or "input[type='text']"
+        password_selector = replay_state.payload.get("password_selector") or "input[type='password']"
+        submit_selector = replay_state.payload.get("submit_selector")
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True)
+                context = await browser.new_context()
+                if getattr(self.settings, "crawl_browser_block_resources", True):
+                    await install_resource_blocking(context)
+                page = await context.new_page()
+                await page.goto(
+                    replay_state.action or replay_state.login_url,
+                    wait_until="domcontentloaded",
+                    timeout=8000,
+                )
+                await settle_page(page)
+                await page.fill(username_selector, username)
+                await page.fill(password_selector, password)
+                # Bounded click with an Enter fallback: a disabled reactive-form
+                # submit button would otherwise block on Playwright's 30s
+                # actionability wait. Pressing Enter submits via keydown regardless
+                # of button state.
+                submitted_click = False
+                if submit_selector:
+                    try:
+                        await page.click(submit_selector, timeout=3000)
+                        submitted_click = True
+                    except Exception as exc:
+                        logger.debug("[auth] replay submit click failed (%s); using Enter", exc)
+                if not submitted_click:
+                    await page.press(password_selector, "Enter")
+                await settle_page(page)
+                cookies = await context.cookies()
+                cookies_dict = {c["name"]: c["value"] for c in cookies}
+                storage_state = None
+                try:
+                    storage_state = await context.storage_state()
+                except Exception:
+                    pass
+                bearer_token = None
+                try:
+                    local_storage = await page.evaluate("() => JSON.stringify(localStorage)")
+                    for key, value in json.loads(local_storage or "{}").items():
+                        if any(hint in str(key).lower() for hint in ("token", "jwt", "auth", "session", "id_token", "access_token")):
+                            if isinstance(value, str) and (value.startswith("Bearer ") or len(value.split(".")) == 3 or len(value) > 30):
+                                bearer_token = value.replace("Bearer ", "").strip()
+                                break
+                except Exception:
+                    pass
+                await context.close()
+                await browser.close()
+
+                client.cookies.update(cookies_dict)
+                if bearer_token:
+                    client.headers["Authorization"] = f"Bearer {bearer_token}"
+                result = await self._verify_auth(client)
+                if result.authenticated:
+                    result.strategy = AuthStrategy.browser_spa
+                    result.cookies = cookies_dict
+                    result.bearer_token = bearer_token
+                    result.storage_state = storage_state
+                    result.replay_state = AuthReplayState(
+                        login_url=replay_state.login_url,
+                        action=replay_state.action,
+                        method="BROWSER",
+                        payload=dict(replay_state.payload),
+                        is_json=False,
+                        headers=dict(replay_state.headers),
+                    )
+                return result
+        except Exception as exc:
+            logger.warning("[auth] Browser login replay failed: %s", exc)
+            return AuthResult(authenticated=False)
 
     async def _detect_spa(self, client: httpx.AsyncClient, root_url: str) -> bool:
         try:
@@ -386,6 +585,10 @@ class SmartAuthenticator:
                     resp = await client.get(script_url)
                     if resp.status_code == 200:
                         script_contents[script_url] = resp.text
+                        keys = ApiExtractor.extract_storage_keys(resp.text)
+                        if keys:
+                            self._discovered_storage_keys.update(keys)
+                            logger.info("[auth] Discovered storage keys in JS asset %s: %s", script_url, keys)
                         routes, endpoints = ApiExtractor.extract_from_javascript(root_url, resp.text)
                         for ep in endpoints:
                             login_hints = ("login", "signin", "sign-in", "auth", "session", "oauth", "token")
@@ -534,10 +737,13 @@ class SmartAuthenticator:
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch(headless=True)
                 context = await browser.new_context()
+                if getattr(self.settings, "crawl_browser_block_resources", True):
+                    await install_resource_blocking(context)
                 page = await context.new_page()
 
                 logger.info("[auth] Browser launched, navigating to %s", root_url)
-                await page.goto(root_url, wait_until="networkidle", timeout=15000)
+                await page.goto(root_url, wait_until="domcontentloaded", timeout=8000)
+                await settle_page(page)
 
                 # Dismiss blocking overlays (cookie consent, Material CDK backdrops,
                 # welcome modals) before searching for form inputs. Without this,
@@ -582,7 +788,7 @@ class SmartAuthenticator:
                                     if await el.is_visible():
                                         logger.info("[auth] Clicking login element: %s", selector)
                                         await el.click()
-                                        await page.wait_for_load_state("networkidle", timeout=5000)
+                                        await settle_page(page)
                                         break
                                 if await page.locator("input[type='password']").count() > 0:
                                     break
@@ -596,9 +802,28 @@ class SmartAuthenticator:
                 except Exception:
                     pass
 
+                # If password input is not present, try direct navigation to common client-side login routes
+                if await page.locator("input[type='password']").count() == 0:
+                    parsed_root = urlparse(root_url)
+                    base_origin = f"{parsed_root.scheme}://{parsed_root.netloc}"
+                    login_paths = ["/login", "/#/login", "/signin", "/#/signin", "/sign-in", "/#/sign-in", "/auth/login", "/#/auth/login"]
+                    for path in login_paths:
+                        target_login_url = base_origin + path
+                        try:
+                            logger.info("[auth] Trying direct navigation to SPA login route: %s", target_login_url)
+                            await page.goto(target_login_url, wait_until="domcontentloaded", timeout=8000)
+                            await settle_page(page)
+                            if await page.locator("input[type='password']").count() > 0:
+                                logger.info("[auth] Found password input after direct navigation to %s", target_login_url)
+                                break
+                        except Exception as e:
+                            logger.debug("[auth] Failed to navigate to %s: %s", target_login_url, e)
+
+                browser_login_url = page.url
+
                 password_inputs = page.locator("input[type='password']")
                 if await password_inputs.count() == 0:
-                    logger.warning("[auth] No password input found in DOM after navigation/clicks")
+                    logger.warning("[auth] No password input found in DOM after navigation/clicks/routing")
                     await context.close()
                     await browser.close()
                     return None
@@ -663,17 +888,35 @@ class SmartAuthenticator:
                 ]
 
                 clicked = False
+                clicked_selector = None
                 for sel in submit_selectors:
                     try:
                         loc = page.locator(sel)
                         if await loc.count() > 0:
                             for i in range(await loc.count()):
                                 el = loc.nth(i)
-                                if await el.is_visible():
-                                    logger.info("[auth] Clicking submit button: %s", sel)
-                                    await el.click()
-                                    clicked = True
-                                    break
+                                # Skip hidden or still-disabled controls fast. A
+                                # reactive-form submit button (Angular/React/Vue)
+                                # stays ``[disabled]`` until the framework marks the
+                                # form valid; clicking it would block on Playwright's
+                                # 30s actionability wait, then throw — two such
+                                # buttons burned ~60s per login. Skipping lets the
+                                # Enter fallback (which submits via keydown
+                                # regardless of button state) fire immediately.
+                                if not await el.is_visible():
+                                    continue
+                                if not await el.is_enabled():
+                                    logger.info(
+                                        "[auth] Submit button disabled, skipping: %s", sel
+                                    )
+                                    continue
+                                logger.info("[auth] Clicking submit button: %s", sel)
+                                # Bounded timeout: never spend the default 30s on a
+                                # single control that turns non-actionable.
+                                await el.click(timeout=3000)
+                                clicked = True
+                                clicked_selector = sel
+                                break
                             if clicked:
                                 break
                     except Exception as e:
@@ -683,7 +926,7 @@ class SmartAuthenticator:
                     logger.info("[auth] Pressing Enter on password input as fallback")
                     await page.press(password_selector, "Enter")
 
-                await page.wait_for_load_state("networkidle", timeout=5000)
+                await settle_page(page)
 
                 cookies = await context.cookies()
                 cookies_dict = {c["name"]: c["value"] for c in cookies}
@@ -703,12 +946,32 @@ class SmartAuthenticator:
                 if local_storage:
                     try:
                         ls_dict = json.loads(local_storage)
-                        for k, v in ls_dict.items():
-                            if any(hint in k.lower() for hint in ("token", "jwt", "auth", "session", "id_token", "access_token")):
-                                if isinstance(v, str) and (v.startswith("Bearer ") or len(v.split(".")) == 3 or len(v) > 30):
-                                    bearer_token = v.replace("Bearer ", "").strip()
-                                    logger.info("[auth] Found bearer token in localStorage key '%s'", k)
+                        # First: try matching any of the discovered storage keys from JS!
+                        for k in self._discovered_storage_keys:
+                            if k in ls_dict:
+                                v = ls_dict[k]
+                                token_val = None
+                                if isinstance(v, str):
+                                    token_val = v
+                                elif isinstance(v, dict):
+                                    for subkey, subval in v.items():
+                                        if any(hint in subkey.lower() for hint in ("token", "jwt", "access", "bearer", "session")):
+                                            if isinstance(subval, str):
+                                                token_val = subval
+                                                break
+                                if token_val:
+                                    bearer_token = token_val.replace("Bearer ", "").strip()
+                                    logger.info("[auth] Found bearer token via discovered JS key '%s'", k)
                                     break
+                        
+                        # Fallback to the existing generic check if not found:
+                        if not bearer_token:
+                            for k, v in ls_dict.items():
+                                if any(hint in k.lower() for hint in ("token", "jwt", "auth", "session", "id_token", "access_token")):
+                                    if isinstance(v, str) and (v.startswith("Bearer ") or len(v.split(".")) == 3 or len(v) > 30):
+                                        bearer_token = v.replace("Bearer ", "").strip()
+                                        logger.info("[auth] Found bearer token in localStorage key '%s'", k)
+                                        break
                     except Exception as e:
                         logger.debug("[auth] Failed to parse localStorage: %s", e)
 
@@ -722,7 +985,17 @@ class SmartAuthenticator:
                     auth_result.cookies = cookies_dict
                     auth_result.bearer_token = bearer_token
                     auth_result.storage_state = storage_state
-                    auth_result.replay_state = None
+                    auth_result.replay_state = AuthReplayState(
+                        login_url=root_url,
+                        action=browser_login_url,
+                        method="BROWSER",
+                        payload={
+                            "username_selector": username_selector,
+                            "password_selector": password_selector,
+                            "submit_selector": clicked_selector or "",
+                        },
+                        is_json=False,
+                    )
                     logger.info("[auth] Strategy 4 succeeded!")
                     await context.close()
                     await browser.close()
@@ -1075,3 +1348,81 @@ class SmartAuthenticator:
                 logger.info("[auth] Secondary account registered via HTML form %s", action)
                 return True
         return False
+
+    async def _capture_browser_storage_state(
+        self, root_url: str, cookies: dict[str, str], bearer_token: str | None
+    ) -> dict | None:
+        """Launch a temporary browser context, seed it with cookies/bearer_token, and capture storage_state."""
+        try:
+            from playwright.async_api import async_playwright
+        except Exception:
+            return None
+
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True)
+                context = await browser.new_context()
+                if getattr(self.settings, "crawl_browser_block_resources", True):
+                    await install_resource_blocking(context)
+
+                # Seed cookies if any
+                if cookies:
+                    parsed = urlparse(root_url)
+                    domain = parsed.netloc.split(":")[0]
+                    path = parsed.path or "/"
+                    cookies_list = []
+                    for name, value in cookies.items():
+                        cookies_list.append(
+                            {
+                                "name": name,
+                                "value": value,
+                                "domain": domain,
+                                "path": path,
+                            }
+                        )
+                    await context.add_cookies(cookies_list)
+
+                page = await context.new_page()
+                await page.goto(root_url, wait_until="commit")
+
+                # Seed bearer token in localStorage if present
+                if bearer_token:
+                    token_keys = {"token", "access_token", "jwt", "auth_token", "authToken", "sentrystrike_token"}
+                    if self._discovered_storage_keys:
+                        token_keys.update(self._discovered_storage_keys)
+
+                    user_keys = [k for k in self._discovered_storage_keys if "user" in k.lower()]
+                    
+                    keys_to_set = list(token_keys)
+                    await page.evaluate("""(args) => {
+                        const { token, keys, userKeys } = args;
+                        for (const key of keys) {
+                            localStorage.setItem(key, token);
+                            localStorage.setItem(key, "Bearer " + token);
+                        }
+                        for (const ukey of userKeys) {
+                            try {
+                                const existing = localStorage.getItem(ukey);
+                                if (existing) {
+                                    const parsed = JSON.parse(existing);
+                                    if (typeof parsed === 'object') {
+                                        parsed.token = token;
+                                        parsed.access_token = token;
+                                        localStorage.setItem(ukey, JSON.stringify(parsed));
+                                        continue;
+                                    }
+                                }
+                            } catch (e) {}
+                            localStorage.setItem(ukey, JSON.stringify({ token: token, access_token: token, email: "scanner@example.com" }));
+                        }
+                    }""", {"token": bearer_token, "keys": keys_to_set, "userKeys": user_keys})
+
+                await page.wait_for_timeout(500)
+                storage_state = await context.storage_state()
+                await context.close()
+                await browser.close()
+                return storage_state
+        except Exception as e:
+            logger.debug("[auth] Failed to capture backup browser storage state: %s", e)
+            return None
+

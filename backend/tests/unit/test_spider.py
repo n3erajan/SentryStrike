@@ -27,7 +27,7 @@ async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch
     observations into the crawl state (the merge runs in ``finally``)."""
 
     class _StubEngine:
-        def __init__(self, max_interactions=25):
+        def __init__(self, max_interactions=25, workers=None):
             self.max_interactions = max_interactions
 
         @staticmethod
@@ -92,13 +92,27 @@ def test_should_run_browser_decision_matrix(monkeypatch, enabled, mode, is_spa, 
 
 @pytest.mark.asyncio
 async def test_run_browser_discovery_degrades_when_playwright_unavailable(monkeypatch):
-    class _UnreadyEngine:
-        def __init__(self, max_interactions=25):
-            raise AssertionError("engine must not be constructed when unavailable")
+    """With the readiness-probe double-launch removed, ``crawl_into`` itself
+    detects unavailability inline: it sets ``browser_available=False`` +
+    ``browser_error`` and returns, and the merge surfaces that as static-only."""
 
-        @staticmethod
-        async def check_readiness():
-            return False, "Playwright import failed: boom"
+    class _UnreadyEngine:
+        def __init__(self, max_interactions=25, workers=None):
+            self.max_interactions = max_interactions
+
+        async def crawl_into(
+            self,
+            state,
+            root_url,
+            auth_cookies=None,
+            auth_headers=None,
+            routes=None,
+            deadline=None,
+            storage_state=None,
+        ):
+            state.browser_available = False
+            state.browser_error = "Playwright import failed: boom"
+            return state
 
     monkeypatch.setattr(spider_module, "BrowserDiscoveryEngine", _UnreadyEngine)
 
@@ -195,6 +209,60 @@ def _start_spa_server(port: int) -> tuple[HTTPServer, threading.Thread]:
     thread.start()
     time.sleep(0.3)
     return httpd, thread
+
+
+class CrossOriginLinkHandler(BaseHTTPRequestHandler):
+    """Serves a page linking to both a same-origin path and an off-origin host."""
+
+    def do_GET(self):
+        if self.path in ("/", "/index"):
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b'<html><body>'
+                b'<a href="/local-page">local</a>'
+                b'<a href="https://github.com/juice-shop/juice-shop">external</a>'
+                b'</body></html>'
+            )
+        elif self.path == "/local-page":
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b'<html><body>local page</body></html>')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_crawl_never_enqueues_off_origin_links(monkeypatch):
+    """Scope guard: an off-origin link (github.com) must never be crawled or
+    end up in the tested URL set, no matter that it is a valid <a href>."""
+    monkeypatch.setenv("CRAWL_DEPTH", "2")
+    monkeypatch.setenv("CRAWL_MAX_URLS", "50")
+    get_settings = __import__("app.config", fromlist=["get_settings"]).get_settings
+    get_settings.cache_clear()
+
+    httpd = HTTPServer(("127.0.0.1", 8096), CrossOriginLinkHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.3)
+    try:
+        spider = WebSpider()
+        result = await spider.crawl("http://127.0.0.1:8096/")
+
+        assert any(url.endswith("/local-page") for url in result.urls)
+        assert not any("github.com" in url for url in result.urls)
+        assert not any("github.com" in getattr(route, "url", "") for route in result.routes)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=1)
+        get_settings.cache_clear()
 
 
 def _start_spa_sensitive_paths_server(port: int) -> tuple[HTTPServer, threading.Thread]:

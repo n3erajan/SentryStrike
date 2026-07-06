@@ -9,6 +9,7 @@ from app.core.detectors.param_selection import SSRF_NAME_TOKENS, ssrf_candidate
 from app.core.verification.oast import OastClient
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.utils.scan_http import build_scan_headers
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,7 @@ class SSRFDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        auth_headers = kwargs.get("auth_headers")
         scan_config = kwargs.get("scan_config")
         settings = get_settings()
         oast_callback = scan_config.get_val("oast_callback_base_url", settings.oast_callback_base_url) if scan_config else settings.oast_callback_base_url
@@ -178,15 +180,20 @@ class SSRFDetector(BaseDetector):
 
         # Build the surface unfiltered, then select on name-OR-value so params
         # whose value looks like a URL qualify even with a generic name.
-        candidates = [
-            candidate
-            for candidate in AttackSurface.build(
+        planner = kwargs.get("attack_planner")
+        surface = (
+            planner.targets_for(self.name)
+            if planner is not None and hasattr(planner, "targets_for")
+            else AttackSurface.build(
                 urls,
                 forms,
                 parameters=kwargs.get("parameters") or [],
                 api_endpoints=kwargs.get("api_endpoints") or [],
                 requests=kwargs.get("requests") or [],
             )
+        )
+        candidates = [
+            candidate for candidate in surface
             if ssrf_candidate(candidate.parameter, candidate.value)
         ]
 
@@ -195,7 +202,7 @@ class SSRFDetector(BaseDetector):
 
         # 2. Active Verification
         semaphore = asyncio.Semaphore(4)
-        verifier = HttpVerifier(cookies=session_cookies)
+        verifier = HttpVerifier(cookies=session_cookies, headers=build_scan_headers(auth_headers))
         verifier.set_request_context(module="ssrf")
 
         def build_request(cand: AttackTarget, value: str):

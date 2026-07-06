@@ -91,6 +91,13 @@ def test_synthesize_generic_fallback_requires_hint():
     # POST with no schema and no body content-type and no path hint => no spraying.
     bare = ApiEndpoint(url="http://x/rest/basket", method="POST")
     assert ApiExtractor.synthesize_body_schema(bare) == (None, None)
+    # RC3: an opt-in caller (already gated on is_api_endpoint) gets one generic
+    # low-confidence leaf for the same bare mutating endpoint.
+    _, opt_in = ApiExtractor.synthesize_body_schema(bare, allow_generic_body=True)
+    assert list(opt_in) == ["data"]
+    # allow_generic_body must never override the GET guard.
+    get_ep = ApiEndpoint(url="http://x/rest/basket", method="GET")
+    assert ApiExtractor.synthesize_body_schema(get_ep, allow_generic_body=True) == (None, None)
     # POST whose path hints a mutating body => single generic leaf.
     hinted = ApiEndpoint(url="http://x/rest/user/login", method="POST")
     content_type, template = ApiExtractor.synthesize_body_schema(hinted)
@@ -233,3 +240,42 @@ def test_build_synthesis_prefers_observed_body_over_synth_for_api():
     # Observed body wins; nothing static_synth for this endpoint.
     assert all(t.source_confidence != "static_synth" for t in targets)
     assert any(t.replayable for t in targets)
+
+
+def test_build_synthesis_skips_unresolved_path_placeholders():
+    ep = ApiEndpoint(
+        url="http://x/rest/basket/{param_1}/checkout",
+        method="POST",
+        source=RouteSource.javascript,
+        evidence="fetch/xhr",
+        content_type="application/json",
+        body_schema=["coupon"],
+    )
+
+    targets = AttackSurface.build([], [], api_endpoints=[ep])
+    telemetry = AttackSurface.body_target_telemetry(api_endpoints=[ep])
+
+    assert targets == []
+    assert telemetry["static_synth_body_targets"] == 0
+    assert telemetry["skipped_unresolved_body_targets"] == 1
+
+
+def test_build_skips_parameter_candidates_with_unresolved_path_placeholders():
+    targets = AttackSurface.build(
+        [],
+        [],
+        parameters=[
+            ApiExtractor.parameters_from_endpoint(
+                ApiEndpoint(
+                    url="http://x/rest/basket/%7Bparam_1%7D/checkout",
+                    method="POST",
+                    source=RouteSource.javascript,
+                    evidence="fetch/xhr",
+                    content_type="application/json",
+                    request_body={"coupon": "SAVE10"},
+                )
+            )[0]
+        ],
+    )
+
+    assert targets == []

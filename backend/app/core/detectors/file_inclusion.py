@@ -14,6 +14,7 @@ from app.core.payload_profile import PayloadProfile, build_payload_profile
 from app.core.verification.response_analyzer import ResponseAnalyzer
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.utils.scan_http import build_scan_headers
 
 logger = logging.getLogger(__name__)
 
@@ -178,21 +179,27 @@ class FileInclusionDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        auth_headers = kwargs.get("auth_headers")
         payload_profile = build_payload_profile(kwargs.get("technology_stack"))
         lfi_payloads = self._select_lfi_payloads(payload_profile)
         rfi_payloads = self._select_rfi_payloads(payload_profile)
 
         # Build the surface unfiltered, then select on name-OR-value so params
         # whose value looks like a path/file qualify even with a generic name.
-        candidates = [
-            candidate
-            for candidate in AttackSurface.build(
+        planner = kwargs.get("attack_planner")
+        surface = (
+            planner.targets_for(self.name)
+            if planner is not None and hasattr(planner, "targets_for")
+            else AttackSurface.build(
                 urls,
                 forms,
                 parameters=kwargs.get("parameters") or [],
                 api_endpoints=kwargs.get("api_endpoints") or [],
                 requests=kwargs.get("requests") or [],
             )
+        )
+        candidates = [
+            candidate for candidate in surface
             if file_candidate(candidate.parameter, candidate.value)
         ]
 
@@ -200,7 +207,7 @@ class FileInclusionDetector(BaseDetector):
             return []
 
         semaphore = asyncio.Semaphore(4)
-        verifier = HttpVerifier(cookies=session_cookies)
+        verifier = HttpVerifier(cookies=session_cookies, headers=build_scan_headers(auth_headers))
         verifier.set_request_context(module="lfi")
 
         rfi_fingerprints = await self._fetch_rfi_fingerprints() if rfi_payloads else {}

@@ -15,6 +15,8 @@ from app.core.crawler.account_session import provision_secondary_session, resolv
 from app.core.crawler.spider import WebSpider
 from app.schemas.scan_schema import ScanConfig
 from app.core.detectors.access_control import AccessControlDetector
+from app.core.detectors.attack_planner import AttackPlanner
+from app.core.detectors.attack_surface import AttackSurface
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
 from app.core.detectors.base_detector import Finding
 from app.core.detectors.crypto_failures import CryptoFailuresDetector
@@ -64,6 +66,7 @@ from app.models.vulnerability import (
 )
 from app.utils.cvss_calculator import CvssCalculator
 from app.utils.scan_metrics import begin_request_counting, end_request_counting, snapshot_request_counts
+from app.core.request_governor import begin_governor, end_governor
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +226,7 @@ class ScanOrchestrator:
             return True
         return False
 
-    async def _apply_submitted_account_sessions(self, scan, accounts_by_role: dict, crawl_context: dict, scan_config: ScanConfig | None = None) -> None:
+    async def _apply_submitted_account_sessions(self, scan, accounts_by_role: dict, crawl_context: dict, scan_config: ScanConfig | None = None, preferred_replay=None, primary_credentials=None) -> None:
         """Resolve second/admin test accounts to live sessions and inject them.
 
         The access-control detector reads ``second_user_cookies``/``_headers`` and
@@ -234,19 +237,28 @@ class ScanOrchestrator:
         (gated by ``ALLOW_SECONDARY_PROVISIONING``).
         """
         role_to_kwargs = {
-            "second": ("second_user_cookies", "second_user_headers"),
-            "admin": ("privileged_cookies", "privileged_headers"),
+            "second": ("second_user_cookies", "second_user_headers", "second_user_storage_state"),
+            "admin": ("privileged_cookies", "privileged_headers", "privileged_storage_state"),
         }
-        for role, (cookie_key, header_key) in role_to_kwargs.items():
+        for role, (cookie_key, header_key, storage_key) in role_to_kwargs.items():
             account = accounts_by_role.get(role)
             if account is None:
                 continue
-            session = await resolve_account_session(scan.target_url, account)
+            session = await resolve_account_session(
+                scan.target_url,
+                account,
+                preferred_replay=preferred_replay,
+                primary_credentials=primary_credentials,
+            )
             if not session.usable:
                 logger.warning("no usable session resolved for %s account on %s", role, scan.target_url)
                 continue
             crawl_context[cookie_key] = session.cookies
             crawl_context[header_key] = session.headers
+            # Forward the full authenticated browser blob when captured so a
+            # browser-based access-control check reuses it instead of re-logging-in.
+            if session.storage_state:
+                crawl_context[storage_key] = session.storage_state
             logger.info(
                 "injected %s account session for access-control testing (cookies=%d, headers=%d)",
                 role,
@@ -266,6 +278,8 @@ class ScanOrchestrator:
             if provisioned.usable:
                 crawl_context["second_user_cookies"] = provisioned.cookies
                 crawl_context["second_user_headers"] = provisioned.headers
+                if provisioned.storage_state:
+                    crawl_context["second_user_storage_state"] = provisioned.storage_state
                 logger.info(
                     "injected auto-provisioned secondary identity for access-control testing "
                     "(cookies=%d, headers=%d)",
@@ -300,6 +314,30 @@ class ScanOrchestrator:
                 crawl_result = await self.spider.fetch_single(scan.target_url)
             else:
                 crawl_result = await self.spider.crawl(scan.target_url, auth_override=main_account, scan_config=scan_config)
+
+            # Filter all crawl results to strictly enforce same-origin target isolation (Issue 2)
+            target_url = scan.target_url
+            
+            def is_same_origin(url_a: str, url_b: str) -> bool:
+                try:
+                    p_a = urlparse(url_a)
+                    p_b = urlparse(url_b)
+                    port_a = p_a.port or (80 if p_a.scheme == "http" else 443 if p_a.scheme == "https" else None)
+                    port_b = p_b.port or (80 if p_b.scheme == "http" else 443 if p_b.scheme == "https" else None)
+                    return (p_a.scheme == p_b.scheme and p_a.hostname == p_b.hostname and port_a == port_b)
+                except Exception:
+                    return False
+
+            crawl_result.urls = [u for u in crawl_result.urls if is_same_origin(target_url, u)]
+            crawl_result.routes = [r for r in crawl_result.routes if is_same_origin(target_url, getattr(r, "url", ""))]
+            crawl_result.api_endpoints = [e for e in crawl_result.api_endpoints if is_same_origin(target_url, getattr(e, "url", ""))]
+            crawl_result.requests = [req for req in crawl_result.requests if is_same_origin(target_url, getattr(req, "url", ""))]
+            crawl_result.parameters = [p for p in crawl_result.parameters if is_same_origin(target_url, getattr(p, "url", ""))]
+            crawl_result.forms = [
+                f for f in crawl_result.forms 
+                if is_same_origin(target_url, getattr(f, "action", "")) or is_same_origin(target_url, getattr(f, "page_url", ""))
+            ]
+
             scan.statistics.total_urls_crawled = len(crawl_result.urls)
             await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {len(crawl_result.urls)} URL(s) discovered")
             await self._check_cancelled(scan_id)
@@ -358,7 +396,29 @@ class ScanOrchestrator:
                 "browser_forms": getattr(crawl_result, "browser_forms", []),
                 "scan_config": scan_config,
             }
-            await self._apply_submitted_account_sessions(scan, auth_accounts_by_role, crawl_context, scan_config=scan_config)
+            # Reuse the winning login path from the main account so second/admin
+            # logins don't restart the strategy cascade from scratch.
+            main_replay = getattr(crawl_result, "auth_replay_state", None)
+            main_credentials = (
+                (main_account.username, main_account.password) if main_account else None
+            )
+            await self._apply_submitted_account_sessions(
+                scan,
+                auth_accounts_by_role,
+                crawl_context,
+                scan_config=scan_config,
+                preferred_replay=main_replay,
+                primary_credentials=main_credentials,
+            )
+            attack_planner = AttackPlanner.from_context(
+                urls=crawl_result.urls,
+                forms=crawl_result.forms,
+                parameters=getattr(crawl_result, "parameters", []),
+                api_endpoints=getattr(crawl_result, "api_endpoints", []),
+                requests=getattr(crawl_result, "requests", []),
+            )
+            crawl_context["attack_planner"] = attack_planner
+            crawl_context["attack_targets"] = attack_planner.targets
             coverage_context = {
                 **crawl_context,
                 "urls": crawl_result.urls,
@@ -401,6 +461,13 @@ class ScanOrchestrator:
 
             detector_request_counts: dict[str, int] = {}
             begin_request_counting()
+            # P1-1: activate the request-budget governor for the detector phase so
+            # per-detector / per-parameter ceilings bound each detector's traffic.
+            _governor_settings = get_settings()
+            begin_governor(
+                _governor_settings.scanner_per_detector_request_cap,
+                _governor_settings.scanner_per_parameter_request_cap,
+            )
             try:
                 detector_results = await asyncio.gather(
                     *[run_detector(detector) for detector in active_detectors],
@@ -498,6 +565,7 @@ class ScanOrchestrator:
                 detector_request_counts = snapshot_request_counts()
             finally:
                 end_request_counting()
+                end_governor()
             self._apply_detector_request_counts(detector_metrics, detector_request_counts)
 
             await self._set_progress(scan, 60, ScanPhase.vulnerability_detection, f"Detector phase complete: {len(findings)} raw finding(s)")
@@ -748,6 +816,17 @@ class ScanOrchestrator:
             crawl_context,
             technology_stack=technology_stack,
         )
+        planner = crawl_context.get("attack_planner")
+        planner_summary: dict[str, object] = {}
+        if isinstance(planner, AttackPlanner):
+            planner_summary = planner.coverage_summary(
+                detector_name,
+                tested_count=self._request_snippet_count(findings),
+            )
+            candidates_built = max(
+                candidates_built,
+                int(planner_summary.get("targets_seen", 0) or 0),
+            )
         skipped_reasons = self._detector_skip_reasons(detector_name, candidates_built, findings, crawl_context)
         if candidates_built == 0 and not findings:
             skipped_reasons["no_candidates_built"] = 1
@@ -772,6 +851,11 @@ class ScanOrchestrator:
             requests_sent=self._request_snippet_count(findings),
             verified_findings=len([finding for finding in findings or [] if getattr(finding, "verified", False)]),
             unverified_findings=len([finding for finding in findings or [] if not getattr(finding, "verified", False)]),
+            replayable_targets_seen=int(planner_summary.get("replayable_targets_seen", 0) or 0),
+            replayable_targets_tested=int(planner_summary.get("replayable_targets_tested", 0) or 0),
+            validated_synth_targets_tested=int(planner_summary.get("validated_synth_targets_tested", 0) or 0),
+            body_targets_skipped=int(planner_summary.get("body_targets_skipped", 0) or 0),
+            skip_reason_by_risk=dict(planner_summary.get("skip_reason_by_risk", {}) or {}),
             skipped_reasons=skipped_reasons,
         )
 
@@ -903,6 +987,10 @@ class ScanOrchestrator:
             request_total = sum(request_counts.get(alias, 0) for alias in aliases)
             if request_total:
                 metric.requests_sent = max(metric.requests_sent, request_total)
+                metric.replayable_targets_tested = max(
+                    metric.replayable_targets_tested,
+                    min(metric.replayable_targets_seen, request_total),
+                )
                 matched_modules.update(aliases)
 
         for module, count in request_counts.items():
@@ -920,13 +1008,17 @@ class ScanOrchestrator:
         for metric in detector_metrics:
             logger.info(
                 "detector coverage: detector=%s candidates_built=%d requests_sent=%d "
-                "verified_findings=%d unverified_findings=%d dropped_verified_mode=%d skipped_reasons=%s",
+                "verified_findings=%d unverified_findings=%d dropped_verified_mode=%d "
+                "replayable_seen=%d replayable_tested=%d body_skipped=%d skipped_reasons=%s",
                 metric.detector,
                 metric.candidates_built,
                 metric.requests_sent,
                 metric.verified_findings,
                 metric.unverified_findings,
                 metric.dropped_findings_verified_mode,
+                metric.replayable_targets_seen,
+                metric.replayable_targets_tested,
+                metric.body_targets_skipped,
                 metric.skipped_reasons,
             )
 
@@ -1573,6 +1665,8 @@ class ScanOrchestrator:
         verified = auth_state_value == "authenticated_verified"
         is_spa = bool(getattr(crawl_result, "is_spa", False))
         requests = getattr(crawl_result, "requests", []) or []
+        post_bodies = len([request for request in requests if getattr(request, "post_data", None)])
+        browser_forms_submitted = int(getattr(crawl_result, "browser_forms_submitted", 0) or 0)
         replayable_json_bodies = len(
             [
                 request
@@ -1581,6 +1675,10 @@ class ScanOrchestrator:
                 and getattr(request, "replayable", True)
                 and "json" in self._request_content_type(request)
             ]
+        )
+        body_target_telemetry = AttackSurface.body_target_telemetry(
+            api_endpoints=getattr(crawl_result, "api_endpoints", []) or [],
+            requests=requests,
         )
         browser_available = getattr(crawl_result, "browser_available", None)
         browser_error = getattr(crawl_result, "browser_error", None)
@@ -1593,6 +1691,8 @@ class ScanOrchestrator:
             browser_available=browser_available,
             browser_error=browser_error,
             browser_requests_observed=len(requests),
+            browser_forms_submitted=browser_forms_submitted,
+            post_bodies=post_bodies,
         )
 
         scan.report_metadata.spa_api_coverage = SpaApiCoverage(
@@ -1607,8 +1707,14 @@ class ScanOrchestrator:
             browser_available=browser_available,
             browser_error=browser_error,
             replayable_json_bodies=replayable_json_bodies,
+            observed_json_body_targets=body_target_telemetry["observed_json_body_targets"],
+            observed_form_body_targets=body_target_telemetry["observed_form_body_targets"],
+            static_synth_body_targets=body_target_telemetry["static_synth_body_targets"],
+            skipped_unresolved_body_targets=body_target_telemetry["skipped_unresolved_body_targets"],
+            post_bodies=post_bodies,
             workflow_states_visited=int(getattr(crawl_result, "workflow_states_visited", 0) or 0),
             browser_forms_discovered=int(getattr(crawl_result, "browser_forms_discovered", 0) or 0),
+            browser_forms_submitted=browser_forms_submitted,
             file_inputs_discovered=int(getattr(crawl_result, "file_inputs_discovered", 0) or 0),
             dynamic_status=dynamic_status,
         )
@@ -1629,6 +1735,8 @@ class ScanOrchestrator:
         browser_available: bool | None,
         browser_error: str | None,
         browser_requests_observed: int,
+        browser_forms_submitted: int = 0,
+        post_bodies: int = 0,
     ) -> str:
         """Classify dynamic-discovery health for honest reporting.
 
@@ -1642,6 +1750,8 @@ class ScanOrchestrator:
         if not browser_available:
             return "dynamic_failed"
         if browser_requests_observed == 0 or browser_error:
+            return "dynamic_partial"
+        if browser_forms_submitted > 0 and post_bodies == 0:
             return "dynamic_partial"
         return "dynamic_ok"
 
@@ -1671,6 +1781,7 @@ class ScanOrchestrator:
         browser_available = getattr(crawl_result, "browser_available", None)
         browser_error = getattr(crawl_result, "browser_error", None)
         browser_forms = int(getattr(crawl_result, "browser_forms_discovered", 0) or 0)
+        browser_forms_submitted = int(getattr(crawl_result, "browser_forms_submitted", 0) or 0)
         file_inputs = int(getattr(crawl_result, "file_inputs_discovered", 0) or 0)
         replayable_json_bodies = [
             request
@@ -1689,6 +1800,10 @@ class ScanOrchestrator:
                 or "multipart/form-data" in self._request_content_type(request)
             )
         ]
+        body_target_telemetry = AttackSurface.body_target_telemetry(
+            api_endpoints=getattr(crawl_result, "api_endpoints", []) or [],
+            requests=requests,
+        )
         if is_spa and not requests:
             warnings.append(
                 "SPA detected, but no browser runtime requests were observed. API coverage is static extraction only."
@@ -1698,7 +1813,25 @@ class ScanOrchestrator:
         if not forms and not browser_forms:
             warnings.append("No HTML forms were discovered; form-based detector coverage was limited.")
         if not replayable_json_bodies and not replayable_form_bodies:
-            warnings.append("No replayable JSON or form request bodies were observed; API body testing was limited.")
+            static_count = body_target_telemetry["static_synth_body_targets"]
+            if static_count:
+                warnings.append(
+                    "No replayable JSON or form request bodies were observed; API body testing used "
+                    f"{static_count} low-confidence static synthesized body target(s)."
+                )
+            else:
+                warnings.append("No replayable JSON or form request bodies were observed; API body testing was limited.")
+        if browser_forms_submitted > 0 and not any(getattr(request, "post_data", None) for request in requests):
+            warnings.append(
+                "Browser submitted form/workflow actions, but no replayable POST bodies were captured; "
+                "dynamic request-body coverage is degraded."
+            )
+        skipped_unresolved = body_target_telemetry["skipped_unresolved_body_targets"]
+        if skipped_unresolved:
+            warnings.append(
+                f"Skipped {skipped_unresolved} static body target(s) with unresolved path placeholders; "
+                "the crawler needs observed IDs or route parameters before those APIs can be safely probed."
+            )
         if auth_headers and not session_cookies:
             warnings.append("Authentication was represented by headers only; cookie/session checks were limited.")
         if file_inputs == 0:

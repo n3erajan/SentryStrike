@@ -11,7 +11,7 @@ from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
-from app.utils.scan_http import create_scan_client
+from app.utils.scan_http import build_scan_headers, create_scan_client
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ class FileUploadDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        auth_headers = kwargs.get("auth_headers")
         settings = get_settings()
 
         candidates: list[UploadCandidate] = []
@@ -110,7 +111,7 @@ class FileUploadDetector(BaseDetector):
         async with create_scan_client(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "SentryStrikeScanner/1.0"},
+            headers=build_scan_headers(auth_headers),
             cookies=session_cookies,
             event_hooks={"response": [make_httpx_response_logger("file_upload", "upload_test")]},
         ) as client:
@@ -154,6 +155,7 @@ class FileUploadDetector(BaseDetector):
         if accepted:
             candidate_urls = self._extract_candidate_urls(response, form_url, site_root, php_name)
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
+            response_evidence = self._has_upload_response_evidence(response, php_name)
             if accessible_url:
                 findings.append(Finding(
                     category=OwaspCategory.a01,
@@ -200,7 +202,7 @@ class FileUploadDetector(BaseDetector):
                     reproducible=True,
                     verified=True,
                 ))
-            else:
+            elif response_evidence:
                 findings.append(Finding(
                     category=OwaspCategory.a01,
                     vuln_type="Weak File Upload Validation",
@@ -209,11 +211,14 @@ class FileUploadDetector(BaseDetector):
                     parameter=file_field,
                     method=method,
                     payload=php_name,
-                    evidence="Dangerous extension accepted with spoofed image content-type.",
-                    confidence_score=80.0,
-                    detection_method="content_type_bypass",
-                    reproducible=True,
-                    verified=True,
+                    evidence=(
+                        "Dangerous extension upload appeared accepted and the response referenced the uploaded file, "
+                        "but subsequent retrieval did not confirm execution or persistence."
+                    ),
+                    confidence_score=65.0,
+                    detection_method="content_type_bypass_response_evidence",
+                    reproducible=False,
+                    verified=False,
                 ))
 
         # --- Test 3: double extension (.php.jpg) ---
@@ -225,6 +230,7 @@ class FileUploadDetector(BaseDetector):
         if accepted:
             candidate_urls = self._extract_candidate_urls(response, form_url, site_root, dbl_name)
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
+            response_evidence = self._has_upload_response_evidence(response, dbl_name)
             if accessible_url:
                 findings.append(Finding(
                     category=OwaspCategory.a01,
@@ -243,7 +249,7 @@ class FileUploadDetector(BaseDetector):
                     reproducible=True,
                     verified=True,
                 ))
-            else:
+            elif response_evidence:
                 findings.append(Finding(
                     category=OwaspCategory.a01,
                     vuln_type="Double Extension Bypass",
@@ -252,11 +258,14 @@ class FileUploadDetector(BaseDetector):
                     parameter=file_field,
                     method=method,
                     payload=dbl_name,
-                    evidence="Double extension upload accepted with dangerous inner extension.",
-                    confidence_score=80.0,
-                    detection_method="double_extension",
-                    reproducible=True,
-                    verified=True,
+                    evidence=(
+                        "Double extension upload appeared accepted and the response referenced the uploaded file, "
+                        "but subsequent retrieval did not confirm execution or persistence."
+                    ),
+                    confidence_score=65.0,
+                    detection_method="double_extension_response_evidence",
+                    reproducible=False,
+                    verified=False,
                 ))
 
         # --- Test 4: unrestricted type - accepts plain .txt ---
@@ -265,20 +274,32 @@ class FileUploadDetector(BaseDetector):
             txt_name, txt_content, "text/plain",
         )
         if accepted and not self._has_error_terms(response.text or ""):
-            findings.append(Finding(
-                category=OwaspCategory.a01,
-                vuln_type="Missing File Type Validation",
-                severity=SeverityLevel.medium,
-                url=form_url,
-                parameter=file_field,
-                method=method,
-                payload=txt_name,
-                evidence="Upload endpoint accepts arbitrary file types without validation feedback.",
-                confidence_score=60.0,
-                detection_method="no_type_validation",
-                reproducible=True,
-                verified=True,
-            ))
+            candidate_urls = self._extract_candidate_urls(response, form_url, site_root, txt_name)
+            accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
+            response_evidence = self._has_upload_response_evidence(response, txt_name)
+            if accessible_url or response_evidence:
+                findings.append(Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Missing File Type Validation",
+                    severity=SeverityLevel.medium,
+                    url=form_url,
+                    parameter=file_field,
+                    method=method,
+                    payload=txt_name,
+                    evidence=(
+                        f"Uploaded text file was retrievable at {accessible_url}."
+                        if accessible_url
+                        else "Upload response referenced the uploaded text file; retrieval did not confirm persistence."
+                    ),
+                    confidence_score=80.0 if accessible_url else 55.0,
+                    detection_method=(
+                        "no_type_validation_persistence"
+                        if accessible_url
+                        else "no_type_validation_response_evidence"
+                    ),
+                    reproducible=bool(accessible_url),
+                    verified=bool(accessible_url),
+                ))
 
     async def _send_upload(
         self,
@@ -475,6 +496,19 @@ class FileUploadDetector(BaseDetector):
     def _has_error_terms(self, body: str) -> bool:
         lowered = body.lower()
         return any(term in lowered for term in self._error_terms)
+
+    def _has_upload_response_evidence(self, response: httpx.Response, filename: str) -> bool:
+        """True when the upload response itself references the submitted file."""
+        location = response.headers.get("Location", "") or response.headers.get("location", "")
+        if filename and filename in location:
+            return True
+        body = response.text or ""
+        if filename and filename in body:
+            return True
+        try:
+            return filename in json.dumps(response.json(), default=str)
+        except Exception:
+            return False
 
     def _extract_candidate_urls(
         self,

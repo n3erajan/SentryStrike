@@ -34,14 +34,21 @@ class CommandInjectionDetector(BaseDetector):
         def cmd_filter(param_name: str) -> bool:
             return self._name_may_be_command_input(param_name)
 
-        candidates = AttackSurface.build(
-            urls,
-            forms,
-            parameters=kwargs.get("parameters") or [],
-            api_endpoints=kwargs.get("api_endpoints") or [],
-            requests=kwargs.get("requests") or [],
-            filter_fn=cmd_filter,
-        )
+        planner = kwargs.get("attack_planner")
+        if planner is not None and hasattr(planner, "targets_for"):
+            candidates = [
+                cand for cand in planner.targets_for(self.name)
+                if cmd_filter(cand.parameter)
+            ]
+        else:
+            candidates = AttackSurface.build(
+                urls,
+                forms,
+                parameters=kwargs.get("parameters") or [],
+                api_endpoints=kwargs.get("api_endpoints") or [],
+                requests=kwargs.get("requests") or [],
+                filter_fn=cmd_filter,
+            )
         candidates = [cand for cand in candidates if self._is_command_candidate(cand)]
 
         if not candidates:
@@ -50,7 +57,10 @@ class CommandInjectionDetector(BaseDetector):
         # 2. Active verification
         semaphore = asyncio.Semaphore(4)
         verifier = CommandInjectionVerifier(timeout_seconds=10.0)
-        verifier.http_verifier.cookies = session_cookies
+        await verifier.http_verifier.configure_auth(
+            cookies=session_cookies,
+            auth_headers=kwargs.get("auth_headers"),
+        )
         settings = get_settings()
         verifier.blind_timing_threshold = (
             scan_config.get_val("blind_injection_timing_threshold", settings.blind_injection_timing_threshold)

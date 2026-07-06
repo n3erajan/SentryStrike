@@ -249,6 +249,55 @@ async def test_access_control_matrix_does_not_flag_public_catalog_ids_without_se
 
 
 @pytest.mark.asyncio
+async def test_access_control_reports_mass_assignment_privilege_field() -> None:
+    detector = AccessControlDetector()
+    request = RequestObservation(
+        url="https://example.com/api/users",
+        method="POST",
+        request_headers={"content-type": "application/json"},
+        post_data='{"email":"alice@example.com","password":"pw12345"}',
+        request_content_type="application/json",
+        replayable=True,
+    )
+    seen_bodies: list[object] = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        body = kwargs.get("json_body")
+        phase = kwargs.get("test_phase", "")
+        seen_bodies.append(body)
+        if phase == "mass_assignment_baseline":
+            return ResponseData(
+                201,
+                {"content-type": "application/json"},
+                '{"id":1,"email":"alice@example.com"}',
+                1.0,
+                request_snippet=f"{method} {url}",
+                response_snippet="HTTP/1.1 201 Created",
+            )
+        if phase == "mass_assignment_probe" and isinstance(body, dict) and body.get("role") == "admin":
+            return ResponseData(
+                201,
+                {"content-type": "application/json"},
+                '{"id":1,"email":"alice@example.com","role":"admin"}',
+                1.0,
+                request_snippet=f"{method} {url}",
+                response_snippet="HTTP/1.1 201 Created\n\n{\"role\":\"admin\"}",
+            )
+        return ResponseData(400, {"content-type": "application/json"}, '{"error":"bad request"}', 1.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[],
+            forms=[],
+            requests=[request],
+            auth_headers={"Authorization": "Bearer low-user"},
+        )
+
+    assert any(body and body.get("role") == "admin" for body in seen_bodies if isinstance(body, dict))
+    assert any(f.vuln_type == "Mass Assignment / Privilege Field Injection" for f in findings)
+
+
+@pytest.mark.asyncio
 async def test_crypto_detector_flags_http() -> None:
     detector = CryptoFailuresDetector()
     urls = ["http://example.com/login"]

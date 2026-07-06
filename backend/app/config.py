@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     # Hard cap on how many routes the browser crawl will visit in one run
     # (the priority queue drops the low-score tail when this is hit).
     crawl_browser_route_cap: int = Field(default=120, alias="CRAWL_BROWSER_ROUTE_CAP")
+    # Parallel browser crawl: number of worker coroutines (each its own context +
+    # page) sharing the value-ordered route heap. 1 = the legacy serial crawl.
+    # N contexts means N× the request rate at the target — browser traffic
+    # bypasses the httpx scan semaphore — so keep this conservative.
+    crawl_browser_workers: int = Field(default=4, alias="CRAWL_BROWSER_WORKERS")
+    # Block non-essential resources (images/media/fonts/stylesheets + known
+    # trackers) during browser crawl/auth to speed up settle. Never blocks
+    # same-origin script/xhr/fetch/document. Disable if a target renders needed
+    # content into CSS/images.
+    crawl_browser_block_resources: bool = Field(default=True, alias="CRAWL_BROWSER_BLOCK_RESOURCES")
     # Bounds for the XSS browser-driven DOM reflection sweep (Task 5). Caps the
     # number of route+param probes and the wall-clock spent so the phase can
     # never dominate a scan.
@@ -54,6 +64,13 @@ class Settings(BaseSettings):
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     scanner_concurrency: int = Field(default=8, alias="SCANNER_CONCURRENCY")
     sensitive_paths_permutation_cap: int = Field(default=200, alias="SENSITIVE_PATHS_PERMUTATION_CAP")
+    # P1-1: request-budget governor. Per-detector and per-(detector,parameter)
+    # ceilings act as runaway backstops so no single detector/parameter can
+    # dominate scan traffic (0 = unlimited). Defaults are generous — far above a
+    # healthy detector's volume — so normal scans are unaffected and only
+    # pathological fan-out (e.g. the header-stored XSS explosion) is capped.
+    scanner_per_detector_request_cap: int = Field(default=6000, alias="SCANNER_PER_DETECTOR_REQUEST_CAP")
+    scanner_per_parameter_request_cap: int = Field(default=600, alias="SCANNER_PER_PARAMETER_REQUEST_CAP")
 
     # Verification / Scanning Settings
     scan_mode: str = Field(default="verified", alias="SCAN_MODE")  # verified / heuristic / aggressive

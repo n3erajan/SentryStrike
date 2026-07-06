@@ -67,7 +67,10 @@ class SQLInjectionDetector(BaseDetector):
         """
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
-        self.verifier.http_verifier.cookies = session_cookies
+        await self.verifier.http_verifier.configure_auth(
+            cookies=session_cookies,
+            auth_headers=kwargs.get("auth_headers"),
+        )
         scan_config = kwargs.get("scan_config")
         settings = get_settings()
         self.verifier.blind_timing_threshold = (
@@ -81,6 +84,7 @@ class SQLInjectionDetector(BaseDetector):
             parameters=kwargs.get("parameters") or [],
             api_endpoints=kwargs.get("api_endpoints") or [],
             requests=kwargs.get("requests") or [],
+            attack_planner=kwargs.get("attack_planner"),
         )
         logger.info(f"Found {len(candidates)} SQL injection candidates")
 
@@ -106,10 +110,16 @@ class SQLInjectionDetector(BaseDetector):
         parameters: list[object] | None = None,
         api_endpoints: list[object] | None = None,
         requests: list[object] | None = None,
+        attack_planner: object | None = None,
     ) -> list[AttackTarget]:
         """
         Phase 1 & 2: Reconnaissance - Extract candidates using ParamDiscovery.
         """
+        if attack_planner is not None and hasattr(attack_planner, "targets_for"):
+            return [
+                target for target in attack_planner.targets_for("injection_sql_command")
+                if self._get_parameter_priority(target.parameter) >= 0
+            ]
         return AttackSurface.build(
             urls,
             forms,

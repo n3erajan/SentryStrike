@@ -96,6 +96,7 @@ class XSSDetector(BaseDetector):
         findings.extend(await self._static_dom_findings_with_browser_confirmation(kwargs, session_cookies))
 
         browser_available = bool(kwargs.get("browser_available"))
+        is_spa = bool(kwargs.get("is_spa", False))
         routes = kwargs.get("routes") or []
         # Full authenticated storage_state (Task A): seed the DOM-sweep browser
         # so authed-only routes render during confirmation. Opaque per-origin blob.
@@ -110,21 +111,32 @@ class XSSDetector(BaseDetector):
             has_xss_prefix = param_lower[:3] in self._form_input_prefixes
             return is_reflective or has_xss_prefix
 
-        targets = AttackSurface.build(
-            urls,
-            forms,
-            parameters=kwargs.get("parameters") or [],
-            api_endpoints=kwargs.get("api_endpoints") or [],
-            requests=kwargs.get("requests") or [],
-            filter_fn=xss_filter,
-        )
+        planner = kwargs.get("attack_planner")
+        if planner is not None and hasattr(planner, "targets_for"):
+            targets = [
+                target for target in planner.targets_for(self.name)
+                if xss_filter(target.parameter)
+            ]
+        else:
+            targets = AttackSurface.build(
+                urls,
+                forms,
+                parameters=kwargs.get("parameters") or [],
+                api_endpoints=kwargs.get("api_endpoints") or [],
+                requests=kwargs.get("requests") or [],
+                filter_fn=xss_filter,
+            )
         candidates: list[AttackTarget | tuple] = list(targets)
 
         # Supplement with header-injection candidates for every discovered URL.
         # These are 4-tuples like URL candidates but carry the header name in
         # the ``param`` slot; XSSVerifier.verify() recognises them via the
         # ``header_injection=True`` flag encoded in the method field.
-        header_candidates = self._build_header_candidates(urls)
+        header_candidates = self._build_header_candidates(
+            urls,
+            is_spa=is_spa,
+            root_url=kwargs.get("root_url"),
+        )
         candidates = list(candidates) + header_candidates
 
         if not candidates:
@@ -168,6 +180,11 @@ class XSSDetector(BaseDetector):
 
             verifier = XSSVerifier()
             verifier.http_verifier.cookies = session_cookies
+            # P0-3: on SPA targets the header-stored GET-replay oracle cannot
+            # observe client-rendered reflection; the verifier uses this flag to
+            # disable that fan-out and defer the stored-header hypothesis to the
+            # browser-DOM sweep instead.
+            verifier.spa_mode = is_spa
             if auth_headers:
                 verifier.http_verifier.headers = {**verifier.http_verifier.headers, **auth_headers}
             try:
@@ -520,7 +537,12 @@ class XSSDetector(BaseDetector):
     # Header-injection candidate builder
     # ---------------------------------------------------------------------- #
 
-    def _build_header_candidates(self, urls: list[str]) -> list[tuple]:
+    def _build_header_candidates(
+        self,
+        urls: list[str],
+        is_spa: bool = False,
+        root_url: str | None = None,
+    ) -> list[tuple]:
         """
         Build 4-tuple candidates for header-based XSS testing.
 
@@ -530,11 +552,32 @@ class XSSDetector(BaseDetector):
         """
         seen: set[str] = set()
         candidates: list[tuple] = []
+        
+        normalized_root = None
+        if root_url:
+            try:
+                parsed = urlparse(root_url)
+                normalized_root = parsed.path.rstrip("/") or "/"
+            except Exception:
+                pass
+
+        from urllib.parse import urlparse
+
         for url in urls:
             base = url.split("?")[0]
             if base in seen:
                 continue
             seen.add(base)
+            
+            if is_spa and normalized_root:
+                try:
+                    parsed_base = urlparse(base)
+                    path = parsed_base.path.rstrip("/") or "/"
+                    if path != normalized_root:
+                        continue
+                except Exception:
+                    pass
+
             for header in self._injectable_headers:
                 candidates.append((base, header, f"HEADER:{header}", ""))
         return candidates

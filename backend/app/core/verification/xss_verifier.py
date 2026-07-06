@@ -146,6 +146,10 @@ class XSSVerifier(BaseVerifier):
     )
 
     _STORED_PROBE_URL_CAP = 25
+    # P0-3: hard ceiling on how many header-sink URLs a single header × payload
+    # combination re-probes. Bounds the header-stored GET-replay fan-out that
+    # otherwise multiplies headers × payloads × every sink-like URL.
+    _STORED_HEADER_SINK_CAP = 8
 
     @classmethod
     def select_stored_probe_urls(cls, urls: list[str]) -> list[str]:
@@ -445,7 +449,17 @@ class XSSVerifier(BaseVerifier):
                     injected_payload, injected.body, baseline_body=pre_test_baseline.body, canary=canary,
                 )
 
-            if not is_reflected or method.upper() == "POST":
+            # P0-3: the header-stored GET-replay oracle is structurally incapable
+            # of confirming reflection on an SPA (the injected header value is
+            # rendered client-side from an API response and never appears in the
+            # raw HTML shell that this raw-string oracle matches against). On SPA
+            # targets skip it entirely for header injections — this is the single
+            # largest source of wasted XSS traffic (~93% of all requests). The
+            # stored-header hypothesis is handled by the browser-DOM sweep. The
+            # single reflected-header check above (one request per header per
+            # payload at the origin) still runs.
+            skip_stored = is_header and getattr(self, "spa_mode", False)
+            if (not is_reflected or method.upper() == "POST") and not skip_stored:
                 await asyncio.sleep(0.1)
                 stored_reflected, stored_locations, stored_was_encoded, stored_resp, stored_evidence = (
                     await self._probe_stored(
@@ -453,7 +467,7 @@ class XSSVerifier(BaseVerifier):
                         url,
                         stored_display_urls,
                         canary=canary,
-                        is_header_injection=is_header,  
+                        is_header_injection=is_header,
                     )
                 )
                 if stored_reflected:
@@ -768,7 +782,10 @@ class XSSVerifier(BaseVerifier):
     )
     # Hard cap on navigations per candidate so the vector × surface loop stays
     # inside a single job's timeout rather than multiplying the job count.
-    _DOM_MAX_ATTEMPTS_PER_CANDIDATE = 12
+    # P0-3: raised from 12 — the browser-DOM sweep is the genuinely effective SPA
+    # confirmer, so budget follows yield now that the header-stored HTTP fan-out
+    # is disabled on SPAs.
+    _DOM_MAX_ATTEMPTS_PER_CANDIDATE = 18
 
     def _dom_xss_vectors(self, canary: str) -> list[tuple[str, str]]:
         """Return ordered ``(vector_name, payload)`` pairs bound to ``canary``."""
@@ -1021,7 +1038,13 @@ class XSSVerifier(BaseVerifier):
             all_urls.append(bare)
 
         if is_header_injection:
-            tier1 = [u for u in all_urls if self._HEADER_SINK_PATTERNS.search(u)]
+            # P0-3: cap the header-sink fan-out. Even on non-SPA server-rendered
+            # apps, probing every sink-like URL for every header × every payload
+            # is the dominant traffic sink for near-zero yield; the highest-value
+            # log/admin/audit views cluster in the first few matches.
+            tier1 = [u for u in all_urls if self._HEADER_SINK_PATTERNS.search(u)][
+                : self._STORED_HEADER_SINK_CAP
+            ]
             tier2 = [u for u in all_urls if u not in tier1][:10]
             urls_to_probe = tier1
         else:

@@ -89,3 +89,7 @@ OWASP\ 2025.txt
 
 # Playwright
 playwright/.auth/
+
+.roo/
+.continue/
+.agents/
