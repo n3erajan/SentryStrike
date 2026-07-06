@@ -22,10 +22,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ResolvedSession:
-    """A resolved account session: cookies + headers ready for HTTP replay."""
+    """A resolved account session: cookies + headers ready for HTTP replay.
+
+    ``storage_state`` is the full authenticated browser blob (cookies +
+    per-origin localStorage/sessionStorage) when the login used a browser path,
+    so a downstream browser-based access-control check can seed its context
+    directly instead of re-running a full login (which can cascade into another
+    Chromium launch).
+    """
 
     cookies: dict[str, str] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
+    storage_state: dict | None = None
 
     @property
     def usable(self) -> bool:
@@ -120,6 +128,10 @@ async def resolve_account_session(
                         session.cookies.setdefault(cookie.name, cookie.value)
                     if result.bearer_token:
                         session.headers["Authorization"] = f"Bearer {result.bearer_token}"
+                    # Forward the full authenticated browser blob (cookies +
+                    # localStorage) when the login captured one, so a browser-based
+                    # access-control check can reuse it instead of re-logging-in.
+                    session.storage_state = getattr(result, "storage_state", None)
                     logger.info(
                         "resolved session for %s account via login (cookies=%d, bearer=%s)",
                         account.role.value,
@@ -167,6 +179,7 @@ async def provision_secondary_session(root_url: str, allow_override: bool | None
                     session.cookies.setdefault(cookie.name, cookie.value)
                 if result.bearer_token:
                     session.headers["Authorization"] = f"Bearer {result.bearer_token}"
+                session.storage_state = getattr(result, "storage_state", None)
                 logger.info(
                     "auto-provisioned secondary identity on %s (cookies=%d, bearer=%s)",
                     root_url,

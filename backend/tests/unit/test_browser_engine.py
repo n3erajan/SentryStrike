@@ -109,12 +109,19 @@ class _FakePage:
 class _FakeContext:
     def __init__(self, page):
         self._page = page
+        self.route_patterns = []
 
     async def add_cookies(self, cookies):
         return None
 
     async def set_extra_http_headers(self, headers):
         return None
+
+    async def add_init_script(self, script):
+        return None
+
+    async def route(self, pattern, handler):
+        self.route_patterns.append(pattern)
 
     async def new_page(self):
         return self._page
@@ -127,10 +134,13 @@ class _FakeBrowser:
     def __init__(self, page):
         self._page = page
         self.new_context_kwargs = []
+        self.contexts = []
 
     async def new_context(self, **kwargs):
         self.new_context_kwargs.append(kwargs)
-        return _FakeContext(self._page)
+        context = _FakeContext(self._page)
+        self.contexts.append(context)
+        return context
 
     async def close(self):
         return None
@@ -1076,6 +1086,83 @@ async def test_crawl_into_flags_lost_session_when_still_logged_out(monkeypatch):
     assert state.browser_error == (
         "authenticated session did not persist into browser context"
     )
+
+
+# --- Change 2: resource blocking installed on the crawl context ------------
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_installs_resource_blocking_by_default(monkeypatch):
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    captured = {}
+    orig_launch = _FakeChromium.launch
+
+    async def _spy_launch(self, headless=True):
+        browser = await orig_launch(self, headless=headless)
+        captured["browser"] = browser
+        return browser
+
+    monkeypatch.setattr(_FakeChromium, "launch", _spy_launch)
+
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    monkeypatch.setattr(engine.settings, "crawl_browser_block_resources", True)
+    state = CrawlState()
+    await engine.crawl_into(state, "http://spa.test/", routes=[])
+
+    context = captured["browser"].contexts[0]
+    assert "**/*" in context.route_patterns
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_skips_resource_blocking_when_disabled(monkeypatch):
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    captured = {}
+    orig_launch = _FakeChromium.launch
+
+    async def _spy_launch(self, headless=True):
+        browser = await orig_launch(self, headless=headless)
+        captured["browser"] = browser
+        return browser
+
+    monkeypatch.setattr(_FakeChromium, "launch", _spy_launch)
+
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    monkeypatch.setattr(engine.settings, "crawl_browser_block_resources", False)
+    state = CrawlState()
+    await engine.crawl_into(state, "http://spa.test/", routes=[])
+
+    context = captured["browser"].contexts[0]
+    assert context.route_patterns == []
+
+
+# --- Change 3a: no readiness-probe double-launch ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_launches_chromium_exactly_once(monkeypatch):
+    """The readiness probe used to cold-launch a throwaway Chromium before the
+    real crawl launch. crawl_into must now launch exactly once."""
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    launches = {"n": 0}
+    orig_launch = _FakeChromium.launch
+
+    async def _counting_launch(self, headless=True):
+        launches["n"] += 1
+        return await orig_launch(self, headless=headless)
+
+    monkeypatch.setattr(_FakeChromium, "launch", _counting_launch)
+
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    state = CrawlState()
+    await engine.crawl_into(state, "http://spa.test/", routes=["/a"])
+
+    assert launches["n"] == 1
 
 
 # --- Task B: value-ordered, submission-driven crawl -------------------------

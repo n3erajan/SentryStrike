@@ -1,7 +1,10 @@
+import asyncio
+
 import pytest
 import httpx
 
 from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder
+from app.utils import scan_throttle
 from app.utils.scan_http import create_scan_client
 
 
@@ -89,4 +92,89 @@ async def test_scan_client_follows_same_origin_redirects():
 
     assert response.status_code == 200
     assert seen_urls == ["http://target.test/start", "http://target.test/next"]
+
+
+@pytest.mark.asyncio
+async def test_send_request_does_not_double_acquire_scan_semaphore(monkeypatch):
+    """Regression: HttpVerifier.send_request must not re-acquire the global scan
+    semaphore that the scan client (create_scan_client) already holds per request.
+
+    The scan client wraps every request in get_scan_http_semaphore() via
+    throttled_request. If send_request acquires it a second time, the
+    non-reentrant asyncio.Semaphore is double-acquired: the outer hold takes a
+    slot and the inner acquire waits for a slot that can never free -> deadlock.
+    With a size-1 semaphore, a single request self-deadlocks, which is a
+    deterministic reproduction of the scan-wide hang.
+    """
+    monkeypatch.setattr(scan_throttle, "_scan_http_semaphore", asyncio.Semaphore(1))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="ok", request=request)
+
+    verifier = HttpVerifier(timeout_seconds=5.0)
+    verifier._client = create_scan_client(transport=httpx.MockTransport(handler))
+
+    try:
+        response = await asyncio.wait_for(
+            verifier.send_request("http://target.test/probe", "GET", test_phase="probe"),
+            timeout=3.0,
+        )
+    except asyncio.TimeoutError:
+        pytest.fail("send_request deadlocked: scan semaphore was acquired twice")
+
+    assert response.status_code == 200
+    await verifier.close()
+
+
+class _BarrierTransport(httpx.AsyncBaseTransport):
+    """Async transport that holds every request until ``parties`` have arrived.
+
+    This forces all in-flight requests to be simultaneously past the semaphore
+    and inside the transport before any completes. It deterministically exposes a
+    double-acquire: if send_request grabs a second slot, the requests never reach
+    the transport at all (they block on the inner acquire), the barrier never
+    releases, and the scan deadlocks.
+    """
+
+    def __init__(self, parties: int) -> None:
+        self._parties = parties
+        self._arrived = 0
+        self._event = asyncio.Event()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self._arrived += 1
+        if self._arrived >= self._parties:
+            self._event.set()
+        await self._event.wait()
+        return httpx.Response(200, text="ok", request=request)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_send_requests_saturate_slots_without_deadlock(monkeypatch):
+    """Regression: with semaphore size == request count, every request must be
+    able to hold a slot and reach the network at once. Under the old
+    double-acquire each request would hold an *outer* slot and then block forever
+    on the *inner* acquire, so none would reach the transport -> deadlock.
+    """
+    parties = 3
+    monkeypatch.setattr(scan_throttle, "_scan_http_semaphore", asyncio.Semaphore(parties))
+
+    verifier = HttpVerifier(timeout_seconds=5.0)
+    verifier._client = create_scan_client(transport=_BarrierTransport(parties))
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *[
+                    verifier.send_request(f"http://target.test/probe/{i}", "GET")
+                    for i in range(parties)
+                ]
+            ),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        pytest.fail("concurrent send_request calls deadlocked on the scan semaphore")
+
+    assert [r.status_code for r in results] == [200] * parties
+    await verifier.close()
 

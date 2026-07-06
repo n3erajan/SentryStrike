@@ -12,7 +12,7 @@ from app.config import get_settings
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ApiEndpoint, CrawlState, RequestObservation, RouteCandidate, RouteSource
 from app.core.crawler.route_priority import score_route_surface
-from app.core.crawler.spa import SpaFallbackDetector
+from app.core.crawler.spa import SpaFallbackDetector, install_resource_blocking, settle_page
 
 logger = logging.getLogger(__name__)
 
@@ -243,9 +243,13 @@ class BrowserDiscoveryEngine:
     activity that static crawling cannot see.
     """
 
-    def __init__(self, max_interactions: int = 25) -> None:
+    def __init__(self, max_interactions: int = 25, workers: int | None = None) -> None:
         self.max_interactions = max_interactions
         self.settings = get_settings()
+        # Number of parallel crawl workers (each its own context/page). None =
+        # read from settings at crawl time so a per-scan override can be threaded
+        # in by the caller (as the spider does for max_interactions).
+        self._workers = workers
 
     @staticmethod
     async def check_readiness() -> tuple[bool, str | None]:
@@ -261,6 +265,165 @@ class BrowserDiscoveryEngine:
         except Exception as exc:
             return False, f"Playwright browser launch failed: {exc}"
         return True, None
+
+    async def _create_seeded_context(
+        self,
+        browser: Any,
+        storage_state: dict | None,
+        auth_cookie_entries: list[dict[str, str]],
+        auth_headers: dict[str, str] | None,
+    ) -> Any:
+        """Create a browser context seeded for authenticated crawling.
+
+        Restores the full ``storage_state`` blob when supplied (cookies +
+        per-origin localStorage/sessionStorage so the SPA's own bootstrap renders
+        the logged-in shell), else a bare context with cookie/header injection.
+        Installs resource blocking (gated), the SPA route hook, auth cookies, and
+        extra headers. One of these is built per worker so each parallel page has
+        its own isolated session context.
+        """
+        if storage_state:
+            try:
+                context = await browser.new_context(storage_state=storage_state)
+            except Exception as exc:
+                logger.warning(
+                    "failed to seed browser context from storage_state; "
+                    "falling back to cookie injection: %s",
+                    exc,
+                )
+                context = await browser.new_context()
+        else:
+            context = await browser.new_context()
+
+        # Abort non-essential resource loads (images/media/fonts/stylesheets +
+        # known trackers) so every navigation settles faster. Never blocks
+        # same-origin script/xhr/fetch/document (those can drive SPA data loads).
+        if getattr(self.settings, "crawl_browser_block_resources", True):
+            await install_resource_blocking(context)
+
+        # Capture programmatic SPA route changes across all pages.
+        try:
+            await context.add_init_script(SPA_ROUTE_HOOK_SCRIPT)
+        except Exception:
+            pass
+
+        if auth_cookie_entries:
+            await context.add_cookies(auth_cookie_entries)
+        if auth_headers:
+            await context.set_extra_http_headers(auth_headers)
+        return context
+
+    def _wire_page_observers(
+        self,
+        page: Any,
+        wstate: CrawlState,
+        by_key: dict[tuple[str, str, str], RequestObservation],
+        inflight: dict[str, int],
+        root_origin_url: str,
+    ) -> None:
+        """Attach the request/response/websocket observers to a worker's page.
+
+        Each worker owns its ``wstate``/``by_key``/``inflight`` so observations
+        stream into per-worker state (merged under lock at the end) and the
+        inflight counter reaches quiescence independently — a single shared
+        counter never drains while any worker is still loading.
+        """
+
+        def _register(observation: RequestObservation) -> RequestObservation:
+            key = self._observation_key(observation.url, observation.method, observation.post_data)
+            existing = by_key.get(key)
+            if existing is not None:
+                return existing
+            by_key[key] = observation
+            wstate.requests.append(observation)
+            return observation
+
+        def _inc_inflight(_request):
+            inflight["count"] += 1
+
+        def _dec_inflight(_request):
+            inflight["count"] = max(0, inflight["count"] - 1)
+
+        async def on_request(request):
+            if self._should_capture_runtime_request(root_origin_url, request):
+                _register(await self._build_request_observation(request))
+
+        async def on_response(response):
+            request = response.request
+            if not self._should_capture_runtime_request(root_origin_url, request):
+                return
+            observation_key = self._observation_key(
+                request.url, request.method, self._safe_post_data(request)
+            )
+            observed = by_key.get(observation_key)
+            if observed is None:
+                observed = _register(await self._build_request_observation(request))
+            headers = dict(response.headers)
+            observed.response_status = response.status
+            observed.response_headers = headers
+            observed.response_content_type = headers.get("content-type")
+            observed.redirect_chain = self._redirect_chain(request)
+            try:
+                observed.response_snippet = (await response.text())[:1000]
+            except Exception:
+                observed.response_snippet = None
+
+        def on_websocket(ws):
+            try:
+                url = ws.url
+            except Exception:
+                return
+            if not self._same_origin_or_websocket(root_origin_url, url):
+                return
+            _register(
+                RequestObservation(
+                    url=url,
+                    method="GET",
+                    resource_type="websocket",
+                    replayable=False,
+                )
+            )
+
+        page.on("request", on_request)
+        page.on("request", _inc_inflight)
+        page.on("requestfinished", _dec_inflight)
+        page.on("requestfailed", _dec_inflight)
+        page.on("response", on_response)
+        try:
+            page.on("websocket", on_websocket)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _merge_worker_state(
+        target: CrawlState,
+        source: CrawlState,
+        seen_observations: set[tuple[str, str, str]],
+    ) -> None:
+        """Fold a worker's local :class:`CrawlState` into ``target`` under no
+        contention (called once per worker after the pool joins).
+
+        ``add_*`` already dedup routes/endpoints/params/forms; requests are
+        deduped across workers by observation key via ``seen_observations`` (each
+        worker already deduped internally, so this only drops cross-worker
+        duplicates while preserving the first-seen enriched observation).
+        """
+        for route in source.routes:
+            target.add_route(route)
+        for form in source.browser_forms:
+            target.add_browser_form(form)
+        target.workflow_states_visited += source.workflow_states_visited
+        target.browser_forms_discovered += source.browser_forms_discovered
+        target.browser_forms_submitted += source.browser_forms_submitted
+        target.file_inputs_discovered += source.file_inputs_discovered
+        for observation in source.requests:
+            key = BrowserDiscoveryEngine._observation_key(
+                observation.url, observation.method, observation.post_data
+            )
+            if key in seen_observations:
+                continue
+            seen_observations.add(key)
+            target.requests.append(observation)
 
     async def crawl(
         self,
@@ -318,17 +481,7 @@ class BrowserDiscoveryEngine:
             return state
 
         loop = asyncio.get_running_loop()
-        by_key: dict[tuple[str, str, str], RequestObservation] = {}
         root_origin_url = root_url
-
-        def _register(observation: RequestObservation) -> RequestObservation:
-            key = self._observation_key(observation.url, observation.method, observation.post_data)
-            existing = by_key.get(key)
-            if existing is not None:
-                return existing
-            by_key[key] = observation
-            state.requests.append(observation)
-            return observation
 
         async with async_playwright() as pw:
             try:
@@ -343,247 +496,241 @@ class BrowserDiscoveryEngine:
             # truncation still reports True rather than the None default.
             state.browser_available = True
 
-            # Seed the context from a full authenticated storage_state when one
-            # was captured by a browser_spa login: this restores cookies AND the
-            # per-origin localStorage/sessionStorage the SPA reads its token from,
-            # so its own bootstrap JS renders the logged-in shell. Falls back to
-            # bare cookie/header injection when absent (cookie-auth apps, static
-            # auth only). Generic: storage_state is an opaque per-origin blob.
-            if storage_state:
-                try:
-                    context = await browser.new_context(storage_state=storage_state)
-                except Exception as exc:
-                    logger.warning(
-                        "failed to seed browser context from storage_state; "
-                        "falling back to cookie injection: %s",
-                        exc,
-                    )
-                    context = await browser.new_context()
-            else:
-                context = await browser.new_context()
-
-            # Capture programmatic SPA route changes across all pages.
-            try:
-                await context.add_init_script(SPA_ROUTE_HOOK_SCRIPT)
-            except Exception:
-                pass
-
             auth_cookie_entries = self._auth_cookie_entries(root_url, auth_cookies)
-            if auth_cookie_entries:
-                await context.add_cookies(auth_cookie_entries)
 
-            if auth_headers:
-                await context.set_extra_http_headers(auth_headers)
+            # --- Shared, value-ordered work queue guarded by a single lock -----
+            # A max-heap keyed by descending surface score, tie-broken by insertion
+            # order for determinism. High-surface routes (auth/forms/API-bearing)
+            # are popped first so meaningful coverage lands before truncation.
+            route_budget = max(1, min(self.settings.crawl_max_urls, self.settings.crawl_browser_route_cap))
+            heap: list[tuple[int, int, str]] = []
+            seen_routes: set[str] = set()
+            submitted_form_keys: set[tuple[str, str, tuple[str, ...]]] = set()
+            counter = 0
+            lock = asyncio.Lock()
+            cond = asyncio.Condition(lock)
 
-            page = await context.new_page()
+            def _enqueue(url: str, evidence: str = "") -> None:
+                """Claim + queue a route. MUST be called while holding ``lock``.
 
-            # Inflight counter for deterministic, networkidle-free settling.
-            inflight = {"count": 0}
-
-            def _inc_inflight(_request):
-                inflight["count"] += 1
-
-            def _dec_inflight(_request):
-                inflight["count"] = max(0, inflight["count"] - 1)
-
-            async def on_request(request):
-                if self._should_capture_runtime_request(root_origin_url, request):
-                    # Append to state.requests immediately (dedup by observation
-                    # key) so partial results are durable before any merge.
-                    _register(await self._build_request_observation(request))
-
-            async def on_response(response):
-                request = response.request
-                if not self._should_capture_runtime_request(root_origin_url, request):
+                Adding to ``seen_routes`` at enqueue time claims the route the
+                instant it is queued, so two workers never grab the same one.
+                """
+                nonlocal counter
+                key = self._normalize_for_seen(url)
+                if key in seen_routes or len(seen_routes) >= route_budget:
                     return
-                observation_key = self._observation_key(
-                    request.url, request.method, self._safe_post_data(request)
-                )
-                observed = by_key.get(observation_key)
-                if observed is None:
-                    observed = _register(await self._build_request_observation(request))
-                headers = dict(response.headers)
-                observed.response_status = response.status
-                observed.response_headers = headers
-                observed.response_content_type = headers.get("content-type")
-                observed.redirect_chain = self._redirect_chain(request)
-                try:
-                    observed.response_snippet = (await response.text())[:1000]
-                except Exception:
-                    observed.response_snippet = None
+                seen_routes.add(key)
+                # Negate score so heapq (a min-heap) pops highest score first;
+                # the monotonic counter preserves FIFO among equal scores.
+                heapq.heappush(heap, (-score_route_surface(url, evidence), counter, url))
+                counter += 1
 
-            def on_websocket(ws):
-                # Record WS endpoints even without a body so they surface in
-                # coverage and to detectors.
-                try:
-                    url = ws.url
-                except Exception:
-                    return
-                if not self._same_origin_or_websocket(root_origin_url, url):
-                    return
-                _register(
-                    RequestObservation(
-                        url=url,
-                        method="GET",
-                        resource_type="websocket",
-                        replayable=False,
+            # Seed known static routes before the crawl starts (no contention yet,
+            # single task) so even a short budget reaches them.
+            for target in self._browser_targets(root_url, routes or []):
+                _enqueue(target, evidence="seed")
+
+            # Effective budget scaled to route count: small apps finish fast, large
+            # apps get proportionally more, always capped by the configured overall
+            # budget. Per-route deadline checks still guarantee a clean truncation.
+            effective_deadline = self._effective_deadline(deadline, loop, len(seen_routes))
+            budget_s = (
+                round(effective_deadline - loop.time(), 1)
+                if effective_deadline is not None else None
+            )
+
+            num_workers = max(1, int(self._workers if self._workers is not None
+                                     else getattr(self.settings, "crawl_browser_workers", 4)))
+            logger.info(
+                "browser discovery starting for %s: seed_routes=%d budget_s=%s workers=%d",
+                root_url, len(seen_routes), budget_s, num_workers,
+            )
+
+            # --- Worker-pool coordination --------------------------------------
+            worker_states: list[CrawlState] = []
+            routes_visited = 0
+            idle_workers = 0
+            running_workers = num_workers
+            finished = False
+
+            def _record_truncation() -> None:
+                nonlocal finished
+                finished = True
+                if not state.browser_error:
+                    state.browser_error = (
+                        "browser discovery truncated: overall budget reached before all routes were visited"
                     )
-                )
 
-            page.on("request", on_request)
-            page.on("request", _inc_inflight)
-            page.on("requestfinished", _dec_inflight)
-            page.on("requestfailed", _dec_inflight)
-            page.on("response", on_response)
-            try:
-                page.on("websocket", on_websocket)
-            except Exception:
-                pass
+            async def _worker(worker_id: int) -> None:
+                nonlocal routes_visited, idle_workers, running_workers, finished
 
-            try:
-                route_budget = max(1, min(self.settings.crawl_max_urls, self.settings.crawl_browser_route_cap))
-                # Value-ordered priority queue (Task B): a max-heap keyed by
-                # descending surface score, tie-broken by insertion order for
-                # determinism. High-surface routes (auth/forms/API-bearing) are
-                # popped first so meaningful coverage lands before truncation.
-                heap: list[tuple[int, int, str]] = []
-                seen_routes: set[str] = set()
-                submitted_form_keys: set[tuple[str, str, tuple[str, ...]]] = set()
-                counter = 0
+                wstate = CrawlState()
+                worker_states.append(wstate)
+                by_key: dict[tuple[str, str, str], RequestObservation] = {}
+                inflight = {"count": 0}
 
-                def _enqueue(url: str, evidence: str = "") -> None:
-                    nonlocal counter
-                    key = self._normalize_for_seen(url)
-                    if key in seen_routes or len(seen_routes) >= route_budget:
-                        return
-                    seen_routes.add(key)
-                    # Negate score so heapq (a min-heap) pops highest score first;
-                    # the monotonic counter preserves FIFO among equal scores.
-                    heapq.heappush(heap, (-score_route_surface(url, evidence), counter, url))
-                    counter += 1
+                # Each worker gets its own seeded context/page: isolated session,
+                # isolated inflight counter (a shared counter never drains while
+                # any worker is loading), isolated observation stream.
+                try:
+                    context = await self._create_seeded_context(
+                        browser, storage_state, auth_cookie_entries, auth_headers
+                    )
+                    page = await context.new_page()
+                except Exception as exc:
+                    logger.warning("worker %d could not open a context: %s", worker_id, exc)
+                    async with lock:
+                        running_workers -= 1
+                        cond.notify_all()
+                    return
 
-                # Seed known static routes (already carry auth/forms/API surface)
-                # with their score before the crawl starts so even a short budget
-                # reaches them. The root target is always included.
-                for target in self._browser_targets(root_url, routes or []):
-                    _enqueue(target, evidence="seed")
-
-                # Effective budget scaled to route count: small apps finish fast,
-                # large apps get proportionally more, always capped by the
-                # configured overall budget. The per-route deadline checks below
-                # still guarantee a clean truncation regardless.
-                effective_deadline = self._effective_deadline(deadline, loop, len(seen_routes))
-                budget_s = (
-                    round(effective_deadline - loop.time(), 1)
-                    if effective_deadline is not None else None
-                )
-                logger.info(
-                    "browser discovery starting for %s: seed_routes=%d budget_s=%s",
-                    root_url, len(seen_routes), budget_s,
-                )
-
-                routes_visited = 0
+                self._wire_page_observers(page, wstate, by_key, inflight, root_origin_url)
                 first = True
-                while heap:
-                    now = loop.time()
-                    if effective_deadline is not None and now >= effective_deadline:
-                        state.browser_error = (
-                            state.browser_error
-                            or "browser discovery truncated: overall budget reached before all routes were visited"
-                        )
-                        break
-                    _, _, target_url = heapq.heappop(heap)
-                    routes_visited += 1
-                    # Per-route interaction gating: once little of the overall
-                    # budget remains, stop blind clicking (expensive, low-yield)
-                    # but always still navigate + settle + capture/submit forms
-                    # (cheap, high-yield). Derived from remaining fraction.
-                    allow_interaction = self._budget_allows_interaction(effective_deadline, loop)
+                try:
+                    while True:
+                        # --- Acquire the next route (or terminate) -------------
+                        async with lock:
+                            target_url = None
+                            while True:
+                                if finished:
+                                    return
+                                if effective_deadline is not None and loop.time() >= effective_deadline:
+                                    _record_truncation()
+                                    cond.notify_all()
+                                    return
+                                if heap:
+                                    _, _, target_url = heapq.heappop(heap)
+                                    routes_visited += 1
+                                    break
+                                # Heap empty: go idle. If every still-running worker
+                                # is idle with an empty heap, the crawl is done.
+                                idle_workers += 1
+                                if idle_workers >= running_workers:
+                                    finished = True
+                                    cond.notify_all()
+                                    return
+                                await cond.wait()
+                                idle_workers -= 1
+                                if finished:
+                                    return
+                                # Loop back to re-check heap/deadline.
+
+                        # --- Process the route on this worker's own page -------
+                        allow_interaction = self._budget_allows_interaction(effective_deadline, loop)
+                        try:
+                            # Each worker's first navigation is a full load (its
+                            # page starts blank); later same-origin routes prefer
+                            # client-side navigation.
+                            await self._navigate(page, target_url, root_url, allow_spa=not first)
+                            first = False
+                            await self._settle_inflight(page, inflight)
+                            await self._clear_blocking_overlays(page)
+                            # Post-auth liveness re-check (generic). On the root a
+                            # logged-out shell means the seeded storage_state never
+                            # persisted (RC-A); on other routes it means interaction
+                            # dropped the session mid-crawl (P1-3). Re-seed cookies
+                            # when we have them rather than crawl unauthenticated.
+                            is_root = self._normalize_for_seen(target_url) == self._normalize_for_seen(root_url)
+                            if (storage_state or auth_cookie_entries) and await self._looks_logged_out(page):
+                                reseeded = await self._reseed_session(context, auth_cookie_entries)
+                                if reseeded:
+                                    logger.info(
+                                        "browser session looked logged-out on %s; re-seeded auth cookies",
+                                        target_url,
+                                    )
+                                elif is_root and storage_state and not state.browser_error:
+                                    state.browser_error = (
+                                        "authenticated session did not persist into browser context"
+                                    )
+                            wstate.add_route(
+                                RouteCandidate(
+                                    url=self._current_url(page, target_url),
+                                    source=RouteSource.browser,
+                                    priority=75,
+                                    evidence="browser_navigation",
+                                )
+                            )
+                            if allow_interaction:
+                                # RC2: bound blind clicking to this route's budget
+                                # share so no single page starves route coverage.
+                                interaction_budget = float(
+                                    getattr(self.settings, "crawl_browser_per_route_seconds", 6.0)
+                                )
+                                if effective_deadline is not None:
+                                    interaction_budget = min(
+                                        interaction_budget,
+                                        max(0.0, effective_deadline - loop.time()),
+                                    )
+                                workflow_stats = await self._exercise_page(
+                                    page, max_seconds=interaction_budget
+                                )
+                                wstate.workflow_states_visited += workflow_stats.get("states", 0)
+                            # Count forms/file inputs from structural clusters (RC-1):
+                            # runs on every route, not gated on literal <form>s.
+                            captured_forms = await self._capture_forms(page, target_url)
+                            wstate.browser_forms_discovered += len(captured_forms)
+                            wstate.file_inputs_discovered += sum(
+                                int(form.get("file_inputs", 0)) for form in captured_forms
+                            )
+                            for form in captured_forms:
+                                wstate.add_browser_form(form)
+                            # Atomically claim un-submitted form keys under the lock
+                            # so two workers never submit the same form; then submit
+                            # outside the lock (slow) against a throwaway dedup set.
+                            async with lock:
+                                new_forms = []
+                                for form in captured_forms:
+                                    key = CrawlState._form_key(form)
+                                    if key not in submitted_form_keys:
+                                        submitted_form_keys.add(key)
+                                        new_forms.append(form)
+                            # Active form submission (Task B): fire the app's real
+                            # POST/PUT/PATCH XHR so on_request captures a replayable
+                            # observation. Skips destructive forms.
+                            wstate.browser_forms_submitted += await self._submit_discovered_forms(
+                                page, new_forms, root_url, target_url, set(),
+                                inflight=inflight,
+                            )
+                            # Enqueue newly-discovered same-origin routes (scored),
+                            # then wake any idle workers to pick them up.
+                            discovered = await self._discover_routes(page, root_url)
+                            async with lock:
+                                for new_route in discovered:
+                                    _enqueue(new_route, evidence="browser_discovered")
+                                cond.notify_all()
+                        except Exception as exc:
+                            logger.warning("browser discovery failed for %s: %s", target_url, exc)
+                finally:
+                    # This worker is leaving the pool: drop it from the running
+                    # count and wake the others so termination re-evaluates.
+                    async with lock:
+                        running_workers -= 1
+                        cond.notify_all()
                     try:
-                        # Root/first target always does a full load; later
-                        # same-origin routes prefer client-side navigation.
-                        was_first = first
-                        await self._navigate(page, target_url, root_url, allow_spa=not first)
-                        first = False
-                        await self._settle_inflight(page, inflight)
-                        await self._clear_blocking_overlays(page)
-                        # Post-auth liveness re-check (generic). On the first route
-                        # a logged-out shell means the seeded storage_state never
-                        # persisted into the context (RC-A). On *later* routes it
-                        # means interaction dropped the session mid-crawl (P1-3): so
-                        # re-assert liveness after every batch and re-seed the auth
-                        # cookies when we have them, rather than silently crawling
-                        # an unauthenticated surface for the rest of the run.
-                        if (storage_state or auth_cookie_entries) and await self._looks_logged_out(page):
-                            reseeded = await self._reseed_session(context, auth_cookie_entries)
-                            if reseeded:
-                                logger.info(
-                                    "browser session looked logged-out on %s; re-seeded auth cookies",
-                                    target_url,
-                                )
-                            elif was_first and storage_state and not state.browser_error:
-                                state.browser_error = (
-                                    "authenticated session did not persist into browser context"
-                                )
-                        state.add_route(
-                            RouteCandidate(
-                                url=self._current_url(page, target_url),
-                                source=RouteSource.browser,
-                                priority=75,
-                                evidence="browser_navigation",
-                            )
-                        )
-                        if allow_interaction:
-                            # RC2: bound blind clicking to this route's budget
-                            # share so no single page starves route coverage —
-                            # especially now that form submission (RC1) waits for
-                            # its XHR to finish and costs more per form-bearing
-                            # route. Capture + submit below always run regardless.
-                            interaction_budget = float(
-                                getattr(self.settings, "crawl_browser_per_route_seconds", 6.0)
-                            )
-                            if effective_deadline is not None:
-                                interaction_budget = min(
-                                    interaction_budget,
-                                    max(0.0, effective_deadline - loop.time()),
-                                )
-                            workflow_stats = await self._exercise_page(
-                                page, max_seconds=interaction_budget
-                            )
-                            state.workflow_states_visited += workflow_stats.get("states", 0)
-                        # Count forms/file inputs from structural clusters (RC-1):
-                        # this runs on every route regardless of the interaction
-                        # budget and is not gated on literal <form> elements, so
-                        # <form>-less SPA surface is finally counted and captured.
-                        captured_forms = await self._capture_forms(page, target_url)
-                        state.browser_forms_discovered += len(captured_forms)
-                        state.file_inputs_discovered += sum(
-                            int(form.get("file_inputs", 0)) for form in captured_forms
-                        )
-                        for form in captured_forms:
-                            state.add_browser_form(form)
-                        # Active form submission (Task B): fire the app's real
-                        # POST/PUT/PATCH XHR with a real body shape so on_request
-                        # captures a replayable observation. Skips destructive forms.
-                        state.browser_forms_submitted += await self._submit_discovered_forms(
-                            page, captured_forms, root_url, target_url, submitted_form_keys,
-                            inflight=inflight,
-                        )
-                        # Enqueue newly-discovered same-origin routes (scored).
-                        for new_route in await self._discover_routes(page, root_url):
-                            _enqueue(new_route, evidence="browser_discovered")
-                    except Exception as exc:
-                        logger.warning("browser discovery failed for %s: %s", target_url, exc)
+                        await context.close()
+                    except Exception:
+                        pass
+
+            try:
+                await asyncio.gather(
+                    *[_worker(i) for i in range(num_workers)], return_exceptions=True
+                )
             finally:
-                # Derive endpoints/params from whatever streamed in — runs even
-                # on truncation so partial coverage yields testable surface.
+                # Merge each worker's local state into the shared state. This runs
+                # in ``finally`` — even under a hard-timeout cancellation — so the
+                # per-worker partial observations (streamed into each ``wstate`` in
+                # place during the run) are never discarded (the RC-1 durability
+                # guarantee, preserved despite per-worker accumulation). add_*
+                # dedup; requests dedup by observation key across workers.
+                seen_observations: set[tuple[str, str, str]] = set()
+                for wstate in worker_states:
+                    self._merge_worker_state(state, wstate, seen_observations)
+                # Derive endpoints/params from whatever streamed in — runs even on
+                # truncation so partial coverage yields testable surface.
                 self._derive_endpoints(state)
-                # Visibility summary: the browser crawl otherwise logs nothing on
-                # success, so there was no way to tell whether form submission
-                # actually produced replayable POST bodies (RC1). This one line
-                # reports the body surface dynamic discovery yielded — read it as:
-                # forms_submitted>0 but post_bodies==0 => submits fire but bodies
-                # are lost; json_bodies>0 => RC1 is working.
+                # Visibility summary: read as forms_submitted>0 but post_bodies==0
+                # => submits fire but bodies are lost; json_bodies>0 => RC1 works.
                 post_bodies = [r for r in state.requests if getattr(r, "post_data", None)]
                 replayable_bodies = [r for r in post_bodies if getattr(r, "replayable", True)]
                 json_bodies = [
@@ -595,7 +742,7 @@ class BrowserDiscoveryEngine:
                     "forms_captured=%d forms_submitted=%d file_inputs=%d "
                     "post_bodies=%d replayable_bodies=%d json_bodies=%d error=%s",
                     root_url,
-                    locals().get("routes_visited", 0),
+                    routes_visited,
                     len(state.requests),
                     state.browser_forms_discovered,
                     state.browser_forms_submitted,
@@ -605,10 +752,6 @@ class BrowserDiscoveryEngine:
                     len(json_bodies),
                     state.browser_error,
                 )
-                try:
-                    await context.close()
-                except Exception:
-                    pass
                 try:
                     await browser.close()
                 except Exception:
@@ -764,26 +907,14 @@ class BrowserDiscoveryEngine:
     ) -> None:
         """Wait until in-flight requests drain, with a hard cap.
 
-        ``networkidle`` never fires on apps with persistent sockets/polling, so
-        we watch an inflight counter and return once it stays at zero for
-        ``quiet_ms`` or ``cap_ms`` elapses — whichever comes first.
+        Thin wrapper over the shared :func:`spa.settle_page`, passing the crawl
+        loop's persistent inflight counter (already wired to the page's request
+        events) so there is exactly one settle implementation. ``networkidle``
+        never fires on apps with persistent sockets/polling, so we watch the
+        counter and return once it stays at zero for ``quiet_ms`` or ``cap_ms``
+        elapses — whichever comes first.
         """
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        quiet_start: float | None = None
-        while True:
-            now = loop.time()
-            if (now - start) * 1000.0 >= cap_ms:
-                break
-            if inflight.get("count", 0) <= 0:
-                if quiet_start is None:
-                    quiet_start = now
-                elif (now - quiet_start) * 1000.0 >= quiet_ms:
-                    break
-            else:
-                quiet_start = None
-            await asyncio.sleep(0.05)
-        await self._bounded(page.wait_for_load_state("domcontentloaded"), 1000)
+        await settle_page(page, inflight=inflight, quiet_ms=quiet_ms, cap_ms=cap_ms)
 
     async def _clear_blocking_overlays(self, page: Any) -> None:
         """Dismiss a blocking full-viewport overlay before interacting.

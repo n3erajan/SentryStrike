@@ -654,21 +654,19 @@ class WebSpider:
         the clean in-engine deadline stop normally fires first. Partial results
         already streamed into ``browser_state`` survive either path.
         """
-        # Probe Playwright once; on failure, degrade to static-only cleanly
-        # rather than crashing the crawl.
-        ready, reason = await BrowserDiscoveryEngine.check_readiness()
-        if not ready:
-            logger.warning("browser discovery unavailable; continuing static-only: %s", reason)
-            crawl_state.browser_available = False
-            crawl_state.browser_error = reason or "browser discovery unavailable"
-            return
-
+        # No separate readiness probe: ``crawl_into`` detects Playwright/browser
+        # availability inline on its own launch (setting ``browser_available``
+        # True the moment Chromium starts, or ``browser_error`` + False on import/
+        # launch failure), so the old ``check_readiness()`` throwaway launch — a
+        # second cold Chromium start every run — is gone. A launch failure merges
+        # cleanly as static-only via the ``finally`` merge below.
         loop = asyncio.get_running_loop()
         budget = self._scan_config.get_val("crawl_browser_budget_seconds", self.settings.crawl_browser_budget_seconds) if self._scan_config else self.settings.crawl_browser_budget_seconds
         deadline = loop.time() + budget
         browser_state = CrawlState()
         engine = BrowserDiscoveryEngine(
-            max_interactions=self._scan_config.get_val("crawl_browser_max_interactions", self.settings.crawl_browser_max_interactions) if self._scan_config else self.settings.crawl_browser_max_interactions
+            max_interactions=self._scan_config.get_val("crawl_browser_max_interactions", self.settings.crawl_browser_max_interactions) if self._scan_config else self.settings.crawl_browser_max_interactions,
+            workers=self._scan_config.get_val("crawl_browser_workers", self.settings.crawl_browser_workers) if self._scan_config else self.settings.crawl_browser_workers,
         )
         task = asyncio.create_task(
             engine.crawl_into(

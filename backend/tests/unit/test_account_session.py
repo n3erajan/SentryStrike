@@ -145,6 +145,29 @@ async def test_resolve_prefers_replay_and_skips_cascade(monkeypatch):
     assert session.cookies["sid"] == "second"
 
 
+async def test_resolve_forwards_storage_state_from_replay(monkeypatch):
+    """Change 3b: the 2nd/admin account's storage_state (captured by the fast
+    replay path) is carried on the ResolvedSession, and no browser relaunch
+    happens on the non-browser replay fast-path (only ``replay`` runs)."""
+    blob = {"cookies": [{"name": "s", "value": "1"}], "origins": []}
+    calls = _patch_replay(
+        monkeypatch,
+        replay_result=AuthResult(
+            authenticated=True, cookies={"sid": "second"}, storage_state=blob
+        ),
+        cascade_result=AuthResult(authenticated=False),
+    )
+    account = ScanAuthAccount(role=ScanAuthRole.second, username="s@x.test", password="pw")
+    replay = AuthReplayState(login_url="http://t/login", action="http://t/api/login",
+                             method="POST", payload={"email": "m@x.test", "password": "mpw"})
+    session = await acct.resolve_account_session(
+        "http://target", account, preferred_replay=replay,
+        primary_credentials=("m@x.test", "mpw"),
+    )
+    assert calls == ["replay"], "fast replay path must not fall through to a browser cascade"
+    assert session.storage_state == blob
+
+
 async def test_resolve_falls_back_to_cascade_when_replay_fails(monkeypatch):
     calls = _patch_replay(
         monkeypatch,

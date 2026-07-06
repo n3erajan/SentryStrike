@@ -14,7 +14,11 @@ from bs4 import BeautifulSoup
 
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ApiEndpoint
-from app.core.crawler.spa import SpaFallbackDetector
+from app.core.crawler.spa import (
+    SpaFallbackDetector,
+    install_resource_blocking,
+    settle_page,
+)
 from app.core.crawler.url_parser import normalize_url, same_domain
 
 logger = logging.getLogger(__name__)
@@ -325,19 +329,22 @@ class SmartAuthenticator:
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch(headless=True)
                 context = await browser.new_context()
+                if getattr(self.settings, "crawl_browser_block_resources", True):
+                    await install_resource_blocking(context)
                 page = await context.new_page()
-                await page.goto(replay_state.action or replay_state.login_url, wait_until="networkidle", timeout=15000)
+                await page.goto(
+                    replay_state.action or replay_state.login_url,
+                    wait_until="domcontentloaded",
+                    timeout=8000,
+                )
+                await settle_page(page)
                 await page.fill(username_selector, username)
                 await page.fill(password_selector, password)
                 if submit_selector:
                     await page.click(submit_selector)
                 else:
                     await page.press(password_selector, "Enter")
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=5000)
-                except Exception:
-                    pass
-                await page.wait_for_timeout(1000)
+                await settle_page(page)
                 cookies = await context.cookies()
                 cookies_dict = {c["name"]: c["value"] for c in cookies}
                 storage_state = None
@@ -721,10 +728,13 @@ class SmartAuthenticator:
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch(headless=True)
                 context = await browser.new_context()
+                if getattr(self.settings, "crawl_browser_block_resources", True):
+                    await install_resource_blocking(context)
                 page = await context.new_page()
 
                 logger.info("[auth] Browser launched, navigating to %s", root_url)
-                await page.goto(root_url, wait_until="networkidle", timeout=15000)
+                await page.goto(root_url, wait_until="domcontentloaded", timeout=8000)
+                await settle_page(page)
 
                 # Dismiss blocking overlays (cookie consent, Material CDK backdrops,
                 # welcome modals) before searching for form inputs. Without this,
@@ -769,7 +779,7 @@ class SmartAuthenticator:
                                     if await el.is_visible():
                                         logger.info("[auth] Clicking login element: %s", selector)
                                         await el.click()
-                                        await page.wait_for_load_state("networkidle", timeout=5000)
+                                        await settle_page(page)
                                         break
                                 if await page.locator("input[type='password']").count() > 0:
                                     break
@@ -792,8 +802,8 @@ class SmartAuthenticator:
                         target_login_url = base_origin + path
                         try:
                             logger.info("[auth] Trying direct navigation to SPA login route: %s", target_login_url)
-                            await page.goto(target_login_url, wait_until="networkidle", timeout=8000)
-                            await page.wait_for_timeout(500)
+                            await page.goto(target_login_url, wait_until="domcontentloaded", timeout=8000)
+                            await settle_page(page)
                             if await page.locator("input[type='password']").count() > 0:
                                 logger.info("[auth] Found password input after direct navigation to %s", target_login_url)
                                 break
@@ -891,11 +901,7 @@ class SmartAuthenticator:
                     logger.info("[auth] Pressing Enter on password input as fallback")
                     await page.press(password_selector, "Enter")
 
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=5000)
-                except Exception as e:
-                    logger.debug("[auth] Networkidle wait timed out, continuing anyway: %s", e)
-                await page.wait_for_timeout(1000)
+                await settle_page(page)
 
                 cookies = await context.cookies()
                 cookies_dict = {c["name"]: c["value"] for c in cookies}
@@ -1331,7 +1337,9 @@ class SmartAuthenticator:
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch(headless=True)
                 context = await browser.new_context()
-                
+                if getattr(self.settings, "crawl_browser_block_resources", True):
+                    await install_resource_blocking(context)
+
                 # Seed cookies if any
                 if cookies:
                     parsed = urlparse(root_url)

@@ -30,7 +30,6 @@ from app.utils.http_logging import (
     log_http_response,
     resolve_request_context,
 )
-from app.utils.scan_throttle import get_scan_http_semaphore
 from app.core import request_governor
 from app.utils.scan_http import build_scan_headers, create_scan_client
 
@@ -213,8 +212,14 @@ class HttpVerifier:
             if cookies:
                 request_kwargs["cookies"] = cookies
 
-            async with get_scan_http_semaphore():
-                response = await client.request(**request_kwargs)
+            # NOTE: do NOT acquire get_scan_http_semaphore() here. The scan client
+            # returned by create_scan_client already wraps every request in that
+            # same process-wide semaphore (scan_http.throttled_request). Acquiring
+            # it a second time around client.request() double-acquires a
+            # non-reentrant asyncio.Semaphore and deadlocks the whole scan once the
+            # concurrency slots fill up (each in-flight request holds one slot while
+            # waiting for a second that can never free).
+            response = await client.request(**request_kwargs)
 
             end_time = time.time() if capture_timing else None
             response_time_ms = (end_time - start_time) * 1000 if capture_timing else 0

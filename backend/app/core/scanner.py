@@ -236,10 +236,10 @@ class ScanOrchestrator:
         (gated by ``ALLOW_SECONDARY_PROVISIONING``).
         """
         role_to_kwargs = {
-            "second": ("second_user_cookies", "second_user_headers"),
-            "admin": ("privileged_cookies", "privileged_headers"),
+            "second": ("second_user_cookies", "second_user_headers", "second_user_storage_state"),
+            "admin": ("privileged_cookies", "privileged_headers", "privileged_storage_state"),
         }
-        for role, (cookie_key, header_key) in role_to_kwargs.items():
+        for role, (cookie_key, header_key, storage_key) in role_to_kwargs.items():
             account = accounts_by_role.get(role)
             if account is None:
                 continue
@@ -254,6 +254,10 @@ class ScanOrchestrator:
                 continue
             crawl_context[cookie_key] = session.cookies
             crawl_context[header_key] = session.headers
+            # Forward the full authenticated browser blob when captured so a
+            # browser-based access-control check reuses it instead of re-logging-in.
+            if session.storage_state:
+                crawl_context[storage_key] = session.storage_state
             logger.info(
                 "injected %s account session for access-control testing (cookies=%d, headers=%d)",
                 role,
@@ -273,6 +277,8 @@ class ScanOrchestrator:
             if provisioned.usable:
                 crawl_context["second_user_cookies"] = provisioned.cookies
                 crawl_context["second_user_headers"] = provisioned.headers
+                if provisioned.storage_state:
+                    crawl_context["second_user_storage_state"] = provisioned.storage_state
                 logger.info(
                     "injected auto-provisioned secondary identity for access-control testing "
                     "(cookies=%d, headers=%d)",

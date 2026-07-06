@@ -27,7 +27,7 @@ async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch
     observations into the crawl state (the merge runs in ``finally``)."""
 
     class _StubEngine:
-        def __init__(self, max_interactions=25):
+        def __init__(self, max_interactions=25, workers=None):
             self.max_interactions = max_interactions
 
         @staticmethod
@@ -92,13 +92,27 @@ def test_should_run_browser_decision_matrix(monkeypatch, enabled, mode, is_spa, 
 
 @pytest.mark.asyncio
 async def test_run_browser_discovery_degrades_when_playwright_unavailable(monkeypatch):
-    class _UnreadyEngine:
-        def __init__(self, max_interactions=25):
-            raise AssertionError("engine must not be constructed when unavailable")
+    """With the readiness-probe double-launch removed, ``crawl_into`` itself
+    detects unavailability inline: it sets ``browser_available=False`` +
+    ``browser_error`` and returns, and the merge surfaces that as static-only."""
 
-        @staticmethod
-        async def check_readiness():
-            return False, "Playwright import failed: boom"
+    class _UnreadyEngine:
+        def __init__(self, max_interactions=25, workers=None):
+            self.max_interactions = max_interactions
+
+        async def crawl_into(
+            self,
+            state,
+            root_url,
+            auth_cookies=None,
+            auth_headers=None,
+            routes=None,
+            deadline=None,
+            storage_state=None,
+        ):
+            state.browser_available = False
+            state.browser_error = "Playwright import failed: boom"
+            return state
 
     monkeypatch.setattr(spider_module, "BrowserDiscoveryEngine", _UnreadyEngine)
 

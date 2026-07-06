@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     # Hard cap on how many routes the browser crawl will visit in one run
     # (the priority queue drops the low-score tail when this is hit).
     crawl_browser_route_cap: int = Field(default=120, alias="CRAWL_BROWSER_ROUTE_CAP")
+    # Parallel browser crawl: number of worker coroutines (each its own context +
+    # page) sharing the value-ordered route heap. 1 = the legacy serial crawl.
+    # N contexts means N× the request rate at the target — browser traffic
+    # bypasses the httpx scan semaphore — so keep this conservative.
+    crawl_browser_workers: int = Field(default=4, alias="CRAWL_BROWSER_WORKERS")
+    # Block non-essential resources (images/media/fonts/stylesheets + known
+    # trackers) during browser crawl/auth to speed up settle. Never blocks
+    # same-origin script/xhr/fetch/document. Disable if a target renders needed
+    # content into CSS/images.
+    crawl_browser_block_resources: bool = Field(default=True, alias="CRAWL_BROWSER_BLOCK_RESOURCES")
     # Bounds for the XSS browser-driven DOM reflection sweep (Task 5). Caps the
     # number of route+param probes and the wall-clock spent so the phase can
     # never dominate a scan.
