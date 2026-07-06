@@ -2,6 +2,7 @@ import pytest
 
 from app.core.detectors.sql_injection import SQLInjectionDetector
 from app.core.verification.sqli_verifier import SQLiVerifier
+from app.core.verification.verification_framework import VerificationResult
 
 def test_sqli_detector_excludes_submit_button():
     detector = SQLInjectionDetector()
@@ -33,6 +34,31 @@ def test_sqli_detector_excludes_submit_button():
     assert "imageBtn" not in params
 
 from app.core.verification.response_analyzer import ResponseData
+
+
+@pytest.mark.asyncio
+async def test_sqli_detector_configures_verifier_with_auth_headers(monkeypatch):
+    detector = SQLInjectionDetector()
+    observed: list[tuple[dict, dict]] = []
+
+    async def verify(self, *args, **kwargs):
+        observed.append((dict(self.http_verifier.headers), dict(self.http_verifier.cookies)))
+        return VerificationResult(False, 0.0, "none")
+
+    monkeypatch.setattr(SQLiVerifier, "verify", verify)
+
+    await detector.detect(
+        urls=["https://example.test/api/products?id=1"],
+        forms=[],
+        session_cookies={"sid": "abc"},
+        auth_headers={"Authorization": "Bearer token"},
+    )
+
+    assert observed
+    headers, cookies = observed[0]
+    assert headers["User-Agent"] == "SentryStrikeScanner/1.0"
+    assert headers["Authorization"] == "Bearer token"
+    assert cookies == {"sid": "abc"}
 
 @pytest.mark.asyncio
 async def test_sqli_verifier_union_requires_version_proof():

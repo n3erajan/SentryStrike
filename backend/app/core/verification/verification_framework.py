@@ -15,7 +15,7 @@ import re
 import httpx
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Mapping, Optional
 from urllib.parse import urlparse, parse_qsl
 
 from app.core.detectors.attack_surface import AttackTarget, build_json_body
@@ -31,6 +31,8 @@ from app.utils.http_logging import (
     resolve_request_context,
 )
 from app.utils.scan_throttle import get_scan_http_semaphore
+from app.core import request_governor
+from app.utils.scan_http import build_scan_headers, create_scan_client
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,20 @@ class HttpVerifier:
         self._client: Optional[httpx.AsyncClient] = None
         self.request_context = ScanRequestContext()
 
+    async def configure_auth(
+        self,
+        *,
+        cookies: Optional[dict] = None,
+        auth_headers: Optional[Mapping[str, object]] = None,
+    ) -> None:
+        """Apply per-scan auth defaults and reset any client using stale auth."""
+        next_cookies = cookies or {}
+        next_headers = build_scan_headers(auth_headers)
+        if next_cookies != self.cookies or next_headers != self.headers:
+            self.cookies = next_cookies
+            self.headers = next_headers
+            await self.close()
+
     def set_request_context(self, **kwargs: str) -> None:
         """Set default module/parameter context for subsequent requests."""
         updates = {key: value for key, value in kwargs.items() if value}
@@ -81,19 +97,12 @@ class HttpVerifier:
     async def get_client(self) -> httpx.AsyncClient:
         """Get or create async HTTP client."""
         if self._client is None:
-            settings = get_settings()
-            pool_size = max(1, settings.scanner_concurrency)
-            timeout = httpx.Timeout(
-                connect=min(5.0, self.timeout_seconds),
-                read=self.timeout_seconds,
-                write=self.timeout_seconds,
-                pool=min(5.0, self.timeout_seconds),
-            )
-            self._client = httpx.AsyncClient(
-                timeout=timeout,
-                limits=httpx.Limits(
-                    max_connections=pool_size,
-                    max_keepalive_connections=pool_size,
+            self._client = create_scan_client(
+                timeout=httpx.Timeout(
+                    connect=min(5.0, self.timeout_seconds),
+                    read=self.timeout_seconds,
+                    write=self.timeout_seconds,
+                    pool=min(5.0, self.timeout_seconds),
                 ),
                 cookies=self.cookies,
                 headers=self.headers,
@@ -170,6 +179,21 @@ class HttpVerifier:
         effective_payload = ctx.payload or infer_payload_from_request(
             ctx.parameter, url, params, data
         )
+
+        # P1-1: consult the request-budget governor. When a detector or parameter
+        # has exhausted its ceiling, skip the network call and return a benign
+        # empty response (fail-safe: reads as "nothing here" to every detector,
+        # never crashes, never fabricates a finding). No-op outside a governed
+        # scan or for uninstrumented callers.
+        if request_governor.admit(ctx.module, ctx.parameter) is request_governor.GovernorDecision.DENY:
+            return ResponseData(
+                status_code=0,
+                headers={},
+                body="",
+                response_time_ms=0.0,
+                request_snippet=request_snippet,
+                response_snippet="[request skipped: request-budget ceiling reached]",
+            )
 
         try:
             start_time = time.time() if capture_timing else None

@@ -174,6 +174,38 @@ async def test_open_redirect_detector_verifies_external_location_header():
 
 
 @pytest.mark.asyncio
+async def test_open_redirect_detector_reports_observed_external_redirect_without_following():
+    detector = OpenRedirectDetector()
+    observed_urls: list[str] = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        observed_urls.append(url)
+        return ResponseData(
+            302,
+            {"Location": "https://github.com/juice-shop/juice-shop"},
+            "",
+            5.0,
+            request_snippet=f"{method} {url}",
+            response_snippet="HTTP/1.1 302 Found\nLocation: https://github.com/juice-shop/juice-shop",
+        )
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=["http://target.test/redirect?to=https://github.com/juice-shop/juice-shop"],
+            forms=[],
+        )
+
+    assert len(observed_urls) == 1
+    assert observed_urls[0].startswith("http://target.test/redirect?to=")
+    assert "github.com" in observed_urls[0]
+    assert any(
+        f.vuln_type == "Open Redirect"
+        and f.detection_method == "observed_external_location_redirect"
+        for f in findings
+    )
+
+
+@pytest.mark.asyncio
 async def test_open_redirect_detector_ignores_same_origin_location_header():
     detector = OpenRedirectDetector()
 
@@ -225,6 +257,48 @@ async def test_file_upload_detector_replays_browser_observed_multipart_request(m
     assert uploads[0]["data"]["userId"] == "sentry_test_val"
     assert uploads[0]["headers"] == {"authorization": "Bearer token"}
     assert any(f.vuln_type == "Unrestricted File Upload" for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_file_upload_detector_passes_auth_headers_to_scan_client(monkeypatch):
+    detector = FileUploadDetector()
+    captured_client_kwargs: dict[str, object] = {}
+
+    form = SimpleNamespace(
+        page_url="https://example.test/profile",
+        action="/api/profile/upload",
+        method="POST",
+        inputs=[SimpleNamespace(name="avatar", input_type="file")],
+    )
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, **kwargs):
+            return httpx.Response(
+                401,
+                text="unauthorized",
+                request=httpx.Request(kwargs["method"], kwargs["url"]),
+            )
+
+    def fake_create_scan_client(**kwargs):
+        captured_client_kwargs.update(kwargs)
+        return FakeClient()
+
+    monkeypatch.setattr("app.core.detectors.file_upload.create_scan_client", fake_create_scan_client)
+
+    await detector.detect(
+        urls=[],
+        forms=[form],
+        auth_headers={"Authorization": "Bearer upload-token"},
+    )
+
+    assert captured_client_kwargs["headers"]["Authorization"] == "Bearer upload-token"
+    assert captured_client_kwargs["headers"]["User-Agent"] == "SentryStrikeScanner/1.0"
 
 
 def test_file_upload_static_formdata_candidate_extraction():

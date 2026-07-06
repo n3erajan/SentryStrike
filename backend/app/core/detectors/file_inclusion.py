@@ -14,6 +14,7 @@ from app.core.payload_profile import PayloadProfile, build_payload_profile
 from app.core.verification.response_analyzer import ResponseAnalyzer
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
+from app.utils.scan_http import build_scan_headers
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,7 @@ class FileInclusionDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        auth_headers = kwargs.get("auth_headers")
         payload_profile = build_payload_profile(kwargs.get("technology_stack"))
         lfi_payloads = self._select_lfi_payloads(payload_profile)
         rfi_payloads = self._select_rfi_payloads(payload_profile)
@@ -200,7 +202,7 @@ class FileInclusionDetector(BaseDetector):
             return []
 
         semaphore = asyncio.Semaphore(4)
-        verifier = HttpVerifier(cookies=session_cookies)
+        verifier = HttpVerifier(cookies=session_cookies, headers=build_scan_headers(auth_headers))
         verifier.set_request_context(module="lfi")
 
         rfi_fingerprints = await self._fetch_rfi_fingerprints() if rfi_payloads else {}

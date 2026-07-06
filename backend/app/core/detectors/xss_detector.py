@@ -96,6 +96,7 @@ class XSSDetector(BaseDetector):
         findings.extend(await self._static_dom_findings_with_browser_confirmation(kwargs, session_cookies))
 
         browser_available = bool(kwargs.get("browser_available"))
+        is_spa = bool(kwargs.get("is_spa", False))
         routes = kwargs.get("routes") or []
         # Full authenticated storage_state (Task A): seed the DOM-sweep browser
         # so authed-only routes render during confirmation. Opaque per-origin blob.
@@ -126,7 +127,7 @@ class XSSDetector(BaseDetector):
         # ``header_injection=True`` flag encoded in the method field.
         header_candidates = self._build_header_candidates(
             urls,
-            is_spa=bool(kwargs.get("is_spa", False)),
+            is_spa=is_spa,
             root_url=kwargs.get("root_url"),
         )
         candidates = list(candidates) + header_candidates
@@ -172,6 +173,11 @@ class XSSDetector(BaseDetector):
 
             verifier = XSSVerifier()
             verifier.http_verifier.cookies = session_cookies
+            # P0-3: on SPA targets the header-stored GET-replay oracle cannot
+            # observe client-rendered reflection; the verifier uses this flag to
+            # disable that fan-out and defer the stored-header hypothesis to the
+            # browser-DOM sweep instead.
+            verifier.spa_mode = is_spa
             if auth_headers:
                 verifier.http_verifier.headers = {**verifier.http_verifier.headers, **auth_headers}
             try:

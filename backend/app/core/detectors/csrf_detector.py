@@ -1,12 +1,17 @@
 import asyncio
 import logging
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
 
+from app.core.crawler.api_extractor import ApiExtractor
+from app.core.crawler.models import ParameterLocation
+from app.core.crawler.spa import SpaFallbackDetector
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
+
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 class _FormInputView:
@@ -95,6 +100,130 @@ class CSRFDetector(BaseDetector):
                 form_candidates.append((form_url, form_method, raw_inputs, is_setup_route))
         return form_candidates
 
+    @staticmethod
+    def _bare(url: str) -> str:
+        """scheme://netloc/path with query/fragment stripped, for endpoint keys."""
+        try:
+            parsed = urlparse(url)
+            return urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") or "/", "", "", "")).lower()
+        except Exception:
+            return (url or "").split("?")[0].rstrip("/").lower()
+
+    def _mutating_endpoint_keys(self, requests: list, api_endpoints: list) -> set[str]:
+        """Bare-URL keys of endpoints confirmed to be real mutating APIs.
+
+        Sourced from observed non-GET XHR/fetch requests and from spec/JS-mined
+        API endpoints with a mutating method. A client-side SPA navigation route
+        (which returns the HTML shell) is never in this set, so CSRF findings can
+        be restricted to genuine state-changing endpoints.
+        """
+        keys: set[str] = set()
+        for observation in requests or []:
+            method = (getattr(observation, "method", "GET") or "GET").upper()
+            if method in _MUTATING_METHODS:
+                keys.add(self._bare(getattr(observation, "url", "")))
+        for endpoint in api_endpoints or []:
+            method = (getattr(endpoint, "method", "GET") or "GET").upper()
+            if method in _MUTATING_METHODS:
+                keys.add(self._bare(getattr(endpoint, "url", "")))
+        return keys
+
+    def _candidates_from_requests(self, requests: list) -> list[tuple]:
+        """Build CSRF candidates from observed mutating XHRs (real API endpoints).
+
+        On a ``<form>``-less SPA these observed non-GET requests are the only
+        genuine state-changing surface. Inputs are synthesised from the captured
+        body schema so the tamper/Origin-bypass submission carries a realistic
+        body. Marked ``is_real_api=True``.
+        """
+        candidates: list[tuple] = []
+        seen: set[tuple[str, str]] = set()
+        for observation in requests or []:
+            method = (getattr(observation, "method", "GET") or "GET").upper()
+            if method not in _MUTATING_METHODS:
+                continue
+            url = getattr(observation, "url", "")
+            if not url:
+                continue
+            if self._has_unresolved_path_placeholder(url):
+                continue
+            key = (self._bare(url), method)
+            if key in seen:
+                continue
+            seen.add(key)
+            inputs = [
+                _FormInputView(name=str(name), input_type="text", value="")
+                for name in (getattr(observation, "body_schema", None) or [])
+                if name
+            ]
+            content_type = str(getattr(observation, "request_content_type", "") or "")
+            location = (
+                ParameterLocation.form
+                if "x-www-form-urlencoded" in content_type.lower()
+                or "multipart/form-data" in content_type.lower()
+                else ParameterLocation.json_body
+            )
+            candidates.append((url, method, inputs, False, True, location, content_type))
+        return candidates
+
+    def _candidates_from_api_endpoints(self, api_endpoints: list) -> list[tuple]:
+        """Build CSRF candidates from discovered mutating API schemas/specs."""
+        candidates: list[tuple] = []
+        seen: set[tuple[str, str]] = set()
+        for endpoint in api_endpoints or []:
+            method = (getattr(endpoint, "method", "GET") or "GET").upper()
+            if method not in _MUTATING_METHODS:
+                continue
+            if not ApiExtractor.is_api_endpoint(endpoint):
+                continue
+            content_type, template = ApiExtractor.synthesize_body_schema(
+                endpoint,
+                allow_generic_body=True,
+            )
+            if not isinstance(template, dict) or not template:
+                continue
+            url = str(getattr(endpoint, "url", "") or "")
+            if not url:
+                continue
+            if self._has_unresolved_path_placeholder(url):
+                continue
+            key = (self._bare(url), method)
+            if key in seen:
+                continue
+            seen.add(key)
+            location = (
+                ParameterLocation.form
+                if "x-www-form-urlencoded" in (content_type or "").lower()
+                or "multipart/form-data" in (content_type or "").lower()
+                else ParameterLocation.json_body
+            )
+            inputs = [
+                _FormInputView(name=str(name), input_type="text", value=value)
+                for name, value in template.items()
+                if name
+            ]
+            candidates.append((url, method, inputs, False, True, location, content_type))
+        return candidates
+
+    @staticmethod
+    def _has_unresolved_path_placeholder(url: str) -> bool:
+        try:
+            path = unquote(urlparse(url).path or "")
+        except Exception:
+            return False
+        for segment in path.split("/"):
+            if not segment:
+                continue
+            if segment.startswith("{") and segment.endswith("}"):
+                return True
+            if segment.startswith("[") and segment.endswith("]"):
+                return True
+            if segment.startswith("<") and segment.endswith(">"):
+                return True
+            if segment.startswith(":") and len(segment) > 1:
+                return True
+        return False
+
     def _token_auth_posture(self, form_candidates: list[tuple]) -> list[Finding]:
         """Informational posture note for header/bearer-token apps.
 
@@ -105,7 +234,8 @@ class CSRFDetector(BaseDetector):
         """
         findings: list[Finding] = []
         seen: set[tuple[str, str]] = set()
-        for form_url, method, _raw_inputs, _is_setup in form_candidates:
+        for candidate in form_candidates:
+            form_url, method = candidate[0], candidate[1]
             key = (form_url.split("?")[0], method)
             if key in seen:
                 continue
@@ -137,11 +267,61 @@ class CSRFDetector(BaseDetector):
         session_cookies = kwargs.get("session_cookies") or {}
         auth_headers = kwargs.get("auth_headers") or {}
         browser_forms = kwargs.get("browser_forms") or []
+        requests = kwargs.get("requests") or []
+        api_endpoints = kwargs.get("api_endpoints") or []
+        is_spa = bool(kwargs.get("is_spa", False))
 
-        # Merge static crawler forms with browser-discovered forms (Task 2/8):
-        # SPAs render their forms only in the DOM, so static discovery finds none.
-        all_forms = [self._normalize_form(f) for f in list(forms) + list(browser_forms)]
-        form_candidates = self._select_candidate_forms(all_forms)
+        # P0-4: only genuine mutating APIs (observed non-GET XHR or a spec/JS
+        # endpoint with a mutating method) are CSRF-testable. A browser-discovered
+        # SPA "form" is an input cluster keyed to a *client-side route* whose
+        # ``action`` is the route URL — submitting to it returns the 200 HTML
+        # shell for every route, which previously produced blanket false CSRF
+        # findings on navigation routes (/register, /search, …).
+        mutating_keys = self._mutating_endpoint_keys(requests, api_endpoints)
+
+        def _tag(candidates: list[tuple], real_default: bool) -> list[tuple]:
+            tagged: list[tuple] = []
+            for form_url, method, raw_inputs, is_setup in candidates:
+                is_real_api = real_default or self._bare(form_url) in mutating_keys
+                tagged.append((form_url, method, raw_inputs, is_setup, is_real_api))
+            return tagged
+
+        # Static crawler forms are real server-rendered endpoints. Browser forms
+        # are only real when backed by an observed/spec mutating API.
+        static_candidates = _tag(
+            self._select_candidate_forms([self._normalize_form(f) for f in forms]), True
+        )
+        browser_candidates = _tag(
+            self._select_candidate_forms([self._normalize_form(f) for f in browser_forms]), False
+        )
+        request_candidates = self._candidates_from_requests(requests)
+        api_candidates = self._candidates_from_api_endpoints(api_endpoints)
+
+        # Dedup by (bare url, method); observed real-API candidates win.
+        by_key: dict[tuple[str, str], tuple] = {}
+        for candidate in request_candidates + api_candidates + static_candidates + browser_candidates:
+            key = (self._bare(candidate[0]), candidate[1])
+            existing = by_key.get(key)
+            if existing is None or (candidate[4] and not existing[4]):
+                by_key[key] = candidate
+        form_candidates = list(by_key.values())
+
+        # On an SPA, never test a client-side navigation route: keep only
+        # confirmed mutating-API candidates so no finding attaches to a route
+        # that merely returns the shell.
+        if is_spa:
+            form_candidates = [c for c in form_candidates if c[4]]
+
+        # Configure an SPA-shell oracle so a verification response equal to the
+        # SPA root shell is treated as "no state change" rather than success.
+        spa_detector: SpaFallbackDetector | None = None
+        spa_root_html = str(kwargs.get("spa_root_html") or "")
+        root_url = str(kwargs.get("root_url") or "")
+        if is_spa and spa_root_html:
+            spa_detector = SpaFallbackDetector()
+            spa_detector.configure_root(root_url, spa_root_html)
+            if not spa_detector.root_looks_like_spa():
+                spa_detector = None
 
         # Auth-model-aware branching (Task 8): cookie-auth keeps the active
         # token-tamper / Origin-bypass verification below; header/bearer-token
@@ -159,7 +339,9 @@ class CSRFDetector(BaseDetector):
         semaphore = asyncio.Semaphore(4)
 
         async def verify_csrf(candidate) -> list[Finding]:
-            form_url, method, raw_inputs, is_setup_route = candidate
+            form_url, method, raw_inputs, is_setup_route, _is_real_api = candidate[:5]
+            location = candidate[5] if len(candidate) > 5 else ParameterLocation.form
+            content_type = candidate[6] if len(candidate) > 6 else None
             cand_findings = []
 
             # Identify if a CSRF token parameter exists
@@ -192,19 +374,34 @@ class CSRFDetector(BaseDetector):
                         # Tamper with the token
                         test_payload[csrf_param] = "invalid_token_xyz"
                     
-                    # Submit the form
-                    injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
-                        form_url, csrf_param or "dummy", "tampered", method
-                    )
-                    
-                    # Overwrite injected data with complete form payload
-                    if method == "POST":
-                        injected_data = test_payload
+                    json_body = None
+                    request_headers = None
+                    if location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
+                        injected_url = form_url
+                        injected_params = None
+                        injected_data = None
+                        json_body = test_payload
+                        request_headers = {"Content-Type": content_type or "application/json"}
                     else:
-                        injected_params = test_payload
+                        # Submit the form
+                        injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
+                            form_url, csrf_param or "dummy", "tampered", method
+                        )
+
+                        # Overwrite injected data with complete form payload
+                        if method in {"POST", "PUT", "PATCH", "DELETE"}:
+                            injected_data = test_payload
+                        else:
+                            injected_params = test_payload
 
                     response = await verifier.send_request(
-                        injected_url, method, injected_params, injected_data, test_phase="token_tamper"
+                        injected_url,
+                        method,
+                        injected_params,
+                        injected_data,
+                        headers=request_headers,
+                        json_body=json_body,
+                        test_phase="token_tamper",
                     )
 
                     # Phase 3: Add optional Origin/Referer bypass test
@@ -214,15 +411,40 @@ class CSRFDetector(BaseDetector):
                     }
                     # Send bypass request if the original request succeeded (to minimize requests), 
                     # but we can also just send it and check its success.
+                    bypass_headers = {**(request_headers or {}), **bypass_headers}
                     bypass_response = await verifier.send_request(
-                        injected_url, method, injected_params, injected_data,
-                        headers=bypass_headers, test_phase="origin_bypass",
+                        injected_url,
+                        method,
+                        injected_params,
+                        injected_data,
+                        headers=bypass_headers,
+                        json_body=json_body,
+                        test_phase="origin_bypass",
                     )
 
                     # Criteria for CSRF vulnerability:
                     # 1. HTTP 200 or 302 redirect (success indicator)
                     # 2. Response body doesn't contain a clear CSRF/token validation error
                     response_to_check = bypass_response if bypass_response.status_code in [200, 302, 303] else response
+
+                    # P0-4: an SPA returns the 200 HTML shell for any client-side
+                    # route, so "200 + no error string" is not evidence of a state
+                    # change. If the response is the SPA shell, no mutation
+                    # occurred — never emit a finding.
+                    if spa_detector is not None:
+                        shell = spa_detector.detect(
+                            injected_url,
+                            response_to_check.status_code,
+                            response_to_check.headers.get("content-type", ""),
+                            response_to_check.body or "",
+                            allow_file_like_path=True,
+                        )
+                        if shell.is_fallback:
+                            logger.debug(
+                                "CSRF: ignoring SPA shell response for %s (%s, similarity=%.3f)",
+                                form_url, shell.reason, shell.similarity,
+                            )
+                            return []
 
                     if response_to_check.status_code in [200, 302, 303]:
                         body_lower = response_to_check.body.lower()

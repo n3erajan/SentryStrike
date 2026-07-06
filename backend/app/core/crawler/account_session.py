@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass, field
 
 from app.config import get_settings
-from app.core.crawler.auth_manager import SmartAuthenticator
+from app.core.crawler.auth_manager import AuthReplayState, SmartAuthenticator
 from app.models.scan import ScanAuthAccount
 from app.utils.scan_http import create_scan_client
 
@@ -54,8 +54,20 @@ def _parse_header_string(value: str | None) -> dict[str, str]:
     return {key: val} if key and val else {}
 
 
-async def resolve_account_session(root_url: str, account: ScanAuthAccount) -> ResolvedSession:
+async def resolve_account_session(
+    root_url: str,
+    account: ScanAuthAccount,
+    *,
+    preferred_replay: AuthReplayState | None = None,
+    primary_credentials: tuple[str | None, str | None] | None = None,
+) -> ResolvedSession:
     """Log ``account`` in against ``root_url`` (or apply its raw cookies/headers).
+
+    When ``preferred_replay`` (the login recipe that authenticated the main
+    account) is supplied, it is replayed first with this account's credentials —
+    so second/admin logins reuse the *same winning path* instead of restarting
+    the whole strategy cascade from Strategy 1. Falls back to the full cascade if
+    the replay does not authenticate.
 
     Never raises: on failure it logs and returns an empty (unusable) session so a
     single bad credential can't abort the scan.
@@ -70,15 +82,37 @@ async def resolve_account_session(root_url: str, account: ScanAuthAccount) -> Re
     if account.username and account.password:
         settings = get_settings()
         login_target = account.login_url or root_url
+        prior_username, prior_password = primary_credentials or (None, None)
         try:
             async with create_scan_client(
                 timeout=settings.request_timeout_seconds,
                 follow_redirects=True,
                 headers={"User-Agent": "SentryStrikeScanner/1.0"},
             ) as client:
-                result = await SmartAuthenticator(settings).authenticate(
-                    client, login_target, account.username, account.password
-                )
+                authenticator = SmartAuthenticator(settings)
+                result = None
+                # Fast path: replay the main account's winning login recipe.
+                if preferred_replay is not None:
+                    result = await authenticator.authenticate_with_replay(
+                        client,
+                        preferred_replay,
+                        account.username,
+                        account.password,
+                        prior_username=prior_username,
+                        prior_password=prior_password,
+                    )
+                    if not (result and result.authenticated):
+                        logger.info(
+                            "recipe replay did not authenticate %s account; "
+                            "falling back to full strategy cascade",
+                            account.role.value,
+                        )
+                        result = None
+                # Fallback: full multi-strategy cascade.
+                if result is None:
+                    result = await authenticator.authenticate(
+                        client, login_target, account.username, account.password
+                    )
                 if result.authenticated:
                     session.cookies.update(result.cookies or {})
                     # Snapshot any cookies the client picked up during the flow.

@@ -67,7 +67,10 @@ class SQLInjectionDetector(BaseDetector):
         """
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
-        self.verifier.http_verifier.cookies = session_cookies
+        await self.verifier.http_verifier.configure_auth(
+            cookies=session_cookies,
+            auth_headers=kwargs.get("auth_headers"),
+        )
         scan_config = kwargs.get("scan_config")
         settings = get_settings()
         self.verifier.blind_timing_threshold = (

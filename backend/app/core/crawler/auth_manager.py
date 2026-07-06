@@ -52,6 +52,7 @@ class AuthReplayState:
     payload: dict[str, str]
     is_json: bool = False
     headers: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -213,6 +214,171 @@ class SmartAuthenticator:
 
         logger.warning("[auth] All authentication strategies failed")
         return AuthResult(authenticated=False, is_spa=is_spa)
+
+    @staticmethod
+    def _substitute_replay_credentials(
+        payload: dict[str, str],
+        prior_username: str | None,
+        prior_password: str | None,
+        username: str,
+        password: str,
+    ) -> dict[str, str]:
+        """Return a copy of ``payload`` with the prior account's credentials
+        swapped for a new account's.
+
+        Prefer exact value replacement when the primary credentials are known,
+        then fall back to credential-field names. The fallback is important for
+        recipes captured from browser/forms where the stored body can contain
+        placeholders/defaults instead of the literal first-account secret.
+        """
+        new_payload: dict[str, str] = {}
+        for key, value in payload.items():
+            key_lower = str(key).lower()
+            if prior_username and value == prior_username:
+                new_payload[key] = username
+            elif prior_password and value == prior_password:
+                new_payload[key] = password
+            elif any(token in key_lower for token in ("email", "username", "user", "login")):
+                new_payload[key] = username
+            elif any(token in key_lower for token in ("password", "passwd", "pass")):
+                new_payload[key] = password
+            else:
+                new_payload[key] = value
+        return new_payload
+
+    async def authenticate_with_replay(
+        self,
+        client: httpx.AsyncClient,
+        replay_state: AuthReplayState,
+        username: str,
+        password: str,
+        *,
+        prior_username: str | None = None,
+        prior_password: str | None = None,
+    ) -> AuthResult:
+        """Log a *different* account in by replaying the winning login recipe.
+
+        Reuses the exact endpoint/method/body that already authenticated the main
+        account (``replay_state``), swapping in this account's credentials, so the
+        second/admin login skips the full strategy cascade (which otherwise
+        restarts from Strategy 1 for every account). Returns an unauthenticated
+        result on any failure so the caller can fall back to the cascade.
+        """
+        payload = self._substitute_replay_credentials(
+            replay_state.payload, prior_username, prior_password, username, password
+        )
+        logger.info(
+            "[auth] Replaying winning login recipe (%s %s) for a secondary account",
+            replay_state.method, replay_state.action,
+        )
+        try:
+            if replay_state.login_url:
+                await client.get(replay_state.login_url, follow_redirects=True)
+            if replay_state.headers:
+                client.headers.update(replay_state.headers)
+            if replay_state.method.upper() == "BROWSER":
+                return await self._authenticate_browser_replay(
+                    client,
+                    replay_state,
+                    username,
+                    password,
+                )
+            if replay_state.method.upper() == "POST":
+                if replay_state.is_json:
+                    resp = await client.post(replay_state.action, json=payload, follow_redirects=True)
+                else:
+                    resp = await client.post(replay_state.action, data=payload, follow_redirects=True)
+            else:
+                resp = await client.get(replay_state.action, params=payload, follow_redirects=True)
+            result = await self._verify_auth(client, resp)
+            if result.authenticated:
+                result.replay_state = AuthReplayState(
+                    login_url=replay_state.login_url,
+                    action=replay_state.action,
+                    method=replay_state.method,
+                    payload=payload,
+                    is_json=replay_state.is_json,
+                    headers=dict(replay_state.headers),
+                )
+            return result
+        except Exception as exc:
+            logger.warning("[auth] Login-recipe replay failed for secondary account: %s", exc)
+            return AuthResult(authenticated=False)
+
+    async def _authenticate_browser_replay(
+        self,
+        client: httpx.AsyncClient,
+        replay_state: AuthReplayState,
+        username: str,
+        password: str,
+    ) -> AuthResult:
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning("[auth] Playwright unavailable for browser replay: %s", exc)
+            return AuthResult(authenticated=False)
+
+        username_selector = replay_state.payload.get("username_selector") or "input[type='text']"
+        password_selector = replay_state.payload.get("password_selector") or "input[type='password']"
+        submit_selector = replay_state.payload.get("submit_selector")
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True)
+                context = await browser.new_context()
+                page = await context.new_page()
+                await page.goto(replay_state.action or replay_state.login_url, wait_until="networkidle", timeout=15000)
+                await page.fill(username_selector, username)
+                await page.fill(password_selector, password)
+                if submit_selector:
+                    await page.click(submit_selector)
+                else:
+                    await page.press(password_selector, "Enter")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1000)
+                cookies = await context.cookies()
+                cookies_dict = {c["name"]: c["value"] for c in cookies}
+                storage_state = None
+                try:
+                    storage_state = await context.storage_state()
+                except Exception:
+                    pass
+                bearer_token = None
+                try:
+                    local_storage = await page.evaluate("() => JSON.stringify(localStorage)")
+                    for key, value in json.loads(local_storage or "{}").items():
+                        if any(hint in str(key).lower() for hint in ("token", "jwt", "auth", "session", "id_token", "access_token")):
+                            if isinstance(value, str) and (value.startswith("Bearer ") or len(value.split(".")) == 3 or len(value) > 30):
+                                bearer_token = value.replace("Bearer ", "").strip()
+                                break
+                except Exception:
+                    pass
+                await context.close()
+                await browser.close()
+
+                client.cookies.update(cookies_dict)
+                if bearer_token:
+                    client.headers["Authorization"] = f"Bearer {bearer_token}"
+                result = await self._verify_auth(client)
+                if result.authenticated:
+                    result.strategy = AuthStrategy.browser_spa
+                    result.cookies = cookies_dict
+                    result.bearer_token = bearer_token
+                    result.storage_state = storage_state
+                    result.replay_state = AuthReplayState(
+                        login_url=replay_state.login_url,
+                        action=replay_state.action,
+                        method="BROWSER",
+                        payload=dict(replay_state.payload),
+                        is_json=False,
+                        headers=dict(replay_state.headers),
+                    )
+                return result
+        except Exception as exc:
+            logger.warning("[auth] Browser login replay failed: %s", exc)
+            return AuthResult(authenticated=False)
 
     async def _detect_spa(self, client: httpx.AsyncClient, root_url: str) -> bool:
         try:
@@ -634,6 +800,8 @@ class SmartAuthenticator:
                         except Exception as e:
                             logger.debug("[auth] Failed to navigate to %s: %s", target_login_url, e)
 
+                browser_login_url = page.url
+
                 password_inputs = page.locator("input[type='password']")
                 if await password_inputs.count() == 0:
                     logger.warning("[auth] No password input found in DOM after navigation/clicks/routing")
@@ -701,6 +869,7 @@ class SmartAuthenticator:
                 ]
 
                 clicked = False
+                clicked_selector = None
                 for sel in submit_selectors:
                     try:
                         loc = page.locator(sel)
@@ -711,6 +880,7 @@ class SmartAuthenticator:
                                     logger.info("[auth] Clicking submit button: %s", sel)
                                     await el.click()
                                     clicked = True
+                                    clicked_selector = sel
                                     break
                             if clicked:
                                 break
@@ -784,7 +954,17 @@ class SmartAuthenticator:
                     auth_result.cookies = cookies_dict
                     auth_result.bearer_token = bearer_token
                     auth_result.storage_state = storage_state
-                    auth_result.replay_state = None
+                    auth_result.replay_state = AuthReplayState(
+                        login_url=root_url,
+                        action=browser_login_url,
+                        method="BROWSER",
+                        payload={
+                            "username_selector": username_selector,
+                            "password_selector": password_selector,
+                            "submit_selector": clicked_selector or "",
+                        },
+                        is_json=False,
+                    )
                     logger.info("[auth] Strategy 4 succeeded!")
                     await context.close()
                     await browser.close()

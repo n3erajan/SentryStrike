@@ -90,6 +90,10 @@ class SpaApiCoverage(BaseModel):
     browser_available: bool | None = None
     browser_error: str | None = None
     replayable_json_bodies: int = 0
+    observed_json_body_targets: int = 0
+    observed_form_body_targets: int = 0
+    static_synth_body_targets: int = 0
+    skipped_unresolved_body_targets: int = 0
     workflow_states_visited: int = 0
     browser_forms_discovered: int = 0
     file_inputs_discovered: int = 0

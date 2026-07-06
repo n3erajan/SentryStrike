@@ -50,7 +50,10 @@ class CommandInjectionDetector(BaseDetector):
         # 2. Active verification
         semaphore = asyncio.Semaphore(4)
         verifier = CommandInjectionVerifier(timeout_seconds=10.0)
-        verifier.http_verifier.cookies = session_cookies
+        await verifier.http_verifier.configure_auth(
+            cookies=session_cookies,
+            auth_headers=kwargs.get("auth_headers"),
+        )
         settings = get_settings()
         verifier.blind_timing_threshold = (
             scan_config.get_val("blind_injection_timing_threshold", settings.blind_injection_timing_threshold)

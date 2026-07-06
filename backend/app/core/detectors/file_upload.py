@@ -11,7 +11,7 @@ from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
-from app.utils.scan_http import create_scan_client
+from app.utils.scan_http import build_scan_headers, create_scan_client
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ class FileUploadDetector(BaseDetector):
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
+        auth_headers = kwargs.get("auth_headers")
         settings = get_settings()
 
         candidates: list[UploadCandidate] = []
@@ -110,7 +111,7 @@ class FileUploadDetector(BaseDetector):
         async with create_scan_client(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "SentryStrikeScanner/1.0"},
+            headers=build_scan_headers(auth_headers),
             cookies=session_cookies,
             event_hooks={"response": [make_httpx_response_logger("file_upload", "upload_test")]},
         ) as client:

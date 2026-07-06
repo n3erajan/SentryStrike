@@ -69,6 +69,19 @@ VOLATILE_REQUEST_HEADERS = {
 # from a skipped one.
 _BOUNDED_FAILED = object()
 
+
+def _parses_as_json(body: Any) -> bool:
+    """True when ``body`` decodes to valid JSON (any top-level type)."""
+    if isinstance(body, (bytes, bytearray)):
+        body = bytes(body).decode("utf-8", "ignore")
+    if not isinstance(body, str) or not body.strip():
+        return False
+    try:
+        json.loads(body)
+        return True
+    except Exception:
+        return False
+
 # Injected at context creation so programmatic SPA route changes (pushState /
 # replaceState / hashchange / popstate) are captured into a global array the
 # engine polls. Framework-agnostic (React Router, Vue Router, Angular, Next).
@@ -306,6 +319,7 @@ class BrowserDiscoveryEngine:
 
         loop = asyncio.get_running_loop()
         by_key: dict[tuple[str, str, str], RequestObservation] = {}
+        root_origin_url = root_url
 
         def _register(observation: RequestObservation) -> RequestObservation:
             key = self._observation_key(observation.url, observation.method, observation.post_data)
@@ -354,21 +368,9 @@ class BrowserDiscoveryEngine:
             except Exception:
                 pass
 
-            if auth_cookies:
-                parsed = urlparse(root_url)
-                domain = parsed.netloc.split(":")[0]
-                path = parsed.path or "/"
-                cookies_list = []
-                for name, value in auth_cookies.items():
-                    cookies_list.append(
-                        {
-                            "name": name,
-                            "value": value,
-                            "domain": domain,
-                            "path": path,
-                        }
-                    )
-                await context.add_cookies(cookies_list)
+            auth_cookie_entries = self._auth_cookie_entries(root_url, auth_cookies)
+            if auth_cookie_entries:
+                await context.add_cookies(auth_cookie_entries)
 
             if auth_headers:
                 await context.set_extra_http_headers(auth_headers)
@@ -385,14 +387,14 @@ class BrowserDiscoveryEngine:
                 inflight["count"] = max(0, inflight["count"] - 1)
 
             async def on_request(request):
-                if request.resource_type in {"xhr", "fetch", "websocket"}:
+                if self._should_capture_runtime_request(root_origin_url, request):
                     # Append to state.requests immediately (dedup by observation
                     # key) so partial results are durable before any merge.
                     _register(await self._build_request_observation(request))
 
             async def on_response(response):
                 request = response.request
-                if request.resource_type not in {"xhr", "fetch", "websocket"}:
+                if not self._should_capture_runtime_request(root_origin_url, request):
                     return
                 observation_key = self._observation_key(
                     request.url, request.method, self._safe_post_data(request)
@@ -416,6 +418,8 @@ class BrowserDiscoveryEngine:
                 try:
                     url = ws.url
                 except Exception:
+                    return
+                if not self._same_origin_or_websocket(root_origin_url, url):
                     return
                 _register(
                     RequestObservation(
@@ -503,13 +507,21 @@ class BrowserDiscoveryEngine:
                         first = False
                         await self._settle_inflight(page, inflight)
                         await self._clear_blocking_overlays(page)
-                        # Post-auth liveness re-check (generic): if we seeded an
-                        # authenticated storage_state but the root still renders the
-                        # logged-out shell, the session did not persist into the
-                        # browser context. Surface it (RC-A regression) rather than
-                        # silently crawling an unauthenticated surface.
-                        if was_first and storage_state and not state.browser_error:
-                            if await self._looks_logged_out(page):
+                        # Post-auth liveness re-check (generic). On the first route
+                        # a logged-out shell means the seeded storage_state never
+                        # persisted into the context (RC-A). On *later* routes it
+                        # means interaction dropped the session mid-crawl (P1-3): so
+                        # re-assert liveness after every batch and re-seed the auth
+                        # cookies when we have them, rather than silently crawling
+                        # an unauthenticated surface for the rest of the run.
+                        if (storage_state or auth_cookie_entries) and await self._looks_logged_out(page):
+                            reseeded = await self._reseed_session(context, auth_cookie_entries)
+                            if reseeded:
+                                logger.info(
+                                    "browser session looked logged-out on %s; re-seeded auth cookies",
+                                    target_url,
+                                )
+                            elif was_first and storage_state and not state.browser_error:
                                 state.browser_error = (
                                     "authenticated session did not persist into browser context"
                                 )
@@ -645,6 +657,35 @@ class BrowserDiscoveryEngine:
             return await asyncio.wait_for(coro, timeout=max(0.05, ms / 1000.0))
         except Exception:
             return _BOUNDED_FAILED
+
+    @staticmethod
+    def _auth_cookie_entries(root_url: str, auth_cookies: dict[str, str] | None) -> list[dict[str, str]]:
+        """Playwright cookie dicts for the target origin, or an empty list."""
+        if not auth_cookies:
+            return []
+        parsed = urlparse(root_url)
+        domain = parsed.netloc.split(":")[0]
+        path = parsed.path or "/"
+        return [
+            {"name": name, "value": value, "domain": domain, "path": path}
+            for name, value in auth_cookies.items()
+        ]
+
+    async def _reseed_session(self, context: Any, entries: list[dict[str, str]]) -> bool:
+        """Re-apply auth cookies to a live context (mid-crawl session recovery).
+
+        Returns True when cookies were re-added. Never raises: a failed re-seed
+        must not abort the crawl. Recovers cookie-session apps that dropped their
+        session during interaction; storage_state/bearer apps are handled by the
+        caller (which surfaces a browser_error instead)."""
+        if not entries:
+            return False
+        try:
+            await context.add_cookies(entries)
+            return True
+        except Exception as exc:
+            logger.debug("session re-seed failed: %s", exc)
+            return False
 
     async def _looks_logged_out(self, page: Any) -> bool:
         """Generic post-auth liveness heuristic.
@@ -1524,8 +1565,18 @@ class BrowserDiscoveryEngine:
         if not body:
             return False
         lowered = (content_type or "").lower()
+        # JSON is replayable whenever the observed body actually parses as JSON —
+        # inferring the schema from the captured body rather than requiring a
+        # pre-existing non-empty ``body_schema``. This keeps top-level arrays,
+        # empty objects, and primitive JSON bodies (schema inference yields
+        # nothing for these) from being silently dropped, which was collapsing
+        # ``replayable_json_bodies`` to 0 on real SPA/JSON-API traffic. Bodies
+        # that carry a JSON content-type but fail to parse (truncated/binary)
+        # remain non-replayable.
         if "json" in lowered:
-            return bool(body_schema)
+            if body_schema:
+                return True
+            return _parses_as_json(body)
         if "application/x-www-form-urlencoded" in lowered:
             return bool(body_schema)
         if "multipart/form-data" in lowered:
@@ -1578,6 +1629,46 @@ class BrowserDiscoveryEngine:
     def _origin(self, url: str) -> str:
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}".lower()
+
+    def _same_origin_or_websocket(self, root_url: str, candidate_url: str) -> bool:
+        try:
+            root = urlparse(root_url)
+            candidate = urlparse(candidate_url)
+        except Exception:
+            return False
+        if root.hostname != candidate.hostname:
+            return False
+
+        def default_port(scheme: str) -> int | None:
+            if scheme in {"http", "ws"}:
+                return 80
+            if scheme in {"https", "wss"}:
+                return 443
+            return None
+
+        root_port = root.port or default_port(root.scheme)
+        candidate_port = candidate.port or default_port(candidate.scheme)
+        if root_port != candidate_port:
+            return False
+        return (root.scheme, candidate.scheme) in {
+            ("http", "http"),
+            ("http", "ws"),
+            ("https", "https"),
+            ("https", "wss"),
+        }
+
+    def _should_capture_runtime_request(self, root_url: str, request: Any) -> bool:
+        try:
+            url = request.url
+            method = str(getattr(request, "method", "GET") or "GET").upper()
+            resource_type = str(getattr(request, "resource_type", "") or "")
+        except Exception:
+            return False
+        if not self._same_origin_or_websocket(root_url, url):
+            return False
+        if resource_type in {"xhr", "fetch", "websocket"}:
+            return True
+        return method not in {"GET", "HEAD", "OPTIONS"}
 
     def _normalize_for_seen(self, url: str) -> str:
         parsed = urlparse(url)

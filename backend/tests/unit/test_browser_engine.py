@@ -240,6 +240,54 @@ async def test_crawl_wrapper_returns_populated_state(monkeypatch):
     assert state.requests
 
 
+@pytest.mark.asyncio
+async def test_crawl_into_filters_off_origin_runtime_requests(monkeypatch):
+    class _MixedOriginPage(_FakePage):
+        async def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            self.url = url
+            same_origin = _FakeRequest(
+                "http://spa.test/api/profile",
+                method="POST",
+                resource_type="fetch",
+                post_data='{"name":"Ada"}',
+            )
+            document_post = _FakeRequest(
+                "http://spa.test/profile/update",
+                method="POST",
+                resource_type="document",
+                post_data="displayName=Ada",
+                headers={"content-type": "application/x-www-form-urlencoded"},
+            )
+            off_origin = _FakeRequest(
+                "https://analytics.example/collect",
+                method="POST",
+                resource_type="fetch",
+                post_data='{"event":"page"}',
+            )
+            await self._fire("request", same_origin)
+            await self._fire("response", _FakeResponse(same_origin))
+            await self._fire("requestfinished", same_origin)
+            await self._fire("request", document_post)
+            await self._fire("response", _FakeResponse(document_post))
+            await self._fire("requestfinished", document_post)
+            await self._fire("request", off_origin)
+            await self._fire("response", _FakeResponse(off_origin))
+            await self._fire("requestfinished", off_origin)
+
+    page = _MixedOriginPage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=1)
+    state = CrawlState()
+    await engine.crawl_into(state, "http://spa.test/", routes=[])
+
+    urls = [request.url for request in state.requests]
+    assert "http://spa.test/api/profile" in urls
+    assert "http://spa.test/profile/update" in urls
+    assert "https://analytics.example/collect" not in urls
+
+
 def test_browser_targets_visit_same_origin_routes_only():
     # Seed set is bounded by the route cap (Task B), not the per-page interaction
     # budget, so all same-origin routes are enqueued regardless of max_interactions.
@@ -326,6 +374,70 @@ def test_browser_json_observation_metadata_preserves_body_and_replay_headers():
     assert body_schema == ["email", "profile", "profile.name"]
     assert multipart_fields == []
     assert engine._is_replayable("POST", raw_body, headers["content-type"], body_schema, multipart_fields)
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        "[{\"id\":1},{\"id\":2}]",  # top-level array — schema inference yields entries
+        "[1,2,3]",                    # top-level array of primitives — empty schema
+        "{}",                          # empty object — empty schema
+        "\"just-a-string\"",         # top-level JSON primitive
+    ],
+)
+def test_browser_json_body_replayable_even_when_schema_empty(raw_body):
+    """P0-1: an observed JSON body must be replayable whenever it parses as
+    JSON, not only when schema inference produced a non-empty field list. Empty
+    objects, top-level arrays, and primitive JSON bodies were being dropped,
+    collapsing ``replayable_json_bodies`` to 0 on real SPA traffic."""
+    engine = BrowserDiscoveryEngine()
+    _, body_schema, multipart_fields = engine._request_body_metadata(raw_body, "application/json")
+    assert engine._is_replayable("POST", raw_body, "application/json", body_schema, multipart_fields)
+
+
+def test_browser_json_body_not_replayable_when_unparseable():
+    """A JSON content-type carrying a truncated/binary body stays non-replayable."""
+    engine = BrowserDiscoveryEngine()
+    assert not engine._is_replayable("POST", "{not valid json", "application/json", [], [])
+
+
+def test_auth_cookie_entries_targets_origin():
+    """P1-3: auth cookies are turned into origin-scoped Playwright cookie dicts."""
+    engine = BrowserDiscoveryEngine()
+    entries = engine._auth_cookie_entries("http://target.test:8080/app", {"session": "abc", "csrf": "d"})
+    assert {e["name"] for e in entries} == {"session", "csrf"}
+    assert all(e["domain"] == "target.test" for e in entries)
+    assert all(e["path"] == "/app" for e in entries)
+    # No cookies -> empty list.
+    assert engine._auth_cookie_entries("http://x/", {}) == []
+
+
+@pytest.mark.asyncio
+async def test_reseed_session_readds_cookies_and_is_failsafe():
+    """P1-3: mid-crawl session recovery re-applies auth cookies, never raising."""
+    engine = BrowserDiscoveryEngine()
+
+    class _Ctx:
+        def __init__(self, fail=False):
+            self.added = []
+            self._fail = fail
+
+        async def add_cookies(self, entries):
+            if self._fail:
+                raise RuntimeError("context closed")
+            self.added.extend(entries)
+
+    entries = [{"name": "session", "value": "abc", "domain": "x", "path": "/"}]
+
+    ok_ctx = _Ctx()
+    assert await engine._reseed_session(ok_ctx, entries) is True
+    assert ok_ctx.added == entries
+
+    # No entries -> no-op, returns False.
+    assert await engine._reseed_session(ok_ctx, []) is False
+
+    # A raising context is swallowed (crawl must not abort).
+    assert await engine._reseed_session(_Ctx(fail=True), entries) is False
 
 
 def test_browser_form_observation_metadata_extracts_fields():

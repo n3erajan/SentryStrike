@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     scanner_concurrency: int = Field(default=8, alias="SCANNER_CONCURRENCY")
     sensitive_paths_permutation_cap: int = Field(default=200, alias="SENSITIVE_PATHS_PERMUTATION_CAP")
+    # P1-1: request-budget governor. Per-detector and per-(detector,parameter)
+    # ceilings act as runaway backstops so no single detector/parameter can
+    # dominate scan traffic (0 = unlimited). Defaults are generous — far above a
+    # healthy detector's volume — so normal scans are unaffected and only
+    # pathological fan-out (e.g. the header-stored XSS explosion) is capped.
+    scanner_per_detector_request_cap: int = Field(default=6000, alias="SCANNER_PER_DETECTOR_REQUEST_CAP")
+    scanner_per_parameter_request_cap: int = Field(default=600, alias="SCANNER_PER_PARAMETER_REQUEST_CAP")
 
     # Verification / Scanning Settings
     scan_mode: str = Field(default="verified", alias="SCAN_MODE")  # verified / heuristic / aggressive

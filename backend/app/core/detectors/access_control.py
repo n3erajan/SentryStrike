@@ -433,14 +433,20 @@ class AccessControlDetector(BaseDetector):
                 privileged_verifier,
                 **kwargs,
             )
-            fb_findings, idor_findings, matrix_findings = await asyncio.gather(
+            mass_assignment_task = self._check_mass_assignment(
+                authed_verifier,
+                **kwargs,
+            )
+            fb_findings, idor_findings, matrix_findings, mass_assignment_findings = await asyncio.gather(
                 forced_browsing_task,
                 idor_task,
                 matrix_task,
+                mass_assignment_task,
             )
             findings.extend(fb_findings)
             findings.extend(idor_findings)
             findings.extend(matrix_findings)
+            findings.extend(mass_assignment_findings)
         finally:
             await authed_verifier.close()
             await unauthed_verifier.close()
@@ -450,6 +456,180 @@ class AccessControlDetector(BaseDetector):
                 await second_verifier.close()
 
         return findings
+
+    # ---------------------------------------------------------------------------
+    # Mass Assignment / Privilege Field Injection
+    # ---------------------------------------------------------------------------
+
+    _MASS_ASSIGNMENT_PROBES: tuple[tuple[str, Any], ...] = (
+        ("role", "admin"),
+        ("roles", ["admin"]),
+        ("isAdmin", True),
+        ("admin", True),
+        ("is_admin", True),
+        ("permissions", ["admin"]),
+    )
+
+    async def _check_mass_assignment(
+        self,
+        authed_verifier: HttpVerifier,
+        **kwargs: object,
+    ) -> list[Finding]:
+        findings: list[Finding] = []
+        requests = kwargs.get("requests") if isinstance(kwargs.get("requests"), list) else []
+        candidates = self._build_mass_assignment_requests(requests)
+        if not candidates:
+            return findings
+
+        semaphore = asyncio.Semaphore(self._CONCURRENCY)
+
+        async def _verify(candidate: PreparedAttackRequest) -> list[Finding]:
+            async with semaphore:
+                try:
+                    return await self._verify_mass_assignment_candidate(authed_verifier, candidate)
+                except Exception:
+                    logger.exception("mass-assignment check failed for %s", candidate.url)
+                    return []
+
+        results = await asyncio.gather(*[_verify(candidate) for candidate in candidates])
+        for result in results:
+            findings.extend(result)
+        return findings
+
+    def _build_mass_assignment_requests(self, requests: list[RequestObservation]) -> list[PreparedAttackRequest]:
+        candidates: list[PreparedAttackRequest] = []
+        seen: set[tuple[str, str, str]] = set()
+        for observation in requests:
+            prepared = self._request_from_observation(observation)
+            if prepared is None or not self._is_mass_assignment_candidate(prepared):
+                continue
+            key = (
+                prepared.method.upper(),
+                self._canonical_request_url(prepared.url),
+                self._body_schema_key(prepared.json_body or prepared.data),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(prepared)
+        return candidates[:25]
+
+    def _is_mass_assignment_candidate(self, request: PreparedAttackRequest) -> bool:
+        if not self._is_replayable_matrix_request(request):
+            return False
+        method = request.method.upper()
+        if method not in {"POST", "PUT", "PATCH"}:
+            return False
+        body = request.json_body if request.json_body is not None else request.data
+        if not isinstance(body, dict) or not body:
+            return False
+        path = urlparse(request.url).path.lower()
+        if any(token in path for token in ("login", "logout", "token", "password", "reset")):
+            return False
+        return any(token in path for token in ("user", "account", "profile", "register", "signup")) or any(
+            token in str(key).lower() for key in body for token in ("email", "user", "account", "profile")
+        )
+
+    async def _verify_mass_assignment_candidate(
+        self,
+        verifier: HttpVerifier,
+        request: PreparedAttackRequest,
+    ) -> list[Finding]:
+        baseline = await self._send_prepared_request(
+            verifier, request, test_phase="mass_assignment_baseline"
+        )
+        baseline_profile = self._response_profile(baseline)
+        if not baseline_profile.success or _looks_like_error_page(baseline.body):
+            return []
+
+        body = request.json_body if request.json_body is not None else request.data
+        if not isinstance(body, dict):
+            return []
+
+        for field, value in self._MASS_ASSIGNMENT_PROBES:
+            if field in body:
+                continue
+            mutated_body = dict(body)
+            mutated_body[field] = value
+            mutated = PreparedAttackRequest(
+                url=request.url,
+                method=request.method,
+                params=request.params,
+                data=mutated_body if request.data is not None and request.json_body is None else None,
+                json_body=mutated_body if request.json_body is not None else None,
+                headers=request.headers,
+                cookies=request.cookies,
+            )
+            response = await self._send_prepared_request(
+                verifier,
+                mutated,
+                test_phase="mass_assignment_probe",
+            )
+            if not (200 <= response.status_code < 300) or _looks_like_error_page(response.body):
+                continue
+            response_json = self._parse_json(response.body)
+            confirmed = self._json_contains_assignment(response_json, field, value)
+            response_profile = self._response_profile(response)
+            shape_changed = bool(response_profile.json_shape - baseline_profile.json_shape)
+            if not confirmed and not shape_changed:
+                continue
+            return [
+                Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Mass Assignment / Privilege Field Injection",
+                    severity=SeverityLevel.high if confirmed else SeverityLevel.medium,
+                    url=request.url,
+                    parameter=field,
+                    method=request.method,
+                    payload=json.dumps({field: value}, separators=(",", ":"), default=str),
+                    evidence=(
+                        f"Authenticated request accepted an unexpected privilege-control field '{field}'. "
+                        f"Baseline HTTP {baseline.status_code}; mutated HTTP {response.status_code}. "
+                        f"Field reflected/accepted: {confirmed}."
+                    ),
+                    confidence_score=90.0 if confirmed else 65.0,
+                    detection_method="mass_assignment_privilege_field",
+                    detection_evidence={
+                        "field": field,
+                        "value": value,
+                        "field_confirmed_in_response": confirmed,
+                        "baseline_shape": sorted(baseline_profile.json_shape)[:20],
+                        "mutated_shape": sorted(response_profile.json_shape)[:20],
+                    },
+                    verified=True,
+                    verification_request_snippet=response.request_snippet,
+                    verification_response_snippet=response.response_snippet,
+                    reproducible=True,
+                )
+            ]
+        return []
+
+    def _json_contains_assignment(self, value: Any, field: str, expected: Any) -> bool:
+        expected_norm = self._normalize_assignment_value(expected)
+        field_lower = field.lower()
+
+        def walk(child: Any) -> bool:
+            if isinstance(child, dict):
+                for key, val in child.items():
+                    if str(key).lower() == field_lower and self._normalize_assignment_value(val) == expected_norm:
+                        return True
+                    if walk(val):
+                        return True
+            elif isinstance(child, list):
+                return any(walk(item) for item in child[:10])
+            return False
+
+        return walk(value)
+
+    @staticmethod
+    def _normalize_assignment_value(value: Any) -> Any:
+        if isinstance(value, list):
+            return [AccessControlDetector._normalize_assignment_value(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key).lower(): AccessControlDetector._normalize_assignment_value(val) for key, val in value.items()}
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
 
     # ---------------------------------------------------------------------------
     # Forced Browsing
@@ -803,6 +983,7 @@ class AccessControlDetector(BaseDetector):
 
         concrete_path_targets = self._concrete_path_idor_targets(urls)
         targets.extend(concrete_path_targets)
+        targets.extend(self._api_path_template_idor_targets(api_endpoints if isinstance(api_endpoints, list) else []))
 
         deduped: list[AttackTarget] = []
         seen: set[tuple[str, str, str, str, str]] = set()
@@ -1225,6 +1406,27 @@ class AccessControlDetector(BaseDetector):
                             security_relevance={"access_control"},
                         )
                     )
+        return targets
+
+    def _api_path_template_idor_targets(self, endpoints: list[ApiEndpoint]) -> list[AttackTarget]:
+        targets: list[AttackTarget] = []
+        for endpoint in endpoints:
+            for parameter in self._parameters_from_endpoint(endpoint):
+                if parameter.location != ParameterLocation.path:
+                    continue
+                if not self._is_idor_param(parameter.name):
+                    continue
+                targets.append(
+                    AttackTarget(
+                        url=endpoint.url,
+                        parameter=parameter.name,
+                        method=endpoint.method.upper(),
+                        value=parameter.baseline_value or "1",
+                        location=ParameterLocation.path,
+                        source="api_path_template",
+                        security_relevance={"access_control"},
+                    )
+                )
         return targets
 
     def _baseline_values_for_target(

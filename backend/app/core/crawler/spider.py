@@ -81,6 +81,10 @@ class CrawlResult:
     auth_headers: dict[str, str] = field(default_factory=dict)
     auth_verification_evidence: str = ""
     auth_storage_state: dict | None = None
+    # The concrete login recipe (endpoint/method/payload) that authenticated the
+    # main account. Reused to log in second/admin accounts via the *same* winning
+    # path instead of re-running the whole strategy cascade from scratch.
+    auth_replay_state: AuthReplayState | None = None
     browser_available: bool | None = None
     browser_error: str | None = None
     workflow_states_visited: int = 0
@@ -424,6 +428,8 @@ class WebSpider:
                     _seen_for_p4.add(_norm)
                     discovered_urls.append(_route.url)
 
+        forms = self._merge_browser_forms(root_url, forms, crawl_state.browser_forms)
+
         for endpoint in crawl_state.api_endpoints:
             for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
                 crawl_state.add_parameter(parameter)
@@ -448,6 +454,7 @@ class WebSpider:
             auth_headers=dict(self._auth_headers),
             auth_verification_evidence=self._auth_verification_evidence,
             auth_storage_state=self._auth_storage_state,
+            auth_replay_state=self._auth_replay_state,
             browser_available=crawl_state.browser_available,
             browser_error=crawl_state.browser_error,
             workflow_states_visited=crawl_state.workflow_states_visited,
@@ -458,6 +465,57 @@ class WebSpider:
         )
         self._log_crawl_inventory(root_url, result)
         return result
+
+    @staticmethod
+    def _merge_browser_forms(
+        root_url: str,
+        forms: list[HtmlForm],
+        browser_forms: list[dict],
+    ) -> list[HtmlForm]:
+        merged = list(forms)
+        seen = {
+            (
+                form.action,
+                form.method.upper(),
+                tuple(sorted(inp.name for inp in form.inputs if inp.name)),
+            )
+            for form in merged
+        }
+        for form in browser_forms or []:
+            action = str(form.get("action") or form.get("page_url") or "")
+            page_url = str(form.get("page_url") or action or root_url)
+            if not action:
+                action = page_url
+            if not same_domain(root_url, action):
+                continue
+            inputs: list[FormInput] = []
+            for raw_input in form.get("inputs") or []:
+                if not isinstance(raw_input, dict):
+                    continue
+                input_type = str(raw_input.get("type") or "text").lower()
+                name = str(raw_input.get("name") or "").strip()
+                if not name and input_type == "file":
+                    name = "file"
+                if not name:
+                    continue
+                inputs.append(FormInput(name=name, input_type=input_type, value=str(raw_input.get("value") or "")))
+            key = (
+                action,
+                str(form.get("method") or "GET").upper(),
+                tuple(sorted(inp.name for inp in inputs if inp.name)),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(
+                HtmlForm(
+                    page_url=page_url,
+                    action=action,
+                    method=str(form.get("method") or "GET").upper(),
+                    inputs=inputs,
+                )
+            )
+        return merged
 
     async def fetch_single(self, target_url: str) -> CrawlResult:
         """Fetch one URL only - no link discovery, sitemaps, or path brute-force."""

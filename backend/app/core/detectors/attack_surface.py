@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
-from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
 
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import (
@@ -167,6 +167,8 @@ class AttackSurface:
 
         for candidate in candidates:
             if cls._is_transport_layer_url(candidate.url):
+                continue
+            if cls._has_unresolved_path_placeholder(candidate.url):
                 continue
             template = None
             form_inputs = candidate.context.get("form_inputs")
@@ -363,6 +365,8 @@ class AttackSurface:
         for endpoint in api_endpoints:
             if (endpoint.url, endpoint.method.upper()) in observed_body_keys:
                 continue
+            if cls._has_unresolved_path_placeholder(endpoint.url):
+                continue
             # Task C (RC-C): only synthesize bodies for genuine API/JSON/form
             # endpoints. SPA HTML navigation routes (e.g. a POST /login route
             # returning the 200 HTML shell) exercise no vulnerable code, so
@@ -445,6 +449,87 @@ class AttackSurface:
                 emitted += 1
                 if emitted >= cls._SYNTH_LEAF_CAP:
                     break
+
+    @classmethod
+    def body_target_telemetry(
+        cls,
+        *,
+        api_endpoints: list[ApiEndpoint] | None = None,
+        requests: list[RequestObservation] | None = None,
+    ) -> dict[str, int]:
+        targets = cls.build(
+            [],
+            [],
+            api_endpoints=api_endpoints or [],
+            requests=requests or [],
+        )
+        return {
+            "observed_json_body_targets": sum(
+                1
+                for target in targets
+                if target.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}
+                and target.source_confidence != "static_synth"
+            ),
+            "observed_form_body_targets": sum(
+                1
+                for target in targets
+                if target.location == ParameterLocation.form
+                and target.source_confidence != "static_synth"
+            ),
+            "static_synth_body_targets": sum(
+                1 for target in targets if target.source_confidence == "static_synth"
+            ),
+            "skipped_unresolved_body_targets": cls._count_unresolved_static_body_targets(
+                api_endpoints or [],
+                requests or [],
+            ),
+        }
+
+    @classmethod
+    def _count_unresolved_static_body_targets(
+        cls,
+        api_endpoints: list[ApiEndpoint],
+        requests: list[RequestObservation],
+    ) -> int:
+        observed_body_keys = {
+            (request.url, request.method.upper())
+            for request in requests
+            if request.post_data
+        }
+        count = 0
+        for endpoint in api_endpoints:
+            if (endpoint.url, endpoint.method.upper()) in observed_body_keys:
+                continue
+            if not cls._has_unresolved_path_placeholder(endpoint.url):
+                continue
+            if not ApiExtractor.is_api_endpoint(endpoint):
+                continue
+            _content_type, template = ApiExtractor.synthesize_body_schema(
+                endpoint,
+                allow_generic_body=True,
+            )
+            if template:
+                count += 1
+        return count
+
+    @staticmethod
+    def _has_unresolved_path_placeholder(url: str) -> bool:
+        try:
+            path = unquote(urlparse(url).path or "")
+        except Exception:
+            return False
+        for segment in path.split("/"):
+            if not segment:
+                continue
+            if segment.startswith("{") and segment.endswith("}"):
+                return True
+            if segment.startswith("[") and segment.endswith("]"):
+                return True
+            if segment.startswith("<") and segment.endswith(">"):
+                return True
+            if segment.startswith(":") and len(segment) > 1:
+                return True
+        return False
 
     @staticmethod
     def _endpoint_templates(endpoints: list[ApiEndpoint]) -> dict[tuple[str, str], tuple[Any, dict[str, str]]]:
