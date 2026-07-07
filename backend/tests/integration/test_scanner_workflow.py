@@ -33,6 +33,11 @@ class FakeSpider:
         class Result:
             urls = ["https://example.com/search?q=1"]
             forms = []
+            routes = []
+            api_endpoints = []
+            requests = []
+            request_audit = []
+            parameters = []
 
         return Result()
 
@@ -40,6 +45,11 @@ class FakeSpider:
         class Result:
             urls = ["https://example.com/search?q=1"]
             forms = []
+            routes = []
+            api_endpoints = []
+            requests = []
+            request_audit = []
+            parameters = []
 
         return Result()
 
@@ -125,7 +135,17 @@ class FakeScan:
         self.overall_risk_score = 0.0
         self.technology_stack = []
         self.vulnerabilities = []
-        self.report_metadata = SimpleNamespace(generated_at=None, generated_by="ai", summary=None)
+        self.report_metadata = SimpleNamespace(
+            generated_at=None,
+            generated_by="ai",
+            summary=None,
+            detector_coverage=[],
+            attack_chains=[],
+            evidence_strength_breakdown=None,
+            spa_api_coverage=None,
+            auth_coverage=None,
+            coverage_warnings=[]
+        )
         self.error_message = None
 
     async def save(self) -> None:
