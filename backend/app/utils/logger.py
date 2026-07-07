@@ -28,6 +28,10 @@ def configure_logging() -> None:
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
 
+    # Browser-engine debug logs are valuable for diagnosing Playwright/crawl
+    # issues without raising the global log level to DEBUG.
+    logging.getLogger("app.core.crawler.browser_engine").setLevel(logging.DEBUG)
+
     # httpx logs bare URLs without scan context; sentry.http provides detail.
     for noisy_logger in ("httpx", "httpcore"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)

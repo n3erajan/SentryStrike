@@ -77,21 +77,58 @@ class AttackPlanner:
             reverse=True,
         )
 
-    def coverage_summary(self, detector_name: str, tested_count: int = 0) -> dict[str, object]:
+    def coverage_summary(
+        self,
+        detector_name: str,
+        attempted_count: int = 0,
+        denied_count: int = 0,
+    ) -> dict[str, object]:
+        """Summarise coverage from *real* attempted/denied counts, not finding count.
+
+        ``attempted_count`` is the number of requests the detector actually issued
+        (governor-admitted); ``denied_count`` is the number the governor refused at
+        the budget ceiling. A body target counts as skipped only when it was not
+        reached, and ``budget_exhausted`` is attributed strictly up to the real
+        ``denied_count`` — never inferred from a shortfall in findings. A detector
+        that ran fully and found nothing therefore reports ``budget_exhausted == 0``.
+        """
+        attempted = max(0, int(attempted_count))
+        denied = max(0, int(denied_count))
         planned = self.planned_for(detector_name)
         replayable = [item for item in planned if item.target.replayable]
         synth = [item for item in planned if item.target.source_confidence == "static_synth"]
         body_targets = [item for item in planned if item.target.location in BODY_LOCATIONS]
-        skipped = max(0, len(body_targets) - tested_count)
+        tested_body = min(attempted, len(body_targets))
+        skipped = max(0, len(body_targets) - tested_body)
         risk_counts: dict[str, int] = {}
-        for item in sorted(body_targets, key=lambda entry: entry.score, reverse=True)[tested_count:]:
+        skipped_items = sorted(body_targets, key=lambda entry: entry.score, reverse=True)[tested_body:]
+        skip_buckets: dict[str, int] = {}
+        budget_remaining = denied
+        for item in skipped_items:
             risk_counts[item.risk] = risk_counts.get(item.risk, 0) + 1
+            target = item.target
+            if target.source_confidence == "static_synth" and not target.replayable:
+                reason = "static_synth_not_validated"
+            elif not target.replayable:
+                reason = "non_replayable"
+            elif budget_remaining > 0:
+                # A genuinely testable target the governor refused at the ceiling.
+                reason = "budget_exhausted"
+                budget_remaining -= 1
+            else:
+                # Testable but never attempted for reasons other than the budget
+                # ceiling (e.g. the detector matched no candidate of this kind).
+                reason = "no_candidates_matched"
+            skip_buckets[reason] = skip_buckets.get(reason, 0) + 1
         return {
             "targets_seen": len(planned),
+            "targets_attempted": attempted,
+            "requests_denied_by_governor": denied,
             "replayable_targets_seen": len(replayable),
-            "replayable_targets_tested": min(tested_count, len(replayable)),
-            "validated_synth_targets_tested": min(tested_count, len(synth)),
+            "replayable_targets_tested": min(attempted, len(replayable)),
+            "validated_synth_targets_tested": min(attempted, len(synth)),
             "body_targets_skipped": skipped,
+            "body_targets_skipped_by_reason": skip_buckets,
             "skip_reason_by_risk": risk_counts,
         }
 

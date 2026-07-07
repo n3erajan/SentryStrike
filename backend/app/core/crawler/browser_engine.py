@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 from app.config import get_settings
 from app.core.crawler.api_extractor import ApiExtractor
@@ -26,6 +26,24 @@ COOKIE_BANNER_LABEL_RE = re.compile(r"\b(accept|agree|allow|ok|got it|continue|c
 SAFE_SUBMIT_LABEL_RE = re.compile(
     r"\b(login|log in|sign in|register|sign up|submit|send|save|search|reset|upload|continue|next)\b",
     re.I,
+)
+# Confirm/repeat fields (password-confirm, retype-email, …). A generic
+# equality-validator satisfier: a field whose name matches this echoes the value
+# just filled into the primary same-type field so "must match" validators pass,
+# regardless of the app-specific field name. No target-specific tokens.
+CONFIRM_FIELD_RE = re.compile(
+    r"(confirm|repeat|verify|retype|re-?enter|re-?type|again|match|_2\b|2$)",
+    re.I,
+)
+# Ask the browser to submit a form element (honours HTML5 validity). Returns
+# true only when a form was actually submitted, so the caller can tell whether
+# this fallback fired anything.
+REQUEST_SUBMIT_JS = (
+    "(sel) => { const f = document.querySelector(sel); if (!f) return false; "
+    "const form = f.tagName === 'FORM' ? f : f.querySelector('form'); "
+    "if (!form) return false; "
+    "if (form.requestSubmit) { form.requestSubmit(); } else { form.submit(); } "
+    "return true; }"
 )
 INTERACTIVE_SELECTOR = (
     "a[href], button, [role=button], input[type=submit], input[type=button], "
@@ -64,6 +82,8 @@ VOLATILE_REQUEST_HEADERS = {
     "upgrade-insecure-requests",
 }
 MAX_CAPTURED_BODY_CHARS = 64_000
+TRANSPORT_NOISE_PATHS = ("/socket.io", "/engine.io", "/sockjs", "/signalr")
+ROOT_API_PATH_RE = re.compile(r"^/(?:api|rest|graphql|gql|v[0-9]+|rpc|trpc|oauth|session)(?:/|$)", re.I)
 
 # Sentinel returned by _bounded when an operation times out or errors, so a
 # successful call returning None (e.g. Playwright click) is distinguishable
@@ -178,15 +198,27 @@ FORM_CAPTURE_SCRIPT = """
       let fileInputs = 0;
       let fieldIndex = 0;
       fieldEls.forEach((el) => {
+        if (!isVisible(el)) return;
         const type = fieldType(el);
         if (type === 'file') fileInputs++;
         const fieldId = cid + ':' + fieldIndex;
         try { el.setAttribute('data-sentry-field', fieldId); } catch (e) {}
-        inputs.push({ name: fieldName(el), type: type, field_id: fieldId });
+        // Never emit an empty name. When the framework name cascade fails (common
+        // pre-hydration on SPAs), fall back to the stable positional field_id so
+        // the field remains addressable for fill + body synthesis.
+        const resolvedName = fieldName(el) || ('field_' + fieldId.replace(':', '_'));
+        inputs.push({ name: resolvedName, type: type, field_id: fieldId, named: !!fieldName(el) });
         fieldIndex++;
       });
       if (!inputs.length) return;
+      const actionable = [...root.querySelectorAll(SUBMIT)].filter(isVisible).length;
+      const fillable = inputs.filter((i) => !['hidden','submit','button','image','reset'].includes(i.type)).length;
+      if (!fillable) return;
+      if (!hasForm && actionable < 1) return;
       try { root.setAttribute('data-sentry-cluster', String(cid)); } catch (e) {}
+      const namedFillable = inputs.filter(
+        (i) => i.named && !['hidden','submit','button','image','reset'].includes(i.type)
+      ).length;
       clusters.push({
         cluster_id: cid,
         action: action || location.href,
@@ -194,6 +226,12 @@ FORM_CAPTURE_SCRIPT = """
         inputs: inputs,
         has_form: !!hasForm,
         file_inputs: fileInputs,
+        action_controls: actionable,
+        // Hydration signal: true when every fillable field resolved a real
+        // framework name (not just a positional fallback). A cluster with
+        // zero named fillable fields is a candidate for a post-settle recapture.
+        all_named: namedFillable > 0 && namedFillable === fillable,
+        named_fillable: namedFillable,
       });
       cid++;
     };
@@ -219,11 +257,12 @@ FORM_CAPTURE_SCRIPT = """
         if (node.parentElement.querySelector(SUBMIT)) { return node.parentElement; }
         node = node.parentElement;
       }
-      return node;
+      return null;
     };
     const seenRoots = [];
     orphans.forEach((el) => {
       const root = rootOf(el);
+      if (!root) return;
       if (seenRoots.indexOf(root) !== -1) return;
       seenRoots.push(root);
       const fields = [...root.querySelectorAll('input,textarea,select')]
@@ -232,6 +271,48 @@ FORM_CAPTURE_SCRIPT = """
     });
   } catch (e) {}
   return clusters;
+}
+"""
+
+
+# Given a cluster_id, report whether its submit control is enabled (or the form
+# is natively valid) and, if not, enumerate the still-invalid required controls
+# so the filler can target them. DOM-anchored on ``data-sentry-cluster`` /
+# ``data-sentry-field`` so it survives framework re-renders.
+_CLUSTER_VALIDITY_SCRIPT = """
+(cid) => {
+  const out = { submittable: false, invalid_fields: [] };
+  try {
+    const root = document.querySelector("[data-sentry-cluster='" + cid + "']");
+    if (!root) return out;
+    const SUBMIT = 'button[type=submit],input[type=submit],button:not([type]),button,[role=button]';
+    const controls = [...root.querySelectorAll(SUBMIT)];
+    const anyEnabled = controls.some((c) => !c.disabled);
+    let formValid = true;
+    const form = root.tagName === 'FORM' ? root : root.closest('form');
+    if (form && typeof form.checkValidity === 'function') {
+      try { formValid = form.checkValidity(); } catch (e) { formValid = true; }
+    }
+    // Submittable when a control is enabled AND (no form or the form is valid).
+    out.submittable = anyEnabled && formValid;
+    if (out.submittable) return out;
+    const fields = [...root.querySelectorAll('input,textarea,select')];
+    fields.forEach((el) => {
+      const type = (el.getAttribute('type') || el.tagName.toLowerCase() || 'text').toLowerCase();
+      if (['hidden','submit','button','image','reset'].includes(type)) return;
+      let invalid = false;
+      try { invalid = typeof el.checkValidity === 'function' ? !el.checkValidity() : false; } catch (e) { invalid = false; }
+      const empty = !(el.value && String(el.value).length);
+      if (invalid || (el.required && empty)) {
+        out.invalid_fields.push({
+          name: el.getAttribute('name') || el.getAttribute('id') || el.getAttribute('formcontrolname') || '',
+          type: type,
+          field_id: el.getAttribute('data-sentry-field') || '',
+        });
+      }
+    });
+  } catch (e) {}
+  return out;
 }
 """
 
@@ -261,11 +342,24 @@ class BrowserDiscoveryEngine:
 
         try:
             async with async_playwright() as pw:
-                browser = await pw.chromium.launch(headless=True)
+                browser = await BrowserDiscoveryEngine._launch_chromium(pw.chromium)
                 await browser.close()
         except Exception as exc:
             return False, f"Playwright browser launch failed: {exc}"
         return True, None
+
+    @staticmethod
+    async def _launch_chromium(chromium: Any) -> Any:
+        try:
+            return await chromium.launch(headless=True)
+        except Exception as first_exc:
+            executable_path = getattr(chromium, "executable_path", None)
+            if executable_path:
+                try:
+                    return await chromium.launch(headless=True, executable_path=executable_path)
+                except Exception:
+                    pass
+            raise first_exc
 
     async def _create_seeded_context(
         self,
@@ -337,7 +431,10 @@ class BrowserDiscoveryEngine:
             if existing is not None:
                 return existing
             by_key[key] = observation
-            wstate.requests.append(observation)
+            if observation.drop_reason is None:
+                wstate.requests.append(observation)
+            wstate.request_audit.append(observation)
+            self._record_request_audit_reason(wstate, observation)
             return observation
 
         def _inc_inflight(_request):
@@ -352,15 +449,21 @@ class BrowserDiscoveryEngine:
             task.add_done_callback(pending_observers.discard)
 
         async def on_request(request):
-            if self._should_capture_runtime_request(root_origin_url, request):
-                try:
-                    _register(await self._build_request_observation(request))
-                except Exception as exc:
-                    logger.debug("request observation capture failed for %s: %s", getattr(request, "url", ""), exc)
+            try:
+                decision = self._classify_runtime_request(root_origin_url, request)
+                if decision == "off_origin":
+                    return
+                observation = await self._build_request_observation(
+                    request,
+                    drop_reason=None if decision == "capture" else decision,
+                )
+                _register(observation)
+            except Exception as exc:
+                logger.debug("request observation capture failed for %s: %s", getattr(request, "url", ""), exc)
 
         async def on_response(response):
             request = response.request
-            if not self._should_capture_runtime_request(root_origin_url, request):
+            if self._classify_runtime_request(root_origin_url, request) == "off_origin":
                 return
             observation_key = self._observation_key(
                 request.url, request.method, self._safe_post_data(request)
@@ -368,7 +471,13 @@ class BrowserDiscoveryEngine:
             observed = by_key.get(observation_key)
             try:
                 if observed is None:
-                    observed = _register(await self._build_request_observation(request))
+                    decision = self._classify_runtime_request(root_origin_url, request)
+                    observed = _register(
+                        await self._build_request_observation(
+                            request,
+                            drop_reason=None if decision == "capture" else decision,
+                        )
+                    )
             except Exception as exc:
                 logger.debug("response observation capture failed for %s: %s", getattr(request, "url", ""), exc)
                 return
@@ -458,6 +567,28 @@ class BrowserDiscoveryEngine:
                 continue
             seen_observations.add(key)
             target.requests.append(observation)
+        seen_audit = {
+            (
+                observation.method.upper(),
+                observation.url,
+                str(observation.post_data or ""),
+                observation.drop_reason or "",
+            )
+            for observation in target.request_audit
+        }
+        for observation in source.request_audit:
+            key = (
+                observation.method.upper(),
+                observation.url,
+                str(observation.post_data or ""),
+                observation.drop_reason or "",
+            )
+            if key in seen_audit:
+                continue
+            seen_audit.add(key)
+            target.request_audit.append(observation)
+        for reason, count in source.request_audit_summary.items():
+            target.request_audit_summary[reason] = target.request_audit_summary.get(reason, 0) + count
 
     async def crawl(
         self,
@@ -519,7 +650,7 @@ class BrowserDiscoveryEngine:
 
         async with async_playwright() as pw:
             try:
-                browser = await pw.chromium.launch(headless=True)
+                browser = await self._launch_chromium(pw.chromium)
             except Exception as exc:
                 logger.warning("Playwright browser launch failed; skipping browser discovery: %s", exc)
                 state.browser_available = False
@@ -694,24 +825,24 @@ class BrowserDiscoveryEngine:
                                     evidence="browser_navigation",
                                 )
                             )
-                            if allow_interaction:
-                                # RC2: bound blind clicking to this route's budget
-                                # share so no single page starves route coverage.
-                                interaction_budget = float(
-                                    getattr(self.settings, "crawl_browser_per_route_seconds", 6.0)
-                                )
-                                if effective_deadline is not None:
-                                    interaction_budget = min(
-                                        interaction_budget,
-                                        max(0.0, effective_deadline - loop.time()),
-                                    )
-                                workflow_stats = await self._exercise_page(
-                                    page, max_seconds=interaction_budget
-                                )
-                                wstate.workflow_states_visited += workflow_stats.get("states", 0)
+                            # Form capture + active submission is the highest-yield
+                            # body-producing work, so it runs BEFORE blind
+                            # interaction — otherwise ``_exercise_page`` consumes the
+                            # per-route budget first and the submit path (which fires
+                            # the app's real POST/PUT/PATCH XHR that on_request
+                            # captures as a replayable body) is starved on truncation.
                             # Count forms/file inputs from structural clusters (RC-1):
                             # runs on every route, not gated on literal <form>s.
                             captured_forms = await self._capture_forms(page, target_url)
+                            # Hydration-aware recapture: if any cluster's fields
+                            # resolved no real framework name (pre-hydration SPA
+                            # capture), let the framework settle and capture once
+                            # more so late-bound names (formcontrolname etc.) land.
+                            if self._forms_need_hydration_recapture(captured_forms):
+                                await self._settle_inflight(page, inflight, cap_ms=1200.0)
+                                recaptured = await self._capture_forms(page, target_url)
+                                if recaptured:
+                                    captured_forms = recaptured
                             wstate.browser_forms_discovered += len(captured_forms)
                             wstate.file_inputs_discovered += sum(
                                 int(form.get("file_inputs", 0)) for form in captured_forms
@@ -736,6 +867,26 @@ class BrowserDiscoveryEngine:
                                 inflight=inflight,
                             )
                             await self._drain_observer_tasks(pending_observers)
+                            # Blind interaction runs last, on whatever budget the
+                            # high-yield submit path left, so it can never starve
+                            # form submission or route coverage.
+                            if allow_interaction:
+                                # RC2: bound blind clicking to this route's budget
+                                # share so no single page starves route coverage.
+                                interaction_budget = float(
+                                    getattr(self.settings, "crawl_browser_per_route_seconds", 6.0)
+                                )
+                                if effective_deadline is not None:
+                                    interaction_budget = min(
+                                        interaction_budget,
+                                        max(0.0, effective_deadline - loop.time()),
+                                    )
+                                if interaction_budget > 0.0:
+                                    workflow_stats = await self._exercise_page(
+                                        page, max_seconds=interaction_budget
+                                    )
+                                    wstate.workflow_states_visited += workflow_stats.get("states", 0)
+                                await self._drain_observer_tasks(pending_observers)
                             # Enqueue newly-discovered same-origin routes (scored),
                             # then wake any idle workers to pick them up.
                             discovered = await self._discover_routes(page, root_url)
@@ -832,6 +983,9 @@ class BrowserDiscoveryEngine:
                 parameter.source = "browser_request"
                 parameter.context["replayable"] = observation.replayable
                 parameter.context["cookies"] = dict(observation.request_cookies)
+                parameter.context["body_schema"] = list(observation.body_schema)
+                if observation.non_replayable_reason:
+                    parameter.context["non_replayable_reason"] = observation.non_replayable_reason
                 state.add_parameter(parameter)
 
     @staticmethod
@@ -997,26 +1151,50 @@ class BrowserDiscoveryEngine:
             if not isinstance(entry, dict):
                 continue
             inputs = entry.get("inputs") if isinstance(entry.get("inputs"), list) else []
+            normalized_inputs = [
+                {
+                    "name": str(i.get("name", "")),
+                    "type": str(i.get("type", "text")),
+                    "field_id": str(i.get("field_id", "")),
+                    # True when a real framework name resolved (not a positional
+                    # field_id fallback). Drives hydration-aware recapture.
+                    "named": bool(i.get("named", True)),
+                }
+                for i in inputs
+                if isinstance(i, dict)
+            ]
+            fillable_inputs = [
+                item for item in normalized_inputs
+                if item["type"].lower() not in {"hidden", "submit", "button", "image", "reset"}
+            ]
+            has_form = bool(entry.get("has_form", True))
+            action_controls = int(entry.get("action_controls", 1) or 0)
+            if not fillable_inputs:
+                continue
+            if not has_form and action_controls < 1:
+                continue
             forms.append(
                 {
                     "action": urljoin(page_url, str(entry.get("action") or page_url)),
                     "method": str(entry.get("method") or "GET").upper(),
-                    "inputs": [
-                        {
-                            "name": str(i.get("name", "")),
-                            "type": str(i.get("type", "text")),
-                            "field_id": str(i.get("field_id", "")),
-                        }
-                        for i in inputs
-                        if isinstance(i, dict)
-                    ],
+                    "inputs": normalized_inputs,
                     "cluster_id": entry.get("cluster_id"),
-                    "has_form": bool(entry.get("has_form", True)),
+                    "has_form": has_form,
                     "file_inputs": int(entry.get("file_inputs", 0) or 0),
                     "page_url": page_url,
+                    "all_named": bool(entry.get("all_named", True)),
                 }
             )
         return forms
+
+    def _forms_need_hydration_recapture(self, forms: list[dict[str, Any]]) -> bool:
+        """True when at least one captured cluster has no real framework names.
+
+        Pre-hydration SPA captures yield fields whose name cascade fell through to
+        the positional field_id fallback (``all_named`` False). Re-running capture
+        after the framework settles usually resolves the real names.
+        """
+        return any(not bool(form.get("all_named", True)) for form in forms or [])
 
     def _effective_deadline(self, deadline: float | None, loop: Any, route_count: int) -> float | None:
         """Scale the browser budget to the number of routes to visit (Task B).
@@ -1133,21 +1311,101 @@ class BrowserDiscoveryEngine:
                         [i.get("name") for i in inputs],
                     )
                     continue
-                await self._submit_form(page, target)
-                # The submit XHR body is captured by ``on_request`` the instant
-                # the request *fires*, not when it completes, so a short cap is
-                # enough to let it leave the page; the full 2.5s cap mostly idles
-                # on persistent sockets that never reach networkidle.
-                await self._settle_inflight(page, inflight_counter, cap_ms=1200.0)
-                submitted += 1
-                logger.debug(
-                    "form submitted on %s: action=%s method=%s fields=%s",
-                    route_url, target.get("action", ""), target.get("method", "GET"),
-                    [i.get("name") for i in inputs],
-                )
+                # Fill-to-valid: a reactive form keeps its submit control disabled
+                # until every required field is valid. If the first pass left it
+                # invalid, re-fill the still-invalid required fields (fields that
+                # mounted late or needed a matching/typed value) so the submit
+                # actually enables and the app fires its real mutating XHR.
+                await self._fill_to_valid(page, target)
+                # Reactive frameworks enable the submit control a microtask after
+                # the final field's input event; give it a brief moment so the
+                # enabled-control click actually fires instead of racing the
+                # disabled→enabled transition.
+                await self._await_submit_enabled(page, target)
+                fired = await self._submit_and_detect_fire(page, target, inflight_counter)
+                if fired:
+                    submitted += 1
+                    logger.debug(
+                        "form submitted on %s: action=%s method=%s fields=%s",
+                        route_url, target.get("action", ""), target.get("method", "GET"),
+                        [i.get("name") for i in inputs],
+                    )
+                else:
+                    logger.debug(
+                        "form submit fired no mutating request on %s: fields=%s",
+                        route_url, [i.get("name") for i in inputs],
+                    )
             except Exception as exc:
                 logger.debug("form submission failed on %s: %s", route_url, exc)
         return submitted
+
+    async def _submit_and_detect_fire(
+        self, page: Any, form: dict[str, Any], inflight_counter: dict[str, int]
+    ) -> bool:
+        """Submit ``form`` and return True only when a MUTATING request (non
+        GET/HEAD/OPTIONS) actually fires during the submit+settle window.
+
+        ``browser_forms_submitted`` must count submissions that produced a real
+        request, not attempts: a disabled/invalid reactive form can be "clicked"
+        or ``requestSubmit``-ed yet fire nothing (validation blocks it), and
+        counting those made the metric claim coverage that never happened. A
+        transient request listener records whether the app actually sent a
+        body-bearing request, which is exactly what makes an observation
+        replayable downstream."""
+        saw = {"fired": False}
+
+        def _watch(request: Any) -> None:
+            try:
+                method = str(getattr(request, "method", "GET")).upper()
+            except Exception:
+                return
+            if method not in ("GET", "HEAD", "OPTIONS"):
+                saw["fired"] = True
+
+        attached = False
+        if hasattr(page, "on"):
+            try:
+                page.on("request", _watch)
+                attached = True
+            except Exception:
+                attached = False
+        try:
+            await self._submit_form(page, form)
+            # The submit XHR body is captured by ``on_request`` the instant the
+            # request *fires*, not when it completes, so a short cap is enough to
+            # let it leave the page; the full 2.5s cap mostly idles on persistent
+            # sockets that never reach networkidle.
+            await self._settle_inflight(page, inflight_counter, cap_ms=1200.0)
+        finally:
+            if attached and hasattr(page, "remove_listener"):
+                try:
+                    page.remove_listener("request", _watch)
+                except Exception:
+                    pass
+        return saw["fired"]
+
+    async def _await_submit_enabled(
+        self, page: Any, form: dict[str, Any], attempts: int = 3, delay: float = 0.12
+    ) -> None:
+        """Briefly poll for the cluster's submit control to become enabled.
+
+        Returns as soon as an enabled submit-like control is found (usually the
+        first probe) or after ``attempts`` short waits — bounded to well under
+        half a second so it never dominates the per-form budget."""
+        cluster_id = form.get("cluster_id")
+        scope = f"[data-sentry-cluster='{cluster_id}'] " if cluster_id is not None else ""
+        selector = (
+            f"{scope}button[type=submit], {scope}input[type=submit], {scope}button"
+        )
+        for attempt in range(attempts):
+            loc = page.locator(selector)
+            count = await self._bounded(loc.count(), 300)
+            if isinstance(count, int) and count > 0:
+                enabled = await self._bounded(loc.first.is_enabled(timeout=150), 300)
+                if enabled is True:
+                    return
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
 
     async def _reacquire_cluster(
         self,
@@ -1174,6 +1432,22 @@ class BrowserDiscoveryEngine:
         from app.core.crawler.models import CrawlState
 
         key = CrawlState._form_key(form)
+        cluster_id = form.get("cluster_id")
+
+        def _match(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+            # Prefer the DOM-anchored cluster_id (stable across framework re-tags
+            # and late-bound names); fall back to the structural name-derived key
+            # only when cluster_id is unavailable/unmatched. This keeps re-capture
+            # matching even when framework field names arrive after capture.
+            if cluster_id is not None:
+                for candidate in candidates:
+                    if candidate.get("cluster_id") == cluster_id:
+                        return candidate
+            for candidate in candidates:
+                if CrawlState._form_key(candidate) == key:
+                    return candidate
+            return None
+
         navigated = self._current_url(page, route_url) != route_url
         if not navigated:
             # Hot path: the page never left the route since capture, so this
@@ -1184,10 +1458,8 @@ class BrowserDiscoveryEngine:
             # in an XHR-driven SPA most submits fire without leaving the route, so
             # paying that cost per form is what exhausted the crawl budget.
             fresh = await self._capture_forms(page, route_url)
-            for candidate in fresh:
-                if CrawlState._form_key(candidate) == key:
-                    return candidate
-            return form
+            matched = _match(fresh)
+            return matched if matched is not None else form
         # A prior submit left the route: navigate back and re-capture against the
         # freshly-mounted DOM, which needs a beat to settle before the cluster
         # exists — otherwise the stale anchors resolve to nothing. Only this
@@ -1197,9 +1469,9 @@ class BrowserDiscoveryEngine:
         await self._clear_blocking_overlays(page)
         for attempt in range(2):
             fresh = await self._capture_forms(page, route_url)
-            for candidate in fresh:
-                if CrawlState._form_key(candidate) == key:
-                    return candidate
+            matched = _match(fresh)
+            if matched is not None:
+                return matched
             # The cluster may mount slightly late; brief settle then retry once.
             if attempt == 0:
                 await asyncio.sleep(0.3)
@@ -1243,6 +1515,9 @@ class BrowserDiscoveryEngine:
         # Per-type occurrence index so positional fallbacks target the right
         # element when a cluster has several inputs of the same type.
         type_seen: dict[str, int] = {}
+        # Last value filled per type, so a confirm/repeat field can echo the
+        # primary field's value and satisfy generic "must match" validators.
+        last_value_by_type: dict[str, str] = {}
         for entry in inputs:
             name = str(entry.get("name", "") or "")
             itype = str(entry.get("type", "text") or "text").lower()
@@ -1250,9 +1525,72 @@ class BrowserDiscoveryEngine:
                 continue
             nth = type_seen.get(itype, 0)
             type_seen[itype] = nth + 1
-            if await self._fill_single_input(page, entry, scope, name, itype, nth):
+            value = self._synthetic_value(name, itype)
+            # A confirm/repeat field must equal the value already entered into
+            # the primary field of the same type; echo it when we have one.
+            if CONFIRM_FIELD_RE.search(name) and itype in last_value_by_type:
+                value = last_value_by_type[itype]
+            elif itype not in last_value_by_type:
+                last_value_by_type[itype] = value
+            if await self._fill_single_input(page, entry, scope, name, itype, nth, value=value):
                 filled = True
         return filled
+
+    async def _fill_to_valid(
+        self, page: Any, form: dict[str, Any], max_rounds: int = 2
+    ) -> bool:
+        """Iterate filling until the cluster's submit control enables (or budget).
+
+        A reactive form disables its submit until every required field is valid.
+        After the first :meth:`_fill_form_fields` pass some required fields may
+        still be invalid (mounted late, needed a matching confirm value, or a
+        typed/format value). This queries the live cluster for still-invalid
+        required controls and re-fills them, up to ``max_rounds`` times. Returns
+        True once a submit control reports ``:enabled`` (or native form validity),
+        else False — best-effort; the submit path still attempts either way.
+        """
+        cluster_id = form.get("cluster_id")
+        if cluster_id is None:
+            return False
+        scope = f"[data-sentry-cluster='{cluster_id}'] "
+        for _ in range(max_rounds):
+            state = await self._bounded(
+                page.evaluate(_CLUSTER_VALIDITY_SCRIPT, str(cluster_id)), 800
+            )
+            if state is _BOUNDED_FAILED or not isinstance(state, dict):
+                return False
+            if state.get("submittable"):
+                return True
+            invalid = state.get("invalid_fields")
+            if not isinstance(invalid, list) or not invalid:
+                # Nothing actionable left to fix (e.g. an impossible pattern).
+                return False
+            filled_any = False
+            type_seen: dict[str, int] = {}
+            for field in invalid:
+                if not isinstance(field, dict):
+                    continue
+                name = str(field.get("name", "") or "")
+                itype = str(field.get("type", "text") or "text").lower()
+                if itype in ("hidden", "submit", "button", "file", "image", "reset"):
+                    continue
+                nth = type_seen.get(itype, 0)
+                type_seen[itype] = nth + 1
+                entry = {
+                    "name": name,
+                    "type": itype,
+                    "field_id": str(field.get("field_id", "") or ""),
+                }
+                value = self._synthetic_value(name, itype)
+                if await self._fill_single_input(page, entry, scope, name, itype, nth, value=value):
+                    filled_any = True
+            if not filled_any:
+                return False
+        # Final validity check after the last fill round.
+        state = await self._bounded(
+            page.evaluate(_CLUSTER_VALIDITY_SCRIPT, str(cluster_id)), 800
+        )
+        return bool(isinstance(state, dict) and state.get("submittable"))
 
     async def _fill_single_input(
         self,
@@ -1262,19 +1600,55 @@ class BrowserDiscoveryEngine:
         name: str,
         itype: str,
         nth: int,
+        value: str | None = None,
     ) -> bool:
         """Fill one captured input, trying each candidate selector until one
-        succeeds. Returns True once any candidate fills/checks the field."""
-        value = self._synthetic_value(name, itype)
+        succeeds. Returns True once any candidate fills/checks/selects the field.
+
+        ``<select>`` elements are driven through ``select_option`` (Playwright's
+        ``fill`` raises on them, which left every required dropdown empty and the
+        form invalid); checkboxes/radios through ``check``; everything else
+        through ``fill``. ``value`` overrides the per-field synthetic value so a
+        caller can echo a confirm/repeat field's primary value."""
+        if value is None:
+            value = self._synthetic_value(name, itype)
         is_toggle = itype in ("checkbox", "radio")
+        is_select = itype in ("select", "select-one", "select-multiple")
         for selector, timeout_ms in self._candidate_field_selectors(entry, scope, name, itype, nth):
             if is_toggle:
                 res = await self._bounded(page.check(selector, timeout=timeout_ms), timeout_ms + 200)
+            elif is_select:
+                res = await self._bounded(self._select_first_option(page, selector, timeout_ms), timeout_ms + 300)
             else:
                 res = await self._bounded(page.fill(selector, str(value), timeout=timeout_ms), timeout_ms + 200)
             if res is not _BOUNDED_FAILED:
                 return True
         return False
+
+    @staticmethod
+    async def _select_first_option(page: Any, selector: str, timeout_ms: float) -> None:
+        """Choose the first enabled, non-placeholder option of a ``<select>``.
+
+        Reactive forms treat an empty/placeholder option as "no selection" and
+        keep the form invalid, so pick the first option with a non-empty value
+        (falling back to the last option, then to index 0). Raises on failure so
+        the bounded caller records a miss and tries the next selector."""
+        loc = page.locator(selector).first
+        values = await loc.evaluate(
+            "el => Array.from((el && el.options) || [])"
+            ".filter(o => !o.disabled).map(o => o.value)"
+        )
+        chosen: str | None = None
+        for candidate in values or []:
+            if str(candidate).strip():
+                chosen = candidate
+                break
+        if chosen is None and values:
+            chosen = values[-1]
+        if chosen is None:
+            await loc.select_option(index=0, timeout=timeout_ms)
+        else:
+            await loc.select_option(chosen, timeout=timeout_ms)
 
     @staticmethod
     def _candidate_field_selectors(
@@ -1344,60 +1718,110 @@ class BrowserDiscoveryEngine:
             token in joined for token in ("email", "username", "user", "login", "account")
         ):
             return self.settings.authentication_username
+        # Format-valid value keyed on the input TYPE. Reactive/HTML5 validators
+        # reject a generic string in a date/number/url/tel field, which leaves
+        # the form invalid and its submit control disabled — so an app never
+        # fires its POST XHR and no body is captured. A type-appropriate value
+        # keeps such fields valid. Name-based hints still win for plain text.
+        typed = self._typed_placeholder(itype)
+        if typed is not None:
+            return typed
         return str(ApiExtractor._baseline_for_name(name))
 
-    async def _submit_form(self, page: Any, form: dict[str, Any]) -> None:
+    @staticmethod
+    def _typed_placeholder(itype: str) -> str | None:
+        """Format-valid synthetic value for an input's HTML type, or None when
+        the type carries no format constraint (plain text handled by name hint)."""
+        itype = (itype or "").lower()
+        return {
+            "email": "scanner@example.com",
+            "url": "https://example.com/",
+            "tel": "+15555550123",
+            "number": "1",
+            "range": "1",
+            "date": "2020-01-01",
+            "datetime-local": "2020-01-01T12:00",
+            "time": "12:00",
+            "month": "2020-01",
+            "week": "2020-W01",
+            "color": "#336699",
+        }.get(itype)
+
+    async def _submit_form(self, page: Any, form: dict[str, Any]) -> bool:
         """Submit an input cluster to fire the app's real request.
 
-        For clusters tagged ``data-sentry-cluster`` (both ``<form>`` and orphan),
-        prefer a submit-like control scoped to the cluster so we never click a
-        control belonging to a different cluster. Literal ``<form>`` clusters
-        fall back to ``requestSubmit``/``submit``; orphan clusters fall back to
-        pressing Enter in their first fillable field (JS handlers commonly submit
-        on Enter). Destructive clusters are filtered upstream in
+        Returns ``True`` only when a submit action was actually performed (an
+        enabled control clicked, a ``<form>`` submitted, or Enter pressed), so
+        the caller does not count a doomed no-op as a submission.
+
+        Reactive forms disable their submit control until the form is valid, and
+        clicking a disabled control merely burns the click-actionability timeout
+        (~800ms) and fires nothing — the dominant reason ``replayable_json_bodies``
+        stayed at ~0 despite many "submitted" forms. So we skip disabled controls
+        with a fast :meth:`~Locator.is_enabled` check instead of paying that
+        timeout, preferring a real ``submit``-type control scoped to the cluster.
+        Literal ``<form>`` clusters fall back to ``requestSubmit`` (which honours
+        HTML validity); orphan clusters fall back to pressing Enter in their first
+        fillable field. Destructive clusters are filtered upstream in
         :meth:`_submit_discovered_forms`.
         """
         cluster_id = form.get("cluster_id")
         scope = f"[data-sentry-cluster='{cluster_id}'] " if cluster_id is not None else ""
-        for selector in (
-            f"{scope}button[type=submit]",
-            f"{scope}input[type=submit]",
-            f"{scope}button:not([type])",
-            f"{scope}button",
-            f"{scope}[role=button]",
+        if await self._click_first_enabled(
+            page,
+            (
+                f"{scope}button[type=submit]",
+                f"{scope}input[type=submit]",
+                f"{scope}button:not([type])",
+                f"{scope}button",
+                f"{scope}[role=button]",
+            ),
         ):
-            loc = page.locator(selector)
-            res = await self._bounded(loc.count(), 500)
-            if isinstance(res, int) and res > 0:
-                clicked = await self._bounded(loc.first.click(timeout=800), 1000)
-                if clicked is not _BOUNDED_FAILED:
-                    return
-        # Literal <form>: submit the element directly via requestSubmit/submit.
+            return True
+        # No enabled submit control (all disabled, or none present). Literal
+        # <form>: ask the browser to submit it directly.
         if form.get("has_form", True):
             selector = (
                 f"[data-sentry-cluster='{cluster_id}']" if cluster_id is not None else "form"
             )
-            await self._bounded(
-                page.evaluate(
-                    "(sel) => { const f = document.querySelector(sel); "
-                    "if (f) { const form = f.tagName === 'FORM' ? f : f.querySelector('form'); "
-                    "if (form) { (form.requestSubmit ? form.requestSubmit() : form.submit()); } } }",
-                    selector,
-                ),
-                1000,
-            )
-            return
+            res = await self._bounded(page.evaluate(REQUEST_SUBMIT_JS, selector), 1000)
+            if res is not _BOUNDED_FAILED and res:
+                return True
         # Orphan cluster with no clickable control: press Enter in a filled field.
         for entry in form.get("inputs", []):
             field_id = str(entry.get("field_id", "") or "")
             itype = str(entry.get("type", "") or "").lower()
             if field_id and itype not in (
-                "hidden", "submit", "button", "file", "image", "reset", "checkbox", "radio",
+                "hidden", "submit", "button", "file", "image", "reset",
+                "checkbox", "radio", "select", "select-one", "select-multiple",
             ):
-                await self._bounded(
+                res = await self._bounded(
                     page.press(f"[data-sentry-field='{field_id}']", "Enter", timeout=800), 1000
                 )
-                return
+                return res is not _BOUNDED_FAILED
+        return False
+
+    async def _click_first_enabled(self, page: Any, selectors: tuple[str, ...]) -> bool:
+        """Click the first ENABLED control matching any of ``selectors``.
+
+        Disabled controls are skipped via a fast ``is_enabled`` probe rather than
+        clicked-and-timed-out, so an invalid reactive form costs milliseconds
+        (not seconds) and never counts as a submission. Only a few matches per
+        selector are probed so a page full of buttons cannot blow the budget."""
+        for selector in selectors:
+            loc = page.locator(selector)
+            count = await self._bounded(loc.count(), 400)
+            if not isinstance(count, int) or count <= 0:
+                continue
+            for index in range(min(count, 5)):
+                item = loc.nth(index)
+                enabled = await self._bounded(item.is_enabled(timeout=200), 400)
+                if enabled is not True:
+                    continue
+                clicked = await self._bounded(item.click(timeout=800), 1000)
+                if clicked is not _BOUNDED_FAILED:
+                    return True
+        return False
 
     async def _discover_routes(self, page: Any, root_url: str) -> list[str]:
         """Collect same-origin routes from captured SPA nav + in-DOM links."""
@@ -1415,12 +1839,13 @@ class BrowserDiscoveryEngine:
             found.append(current)
 
         root_origin = self._origin(root_url)
+        hash_routed = self._looks_hash_routed(root_url, found)
         result: list[str] = []
         emitted: set[str] = set()
         for item in found:
             if not item:
                 continue
-            absolute = urljoin(root_url, item)
+            absolute = self._canonical_route_url(root_url, item, hash_routed=hash_routed)
             if self._origin(absolute) != root_origin:
                 continue
             key = self._normalize_for_seen(absolute)
@@ -1722,8 +2147,64 @@ class BrowserDiscoveryEngine:
         except Exception:
             return ""
 
+    def _looks_hash_routed(self, root_url: str, candidates: list[str]) -> bool:
+        urls = [root_url, *[str(candidate) for candidate in candidates or []]]
+        return any(self._route_fragment(urlparse(urljoin(root_url, url)).fragment) for url in urls)
+
+    def _canonical_route_url(self, root_url: str, candidate: str, *, hash_routed: bool = False) -> str:
+        candidate = str(candidate or "").strip()
+        if not candidate:
+            return root_url
+        root = urlparse(root_url)
+        root_base = urlunparse((root.scheme, root.netloc, "/", "", "", ""))
+        if candidate.startswith(("#/", "#!/")):
+            fragment = self._route_fragment(candidate[1:]) or candidate[1:]
+            return urlunparse((root.scheme, root.netloc, "/", "", "", fragment))
+
+        absolute = urljoin(root_url, candidate)
+        parsed = urlparse(absolute)
+        route_fragment = self._route_fragment(parsed.fragment)
+        if route_fragment:
+            return urlunparse((parsed.scheme, parsed.netloc, "/", "", "", route_fragment))
+
+        path = parsed.path or "/"
+        if hash_routed and path != "/" and not self._is_root_api_path(path):
+            fragment = path
+            if parsed.query:
+                fragment = f"{fragment}?{parsed.query}"
+            return urlunparse((parsed.scheme, parsed.netloc, "/", "", "", fragment))
+
+        if self._is_root_relative_api_candidate(candidate):
+            return urljoin(root_base, candidate.lstrip("/"))
+        return absolute
+
+    @staticmethod
+    def _route_fragment(fragment: str) -> str:
+        fragment = str(fragment or "")
+        if fragment.startswith("!/"):
+            return "/" + fragment[2:].lstrip("/")
+        if fragment.startswith("/"):
+            return fragment
+        return ""
+
+    @staticmethod
+    def _is_root_api_path(path: str) -> bool:
+        return bool(ROOT_API_PATH_RE.search(path or ""))
+
+    @staticmethod
+    def _is_root_relative_api_candidate(candidate: str) -> bool:
+        candidate = str(candidate or "").strip()
+        if candidate.startswith(("http://", "https://", "//", "#")):
+            return False
+        parsed = urlparse(candidate)
+        path = parsed.path or candidate
+        if path.startswith("/"):
+            return BrowserDiscoveryEngine._is_root_api_path(path)
+        return BrowserDiscoveryEngine._is_root_api_path(f"/{path}")
+
     def _browser_targets(self, root_url: str, routes: list[str]) -> list[str]:
         root_origin = self._origin(root_url)
+        hash_routed = self._looks_hash_routed(root_url, routes)
         targets = [root_url]
         seen = {self._normalize_for_seen(root_url)}
         # Seed all known static routes up to the route cap (Task B): high-value
@@ -1733,7 +2214,7 @@ class BrowserDiscoveryEngine:
         # that guarantee decoupled from how much clicking each page gets.
         seed_cap = max(1, min(self.settings.crawl_max_urls, self.settings.crawl_browser_route_cap))
         for route in routes:
-            absolute = urljoin(root_url, route)
+            absolute = self._canonical_route_url(root_url, route, hash_routed=hash_routed)
             if self._origin(absolute) != root_origin:
                 continue
             key = self._normalize_for_seen(absolute)
@@ -1821,7 +2302,12 @@ class BrowserDiscoveryEngine:
             )
         return body, body_source, "captured", capture_error
 
-    async def _build_request_observation(self, request: Any) -> RequestObservation:
+    async def _build_request_observation(
+        self,
+        request: Any,
+        *,
+        drop_reason: str | None = None,
+    ) -> RequestObservation:
         headers = await self._request_headers(request)
         normalized_headers = self._normalize_request_headers(headers)
         content_type = self._header_value(normalized_headers, "content-type")
@@ -1829,7 +2315,16 @@ class BrowserDiscoveryEngine:
         post_data, body_source, body_capture_status, capture_error = self._capture_post_data(request)
         body_kind, body_schema, multipart_fields = self._request_body_metadata(post_data, content_type)
         replayable = self._is_replayable(request.method, post_data, content_type, body_schema, multipart_fields)
-        if body_capture_status != "captured" and str(request.method).upper() not in {"GET", "HEAD", "OPTIONS"}:
+        non_replayable_reason = self._non_replayable_reason(
+            request.method,
+            post_data,
+            content_type,
+            body_capture_status,
+            body_kind,
+            replayable,
+            drop_reason,
+        )
+        if non_replayable_reason:
             replayable = False
         return RequestObservation(
             url=request.url,
@@ -1846,6 +2341,9 @@ class BrowserDiscoveryEngine:
             multipart_fields=multipart_fields,
             replayable=replayable,
             capture_error=capture_error,
+            initiator_url=self._request_initiator_url(request),
+            drop_reason=drop_reason,
+            non_replayable_reason=non_replayable_reason,
         )
 
     async def _request_headers(self, request: Any) -> dict[str, str]:
@@ -1905,6 +2403,56 @@ class BrowserDiscoveryEngine:
             fields = self._multipart_field_metadata(body)
             return "multipart", sorted(field["name"] for field in fields if field.get("name")), fields
         return None, [], []
+
+    @staticmethod
+    def _non_replayable_reason(
+        method: str,
+        body: Any,
+        content_type: str | None,
+        body_capture_status: str,
+        body_kind: str | None,
+        replayable: bool,
+        drop_reason: str | None,
+    ) -> str | None:
+        if drop_reason:
+            return drop_reason
+        if replayable:
+            return None
+        method = str(method or "GET").upper()
+        if method in {"GET", "HEAD", "OPTIONS"} and not body:
+            return None
+        if body_capture_status == "truncated":
+            return "body_capture_truncated"
+        if body_capture_status == "unavailable":
+            return "body_capture_unavailable"
+        if not body:
+            return "empty_body"
+        lowered = (content_type or "").lower()
+        if "json" in lowered:
+            return "unparseable_json"
+        if "application/x-www-form-urlencoded" in lowered:
+            return "form_body_without_fields"
+        if "multipart/form-data" in lowered:
+            return "multipart_without_fields"
+        if body_kind is None:
+            return "unsupported_content_type"
+        return "non_replayable"
+
+    @staticmethod
+    def _request_initiator_url(request: Any) -> str | None:
+        try:
+            frame = getattr(request, "frame", None)
+            if frame is not None:
+                url = getattr(frame, "url", None)
+                if url:
+                    return str(url)
+        except Exception:
+            pass
+        try:
+            headers = getattr(request, "headers", {}) or {}
+            return headers.get("referer") or headers.get("referrer")
+        except Exception:
+            return None
 
     def _multipart_field_metadata(self, body: str) -> list[dict[str, Any]]:
         fields: list[dict[str, Any]] = []
@@ -2035,18 +2583,50 @@ class BrowserDiscoveryEngine:
             ("https", "wss"),
         }
 
-    def _should_capture_runtime_request(self, root_url: str, request: Any) -> bool:
+    def _classify_runtime_request(self, root_url: str, request: Any) -> str:
         try:
             url = request.url
             method = str(getattr(request, "method", "GET") or "GET").upper()
             resource_type = str(getattr(request, "resource_type", "") or "")
         except Exception:
-            return False
+            return "invalid_request"
         if not self._same_origin_or_websocket(root_url, url):
-            return False
+            return "off_origin"
+        if self._is_transport_noise_url(url, resource_type):
+            return "transport_noise"
         if resource_type in {"xhr", "fetch", "websocket"}:
+            return "capture"
+        if method not in {"GET", "HEAD", "OPTIONS"}:
+            return "capture"
+        return "resource_noise"
+
+    def _should_capture_runtime_request(self, root_url: str, request: Any) -> bool:
+        return self._classify_runtime_request(root_url, request) == "capture"
+
+    @staticmethod
+    def _is_transport_noise_url(url: str, resource_type: str = "") -> bool:
+        try:
+            parsed = urlparse(url)
+            path = parsed.path.lower()
+            query = parse_qs(parsed.query)
+        except Exception:
+            return False
+        if resource_type == "websocket":
             return True
-        return method not in {"GET", "HEAD", "OPTIONS"}
+        if any(token in path for token in TRANSPORT_NOISE_PATHS):
+            return True
+        if "EIO" in query and "transport" in query:
+            return True
+        if "transport" in query and any(token in path for token in ("hub", "negotiate", "connect")):
+            return True
+        return False
+
+    @staticmethod
+    def _record_request_audit_reason(state: CrawlState, observation: RequestObservation) -> None:
+        reason = observation.drop_reason or observation.non_replayable_reason
+        if reason is None:
+            reason = "replayable" if observation.replayable else "observed"
+        state.request_audit_summary[reason] = state.request_audit_summary.get(reason, 0) + 1
 
     def _normalize_for_seen(self, url: str) -> str:
         parsed = urlparse(url)
@@ -2058,7 +2638,8 @@ class BrowserDiscoveryEngine:
         # the bare origin and is discarded at seeding/enqueue time, so form pages
         # are never navigated and no request bodies are ever produced. A plain
         # ``#section`` anchor (same page, different scroll) is still ignored.
-        fragment = parsed.fragment
-        if fragment.startswith("/") or fragment.startswith("!/"):
-            return f"{base}#{fragment.rstrip('/').lower()}"
+        fragment = self._route_fragment(parsed.fragment)
+        if fragment:
+            origin_base = f"{parsed.scheme}://{parsed.netloc}".lower()
+            return f"{origin_base}#{fragment.rstrip('/').lower()}"
         return base

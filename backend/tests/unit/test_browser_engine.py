@@ -908,23 +908,25 @@ async def test_capture_forms_returns_structured_forms():
         {
             "action": "http://spa.test/submit",
             "method": "POST",
-            "inputs": [{"name": "email", "type": "email", "field_id": "0:0"}],
+            "inputs": [{"name": "email", "type": "email", "field_id": "0:0", "named": True}],
             "cluster_id": 0,
             "has_form": True,
             "file_inputs": 0,
             "page_url": "http://spa.test/page",
+            "all_named": True,
         },
         {
             "action": "http://spa.test/upload",
             "method": "POST",
             "inputs": [
-                {"name": "avatar", "type": "file", "field_id": "1:0"},
-                {"name": "bio", "type": "text", "field_id": "1:1"},
+                {"name": "avatar", "type": "file", "field_id": "1:0", "named": True},
+                {"name": "bio", "type": "text", "field_id": "1:1", "named": True},
             ],
             "cluster_id": 1,
             "has_form": False,
             "file_inputs": 1,
             "page_url": "http://spa.test/page",
+            "all_named": True,
         },
     ]
 
@@ -1270,6 +1272,13 @@ class _SubmitFakePage:
             async def count(self):
                 return 1 if "submit" in self._sel else 0
 
+            def nth(self, index):
+                return self
+
+            async def is_enabled(self, timeout=None):
+                # A real submit control is enabled once the form is valid.
+                return "submit" in self._sel
+
             async def click(self, timeout=None):
                 page.submit_clicks += 1
                 # Submitting fires the app's real POST XHR with a body.
@@ -1607,6 +1616,71 @@ def test_browser_targets_seeds_hash_routes():
     assert "http://spa.test/#/login" in targets
     assert "http://spa.test/#/register" in targets
     assert "http://spa.test/#/contact" in targets
+
+
+def test_hash_routed_targets_canonicalize_path_routes_and_dedupe():
+    engine = BrowserDiscoveryEngine()
+    targets = engine._browser_targets(
+        "http://spa.test/",
+        ["/#/login", "/login", "http://spa.test/current#/login", "/api/users"],
+    )
+
+    assert targets.count("http://spa.test/#/login") == 1
+    assert "http://spa.test/login" not in targets
+    assert "http://spa.test/current#/login" not in targets
+    assert "http://spa.test/api/users" in targets
+    assert engine._normalize_for_seen("http://spa.test/current#/login") == engine._normalize_for_seen(
+        "http://spa.test/#/login"
+    )
+
+
+def test_runtime_request_classifier_records_concrete_drop_reasons():
+    engine = BrowserDiscoveryEngine()
+
+    assert engine._classify_runtime_request(
+        "http://spa.test/",
+        _FakeRequest("https://other.test/api", method="POST", resource_type="fetch", post_data="{}"),
+    ) == "off_origin"
+    assert engine._classify_runtime_request(
+        "http://spa.test/",
+        _FakeRequest("http://spa.test/socket.io/?EIO=4&transport=polling", resource_type="fetch"),
+    ) == "transport_noise"
+    assert engine._classify_runtime_request(
+        "http://spa.test/",
+        _FakeRequest("http://spa.test/app.css", method="GET", resource_type="stylesheet"),
+    ) == "resource_noise"
+    assert engine._classify_runtime_request(
+        "http://spa.test/",
+        _FakeRequest("http://spa.test/api/profile", method="POST", resource_type="fetch", post_data="{}"),
+    ) == "capture"
+
+
+@pytest.mark.asyncio
+async def test_capture_forms_skips_non_actionable_or_empty_clusters():
+    class _Page:
+        async def evaluate(self, script, *args):
+            return [
+                {
+                    "cluster_id": 0,
+                    "action": "/noop",
+                    "method": "POST",
+                    "inputs": [{"name": "email", "type": "email", "field_id": "0:0"}],
+                    "has_form": False,
+                    "action_controls": 0,
+                },
+                {
+                    "cluster_id": 1,
+                    "action": "/empty",
+                    "method": "POST",
+                    "inputs": [{"name": "submit", "type": "submit", "field_id": "1:0"}],
+                    "has_form": True,
+                    "action_controls": 1,
+                },
+            ]
+
+    forms = await BrowserDiscoveryEngine()._capture_forms(_Page(), "http://spa.test/page")
+
+    assert forms == []
 
 
 def test_type_selector_maps_captured_types():

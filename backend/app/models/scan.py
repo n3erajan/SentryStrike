@@ -126,6 +126,8 @@ class DetectorCoverageMetric(BaseModel):
     candidates_built: int = 0
     candidates_filtered: int = 0
     requests_sent: int = 0
+    targets_attempted: int = 0
+    requests_denied_by_governor: int = 0
     verified_findings: int = 0
     unverified_findings: int = 0
     dropped_findings_verified_mode: int = 0
@@ -133,6 +135,7 @@ class DetectorCoverageMetric(BaseModel):
     replayable_targets_tested: int = 0
     validated_synth_targets_tested: int = 0
     body_targets_skipped: int = 0
+    body_targets_skipped_by_reason: dict[str, int] = Field(default_factory=dict)
     skip_reason_by_risk: dict[str, int] = Field(default_factory=dict)
     skipped_reasons: dict[str, int] = Field(default_factory=dict)
 

@@ -180,18 +180,20 @@ class HttpVerifier:
         )
 
         # P1-1: consult the request-budget governor. When a detector or parameter
-        # has exhausted its ceiling, skip the network call and return a benign
-        # empty response (fail-safe: reads as "nothing here" to every detector,
-        # never crashes, never fabricates a finding). No-op outside a governed
-        # scan or for uninstrumented callers.
+        # has exhausted its ceiling, skip the network call and return an explicit
+        # "not tested" sentinel (status_code == -1) rather than a benign 0. A real
+        # 0 means connection error/timeout ("nothing there"); -1 means the probe
+        # was never sent, so detectors must treat it as UNTESTED — never a negative
+        # — so a budget-denied tail probe cannot score a real vuln as absent.
+        # No-op outside a governed scan or for uninstrumented callers.
         if request_governor.admit(ctx.module, ctx.parameter) is request_governor.GovernorDecision.DENY:
             return ResponseData(
-                status_code=0,
+                status_code=-1,
                 headers={},
                 body="",
                 response_time_ms=0.0,
                 request_snippet=request_snippet,
-                response_snippet="[request skipped: request-budget ceiling reached]",
+                response_snippet="[request skipped: budget ceiling]",
             )
 
         try:

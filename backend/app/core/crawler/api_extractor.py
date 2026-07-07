@@ -35,6 +35,7 @@ class ApiExtractor:
     ANGULAR_ROUTE_RE = re.compile(r"""\{\s*path\s*:\s*["'`](?P<path>[^"'`]*)["'`]""", re.I)
     GRAPHQL_OP_RE = re.compile(r"""\b(query|mutation|subscription)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)""")
     GRAPHQL_VAR_RE = re.compile(r"""\$(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:""")
+    ROOT_RELATIVE_API_RE = re.compile(r"^(?:api|graphql|gql|rest|v[0-9]+|rpc|trpc|oauth|session)(?:/|$)", re.I)
 
     @classmethod
     def extract_from_javascript(cls, base_url: str, script_text: str) -> tuple[list[str], list[ApiEndpoint]]:
@@ -62,6 +63,7 @@ class ApiExtractor:
             content_type: str | None = None,
         ) -> None:
             normalized_path = cls.normalize_template_url(path)
+            normalized_path = cls._canonical_api_path(normalized_path)
             absolute = normalize_url(base_url, normalized_path)
             key = (absolute, method.upper(), operation or "")
             existing = endpoint_by_key.get(key)
@@ -313,7 +315,7 @@ class ApiExtractor:
                         security_relevance=cls.classify_parameter(key),
                     )
                 )
-        elif isinstance(body, dict):
+        elif isinstance(body, (dict, list)):
             cls._walk_json_params(body, endpoint.url, endpoint.method, params)
 
         if endpoint.operation:
@@ -348,6 +350,15 @@ class ApiExtractor:
             prefix, suffix = path.split("/", 1)
             if cls._looks_like_base_expression(prefix):
                 path = "/" + suffix
+        return path
+
+    @classmethod
+    def _canonical_api_path(cls, path: str) -> str:
+        path = str(path or "")
+        if path.startswith(("http://", "https://", "//", "/")):
+            return path
+        if cls.ROOT_RELATIVE_API_RE.match(path):
+            return f"/{path}"
         return path
 
     @classmethod
@@ -398,6 +409,8 @@ class ApiExtractor:
     @staticmethod
     def _looks_api_path(path: str) -> bool:
         lowered = path.lower()
+        if ApiExtractor.ROOT_RELATIVE_API_RE.match(lowered):
+            return True
         return any(
             token in lowered
             for token in (

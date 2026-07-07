@@ -242,6 +242,64 @@ def test_build_synthesis_prefers_observed_body_over_synth_for_api():
     assert any(t.replayable for t in targets)
 
 
+def test_observed_json_array_body_builds_replayable_targets():
+    observed = RequestObservation(
+        url="http://x/api/items",
+        method="POST",
+        request_headers={"content-type": "application/json"},
+        request_content_type="application/json",
+        post_data='[{"id":1,"name":"alpha"}]',
+        body_kind="json",
+        replayable=True,
+    )
+
+    targets = AttackSurface.build([], [], requests=[observed])
+    id_target = next(target for target in targets if target.parameter == "id")
+    body = build_json_body(id_target.json_template, id_target, "99")
+
+    assert id_target.replayable is True
+    assert id_target.parent_path == "[0].id"
+    assert body[0]["id"] == "99"
+
+
+def test_body_target_telemetry_splits_skip_reasons():
+    static_endpoint = ApiEndpoint(
+        url="http://x/api/static",
+        method="POST",
+        source=RouteSource.javascript,
+        evidence="fetch/xhr",
+        content_type="application/json",
+        body_schema=["name"],
+    )
+    non_replayable = RequestObservation(
+        url="http://x/api/binary",
+        method="POST",
+        request_content_type="application/octet-stream",
+        post_data="raw",
+        replayable=False,
+        non_replayable_reason="unsupported_content_type",
+    )
+    transport = RequestObservation(
+        url="http://x/socket.io/?EIO=4&transport=polling",
+        method="POST",
+        resource_type="fetch",
+        post_data="40",
+        replayable=False,
+        drop_reason="transport_noise",
+    )
+
+    telemetry = AttackSurface.body_target_telemetry(
+        api_endpoints=[static_endpoint],
+        requests=[non_replayable, transport],
+    )
+
+    assert telemetry["observed_body_requests"] == 2
+    assert telemetry["replayable_body_requests"] == 0
+    assert telemetry["body_targets_skipped_static_synth_not_validated"] >= 1
+    assert telemetry["body_targets_skipped_non_replayable"] >= 1
+    assert telemetry["body_targets_skipped_transport_noise"] >= 1
+
+
 def test_build_synthesis_skips_unresolved_path_placeholders():
     ep = ApiEndpoint(
         url="http://x/rest/basket/{param_1}/checkout",

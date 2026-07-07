@@ -83,3 +83,17 @@ def test_javascript_extraction_infers_axios_and_jquery_json_bodies():
     assert profile.request_body == {"email": "scanner@example.com", "displayName": "Scanner Test"}
     assert contact.method == "POST"
     assert contact.request_body == {"message": "Scanner test message", "callbackUrl": "https://example.com/"}
+
+
+def test_relative_api_paths_resolve_from_origin_root_not_frontend_route():
+    script = """
+        fetch('api/orders', { method: 'POST', body: JSON.stringify({ orderId: id }) });
+        axios.get('rest/user/profile');
+    """
+
+    _, endpoints = ApiExtractor.extract_from_javascript("https://example.test/shop/cart", script)
+    urls = {endpoint.url for endpoint in endpoints}
+
+    assert "https://example.test/api/orders" in urls
+    assert "https://example.test/rest/user/profile" in urls
+    assert all("/shop/cart/api/" not in url and "/shop/cart/rest/" not in url for url in urls)

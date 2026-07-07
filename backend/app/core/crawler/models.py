@@ -91,6 +91,9 @@ class RequestObservation:
     response_snippet: str | None = None
     redirect_chain: list[str] = field(default_factory=list)
     initiator: str = "browser"
+    initiator_url: str | None = None
+    drop_reason: str | None = None
+    non_replayable_reason: str | None = None
 
 
 @dataclass
@@ -110,6 +113,8 @@ class CrawlState:
     browser_available: bool | None = None
     browser_error: str | None = None
     browser_forms: list[dict[str, Any]] = field(default_factory=list)
+    request_audit: list[RequestObservation] = field(default_factory=list)
+    request_audit_summary: dict[str, int] = field(default_factory=dict)
 
     def add_route(self, candidate: RouteCandidate) -> None:
         if candidate.url not in {route.url for route in self.routes}:

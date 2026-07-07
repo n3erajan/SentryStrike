@@ -189,6 +189,10 @@ class CommandInjectionVerifier(BaseVerifier):
                         test_phase="output_injection", payload=payload,
                     )
 
+                    # Budget-denied probe: untested, never a negative. Skip scoring.
+                    if injected.not_tested:
+                        continue
+
                     injected_body = injected.body or ""
 
                     if not injected_body.strip():
@@ -472,6 +476,7 @@ class CommandInjectionVerifier(BaseVerifier):
                 )
 
                 injected_times = []
+                budget_denied = False
                 for _ in range(2):
                     resp = await self._send(
                         injected_url, method, injected_params, injected_data,
@@ -479,8 +484,16 @@ class CommandInjectionVerifier(BaseVerifier):
                         json_body=injected_json,
                         test_phase="time_injection", payload=payload,
                     )
+                    # Budget-denied probe has response_time_ms==0.0, which would
+                    # read as "no delay" (a false negative). Treat as untested.
+                    if resp.not_tested:
+                        budget_denied = True
+                        break
                     injected_times.append(resp.response_time_ms)
                     await asyncio.sleep(0.1)
+
+                if budget_denied:
+                    continue
 
                 # Analyze timing
                 settings = get_settings()

@@ -273,22 +273,26 @@ class XSSVerifier(BaseVerifier):
                         test_phase="canary", payload=canary_payload,
                     )
 
-                    is_canary_reflected, reflection_evidence = ResponseAnalyzer.verify_reflection(
-                        canary_payload, canary_resp.body, baseline_body=pre_test_baseline.body, canary=canary,
-                    )
-
-                    if not is_canary_reflected or method.upper() == "POST":
-                        reflected_in_stored = await self._check_stored_reflection(
-                            canary_payload, url, stored_display_urls, canary=canary
+                    # A budget-denied canary is UNTESTED, not "not reflected". Skip
+                    # the negative early-return; the payload loop below itself skips
+                    # budget-denied probes, so no false negative is produced.
+                    if getattr(canary_resp, "status_code", 200) != -1:
+                        is_canary_reflected, reflection_evidence = ResponseAnalyzer.verify_reflection(
+                            canary_payload, canary_resp.body, baseline_body=pre_test_baseline.body, canary=canary,
                         )
-                        if reflected_in_stored:
-                            is_canary_reflected = True
 
-                    if not is_canary_reflected:
-                        return VerificationResult(
-                            is_vulnerable=False, confidence_score=0.0, detection_method="canary_check",
-                            findings=[], evidence={"reflected": False, "reason": "Canary payload not reflected"},
-                        )
+                        if not is_canary_reflected or method.upper() == "POST":
+                            reflected_in_stored = await self._check_stored_reflection(
+                                canary_payload, url, stored_display_urls, canary=canary
+                            )
+                            if reflected_in_stored:
+                                is_canary_reflected = True
+
+                        if not is_canary_reflected:
+                            return VerificationResult(
+                                is_vulnerable=False, confidence_score=0.0, detection_method="canary_check",
+                                findings=[], evidence={"reflected": False, "reason": "Canary payload not reflected"},
+                            )
                 except Exception as e:
                     logger.debug("Failed to perform canary reflection check: %s", e)
 
@@ -439,6 +443,13 @@ class XSSVerifier(BaseVerifier):
                 headers=injected_headers, cookies=injected_cookies, json_body=injected_json,
                 test_phase=f"payload_{payload_type}", payload=injected_payload,
             )
+
+            # Budget-denied probe: untested, never a negative reflection verdict.
+            if getattr(injected, "status_code", 200) == -1:
+                return VerificationResult(
+                    is_vulnerable=False, confidence_score=0.0, detection_method=payload_type,
+                    findings=[], evidence={"not_tested": True, "reason": "budget ceiling"},
+                )
 
             is_reflected, locations, was_encoded = self._detect_reflection(injected_payload, injected.body)
             is_stored = False

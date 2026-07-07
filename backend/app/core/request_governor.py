@@ -42,6 +42,10 @@ class _GovernorState:
     parameter_counts: dict[tuple[str, str], int] = field(default_factory=dict)
     # Detectors/parameters already reported as capped (so we log once, not per probe).
     denied_detectors: set[str] = field(default_factory=set)
+    # Per-detector count of DENIED (ceiling-hit) requests — distinct from the
+    # admitted counts above. Feeds truthful "budget_exhausted" telemetry so the
+    # coverage summary never infers a budget deny from a mere finding gap.
+    denied_counts: dict[str, int] = field(default_factory=dict)
 
 
 _state: ContextVar[_GovernorState | None] = ContextVar("request_governor_state", default=None)
@@ -74,11 +78,13 @@ def admit(module: str, parameter: str) -> GovernorDecision:
 
     if state.per_detector_cap and state.detector_counts.get(module, 0) >= state.per_detector_cap:
         state.denied_detectors.add(module)
+        state.denied_counts[module] = state.denied_counts.get(module, 0) + 1
         return GovernorDecision.DENY
 
     if parameter and state.per_parameter_cap:
         key = (module, parameter)
         if state.parameter_counts.get(key, 0) >= state.per_parameter_cap:
+            state.denied_counts[module] = state.denied_counts.get(module, 0) + 1
             return GovernorDecision.DENY
 
     state.detector_counts[module] = state.detector_counts.get(module, 0) + 1
@@ -97,3 +103,9 @@ def snapshot() -> dict[str, int]:
     """Per-detector admitted-request counts for reporting/telemetry."""
     state = _state.get()
     return dict(state.detector_counts) if state else {}
+
+
+def denied_snapshot() -> dict[str, int]:
+    """Per-detector DENIED-request counts (ceiling hits) for telemetry."""
+    state = _state.get()
+    return dict(state.denied_counts) if state else {}

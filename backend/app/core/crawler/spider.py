@@ -60,6 +60,12 @@ class HtmlForm:
     action: str
     method: str
     inputs: list[FormInput] = field(default_factory=list)
+    # Provenance: "html" for a literal server-rendered <form>, "browser_cluster"
+    # for an input cluster captured at runtime by the browser engine. SPA clusters
+    # submit JSON to an API, so they get a best-effort JSON-body synthesis fallback
+    # (see AttackSurface._synthesize_form_cluster_targets) when the live submit
+    # never produced an observed request body.
+    source: str = "html"
 
 
 @dataclass
@@ -73,6 +79,8 @@ class CrawlResult:
     api_endpoints: list[ApiEndpoint] = field(default_factory=list)
     parameters: list[ParameterCandidate] = field(default_factory=list)
     requests: list[object] = field(default_factory=list)
+    request_audit: list[object] = field(default_factory=list)
+    request_audit_summary: dict[str, int] = field(default_factory=dict)
     assets: list[str] = field(default_factory=list)
     js_extractions: list[dict[str, object]] = field(default_factory=list)
     api_docs: list[str] = field(default_factory=list)
@@ -446,6 +454,8 @@ class WebSpider:
             api_endpoints=crawl_state.api_endpoints,
             parameters=crawl_state.parameters,
             requests=crawl_state.requests,
+            request_audit=crawl_state.request_audit,
+            request_audit_summary=dict(crawl_state.request_audit_summary),
             assets=sorted(crawl_state.assets),
             js_extractions=list(crawl_state.js_extractions),
             api_docs=list(crawl_state.api_docs),
@@ -513,6 +523,7 @@ class WebSpider:
                     action=action,
                     method=str(form.get("method") or "GET").upper(),
                     inputs=inputs,
+                    source="browser_cluster",
                 )
             )
         return merged

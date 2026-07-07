@@ -28,6 +28,16 @@ class ResponseData:
     request_snippet: str | None = None
     response_snippet: str | None = None
 
+    @property
+    def not_tested(self) -> bool:
+        """True when the probe was never sent (governor budget deny).
+
+        ``status_code == -1`` is the "not tested" sentinel set by the request
+        governor. Detectors/verifiers must treat this as UNTESTED (no finding,
+        no negative verdict), distinct from a real ``0`` (connection error).
+        """
+        return self.status_code == -1
+
 
 @dataclass
 class DifferentialAnalysis:

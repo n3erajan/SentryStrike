@@ -568,6 +568,10 @@ class SQLiVerifier(BaseVerifier):
                     test_phase="boolean_false", payload=false_payload,
                 )
 
+                # Budget-denied probe: untested, never a negative differential. Skip.
+                if true_resp.not_tested or false_resp.not_tested:
+                    continue
+
                 _, analysis = ResponseAnalyzer.analyze_boolean_differential(
                     baseline, true_resp, false_resp
                 )
@@ -751,6 +755,9 @@ class SQLiVerifier(BaseVerifier):
                     json_body=inj_json,
                     test_phase="error_injection", payload=payload,
                 )
+                # Budget-denied probe: untested, never a negative. Skip scoring.
+                if inj_resp.not_tested:
+                    continue
                 inj_body = inj_resp.body or ""
 
                 # FIX: Replaced self._baseline_value with the local variable 'value'
@@ -948,6 +955,10 @@ class SQLiVerifier(BaseVerifier):
                         json_body=inj_json,
                         test_phase="union_null", payload=payload,
                     )
+
+                    # Budget-denied probe: untested, never a negative. Skip scoring.
+                    if inj_resp.not_tested:
+                        continue
 
                     # ------------------------------------------------------------
                     # GUARD #1: Stop Stored XSS text pollution from impacting Pass 2 / 4
@@ -1235,8 +1246,19 @@ class SQLiVerifier(BaseVerifier):
                     json_body=baseline_json,
                     test_phase="time_baseline",
                 )
+                # Budget-denied baseline probe carries no timing; skip it.
+                if resp.not_tested:
+                    continue
                 baseline_times.append(resp.response_time_ms)
                 await asyncio.sleep(0.1)
+
+            if not baseline_times:
+                # Every baseline probe was budget-denied: untested, not a negative.
+                return VerificationResult(
+                    is_vulnerable=False, confidence_score=0.0,
+                    detection_method="time_based", findings=[],
+                    evidence={"skipped": "not_tested_budget_denied"},
+                )
 
             baseline_mean = sum(baseline_times) / len(baseline_times)
 
@@ -1260,6 +1282,7 @@ class SQLiVerifier(BaseVerifier):
                 )
                 inj_times = []
                 last_resp = None
+                budget_denied = False
                 for _ in range(2):
                     resp = await self._send(
                         inj_url, method, inj_params, inj_data,
@@ -1267,9 +1290,16 @@ class SQLiVerifier(BaseVerifier):
                         json_body=inj_json,
                         test_phase="time_injection", payload=payload,
                     )
+                    # Budget-denied probe has no timing; treat payload as untested.
+                    if resp.not_tested:
+                        budget_denied = True
+                        break
                     inj_times.append(resp.response_time_ms)
                     last_resp = resp
                     await asyncio.sleep(0.1)
+
+                if budget_denied:
+                    continue
 
                 is_significant, timing = ResponseAnalyzer.is_timing_significant(
                     baseline_times, inj_times,

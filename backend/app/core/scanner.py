@@ -66,7 +66,7 @@ from app.models.vulnerability import (
 )
 from app.utils.cvss_calculator import CvssCalculator
 from app.utils.scan_metrics import begin_request_counting, end_request_counting, snapshot_request_counts
-from app.core.request_governor import begin_governor, end_governor
+from app.core.request_governor import begin_governor, end_governor, denied_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +332,11 @@ class ScanOrchestrator:
             crawl_result.routes = [r for r in crawl_result.routes if is_same_origin(target_url, getattr(r, "url", ""))]
             crawl_result.api_endpoints = [e for e in crawl_result.api_endpoints if is_same_origin(target_url, getattr(e, "url", ""))]
             crawl_result.requests = [req for req in crawl_result.requests if is_same_origin(target_url, getattr(req, "url", ""))]
+            if hasattr(crawl_result, "request_audit"):
+                crawl_result.request_audit = [
+                    req for req in crawl_result.request_audit
+                    if is_same_origin(target_url, getattr(req, "url", ""))
+                ]
             crawl_result.parameters = [p for p in crawl_result.parameters if is_same_origin(target_url, getattr(p, "url", ""))]
             crawl_result.forms = [
                 f for f in crawl_result.forms 
@@ -388,6 +393,8 @@ class ScanOrchestrator:
                 "api_endpoints": getattr(crawl_result, "api_endpoints", []),
                 "parameters": getattr(crawl_result, "parameters", []),
                 "requests": getattr(crawl_result, "requests", []),
+                "request_audit": getattr(crawl_result, "request_audit", []),
+                "request_audit_summary": getattr(crawl_result, "request_audit_summary", {}),
                 "routes": getattr(crawl_result, "routes", []),
                 "assets": getattr(crawl_result, "assets", []),
                 "dead_routes": getattr(crawl_result, "dead_routes", []),
@@ -460,6 +467,7 @@ class ScanOrchestrator:
                 )
 
             detector_request_counts: dict[str, int] = {}
+            detector_denied_counts: dict[str, int] = {}
             begin_request_counting()
             # P1-1: activate the request-budget governor for the detector phase so
             # per-detector / per-parameter ceilings bound each detector's traffic.
@@ -563,10 +571,16 @@ class ScanOrchestrator:
                 )
                 findings.extend(supply_chain_findings)
                 detector_request_counts = snapshot_request_counts()
+                detector_denied_counts = denied_snapshot()
             finally:
                 end_request_counting()
                 end_governor()
-            self._apply_detector_request_counts(detector_metrics, detector_request_counts)
+            self._apply_detector_request_counts(
+                detector_metrics,
+                detector_request_counts,
+                detector_denied_counts,
+                coverage_context.get("attack_planner"),
+            )
 
             await self._set_progress(scan, 60, ScanPhase.vulnerability_detection, f"Detector phase complete: {len(findings)} raw finding(s)")
             await self._check_cancelled(scan_id)
@@ -819,9 +833,14 @@ class ScanOrchestrator:
         planner = crawl_context.get("attack_planner")
         planner_summary: dict[str, object] = {}
         if isinstance(planner, AttackPlanner):
+            # Baseline summary with zero real attempts/denies. Real governor
+            # attempted/denied counts are applied post-loop in
+            # _apply_detector_request_counts, which recomputes these fields; this
+            # baseline deliberately never infers budget_exhausted from findings.
             planner_summary = planner.coverage_summary(
                 detector_name,
-                tested_count=self._request_snippet_count(findings),
+                attempted_count=0,
+                denied_count=0,
             )
             candidates_built = max(
                 candidates_built,
@@ -849,12 +868,17 @@ class ScanOrchestrator:
             detector=detector_name,
             candidates_built=candidates_built,
             requests_sent=self._request_snippet_count(findings),
+            targets_attempted=int(planner_summary.get("targets_attempted", 0) or 0),
+            requests_denied_by_governor=int(planner_summary.get("requests_denied_by_governor", 0) or 0),
             verified_findings=len([finding for finding in findings or [] if getattr(finding, "verified", False)]),
             unverified_findings=len([finding for finding in findings or [] if not getattr(finding, "verified", False)]),
             replayable_targets_seen=int(planner_summary.get("replayable_targets_seen", 0) or 0),
             replayable_targets_tested=int(planner_summary.get("replayable_targets_tested", 0) or 0),
             validated_synth_targets_tested=int(planner_summary.get("validated_synth_targets_tested", 0) or 0),
             body_targets_skipped=int(planner_summary.get("body_targets_skipped", 0) or 0),
+            body_targets_skipped_by_reason=dict(
+                planner_summary.get("body_targets_skipped_by_reason", {}) or {}
+            ),
             skip_reason_by_risk=dict(planner_summary.get("skip_reason_by_risk", {}) or {}),
             skipped_reasons=skipped_reasons,
         )
@@ -871,6 +895,7 @@ class ScanOrchestrator:
         parameters = crawl_context.get("parameters") or []
         api_endpoints = crawl_context.get("api_endpoints") or []
         requests = crawl_context.get("requests") or []
+        request_audit_summary = crawl_context.get("request_audit_summary") or {}
         auth_headers = crawl_context.get("auth_headers") or {}
         session_cookies = crawl_context.get("session_cookies") or {}
         browser_forms = crawl_context.get("browser_forms") or []
@@ -920,6 +945,15 @@ class ScanOrchestrator:
             and not synthesizable_body_endpoints
         ):
             skipped["no_replayable_request_bodies"] = 1
+        for reason, count in request_audit_summary.items():
+            if reason in {"transport_noise", "resource_noise"}:
+                continue
+            if str(reason).startswith("body_") or reason in {
+                "unsupported_content_type",
+                "unparseable_json",
+                "empty_body",
+            }:
+                skipped[f"browser_body_{reason}"] = int(count)
         if not findings and candidates_built > 0:
             skipped["no_findings_after_verification"] = 1
         return skipped
@@ -980,17 +1014,39 @@ class ScanOrchestrator:
         self,
         detector_metrics: list[DetectorCoverageMetric],
         request_counts: dict[str, int],
+        denied_counts: dict[str, int] | None = None,
+        planner: "AttackPlanner | None" = None,
     ) -> None:
+        denied_counts = denied_counts or {}
         matched_modules: set[str] = set()
         for metric in detector_metrics:
             aliases = self._detector_request_aliases(metric.detector)
             request_total = sum(request_counts.get(alias, 0) for alias in aliases)
+            denied_total = sum(denied_counts.get(alias, 0) for alias in aliases)
+            metric.targets_attempted = request_total
+            metric.requests_denied_by_governor = denied_total
+            # Recompute the planner-derived coverage fields from the REAL
+            # governor attempted/denied counts, replacing the zero-attempt
+            # baseline set during the detector loop. budget_exhausted is now
+            # attributed strictly from denied_total — never a finding shortfall.
+            if isinstance(planner, AttackPlanner):
+                summary = planner.coverage_summary(
+                    metric.detector,
+                    attempted_count=request_total,
+                    denied_count=denied_total,
+                )
+                metric.replayable_targets_tested = int(summary.get("replayable_targets_tested", 0) or 0)
+                metric.validated_synth_targets_tested = int(summary.get("validated_synth_targets_tested", 0) or 0)
+                metric.body_targets_skipped = int(summary.get("body_targets_skipped", 0) or 0)
+                metric.body_targets_skipped_by_reason = dict(summary.get("body_targets_skipped_by_reason", {}) or {})
+                metric.skip_reason_by_risk = dict(summary.get("skip_reason_by_risk", {}) or {})
             if request_total:
                 metric.requests_sent = max(metric.requests_sent, request_total)
-                metric.replayable_targets_tested = max(
-                    metric.replayable_targets_tested,
-                    min(metric.replayable_targets_seen, request_total),
-                )
+                if not isinstance(planner, AttackPlanner):
+                    metric.replayable_targets_tested = max(
+                        metric.replayable_targets_tested,
+                        min(metric.replayable_targets_seen, request_total),
+                    )
                 matched_modules.update(aliases)
 
         for module, count in request_counts.items():
@@ -1001,6 +1057,11 @@ class ScanOrchestrator:
                     detector=module,
                     requests_sent=count,
                     candidates_built=count,
+                    targets_attempted=count,
+                    requests_denied_by_governor=sum(
+                        denied_counts.get(alias, 0)
+                        for alias in self._detector_request_aliases(module)
+                    ),
                 )
             )
 
@@ -1009,7 +1070,8 @@ class ScanOrchestrator:
             logger.info(
                 "detector coverage: detector=%s candidates_built=%d requests_sent=%d "
                 "verified_findings=%d unverified_findings=%d dropped_verified_mode=%d "
-                "replayable_seen=%d replayable_tested=%d body_skipped=%d skipped_reasons=%s",
+                "replayable_seen=%d replayable_tested=%d body_skipped=%d "
+                "body_skipped_by_reason=%s skipped_reasons=%s",
                 metric.detector,
                 metric.candidates_built,
                 metric.requests_sent,
@@ -1019,6 +1081,7 @@ class ScanOrchestrator:
                 metric.replayable_targets_seen,
                 metric.replayable_targets_tested,
                 metric.body_targets_skipped,
+                metric.body_targets_skipped_by_reason,
                 metric.skipped_reasons,
             )
 

@@ -168,7 +168,11 @@ class AttackSurface:
         for candidate in candidates:
             if cls._is_transport_layer_url(candidate.url):
                 continue
-            if cls._has_unresolved_path_placeholder(candidate.url):
+            if cls._has_unresolved_path_placeholder(candidate.url) and not cls._candidate_resolves_own_path(candidate):
+                # A path-location candidate legitimately carries its own placeholder
+                # (the injection point). Keep it only when filling that parameter
+                # resolves every placeholder in the URL; endpoints with a second,
+                # unfilled path placeholder would 404, so those stay dropped.
                 continue
             template = None
             form_inputs = candidate.context.get("form_inputs")
@@ -213,7 +217,7 @@ class AttackSurface:
                 continue
             content_type = cls._request_content_type(request)
             body = cls._parse_json(request.post_data)
-            if not isinstance(body, dict):
+            if not isinstance(body, (dict, list)):
                 form_body = cls._parse_form_data(request.post_data, request.request_headers or {}, content_type)
                 multipart_fields = cls._observed_multipart_inputs(request) or cls._parse_multipart_fields(
                     request.post_data,
@@ -457,13 +461,30 @@ class AttackSurface:
         api_endpoints: list[ApiEndpoint] | None = None,
         requests: list[RequestObservation] | None = None,
     ) -> dict[str, int]:
+        requests = requests or []
+        api_endpoints = api_endpoints or []
         targets = cls.build(
             [],
             [],
-            api_endpoints=api_endpoints or [],
-            requests=requests or [],
+            api_endpoints=api_endpoints,
+            requests=requests,
+        )
+        observed_body_requests = [
+            request for request in requests
+            if getattr(request, "post_data", None)
+        ]
+        replayable_body_requests = [
+            request for request in observed_body_requests
+            if getattr(request, "replayable", False)
+        ]
+        skip_buckets = cls.body_target_skip_buckets(
+            api_endpoints=api_endpoints,
+            requests=requests,
+            targets=targets,
         )
         return {
+            "observed_body_requests": len(observed_body_requests),
+            "replayable_body_requests": len(replayable_body_requests),
             "observed_json_body_targets": sum(
                 1
                 for target in targets
@@ -480,10 +501,74 @@ class AttackSurface:
                 1 for target in targets if target.source_confidence == "static_synth"
             ),
             "skipped_unresolved_body_targets": cls._count_unresolved_static_body_targets(
-                api_endpoints or [],
-                requests or [],
+                api_endpoints,
+                requests,
             ),
+            **{f"body_targets_skipped_{reason}": count for reason, count in skip_buckets.items()},
         }
+
+    @classmethod
+    def body_target_skip_buckets(
+        cls,
+        *,
+        api_endpoints: list[ApiEndpoint] | None = None,
+        requests: list[RequestObservation] | None = None,
+        targets: list[AttackTarget] | None = None,
+    ) -> dict[str, int]:
+        requests = requests or []
+        api_endpoints = api_endpoints or []
+        targets = targets if targets is not None else cls.build(
+            [],
+            [],
+            api_endpoints=api_endpoints,
+            requests=requests,
+        )
+        buckets: dict[str, int] = {
+            "non_replayable": 0,
+            "static_synth_not_validated": 0,
+            "unresolved_path_placeholder": 0,
+            "transport_noise": 0,
+            "duplicate": 0,
+            "budget_exhausted": 0,
+        }
+        seen: set[tuple[str, str, str, str, str]] = set()
+        for target in targets:
+            if target.location not in {
+                ParameterLocation.form,
+                ParameterLocation.json_body,
+                ParameterLocation.graphql_variable,
+            }:
+                continue
+            key = (
+                target.url,
+                target.method.upper(),
+                target.parameter,
+                target.location.value,
+                target.parent_path or "",
+            )
+            if key in seen:
+                buckets["duplicate"] += 1
+            seen.add(key)
+            if target.source_confidence == "static_synth" and not target.replayable:
+                buckets["static_synth_not_validated"] += 1
+            elif not target.replayable:
+                buckets["non_replayable"] += 1
+            if cls._has_unresolved_path_placeholder(target.url):
+                buckets["unresolved_path_placeholder"] += 1
+            if cls._is_transport_layer_url(target.url):
+                buckets["transport_noise"] += 1
+
+        for request in requests:
+            reason = getattr(request, "drop_reason", None) or getattr(request, "non_replayable_reason", None)
+            if reason == "transport_noise":
+                buckets["transport_noise"] += 1
+            elif reason:
+                buckets["non_replayable"] += 1
+        buckets["unresolved_path_placeholder"] += cls._count_unresolved_static_body_targets(
+            api_endpoints,
+            requests,
+        )
+        return {reason: count for reason, count in buckets.items() if count}
 
     @classmethod
     def _count_unresolved_static_body_targets(
@@ -530,6 +615,25 @@ class AttackSurface:
             if segment.startswith(":") and len(segment) > 1:
                 return True
         return False
+
+    @classmethod
+    def _candidate_resolves_own_path(cls, candidate: ParameterCandidate) -> bool:
+        """True when injecting this path candidate leaves no unresolved placeholder.
+
+        A ``path``-location candidate (e.g. ``/api/users/{userId}``) owns its
+        placeholder — that segment is the injection point, not a broken URL.
+        Substituting a probe value should yield a concrete, requestable URL; if a
+        second placeholder remains (multi-segment templates), the request would
+        404, so the candidate is not kept. Generic ``param_N`` names come from
+        ``normalize_template_url`` when the real segment value is unknown; those
+        are guesswork that only generates 404 noise, so they stay dropped too.
+        """
+        if candidate.location != ParameterLocation.path:
+            return False
+        if re.fullmatch(r"param_\d+", candidate.name or ""):
+            return False
+        resolved = inject_path_parameter(candidate.url, candidate.name, "1")
+        return not cls._has_unresolved_path_placeholder(resolved)
 
     @staticmethod
     def _endpoint_templates(endpoints: list[ApiEndpoint]) -> dict[tuple[str, str], tuple[Any, dict[str, str]]]:
@@ -702,7 +806,7 @@ class AttackSurface:
 
 def build_json_body(template: Any, target: AttackTarget, injected_value: Any) -> Any:
     body = copy.deepcopy(template) if template is not None else {}
-    if not isinstance(body, dict):
+    if not isinstance(body, (dict, list)):
         body = {}
 
     path = target.parent_path or target.parameter
@@ -822,9 +926,10 @@ def inject_path_parameter(url: str, parameter_name: str, parameter_value: str) -
     return urlunparse(parsed._replace(path=path))
 
 
-def _set_json_path(body: dict, path: str, value: Any) -> None:
+def _set_json_path(body: Any, path: str, value: Any) -> None:
     if not path:
-        body["value"] = value
+        if isinstance(body, dict):
+            body["value"] = value
         return
 
     parts = [part for part in path.replace("[", ".[").split(".") if part]
@@ -832,6 +937,18 @@ def _set_json_path(body: dict, path: str, value: Any) -> None:
     for index, part in enumerate(parts):
         is_last = index == len(parts) - 1
         if part.startswith("["):
+            if not isinstance(current, list):
+                continue
+            try:
+                list_index = int(part.strip("[]"))
+            except ValueError:
+                continue
+            if not 0 <= list_index < len(current):
+                continue
+            if is_last:
+                current[list_index] = value
+                return
+            current = current[list_index]
             continue
         if is_last:
             if isinstance(current, dict):
