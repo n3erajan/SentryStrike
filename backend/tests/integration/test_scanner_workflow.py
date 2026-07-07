@@ -33,6 +33,15 @@ class FakeSpider:
         class Result:
             urls = ["https://example.com/search?q=1"]
             forms = []
+            routes = []
+            api_endpoints = []
+            requests = []
+            parameters = []
+            session_cookies = {}
+            auth_headers = {}
+            is_spa = False
+            assets = []
+            dead_routes = []
 
         return Result()
 
@@ -40,6 +49,15 @@ class FakeSpider:
         class Result:
             urls = ["https://example.com/search?q=1"]
             forms = []
+            routes = []
+            api_endpoints = []
+            requests = []
+            parameters = []
+            session_cookies = {}
+            auth_headers = {}
+            is_spa = False
+            assets = []
+            dead_routes = []
 
         return Result()
 

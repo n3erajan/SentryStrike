@@ -168,7 +168,7 @@ class AttackSurface:
         for candidate in candidates:
             if cls._is_transport_layer_url(candidate.url):
                 continue
-            if cls._has_unresolved_path_placeholder(candidate.url):
+            if candidate.location != ParameterLocation.path and cls._has_unresolved_path_placeholder(candidate.url):
                 continue
             template = None
             form_inputs = candidate.context.get("form_inputs")
@@ -365,6 +365,9 @@ class AttackSurface:
         for endpoint in api_endpoints:
             if (endpoint.url, endpoint.method.upper()) in observed_body_keys:
                 continue
+            # If the URL has unresolved path placeholders, we can only test the
+            # path parameters themselves (which aren't subject to body synthesis).
+            # Skip body synthesis for these endpoints.
             if cls._has_unresolved_path_placeholder(endpoint.url):
                 continue
             # Task C (RC-C): only synthesize bodies for genuine API/JSON/form
