@@ -5,8 +5,7 @@ import {
   FileArrowDown,
 } from "@phosphor-icons/react";
 
-// The themed brand side of the split auth layout. Shared by the login and
-// registration screens; the pages decide which column it sits in.
+// Shared brand panel for the auth screens.
 function AuthBrand() {
   return (
     <aside className='auth-brand'>

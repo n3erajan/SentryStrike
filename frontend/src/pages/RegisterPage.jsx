@@ -42,7 +42,8 @@ function RegisterPage({ onAuthed, onGoLogin }) {
 
   return (
     <div className='auth-split'>
-      {/* Inverted: form on the left, brand on the right */}
+      <AuthBrand />
+
       <div className='auth-form-panel'>
         <div className='auth-form-inner'>
           <div className='auth-head'>
@@ -159,8 +160,6 @@ function RegisterPage({ onAuthed, onGoLogin }) {
           </p>
         </div>
       </div>
-
-      <AuthBrand />
     </div>
   );
 }
