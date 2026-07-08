@@ -1161,64 +1161,110 @@ class AuthenticationFailuresDetector(BaseDetector):
         return unique
 
     def _jwt_findings(self, kwargs: dict[str, object], session_cookies: dict) -> list[Finding]:
-        findings: list[Finding] = []
+        # JWT weaknesses are a server token-policy issue, not an endpoint-specific
+        # one. Aggregate per (host, vuln_type) so a single policy gap is reported
+        # once per host instead of fanning out across every URL/token that carried it.
         now = int(time.time())
         sensitive_claim_terms = (
             "password", "passwd", "pwd", "secret", "api_key", "apikey", "private_key",
             "reset_token", "refresh_token", "access_token", "hash",
         )
+        root_url = str(kwargs.get("root_url") or "")
+
+        decoded_tokens: list[dict] = []
         for item in self._tokens_from_context(kwargs, session_cookies):
             decoded = self._decode_jwt(item["token"])
             if not decoded:
                 continue
             header, payload = decoded
-            url = str(item.get("url") or kwargs.get("root_url") or "")
-            source = str(item.get("source") or "jwt")
+            url = str(item.get("url") or root_url)
+            decoded_tokens.append({
+                "header": header,
+                "payload": payload,
+                "source": str(item.get("source") or "jwt"),
+                "url": url,
+                "host": urlparse(url).netloc,
+            })
+
+        groups: dict[tuple[str, str], dict] = {}
+
+        def _add(
+            host: str,
+            vuln_type: str,
+            severity: SeverityLevel,
+            evidence: str,
+            detection_method: str,
+            confidence: float,
+            token: dict,
+            extra: dict,
+        ) -> None:
+            key = (host, vuln_type)
+            group = groups.get(key)
+            if group is None:
+                group = {
+                    "vuln_type": vuln_type,
+                    "severity": severity,
+                    "evidence": evidence,
+                    "detection_method": detection_method,
+                    "confidence_score": confidence,
+                    "sources": [],
+                    "urls": [],
+                    "claim_sets": [],
+                    "extras": [],
+                }
+                groups[key] = group
+            if token["source"] not in group["sources"]:
+                group["sources"].append(token["source"])
+            if token["url"] not in group["urls"]:
+                group["urls"].append(token["url"])
+            claim_set = sorted(token["payload"].keys())
+            if claim_set not in group["claim_sets"]:
+                group["claim_sets"].append(claim_set)
+            group["extras"].append(extra)
+
+        for token in decoded_tokens:
+            header = token["header"]
+            payload = token["payload"]
+            host = token["host"]
             alg = str(header.get("alg", "")).lower()
             if alg == "none":
-                findings.append(
-                    self._finding(
-                        vuln_type="JWT Uses alg=none",
-                        url=url,
-                        severity=SeverityLevel.critical,
-                        evidence="Bearer/session JWT declares alg=none, meaning signature verification may be disabled.",
-                        verified=True,
-                        detection_method="jwt_metadata_inspection",
-                        confidence_score=95.0,
-                        detection_evidence={"source": source, "header": header},
-                    )
+                _add(
+                    host,
+                    "JWT Uses alg=none",
+                    SeverityLevel.critical,
+                    "Bearer/session JWT declares alg=none, meaning signature verification may be disabled.",
+                    "jwt_metadata_inspection",
+                    95.0,
+                    token,
+                    {"header": header},
                 )
 
             exp = payload.get("exp")
             if exp is None:
-                findings.append(
-                    self._finding(
-                        vuln_type="JWT Missing Expiration Claim",
-                        url=url,
-                        severity=SeverityLevel.high,
-                        evidence="Bearer/session JWT has no exp claim, so token lifetime cannot be bounded by the token itself.",
-                        verified=True,
-                        detection_method="jwt_claim_inspection",
-                        confidence_score=85.0,
-                        detection_evidence={"source": source, "claims": sorted(payload.keys())},
-                    )
+                _add(
+                    host,
+                    "JWT Missing Expiration Claim",
+                    SeverityLevel.high,
+                    "Bearer/session JWT has no exp claim, so token lifetime cannot be bounded by the token itself.",
+                    "jwt_claim_inspection",
+                    85.0,
+                    token,
+                    {"claims": sorted(payload.keys())},
                 )
             else:
                 try:
                     exp_int = int(exp)
                     iat_int = int(payload.get("iat", now))
                     if exp_int - iat_int > 60 * 60 * 24 * 30 or exp_int - now > 60 * 60 * 24 * 30:
-                        findings.append(
-                            self._finding(
-                                vuln_type="JWT Expiration Is Excessively Long",
-                                url=url,
-                                severity=SeverityLevel.medium,
-                                evidence="Bearer/session JWT remains valid for more than 30 days.",
-                                verified=True,
-                                detection_method="jwt_claim_inspection",
-                                confidence_score=80.0,
-                                detection_evidence={"source": source, "exp": exp_int, "iat": payload.get("iat")},
-                            )
+                        _add(
+                            host,
+                            "JWT Expiration Is Excessively Long",
+                            SeverityLevel.medium,
+                            "Bearer/session JWT remains valid for more than 30 days.",
+                            "jwt_claim_inspection",
+                            80.0,
+                            token,
+                            {"exp": exp_int, "iat": payload.get("iat")},
                         )
                 except Exception:
                     pass
@@ -1228,18 +1274,63 @@ class AuthenticationFailuresDetector(BaseDetector):
                 if any(term in str(key).lower() for term in sensitive_claim_terms)
             ]
             if sensitive_claims:
-                findings.append(
-                    self._finding(
-                        vuln_type="JWT Contains Sensitive Claims",
-                        url=url,
-                        severity=SeverityLevel.high,
-                        evidence=f"JWT payload exposes sensitive claim names: {sorted(sensitive_claims)}.",
-                        verified=True,
-                        detection_method="jwt_sensitive_claim_inspection",
-                        confidence_score=90.0,
-                        detection_evidence={"source": source, "sensitive_claims": sorted(sensitive_claims)},
-                    )
+                _add(
+                    host,
+                    "JWT Contains Sensitive Claims",
+                    SeverityLevel.high,
+                    f"JWT payload exposes sensitive claim names: {sorted(sensitive_claims)}.",
+                    "jwt_sensitive_claim_inspection",
+                    90.0,
+                    token,
+                    {"sensitive_claims": sorted(sensitive_claims)},
                 )
+
+        findings: list[Finding] = []
+        for (host, vuln_type), group in groups.items():
+            rep_url = (
+                root_url
+                if root_url and urlparse(root_url).netloc == host
+                else (group["urls"][0] if group["urls"] else root_url)
+            )
+            detection_evidence: dict = {
+                "sources": group["sources"],
+                "urls": group["urls"],
+                "claim_sets": group["claim_sets"],
+            }
+            if vuln_type == "JWT Uses alg=none":
+                detection_evidence["headers"] = [
+                    e["header"] for e in group["extras"] if e.get("header") is not None
+                ]
+            elif vuln_type == "JWT Expiration Is Excessively Long":
+                detection_evidence["exp_values"] = [
+                    e["exp"] for e in group["extras"] if e.get("exp") is not None
+                ]
+                detection_evidence["iat_values"] = [
+                    e["iat"] for e in group["extras"] if e.get("iat") is not None
+                ]
+            elif vuln_type == "JWT Contains Sensitive Claims":
+                detection_evidence["sensitive_claims"] = sorted(
+                    {s for e in group["extras"] for s in (e.get("sensitive_claims") or [])}
+                )
+
+            evidence = group["evidence"]
+            if len(group["sources"]) > 1:
+                evidence += (
+                    f" Observed across {len(group['sources'])} token source(s) on host {host}."
+                )
+
+            findings.append(
+                self._finding(
+                    vuln_type=vuln_type,
+                    url=rep_url,
+                    severity=group["severity"],
+                    evidence=evidence,
+                    verified=True,
+                    detection_method=group["detection_method"],
+                    confidence_score=group["confidence_score"],
+                    detection_evidence=detection_evidence,
+                )
+            )
         return findings
 
     def _cookie_attribute_findings(self, kwargs: dict[str, object]) -> list[Finding]:
@@ -1697,10 +1788,13 @@ class AuthenticationFailuresDetector(BaseDetector):
                     detection_method="observed_credential_disclosure",
                     detection_evidence={
                         "source_vuln_type": source.vuln_type,
+                        "source_detection_method": getattr(source, "detection_method", None),
                         "matched_patterns": matched_patterns,
                     },
                     verified=True,
                     reproducible=getattr(source, "reproducible", False),
+                    verification_request_snippet=getattr(source, "verification_request_snippet", None),
+                    verification_response_snippet=observed_text or getattr(source, "verification_response_snippet", None),
                 )
             )
 

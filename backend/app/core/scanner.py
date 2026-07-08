@@ -525,6 +525,13 @@ class ScanOrchestrator:
                         self._add_findings_to_metric(metric, observed_credential_findings)
                         findings.extend(observed_credential_findings)
 
+                # A10/A07 derived-evidence cross-guard: when the same source finding
+                # yields both a verbose-error (A10) and a credential disclosure
+                # (A07) derivation, fold the verbose-error finding into the
+                # credential finding so one response body isn't counted twice.
+                # Only same-source derived findings merge; independent findings stay.
+                self._merge_same_source_derived_findings(findings)
+
                 # Provide the scan root URL so site-wide detectors can avoid duplicate page-level findings.
                 crypto_detector = next((detector for detector in self.detectors if isinstance(detector, CryptoFailuresDetector)), None)
                 if crypto_detector is not None:
@@ -808,6 +815,73 @@ class ScanOrchestrator:
     def _tag_detector_findings(self, findings: list[Finding], detector_name: str) -> None:
         for finding in findings or []:
             setattr(finding, "detector_name", detector_name)
+
+    @staticmethod
+    def _merge_same_source_derived_findings(findings: list[Finding]) -> None:
+        """Fold same-source derived A10 (Verbose Error) findings into matching
+        A07 (Credential / Config Disclosure) findings in place.
+
+        Only findings derived from observed evidence (detection_method of
+        ``observed_exception_evidence`` and ``observed_credential_disclosure``)
+        that share the same source-finding key (url, parameter, source vuln
+        type, source detection method) are merged. The A07 finding stays primary
+        and records the verbose-error patterns as supporting evidence; the A10
+        finding is dropped. Independent findings are never merged, so A10 and
+        A07 findings that do not share a source stay as-is.
+        """
+        verbose_method = "observed_exception_evidence"
+        credential_method = "observed_credential_disclosure"
+
+        def _source_key(finding: Finding) -> tuple:
+            evidence = finding.detection_evidence or {}
+            return (
+                finding.url or "",
+                finding.parameter or "",
+                str(evidence.get("source_vuln_type") or ""),
+                str(evidence.get("source_detection_method") or ""),
+            )
+
+        credential_by_key: dict[tuple, Finding] = {}
+        for finding in findings:
+            if getattr(finding, "detection_method", None) == credential_method:
+                key = _source_key(finding)
+                if key not in credential_by_key:
+                    credential_by_key[key] = finding
+
+        if not credential_by_key:
+            return
+
+        merged: list[Finding] = []
+        for finding in findings:
+            if getattr(finding, "detection_method", None) != verbose_method:
+                merged.append(finding)
+                continue
+            primary = credential_by_key.get(_source_key(finding))
+            if primary is None:
+                merged.append(finding)
+                continue
+            verbose_patterns = (finding.detection_evidence or {}).get("matched_patterns", [])
+            primary_evidence = primary.detection_evidence or {}
+            supporting = primary_evidence.get("supporting_verbose_error_patterns", [])
+            for pattern in verbose_patterns:
+                if pattern not in supporting:
+                    supporting.append(pattern)
+            primary_evidence["supporting_verbose_error_patterns"] = supporting
+            if finding.evidence:
+                prior = primary_evidence.get("supporting_verbose_evidence", "")
+                primary_evidence["supporting_verbose_evidence"] = (
+                    f"{prior}\n{finding.evidence}".strip()
+                )
+            primary.detection_evidence = primary_evidence
+            if verbose_patterns:
+                primary.evidence = (primary.evidence or "") + (
+                    f" Verbose error disclosure also observed in the same response: "
+                    f"{', '.join(verbose_patterns[:2])}."
+                )
+            # Drop the verbose-error finding; it has been folded into the
+            # credential disclosure finding above.
+        findings.clear()
+        findings.extend(merged)
 
     def _add_findings_to_metric(self, metric: DetectorCoverageMetric, findings: list[Finding]) -> None:
         metric.candidates_built += len(findings or [])

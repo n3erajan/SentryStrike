@@ -506,6 +506,14 @@ class WebSpider:
             for raw_input in form.get("inputs") or []:
                 if not isinstance(raw_input, dict):
                     continue
+                # Synthetic positional fallback names (field_<cid>_<idx>) are
+                # internal handles for fill/submit addressing, never real backend
+                # parameter names. Dropping them here prevents useless injection
+                # targets against names the server doesn't recognize. The live
+                # submit path uses field_id (data-sentry-field attr), not the name,
+                # so this does not affect form submission.
+                if raw_input.get("named") is False:
+                    continue
                 input_type = str(raw_input.get("type") or "text").lower()
                 name = str(raw_input.get("name") or "").strip()
                 if not name and input_type == "file":

@@ -495,8 +495,15 @@ class FindingDeduplicator:
             return "admin_or_sensitive_endpoint"
         if "csrf" in vt:
             return "csrf"
-        if "insecure transport" in vt or "weak tls" in vt or "ssl configuration" in vt:
+        if (
+            "insecure transport" in vt
+            or "weak tls" in vt
+            or "ssl configuration" in vt
+            or "no tls" in vt
+        ):
             return "transport_security"
+        if "lockout" in vt or "brute-force" in vt or "brute force" in vt:
+            return "auth_rate_limit"
         if "credential" in vt and ("get" in vt or "url" in vt):
             return "credentials_in_url"
         if "sensitive data in url" in vt:
@@ -525,7 +532,7 @@ class FindingDeduplicator:
             canonical_url = FindingDeduplicator._canonical_url(finding.url)
             family = FindingDeduplicator._dedupe_family(finding.vuln_type)
             parameter = finding.parameter
-            if family in {"csrf", "admin_or_sensitive_endpoint", "transport_security", "exception_disclosure"}:
+            if family in {"csrf", "admin_or_sensitive_endpoint", "transport_security", "exception_disclosure", "auth_rate_limit"}:
                 parameter = None
             key = (canonical_url, parameter, family)
             if key not in groups:
