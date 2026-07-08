@@ -261,6 +261,39 @@ def _strip_query(url: str) -> str:
 # We implement the same multi-signal differential below.
 # ---------------------------------------------------------------------------
 
+def _json_structural_analysis(a: str, b: str) -> tuple[float, float] | None:
+    import json
+    try:
+        ja = json.loads(a)
+        jb = json.loads(b)
+    except Exception:
+        return None
+        
+    def flatten(obj: object, prefix: str = "") -> dict[str, object]:
+        items: dict[str, object] = {}
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                items.update(flatten(v, f"{prefix}.{k}"))
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                items.update(flatten(v, f"{prefix}[{i}]"))
+        else:
+            items[prefix] = obj
+        return items
+        
+    fa = flatten(ja)
+    fb = flatten(jb)
+    if not fa and not fb:
+        return 1.0, 1.0
+        
+    keys_union = set(fa.keys()) | set(fb.keys())
+    if not keys_union:
+        return 1.0, 1.0
+        
+    key_matches = sum(1 for k in keys_union if k in fa and k in fb)
+    val_matches = sum(1 for k in keys_union if fa.get(k) == fb.get(k))
+    return key_matches / len(keys_union), val_matches / len(keys_union)
+
 def _differential_idor_verdict(
     *,
     own_body: str,
@@ -270,51 +303,40 @@ def _differential_idor_verdict(
     """
     Apply Burp-Suite-style differential analysis to decide whether a response
     to a mutated ID represents a genuine IDOR or a false positive.
-
-    Returns (is_idor, similarity_own_vs_mutated, reason).
-
-    Rules (applied in order):
-      R1. If the mutated+authed body looks like an error / not-found page →
-          not IDOR (the app rejected the mutated ID gracefully).
-      R2. If the mutated+unauthed body is provided and is nearly identical to
-          the mutated+authed body → the resource is publicly accessible,
-          so this is not a meaningful access-control bypass.
-      R3. similarity(own, mutated_authed) > 0.98 → both requests returned the
-          same generic template; not a real different object.
-      R4. similarity(own, mutated_authed) < 0.10 → the response is so
-          different that it is probably a generic error page that slipped
-          through the keyword filter.
-      R5. Passed all guards → genuine IDOR signal; report with similarity score.
-
-    The similarity thresholds are intentionally conservative to minimise
-    false positives at the cost of a slightly higher miss rate.
     """
-    # R1: error-page guard
     if _looks_like_error_page(mutated_authed_body):
         return False, 0.0, "mutated response resembles an error/not-found page"
 
-    # R2: public-resource guard
+    # Semantic JSON Differential
+    json_sims = _json_structural_analysis(own_body, mutated_authed_body)
+    if json_sims is not None:
+        key_sim, val_sim = json_sims
+        if key_sim < 0.50:
+            return False, key_sim, "mutated JSON structure differs too much (likely an error object)"
+        if val_sim == 1.0:
+            return False, 1.0, "mutated JSON has identical values (generic template or same object)"
+            
+        if mutated_unauthed_body is not None:
+            unauth_json_sims = _json_structural_analysis(mutated_authed_body, mutated_unauthed_body)
+            if unauth_json_sims is not None:
+                _, unauth_val_sim = unauth_json_sims
+                if unauth_val_sim > 0.99:
+                    return False, 0.0, "mutated JSON is identical to unauthed JSON (publicly accessible)"
+                    
+        return True, val_sim, "JSON differential analysis passed"
+
+    # Fallback to Text-Based Differential
     if mutated_unauthed_body is not None:
         unauth_sim = _body_similarity(mutated_authed_body, mutated_unauthed_body)
         if unauth_sim > 0.85:
-            return (
-                False,
-                0.0,
-                f"mutated resource is publicly accessible (authed vs unauthed similarity: {unauth_sim:.0%})",
-            )
+            return False, 0.0, f"mutated resource is publicly accessible (authed vs unauthed similarity: {unauth_sim:.0%})"
 
-    # R3 / R4: own-vs-mutated similarity band
     own_sim = _body_similarity(own_body, mutated_authed_body)
     if own_sim > 0.95:
         return False, own_sim, "mutated response is virtually identical to own resource (generic template)"
     if own_sim < 0.10:
-        return (
-            False,
-            own_sim,
-            "mutated response is too dissimilar from own resource — likely an error page",
-        )
+        return False, own_sim, "mutated response is too dissimilar from own resource — likely an error page"
 
-    # Passed all guards
     return True, own_sim, "differential analysis passed"
 
 

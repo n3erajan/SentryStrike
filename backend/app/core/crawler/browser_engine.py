@@ -45,9 +45,26 @@ REQUEST_SUBMIT_JS = (
     "if (form.requestSubmit) { form.requestSubmit(); } else { form.submit(); } "
     "return true; }"
 )
+# A dropdown option whose visible text is a generic placeholder maps to no real
+# value and leaves a required field invalid. Skipped when a real option exists.
+_PLACEHOLDER_OPTION_RE = re.compile(
+    r"^(?:-+|—+|\.\.\.|select\b.*|choose\b.*|please\s+select.*|none\b.*|"
+    r"pick\b.*|--.*)$",
+    re.I,
+)
+# Volatile tokens that some apps echo back into a POST body from a prior GET
+# (a server-stamped timestamp on a nested object the form carried along). Two
+# submits of the SAME form then differ only here, so they are collapsed for the
+# dedup key only (the stored body is untouched). ISO-8601 date-times are the
+# dominant, high-confidence case; keeping the pattern tight avoids collapsing
+# real distinct values. Applied in :meth:`_dedupe_body_key`.
+_VOLATILE_TOKEN_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
+)
 INTERACTIVE_SELECTOR = (
     "a[href], button, [role=button], input[type=submit], input[type=button], "
-    "input[type=checkbox], input[type=radio], [tabindex]:not([tabindex='-1'])"
+    "input[type=checkbox], input[type=radio], [tabindex]:not([tabindex='-1']), "
+    "div[class*='btn'], div[class*='button'], span[class*='btn'], span[class*='button']"
 )
 SAFE_FIELD_VALUES = {
     "email": "scanner@example.com",
@@ -84,6 +101,17 @@ VOLATILE_REQUEST_HEADERS = {
 MAX_CAPTURED_BODY_CHARS = 64_000
 TRANSPORT_NOISE_PATHS = ("/socket.io", "/engine.io", "/sockjs", "/signalr")
 ROOT_API_PATH_RE = re.compile(r"^/(?:api|rest|graphql|gql|v[0-9]+|rpc|trpc|oauth|session)(?:/|$)", re.I)
+
+# File extensions whose content is data/assets, never an app page worth
+# navigating a browser to. Generic across stacks; used to keep the browser's
+# finite navigation budget on HTML/SPA routes (the only ones bearing forms and
+# client-side routes) rather than full-loading a JSON/asset leaf.
+NON_NAVIGABLE_SUFFIXES = (
+    ".json", ".xml", ".txt", ".csv", ".pdf", ".js", ".mjs", ".css", ".map",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
+    ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".webm", ".mp3", ".wav",
+    ".zip", ".gz", ".tar", ".wasm",
+)
 
 # Sentinel returned by _bounded when an operation times out or errors, so a
 # successful call returning None (e.g. Playwright click) is distinguishable
@@ -148,6 +176,30 @@ OVERLAY_DETECT_SCRIPT = """
       node = node.parentElement;
     }
     return false;
+  } catch (e) { return false; }
+}
+"""
+
+# True only when the CURRENT document is a live, routable SPA shell (a framework
+# mount point / router outlet, or a script-driven HTML tree). A raw JSON/text/file
+# body (Chromium renders these as a single <pre>) or a scriptless error page is
+# NOT a shell: client-side routing (location.hash/pushState) against such a
+# document merely rewrites its URL and the framework router never reacts. Keying
+# on DOM structure only keeps this framework-agnostic (Angular/React/Vue/Next/Nuxt).
+SPA_SHELL_PROBE_SCRIPT = """
+() => {
+  try {
+    if (document.querySelector(
+      'app-root,[ng-version],router-outlet,#root,#app,#__next,#__nuxt,' +
+      '[data-reactroot],[data-server-rendered],[data-svelte]'
+    )) return true;
+    const body = document.body;
+    if (!body) return false;
+    const kids = [...body.children];
+    // Chromium wraps a raw JSON/text/file response in a single <pre> — never a shell.
+    if (kids.length === 1 && kids[0].tagName === 'PRE') return false;
+    // Otherwise a shell is a script-driven HTML document with a real element tree.
+    return document.querySelectorAll('script[src]').length > 0 && kids.length > 0;
   } catch (e) { return false; }
 }
 """
@@ -536,6 +588,15 @@ class BrowserDiscoveryEngine:
                 logger.debug("browser observer task failed: %s", exc)
         for task in pending:
             task.cancel()
+        # Await the just-cancelled tasks so their exceptions are retrieved. A
+        # still-running observer (e.g. one mid ``response.text()`` when the page
+        # /context closes at crawl end) otherwise resolves to an unretrieved
+        # ``TargetClosedError`` future, which asyncio reports as the noisy
+        # "Future exception was never retrieved" at shutdown. Results are already
+        # captured; this only silences the leak. ``return_exceptions`` keeps the
+        # gather from re-raising the CancelledError/close error we expect.
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     @staticmethod
     def _merge_worker_state(
@@ -648,6 +709,61 @@ class BrowserDiscoveryEngine:
         loop = asyncio.get_running_loop()
         root_origin_url = root_url
 
+        # Playwright rejects a call's internal protocol future with
+        # ``TargetClosedError`` when the page/context closes while a bounded
+        # ``fill``/``select`` is still resolving a locator (its ``asyncio.wait_for``
+        # already timed out and moved on, but the underlying CDP call is orphaned).
+        # That future is never awaited by anyone, so at GC asyncio logs a noisy
+        # "Future exception was never retrieved" at crawl end. Results are already
+        # fully captured — this only silences the benign teardown artefact. A
+        # scoped handler swallows ONLY that specific closed-target case and
+        # delegates everything else to the previous handler, and is restored in
+        # ``finally`` so no global state leaks out of the crawl.
+        previous_handler = loop.get_exception_handler()
+
+        def _suppress_target_closed(active_loop: Any, context: dict) -> None:
+            exc = context.get("exception")
+            if exc is not None and type(exc).__name__ == "TargetClosedError":
+                return
+            if previous_handler is not None:
+                previous_handler(active_loop, context)
+            else:
+                active_loop.default_exception_handler(context)
+
+        loop.set_exception_handler(_suppress_target_closed)
+        try:
+            return await self._crawl_into_impl(
+                state,
+                root_url,
+                root_origin_url,
+                loop,
+                auth_cookies=auth_cookies,
+                auth_headers=auth_headers,
+                routes=routes,
+                deadline=deadline,
+                storage_state=storage_state,
+            )
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    async def _crawl_into_impl(
+        self,
+        state: CrawlState,
+        root_url: str,
+        root_origin_url: str,
+        loop: Any,
+        auth_cookies: dict[str, str] | None = None,
+        auth_headers: dict[str, str] | None = None,
+        routes: list[str] | None = None,
+        deadline: float | None = None,
+        storage_state: dict | None = None,
+    ) -> CrawlState:
+        """Body of :meth:`crawl_into` (see its docstring). Split out so the loop
+        exception handler that silences the benign ``TargetClosedError`` teardown
+        future can wrap the whole crawl and be restored in a single ``finally``.
+        """
+        from playwright.async_api import async_playwright
+
         async with async_playwright() as pw:
             try:
                 browser = await self._launch_chromium(pw.chromium)
@@ -684,6 +800,17 @@ class BrowserDiscoveryEngine:
                 nonlocal counter
                 key = self._normalize_for_seen(url)
                 if key in seen_routes or len(seen_routes) >= route_budget:
+                    return
+                # Skip raw API/data/asset endpoints as NAVIGATION targets: the
+                # browser's value is rendering the SPA and exercising forms, which
+                # such URLs never do (a JSON/text body renders as a dead <pre>, an
+                # asset as bytes) — yet full-loading each one burns the finite
+                # budget that high-value app routes need to be reached and their
+                # forms submitted. These endpoints are already covered by the HTTP
+                # crawler + JS api_extractor, and passive XHR capture during SPA
+                # navigation is unaffected (we gate targets, not observed traffic).
+                # The root is always allowed so the shell can bootstrap.
+                if key != self._normalize_for_seen(root_url) and not self._is_browser_navigable(url):
                     return
                 seen_routes.add(key)
                 # Negate score so heapq (a min-heap) pops highest score first;
@@ -856,9 +983,24 @@ class BrowserDiscoveryEngine:
                                 new_forms = []
                                 for form in captured_forms:
                                     key = CrawlState._form_key(form)
-                                    if key not in submitted_form_keys:
-                                        submitted_form_keys.add(key)
-                                        new_forms.append(form)
+                                    # A site-wide widget (e.g. the header search box)
+                                    # is captured on EVERY route with a per-route
+                                    # action, so its ``_form_key`` differs each time
+                                    # and it would be re-submitted on every page —
+                                    # each attempt firing a useless GET and burning
+                                    # ~1-2s of the budget owed to unreached form
+                                    # routes. Dedup a second time on a route-independent
+                                    # structural signature (method + field names) so
+                                    # such a widget is exercised once globally. Two
+                                    # genuinely-distinct forms sharing a signature
+                                    # yield the same body schema anyway, which is what
+                                    # downstream detectors consume.
+                                    sig = self._form_structural_signature(form)
+                                    if key in submitted_form_keys or sig in submitted_form_keys:
+                                        continue
+                                    submitted_form_keys.add(key)
+                                    submitted_form_keys.add(sig)
+                                    new_forms.append(form)
                             # Active form submission (Task B): fire the app's real
                             # POST/PUT/PATCH XHR so on_request captures a replayable
                             # observation. Skips destructive forms.
@@ -990,7 +1132,32 @@ class BrowserDiscoveryEngine:
 
     @staticmethod
     def _observation_key(url: str, method: str, post_data: Any = None) -> tuple[str, str, str]:
-        return (method.upper(), url, str(post_data or ""))
+        return (method.upper(), url, BrowserDiscoveryEngine._dedupe_body_key(post_data))
+
+    @staticmethod
+    def _dedupe_body_key(post_data: Any) -> str:
+        """Normalise a request body for DEDUP KEYING only (never for storage).
+
+        Some frameworks echo a server-generated, per-request volatile token back
+        into the very body they POST — most commonly an ISO-8601 timestamp
+        (``createdAt``/``updatedAt``/``iat``) baked into a nested object the form
+        pulled from a prior GET. Two submits of the SAME form to the SAME endpoint
+        then differ only by that timestamp, so the raw-body dedup key treats them
+        as distinct and the identical replayable body is counted twice (observed
+        as a phantom "double submit" of e.g. ``POST /api/Users/``). Collapsing
+        only high-confidence volatile tokens keeps genuinely-distinct payloads
+        (different credentials, different search terms) fully separate — url +
+        method still isolate endpoints, and every non-volatile value is preserved
+        verbatim in the key. The stored observation always keeps its original,
+        replayable body; only this key is normalised. Framework-agnostic: matches
+        a token shape, never an app-specific field name.
+        """
+        body = post_data
+        if isinstance(body, (bytes, bytearray)):
+            body = bytes(body).decode("utf-8", "ignore")
+        if not isinstance(body, str) or not body:
+            return str(post_data or "")
+        return _VOLATILE_TOKEN_RE.sub("<volatile>", body)
 
     async def _bounded(self, coro: Any, ms: float) -> Any:
         """Await ``coro`` with a hard millisecond deadline.
@@ -1063,7 +1230,17 @@ class BrowserDiscoveryEngine:
         await element.click(timeout=800, force=True)
 
     async def _navigate(self, page: Any, target_url: str, root_url: str, allow_spa: bool) -> None:
-        """Navigate to ``target_url``, preferring client-side routing for SPAs."""
+        """Navigate to ``target_url``, preferring client-side routing for SPAs.
+
+        Client-side routing is attempted only when the page currently holds a
+        live, same-origin SPA shell (see :meth:`_navigate_spa_route`). Otherwise
+        — and whenever the SPA hop fails to land — a real ``page.goto`` full load
+        boots the shell so its router processes the route from a clean document.
+        This is the fix for the poisoning bug: a worker whose page held a non-SPA
+        document (a JSON API body, a static file, an error page) would otherwise
+        route by mutating that dead document's URL (``…/api/Feedbacks#/login``),
+        the framework router never ran, and no form/XHR was ever produced.
+        """
         if allow_spa and self._origin(target_url) == self._origin(root_url):
             if await self._navigate_spa_route(page, target_url):
                 return
@@ -1074,10 +1251,28 @@ class BrowserDiscoveryEngine:
     async def _navigate_spa_route(self, page: Any, route: str) -> bool:
         """Exercise the SPA router without a full reload.
 
+        Returns ``True`` only when client-side routing was applied to a live SPA
+        shell AND the URL actually changed to the target route. Returns ``False``
+        (so the caller falls back to a full ``page.goto``) when:
+
+        - the current document is NOT a routable SPA shell (a raw JSON/text/file
+          body or a scriptless page): routing it would only rewrite a dead
+          document's URL and the framework router would never react — the exact
+          cause of ``replayable_json_bodies == 0`` in production, where workers
+          picked up HTTP-discovered API/file routes and were poisoned for their
+          whole lifetime; or
+        - the programmatic history change errors or does not take effect.
+
         Hash routes set ``location.hash``; path routes call ``history.pushState``
-        and dispatch ``popstate`` so the framework router reacts. Returns False
-        (caller falls back to ``page.goto``) if the programmatic change errors.
+        and dispatch ``popstate`` so the framework router reacts.
         """
+        # Guard: only route a live SPA shell. A non-shell document (JSON/file/error
+        # page) must be handled by a full reload, not client-side routing.
+        is_shell = await self._bounded(page.evaluate(SPA_SHELL_PROBE_SCRIPT), 800)
+        if is_shell is not True:
+            return False
+
+        before_url = self._current_url(page, "")
         parsed = urlparse(route)
         try:
             if parsed.fragment:
@@ -1098,7 +1293,34 @@ class BrowserDiscoveryEngine:
             return False
         # Bounded settle for the router to react before the caller proceeds.
         await self._bounded(page.wait_for_timeout(200), 400)
+        # Verify the hop landed: the URL must now reflect the requested route.
+        # A hash route must appear in the fragment; a path route in the path.
+        # If routing silently no-op'd (stale document, blocked pushState), report
+        # failure so the caller performs a real full load instead.
+        after_url = self._current_url(page, "")
+        if not self._spa_route_landed(after_url, before_url, parsed):
+            return False
         return True
+
+    @staticmethod
+    def _spa_route_landed(after_url: str, before_url: str, parsed: Any) -> bool:
+        """True when the post-routing URL reflects the requested SPA route.
+
+        For a hash route, the target fragment must be present in the current
+        fragment. For a path route, the current path must match the target path.
+        A pure no-op (URL unchanged when the route differs) is treated as failure.
+        """
+        after = urlparse(after_url)
+        if parsed.fragment:
+            want = parsed.fragment.lstrip("/").rstrip("/").lower()
+            have = (after.fragment or "").lstrip("/").rstrip("/").lower()
+            return bool(want) and want in have
+        target_path = (parsed.path or "/").rstrip("/") or "/"
+        have_path = (after.path or "/").rstrip("/") or "/"
+        if target_path == have_path:
+            return True
+        # Path route that didn't move the URL at all: no-op — force a full load.
+        return after_url != before_url
 
     async def _settle_inflight(
         self,
@@ -1231,6 +1453,22 @@ class BrowserDiscoveryEngine:
         # Skip interaction only when comfortably little time is left in absolute
         # AND relative terms; early in the crawl interaction always runs.
         return remaining > max(0.0, 0.25 * total) or remaining > 45.0
+
+    @staticmethod
+    def _form_structural_signature(form: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+        """Route-independent structural key for a captured cluster.
+
+        ``CrawlState._form_key`` includes the per-route action URL, so a site-wide
+        widget rendered on every page (a header search box, a newsletter signup)
+        gets a different key per route and is re-submitted everywhere. This keys on
+        method + sorted field names only, with a sentinel action so it can share
+        the ``submitted_form_keys`` set without ever colliding with a real
+        ``_form_key`` (whose first element is a real action URL, never the
+        sentinel). Framework-agnostic: keys on captured structure alone.
+        """
+        inputs = form.get("inputs") or []
+        names = tuple(sorted(str(i.get("name", "")) for i in inputs))
+        return ("\x00structural\x00", str(form.get("method", "GET")).upper(), names)
 
     async def _submit_discovered_forms(
         self,
@@ -1534,7 +1772,103 @@ class BrowserDiscoveryEngine:
                 last_value_by_type[itype] = value
             if await self._fill_single_input(page, entry, scope, name, itype, nth, value=value):
                 filled = True
+        # Custom dropdowns (Angular Material ``mat-select``, and other ARIA
+        # ``role=combobox``/``listbox`` widgets in React/Vue kits) are NOT native
+        # ``<select>`` elements — ``fill``/``select_option`` cannot satisfy them,
+        # so a reactive form gated on one stays invalid and never fires its POST.
+        # Engaging them generically (open, pick the first real option) is the only
+        # way to make such forms submittable, framework-agnostically.
+        if await self._engage_aria_comboboxes(page, scope):
+            filled = True
         return filled
+
+    async def _engage_aria_comboboxes(self, page: Any, scope: str) -> bool:
+        """Open each custom dropdown in ``scope`` and pick its first real option.
+
+        Targets ARIA/framework dropdowns that are not native ``<select>`` (which
+        :meth:`_fill_single_input` already handles): ``mat-select`` and elements
+        with ``role=combobox``/``role=listbox``/``aria-haspopup=listbox``. Clicking
+        the trigger opens an options panel (often portalled to ``<body>``, outside
+        the cluster), so options are matched globally by ``[role=option]`` /
+        ``mat-option`` and the first non-placeholder one is chosen. Best-effort and
+        fully bounded: any widget that will not engage is skipped without cost.
+
+        Returns True when at least one dropdown was engaged (an option selected).
+        """
+        trigger_sel = (
+            f"{scope}mat-select, {scope}[role=combobox], "
+            f"{scope}[aria-haspopup=listbox]"
+        )
+        try:
+            triggers = page.locator(trigger_sel)
+            count = await self._bounded(triggers.count(), 400)
+        except Exception:
+            # A page object without full locator support (e.g. a lightweight test
+            # stub) has no custom dropdowns to engage; never break the fill path.
+            return False
+        if not isinstance(count, int) or count <= 0:
+            return False
+        engaged = False
+        for index in range(min(count, 6)):
+            trigger = triggers.nth(index)
+            visible = await self._bounded(trigger.is_visible(timeout=200), 400)
+            if visible is not True:
+                continue
+            clicked = await self._bounded(trigger.click(timeout=600), 800)
+            if clicked is _BOUNDED_FAILED:
+                # A lingering overlay can intercept the trigger; a forced click
+                # bypasses hit-testing (the trigger itself is the intended target,
+                # never a destructive control) so the panel still opens.
+                clicked = await self._bounded(trigger.click(timeout=600, force=True), 800)
+                if clicked is _BOUNDED_FAILED:
+                    continue
+            # The options panel mounts asynchronously (often portalled to body).
+            await self._bounded(page.wait_for_timeout(150), 300)
+            options = page.locator("mat-option, [role=option]")
+            opt_count = await self._bounded(options.count(), 400)
+            if not isinstance(opt_count, int) or opt_count <= 0:
+                # Nothing opened; press Escape so a stuck panel cannot block the
+                # next interaction, then move on.
+                keyboard = getattr(page, "keyboard", None)
+                if keyboard is not None:
+                    await self._bounded(keyboard.press("Escape"), 300)
+                continue
+            # Choose the first non-placeholder option. A leading "--"/"Select…"
+            # style entry maps to an empty value and leaves the form invalid (the
+            # same trap native <select> placeholders spring), so options whose text
+            # is empty or a generic placeholder are skipped when a real one exists.
+            picked = False
+            best_index: int | None = None
+            for opt_index in range(min(opt_count, 12)):
+                option = options.nth(opt_index)
+                opt_visible = await self._bounded(option.is_visible(timeout=150), 300)
+                if opt_visible is not True:
+                    continue
+                if best_index is None:
+                    best_index = opt_index  # first visible, as a last resort
+                text = await self._bounded(option.inner_text(timeout=150), 300)
+                text_s = text.strip().lower() if isinstance(text, str) else ""
+                if not text_s or _PLACEHOLDER_OPTION_RE.match(text_s):
+                    continue
+                chosen = await self._bounded(option.click(timeout=600), 800)
+                if chosen is not _BOUNDED_FAILED:
+                    engaged = True
+                    picked = True
+                    break
+            if not picked and best_index is not None:
+                # Every option looked like a placeholder — select the first visible
+                # one so a single-option dropdown is still satisfied.
+                chosen = await self._bounded(
+                    options.nth(best_index).click(timeout=600), 800
+                )
+                if chosen is not _BOUNDED_FAILED:
+                    engaged = True
+                    picked = True
+            if not picked:
+                keyboard = getattr(page, "keyboard", None)
+                if keyboard is not None:
+                    await self._bounded(keyboard.press("Escape"), 300)
+        return engaged
 
     async def _fill_to_valid(
         self, page: Any, form: dict[str, Any], max_rounds: int = 2
@@ -2190,6 +2524,36 @@ class BrowserDiscoveryEngine:
     @staticmethod
     def _is_root_api_path(path: str) -> bool:
         return bool(ROOT_API_PATH_RE.search(path or ""))
+
+    @classmethod
+    def _is_browser_navigable(cls, url: str) -> bool:
+        """True when ``url`` is worth navigating a browser to (an HTML/app page).
+
+        Generic, framework-agnostic gate that excludes raw API/data/asset leaves
+        which render as a dead ``<pre>``/bytes and bear no forms or client-side
+        routes: a browser full-load of one yields nothing but spends budget owed
+        to real app routes. A hash-router route (``/#/…``) is ALWAYS navigable —
+        its path is ``/`` and the real route lives in the fragment, so it is the
+        SPA shell every time. Otherwise a path under a root API prefix
+        (``/api``/``/rest``/``/graphql``/…) or ending in a data/asset suffix is
+        rejected. Everything else (unknown/app-like paths) is allowed, so the gate
+        never hides a genuine page. These endpoints are still covered by the HTTP
+        crawler + JS api_extractor, and passive XHR capture is unaffected.
+        """
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return True
+        # Hash-router route: the fragment carries the real route; the shell renders.
+        if cls._route_fragment(parsed.fragment):
+            return True
+        path = (parsed.path or "/").lower()
+        if cls._is_root_api_path(path):
+            return False
+        last = path.rsplit("/", 1)[-1]
+        if "." in last and last.endswith(NON_NAVIGABLE_SUFFIXES):
+            return False
+        return True
 
     @staticmethod
     def _is_root_relative_api_candidate(candidate: str) -> bool:

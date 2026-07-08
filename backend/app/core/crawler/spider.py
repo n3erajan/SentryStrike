@@ -409,7 +409,11 @@ class WebSpider:
                 await asyncio.gather(*workers, return_exceptions=True)
 
             if self._should_run_browser(self._is_spa or spa_detector.root_looks_like_spa()):
-                browser_routes = [route.url for route in crawl_state.routes if route.source == RouteSource.javascript]
+                browser_routes = [
+                    route.url for route in crawl_state.routes 
+                    if route.source in (RouteSource.javascript, RouteSource.html, RouteSource.sitemap, RouteSource.brute_force)
+                    and not getattr(route, "is_dead", False)
+                ]
                 await self._run_browser_discovery(crawl_state, root_url, browser_routes)
 
         # P4: browser-navigated routes with query strings hold real parameter

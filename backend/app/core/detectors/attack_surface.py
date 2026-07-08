@@ -318,6 +318,13 @@ class AttackSurface:
             filter_fn,
         )
 
+        cls._synthesize_form_cluster_targets(
+            forms or [],
+            targets,
+            seen,
+            filter_fn,
+        )
+
         return targets
 
     @staticmethod
@@ -448,6 +455,79 @@ class AttackSurface:
                         security_relevance=set(parameter.security_relevance),
                         replayable=False,
                         source_confidence="static_synth",
+                    )
+                )
+                emitted += 1
+                if emitted >= cls._SYNTH_LEAF_CAP:
+                    break
+
+    # Input types that carry no injectable free-text body value.
+    _CLUSTER_SKIP_INPUT_TYPES = {"hidden", "submit", "button", "reset", "image", "file"}
+
+    @classmethod
+    def _synthesize_form_cluster_targets(
+        cls,
+        forms: list[object],
+        targets: list[AttackTarget],
+        seen: set[tuple[str, str, str, str, str]],
+        filter_fn: Callable[[str], bool] | None,
+    ) -> None:
+        """Best-effort JSON body targets from browser-captured form clusters.
+
+        SPA input clusters (``source == "browser_cluster"``) submit their fields as
+        a JSON POST to an API endpoint, but only *if* the live submit fired. When
+        the submit path fails (disabled control, impossible validation, no observed
+        XHR), the captured field names/types are still known — so synthesize a
+        skeleton JSON body and emit one low-confidence ``json_body`` target per
+        field (``replayable=False``, ``source_confidence="form_synth"``). This
+        decouples injection coverage from the fragile runtime submit (Phase 4).
+
+        Observed request bodies and higher-confidence targets always win: any leaf
+        already emitted under the same ``(url, method, name, location, parent_path)``
+        key is skipped via ``seen``.
+        """
+        for form in forms:
+            if getattr(form, "source", "html") != "browser_cluster":
+                continue
+            url = str(getattr(form, "action", "") or getattr(form, "page_url", "") or "")
+            if not url or cls._has_unresolved_path_placeholder(url):
+                continue
+            # A cluster submitted from an SPA is a mutation (login, register,
+            # create). The DOM method defaults to GET on orphan clusters that have
+            # no <form>, so it is not a reliable signal; POST the synthesized body.
+            method = "POST"
+            field_names: list[str] = []
+            for inp in getattr(form, "inputs", []) or []:
+                name = str(getattr(inp, "name", "") or "").strip()
+                input_type = str(getattr(inp, "input_type", "text") or "text").lower()
+                if not name or input_type in cls._CLUSTER_SKIP_INPUT_TYPES:
+                    continue
+                if name not in field_names:
+                    field_names.append(name)
+            if not field_names:
+                continue
+            template = {name: ApiExtractor._baseline_for_name(name) for name in field_names}
+            emitted = 0
+            for name in field_names:
+                if filter_fn and not filter_fn(name):
+                    continue
+                key = (url, method, name, ParameterLocation.json_body.value, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                targets.append(
+                    AttackTarget(
+                        url=url,
+                        parameter=name,
+                        method=method,
+                        value=template[name],
+                        location=ParameterLocation.json_body,
+                        parent_path=name,
+                        source="form_synth",
+                        json_template=template,
+                        security_relevance=ApiExtractor.classify_parameter(name),
+                        replayable=False,
+                        source_confidence="form_synth",
                     )
                 )
                 emitted += 1

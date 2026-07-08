@@ -325,6 +325,28 @@ def test_browser_targets_visit_same_origin_routes_only():
     assert "http://evil.example/api" not in targets
 
 
+def test_browser_navigable_gate_excludes_api_and_asset_leaves():
+    """The browser navigation gate keeps the finite budget on HTML/app routes:
+    raw API/data/asset leaves (which render as a dead <pre>/bytes and bear no
+    forms or client-side routes) are excluded, while app pages and hash-router
+    routes are always navigable."""
+    nav = BrowserDiscoveryEngine._is_browser_navigable
+    # Raw API/data/asset leaves — excluded (already covered by the HTTP crawler).
+    assert nav("http://x.test/api/Feedbacks") is False
+    assert nav("http://x.test/rest/products/search") is False
+    assert nav("http://x.test/graphql") is False
+    assert nav("http://x.test/assets/i18n/en.json") is False
+    assert nav("http://x.test/main.js") is False
+    assert nav("http://x.test/logo.png") is False
+    # App pages and hash-router routes — always navigable.
+    assert nav("http://x.test/") is True
+    assert nav("http://x.test/login") is True
+    assert nav("http://x.test/#/register") is True
+    assert nav("http://x.test/#/search?q=test") is True
+    assert nav("http://x.test/api-docs") is True  # Swagger HTML page, not an /api leaf
+    assert nav("http://x.test/products/42") is True
+
+
 def test_browser_request_dedupe_uses_url_template_and_body_schema():
     engine = BrowserDiscoveryEngine()
     first = RequestObservation(
@@ -976,6 +998,8 @@ class _RichFakePage:
     async def evaluate(self, script, *args):
         if "elementFromPoint" in script:
             return False
+        if "script[src]" in script:  # unique to SPA_SHELL_PROBE_SCRIPT
+            return True  # this fake page models a live SPA shell
         if "__sentry_routes" in script:
             return []
         if "routerLink" in script:  # unique to DOM_LINK_SCRIPT
@@ -1567,7 +1591,7 @@ async def test_crawl_into_visits_high_value_routes_first(monkeypatch):
     routes = [
         "/about",
         "/blog",
-        "/rest/user/login",
+        "/login",
         "/search?q=test",
         "/contact",
     ]

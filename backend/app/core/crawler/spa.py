@@ -15,8 +15,8 @@ async def settle_page(
     page: Any,
     *,
     inflight: dict[str, int] | None = None,
-    quiet_ms: float = 300.0,
-    cap_ms: float = 2500.0,
+    quiet_ms: float = 500.0,
+    cap_ms: float = 4000.0,
 ) -> None:
     """domcontentloaded + inflight-drain settle. ``networkidle``-free.
 

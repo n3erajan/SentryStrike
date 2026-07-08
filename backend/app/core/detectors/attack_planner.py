@@ -154,7 +154,7 @@ class AttackPlanner:
             score += 8
             reasons.append("security_relevant_parameter")
         if target.source_confidence == "static_synth":
-            score -= 25
+            score -= 10
             reasons.append("static_synth")
         risk = "high" if score >= 75 else "medium" if score >= 45 else "low"
         return PlannedAttackTarget(target=target, score=score, risk=risk, reasons=tuple(reasons))

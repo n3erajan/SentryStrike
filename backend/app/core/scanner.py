@@ -329,7 +329,7 @@ class ScanOrchestrator:
                     return False
 
             crawl_result.urls = [u for u in crawl_result.urls if is_same_origin(target_url, u)]
-            crawl_result.routes = [r for r in crawl_result.routes if is_same_origin(target_url, getattr(r, "url", ""))]
+            crawl_result.routes = [r for r in crawl_result.routes if is_same_origin(target_url, getattr(r, "url", "")) and not getattr(r, "is_dead", False)]
             crawl_result.api_endpoints = [e for e in crawl_result.api_endpoints if is_same_origin(target_url, getattr(e, "url", ""))]
             crawl_result.requests = [req for req in crawl_result.requests if is_same_origin(target_url, getattr(req, "url", ""))]
             if hasattr(crawl_result, "request_audit"):

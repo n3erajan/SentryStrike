@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ApiEndpoint, ParameterLocation, RequestObservation, RouteSource
+from app.core.crawler.spider import FormInput, HtmlForm
 from app.core.detectors.attack_surface import AttackSurface, build_json_body
 
 
@@ -337,3 +338,91 @@ def test_build_skips_parameter_candidates_with_unresolved_path_placeholders():
     )
 
     assert targets == []
+
+
+# --- Phase 4: synthetic body fallback for captured-but-unsubmittable forms -------------
+
+
+def _browser_cluster_form(action, inputs, method="GET"):
+    return HtmlForm(
+        page_url="http://x/#/register",
+        action=action,
+        method=method,
+        inputs=[FormInput(name=n, input_type=t) for n, t in inputs],
+        source="browser_cluster",
+    )
+
+
+def test_build_synthesizes_form_synth_json_targets_from_browser_cluster():
+    form = _browser_cluster_form(
+        "http://x/#/register",
+        [("email", "text"), ("password", "password")],
+    )
+    targets = AttackSurface.build([], [form])
+
+    synth = [t for t in targets if t.source_confidence == "form_synth"]
+    assert {t.parameter for t in synth} == {"email", "password"}
+    for target in synth:
+        assert target.location == ParameterLocation.json_body
+        assert target.method == "POST"
+        assert target.replayable is False
+        assert target.source == "form_synth"
+        # the synthesized template is injectable
+        body = build_json_body(target.json_template, target, "' OR 1=1--")
+        assert body[target.parameter] == "' OR 1=1--"
+
+
+def test_form_synth_respects_filter_fn():
+    form = _browser_cluster_form(
+        "http://x/#/register",
+        [("email", "text"), ("password", "password")],
+    )
+    targets = AttackSurface.build([], [form], filter_fn=lambda name: name == "email")
+    synth = [t for t in targets if t.source_confidence == "form_synth"]
+    assert {t.parameter for t in synth} == {"email"}
+
+
+def test_form_synth_skips_non_injectable_input_types():
+    form = _browser_cluster_form(
+        "http://x/#/register",
+        [("email", "text"), ("csrf", "hidden"), ("go", "submit"), ("avatar", "file")],
+    )
+    targets = AttackSurface.build([], [form])
+    synth = [t for t in targets if t.source_confidence == "form_synth"]
+    assert {t.parameter for t in synth} == {"email"}
+
+
+def test_form_synth_only_fires_for_browser_clusters_not_html_forms():
+    # A server-rendered <form> already yields observed form-location targets; it
+    # must NOT also get a form_synth JSON fallback.
+    html_form = HtmlForm(
+        page_url="http://x/login",
+        action="http://x/login",
+        method="POST",
+        inputs=[FormInput(name="email", input_type="text")],
+        source="html",
+    )
+    targets = AttackSurface.build([], [html_form])
+    assert all(t.source_confidence != "form_synth" for t in targets)
+
+
+def test_form_synth_deduped_and_coexists_with_observed_form_target():
+    form = _browser_cluster_form(
+        "http://x/#/register",
+        [("email", "text")],
+    )
+    targets = AttackSurface.build([], [form])
+    observed = [t for t in targets if t.source_confidence != "form_synth"]
+    synth = [t for t in targets if t.source_confidence == "form_synth"]
+    # The cluster produced a normal form target (from inventory) AND a JSON fallback.
+    assert any(t.location == ParameterLocation.form for t in observed)
+    assert any(t.location == ParameterLocation.json_body for t in synth)
+
+
+def test_form_synth_skips_unresolved_path_placeholder():
+    form = _browser_cluster_form(
+        "http://x/rest/basket/{param_1}/checkout",
+        [("coupon", "text")],
+    )
+    targets = AttackSurface.build([], [form])
+    assert all(t.source_confidence != "form_synth" for t in targets)
