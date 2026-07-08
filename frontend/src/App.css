@@ -91,9 +91,9 @@ nav.navbar {
   position: sticky;
   top: 0;
   z-index: 100;
-  background: rgba(255, 255, 255, 0.75);
-  backdrop-filter: blur(22px) saturate(140%);
-  -webkit-backdrop-filter: blur(22px) saturate(140%);
+  background: rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(28px) saturate(150%);
+  -webkit-backdrop-filter: blur(28px) saturate(150%);
   border-bottom: 1px solid var(--line);
   padding: 0 2rem;
   height: 64px;
@@ -115,6 +115,7 @@ nav.navbar {
 .logo-icon {
   width: 36px;
   height: 36px;
+  border-radius: 25%;
   background: linear-gradient(135deg, var(--blue-solid), var(--cyan));
   display: flex;
   align-items: center;
@@ -854,6 +855,215 @@ nav.navbar {
   color: var(--text-2);
   line-height: 1.5;
   margin-bottom: 12px;
+}
+
+/* Advanced panel — two separated regions (tuning vs. credentials) */
+.advanced-section {
+  padding-top: 4px;
+}
+.advanced-section + .advanced-section {
+  margin-top: 30px;
+  padding-top: 26px;
+  border-top: 1px solid var(--line-2);
+}
+.advanced-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-bottom: 4px;
+}
+.advanced-section-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+.advanced-section-note {
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+/* A titled sub-group of config inputs */
+.config-block {
+  margin-top: 20px;
+}
+.config-block-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.config-block-icon {
+  color: var(--blue);
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.config-block-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.config-block-blurb {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.45;
+  margin-top: 2px;
+}
+.config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 14px 16px;
+}
+.config-field {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.config-field-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.config-unit {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-2);
+}
+.config-input {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line-2);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13px;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.config-input:focus {
+  outline: none;
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+}
+.config-input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+select.config-input {
+  cursor: pointer;
+  appearance: none;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--text-2) 50%),
+    linear-gradient(135deg, var(--text-2) 50%, transparent 50%);
+  background-position:
+    calc(100% - 16px) center,
+    calc(100% - 11px) center;
+  background-size:
+    5px 5px,
+    5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 30px;
+}
+.config-help {
+  font-size: 10.5px;
+  color: var(--text-2);
+  line-height: 1.45;
+  margin-top: 5px;
+}
+
+/* Per-role credential accounts */
+.cred-account {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 14px;
+  margin-top: 12px;
+}
+.cred-account-lead {
+  background: var(--bg);
+  border-color: var(--line-2);
+  border-left: 2px solid var(--blue);
+}
+.cred-account-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 10px;
+}
+.cred-role {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+.cred-role-tag {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--blue);
+  background: var(--blue-weak);
+  padding: 2px 7px;
+  border-radius: 2px;
+}
+.cred-role-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--blue);
+}
+.cred-role-desc {
+  font-size: 11.5px;
+  color: var(--text-2);
+  line-height: 1.4;
+}
+.cred-input {
+  margin-top: 8px;
+}
+.cred-advanced-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--blue);
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.cred-advanced {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px 14px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line-2);
+}
+.config-checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 18px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-1);
+  cursor: pointer;
+}
+.config-checkbox input {
+  margin-top: 2px;
+  flex-shrink: 0;
+  accent-color: var(--blue);
 }
 
 /* Progress */
@@ -1683,5 +1893,9 @@ nav.navbar {
   }
   .nav-user {
     display: none;
+  }
+  .config-grid,
+  .cred-advanced {
+    grid-template-columns: 1fr;
   }
 }

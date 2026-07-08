@@ -16,13 +16,13 @@ import {
 } from "@phosphor-icons/react";
 import { useState } from "react";
 import { useScan } from "../hooks/useScan.js";
-import { SCAN_STAGES } from "../data/constants.js";
-
-const SCAN_MODES = [
-  ["verified", "Verified", "Only evidence-verified findings"],
-  ["heuristic", "Heuristic", "Adds strong heuristic matches"],
-  ["aggressive", "Aggressive", "Widest checks, more noise"],
-];
+import {
+  SCAN_STAGES,
+  SCAN_MODES,
+  CONFIG_GROUPS,
+  CRED_ROLES,
+  CRED_FIELDS,
+} from "../data/constants.js";
 
 const STATUS_LABEL = {
   queued: "Queued",
@@ -50,6 +50,146 @@ const NOTES = [
   },
 ];
 
+// Coerce an <input> value to the type the backend field expects. Empty string
+// clears the field (falls back to the backend default); NaN is treated as
+// empty so half-typed numbers don't get submitted.
+function coerce(field, raw) {
+  if (raw === "") return "";
+  if (field.type === "int") {
+    const n = parseInt(raw, 10);
+    return Number.isNaN(n) ? "" : n;
+  }
+  if (field.type === "float") {
+    const n = parseFloat(raw);
+    return Number.isNaN(n) ? "" : n;
+  }
+  return raw;
+}
+
+// A single ScanConfig override input, rendered from field metadata.
+function ConfigField({ field, value, onChange, disabled }) {
+  const id = `cfg-${field.key}`;
+  return (
+    <div className='config-field'>
+      <label className='config-field-label' htmlFor={id}>
+        {field.label}
+        {field.unit && <span className='config-unit'>{field.unit}</span>}
+      </label>
+      {field.type === "select" ? (
+        <select
+          id={id}
+          className='config-input'
+          value={value ?? ""}
+          onChange={(e) => onChange(field.key, e.target.value)}
+          disabled={disabled}
+        >
+          <option value=''>Default</option>
+          {field.options.map(([val, label]) => (
+            <option key={val} value={val}>
+              {label}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input
+          id={id}
+          className='config-input'
+          type={field.type === "text" ? "text" : "number"}
+          inputMode={field.type === "int" ? "numeric" : undefined}
+          min={field.min}
+          max={field.max}
+          step={field.step ?? (field.type === "int" ? 1 : "any")}
+          maxLength={field.maxLength}
+          placeholder={field.placeholder || "Default"}
+          value={value ?? ""}
+          onChange={(e) => onChange(field.key, coerce(field, e.target.value))}
+          disabled={disabled}
+        />
+      )}
+      {field.help && <p className='config-help'>{field.help}</p>}
+    </div>
+  );
+}
+
+// A single credential account (main/second/admin). Basic identity fields are
+// always shown; the login-flow overrides live behind a per-account toggle.
+function CredentialAccount({ role, account, onField, disabled, lead }) {
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const basic = CRED_FIELDS.filter((f) => !f.advanced);
+  const advanced = CRED_FIELDS.filter((f) => f.advanced);
+  const filled = Object.keys(account).length > 0;
+
+  return (
+    <div className={`cred-account ${lead ? "cred-account-lead" : ""}`}>
+      <div className='cred-account-head'>
+        <span className='cred-role'>
+          {role.label}
+          {lead && <span className='cred-role-tag'>drives the crawl</span>}
+          {filled && !lead && <span className='cred-role-dot' aria-hidden />}
+        </span>
+        <span className='cred-role-desc'>{role.desc}</span>
+      </div>
+      {basic.map((field) => (
+        <div className='input-group cred-input' key={field.key}>
+          {field.key === "username" ? (
+            <User className='field-icon' size={17} />
+          ) : (
+            <Lock className='field-icon' size={17} />
+          )}
+          <input
+            type={field.type}
+            autoComplete='off'
+            maxLength={field.maxLength}
+            placeholder={field.label}
+            value={account[field.key] ?? ""}
+            onChange={(e) => onField(role.key, field.key, e.target.value)}
+            disabled={disabled}
+          />
+        </div>
+      ))}
+      <button
+        type='button'
+        className='cred-advanced-toggle'
+        onClick={() => setShowAdvanced((o) => !o)}
+        aria-expanded={showAdvanced}
+      >
+        Login-flow overrides
+        <CaretDown
+          className={`chevron ${showAdvanced ? "open" : ""}`}
+          size={13}
+          weight='bold'
+        />
+      </button>
+      {showAdvanced && (
+        <div className='cred-advanced'>
+          {advanced.map((field) => (
+            <div className='config-field' key={field.key}>
+              <label
+                className='config-field-label'
+                htmlFor={`cred-${role.key}-${field.key}`}
+              >
+                {field.label}
+              </label>
+              <input
+                id={`cred-${role.key}-${field.key}`}
+                className='config-input'
+                type='text'
+                autoComplete='off'
+                maxLength={field.maxLength}
+                placeholder={field.placeholder || ""}
+                value={account[field.key] ?? ""}
+                onChange={(e) => onField(role.key, field.key, e.target.value)}
+                disabled={disabled}
+              />
+              {field.help && <p className='config-help'>{field.help}</p>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ScanPage({ onComplete }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const {
@@ -63,12 +203,10 @@ function ScanPage({ onComplete }) {
     setConsent,
     touched,
     setTouched,
-    scanMode,
-    setScanMode,
-    authUsername,
-    setAuthUsername,
-    authPassword,
-    setAuthPassword,
+    config,
+    setConfigField,
+    credentials,
+    setCredentialField,
     scanning,
     status,
     progress,
@@ -79,6 +217,8 @@ function ScanPage({ onComplete }) {
     startScan,
     cancel,
   } = useScan(onComplete);
+
+  const scanMode = config.scan_mode || "";
 
   return (
     <div className='page'>
@@ -194,58 +334,128 @@ function ScanPage({ onComplete }) {
         </button>
         {advancedOpen && (
           <div className='advanced-panel'>
-            <label className='form-label'>
-              Scan mode <span className='label-optional'>optional</span>
-            </label>
-            <div
-              className='segmented segmented-3'
-              role='group'
-              aria-label='Scan mode'
-            >
-              {SCAN_MODES.map(([val, title, desc]) => (
-                <button
-                  key={val}
-                  type='button'
-                  className={`segmented-btn ${scanMode === val ? "active" : ""}`}
-                  onClick={() => setScanMode(scanMode === val ? "" : val)}
-                  disabled={scanning}
+            {/* Region 1 — tuning knobs that shape scan behaviour. */}
+            <div className='advanced-section'>
+              <div className='advanced-section-head'>
+                <span className='advanced-section-title'>Scan tuning</span>
+                <span className='advanced-section-note'>
+                  Every field is optional. Blank means the server default.
+                </span>
+              </div>
+
+              {/* Scan verification mode → config.scan_mode */}
+              <div className='config-block'>
+                <div className='config-block-head'>
+                  <ShieldCheck
+                    className='config-block-icon'
+                    size={16}
+                    weight='bold'
+                  />
+                  <div>
+                    <div className='config-block-title'>Verification mode</div>
+                    <p className='config-block-blurb'>
+                      How strict the evidence bar is before a finding is
+                      reported.
+                    </p>
+                  </div>
+                </div>
+                <div
+                  className='segmented segmented-3'
+                  role='group'
+                  aria-label='Scan mode'
                 >
-                  <span className='segmented-title'>{title}</span>
-                  <span className='segmented-desc'>{desc}</span>
-                </button>
-              ))}
+                  {SCAN_MODES.map(([val, title, desc]) => (
+                    <button
+                      key={val}
+                      type='button'
+                      className={`segmented-btn ${scanMode === val ? "active" : ""}`}
+                      onClick={() =>
+                        setConfigField("scan_mode", scanMode === val ? "" : val)
+                      }
+                      disabled={scanning}
+                    >
+                      <span className='segmented-title'>{title}</span>
+                      <span className='segmented-desc'>{desc}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Every remaining ScanConfig override, one block per group. */}
+              {CONFIG_GROUPS.map((group) => {
+                const GroupIcon = group.icon;
+                return (
+                  <div className='config-block' key={group.title}>
+                    <div className='config-block-head'>
+                      <GroupIcon
+                        className='config-block-icon'
+                        size={16}
+                        weight='bold'
+                      />
+                      <div>
+                        <div className='config-block-title'>{group.title}</div>
+                        <p className='config-block-blurb'>{group.blurb}</p>
+                      </div>
+                    </div>
+                    <div className='config-grid'>
+                      {group.fields.map((field) => (
+                        <ConfigField
+                          key={field.key}
+                          field={field}
+                          value={config[field.key]}
+                          onChange={setConfigField}
+                          disabled={scanning}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
 
-            <label className='form-label' style={{ marginTop: 20 }}>
-              Authenticated testing{" "}
-              <span className='label-optional'>optional</span>
-            </label>
-            <p className='advanced-hint'>
-              Add a test account to crawl authenticated pages and check for
-              access-control and IDOR issues. Used for this scan only, never
-              stored.
-            </p>
-            <div className='input-group'>
-              <User className='field-icon' size={17} />
-              <input
-                type='text'
-                autoComplete='off'
-                placeholder='Username or email'
-                value={authUsername}
-                onChange={(event) => setAuthUsername(event.target.value)}
-                disabled={scanning}
-              />
-            </div>
-            <div className='input-group' style={{ marginTop: 10 }}>
-              <Lock className='field-icon' size={17} />
-              <input
-                type='password'
-                autoComplete='off'
-                placeholder='Password'
-                value={authPassword}
-                onChange={(event) => setAuthPassword(event.target.value)}
-                disabled={scanning}
-              />
+            {/* Region 2 — credentials, visually separated from tuning knobs. */}
+            <div className='advanced-section'>
+              <div className='advanced-section-head'>
+                <span className='advanced-section-title'>
+                  Authenticated testing
+                </span>
+                <span className='advanced-section-note'>
+                  Used for this scan only, never stored.
+                </span>
+              </div>
+              <p className='advanced-hint'>
+                Add test accounts to reach logged-in pages and check for
+                access-control and IDOR issues. A second or admin account proves
+                horizontal and vertical privilege escalation.
+              </p>
+              {CRED_ROLES.map((role) => (
+                <CredentialAccount
+                  key={role.key}
+                  role={role}
+                  account={credentials[role.key] || {}}
+                  onField={setCredentialField}
+                  disabled={scanning}
+                  lead={role.key === "main"}
+                />
+              ))}
+
+              <label className='config-checkbox'>
+                <input
+                  type='checkbox'
+                  checked={Boolean(config.allow_secondary_provisioning)}
+                  onChange={(e) =>
+                    setConfigField(
+                      "allow_secondary_provisioning",
+                      e.target.checked ? true : "",
+                    )
+                  }
+                  disabled={scanning}
+                />
+                <span>
+                  Auto-provision a throwaway second identity when no second
+                  account is supplied (for horizontal IDOR testing).
+                </span>
+              </label>
             </div>
           </div>
         )}

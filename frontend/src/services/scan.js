@@ -2,7 +2,8 @@
 //
 //   POST   /scans                 { target_url, crawl_mode,
 //                                   authorization_confirmed, authorization_text,
-//                                   credentials?, config? }
+//                                   credentials? (main/second/admin accounts),
+//                                   config? (full ScanConfig overrides) }
 //                                 -> 202 { scan_id, status, progress, ... }
 //   GET    /scans                 ?skip&limit -> { items: [...], total }
 //   GET    /scans/{id}            -> full scan document
@@ -12,25 +13,28 @@
 // `status` is one of: queued | running | completed | failed | cancelled
 import { apiRequest } from "./apiClient.js";
 
-// Build the optional `credentials` block only when a main account is supplied.
-// The backend accepts up to three roles (main/second/admin); we expose the
-// primary account, which drives the authenticated crawl and IDOR baseline.
-function buildCredentials({ authUsername, authPassword } = {}) {
-  if (!authUsername || !authPassword) return undefined;
-  return {
-    main: {
-      username: authUsername.trim(),
-      password: authPassword,
-    },
-  };
+// Drop empty strings/null/undefined so unset fields are omitted entirely and
+// the backend falls back to its own defaults. Returns the object only if it
+// still has keys, else undefined.
+function compact(obj) {
+  const out = {};
+  for (const [key, value] of Object.entries(obj || {})) {
+    if (value === null || value === undefined || value === "") continue;
+    out[key] = typeof value === "string" ? value.trim() : value;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
-// Only send config keys the user actually set, so unset fields fall back to
-// the backend's global defaults.
-function buildConfig({ scanMode } = {}) {
-  const config = {};
-  if (scanMode) config.scan_mode = scanMode;
-  return Object.keys(config).length ? config : undefined;
+// Build the optional `credentials` block from up to three role accounts
+// (main/second/admin). Each account is a ScanAccountCredential; empty accounts
+// are dropped so we never send blank roles.
+function buildCredentials(credentials = {}) {
+  const out = {};
+  for (const role of ["main", "second", "admin"]) {
+    const account = compact(credentials[role]);
+    if (account) out[role] = account;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 export function createScan({
@@ -38,9 +42,8 @@ export function createScan({
   crawlMode,
   authorizationConfirmed,
   authorizationText,
-  authUsername,
-  authPassword,
-  scanMode,
+  credentials,
+  config,
 }) {
   return apiRequest("/scans", {
     method: "POST",
@@ -49,8 +52,8 @@ export function createScan({
       crawl_mode: crawlMode,
       authorization_confirmed: authorizationConfirmed,
       authorization_text: authorizationText ? authorizationText.trim() : null,
-      credentials: buildCredentials({ authUsername, authPassword }),
-      config: buildConfig({ scanMode }),
+      credentials: buildCredentials(credentials),
+      config: compact(config),
     },
   });
 }

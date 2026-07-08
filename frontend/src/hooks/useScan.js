@@ -23,11 +23,38 @@ function useScan(onComplete) {
   const [consent, setConsent] = useState(false);
   const [touched, setTouched] = useState(false);
 
-  // Optional advanced overrides (all map to CreateScanRequest.config /
-  // .credentials; unset values fall back to the backend defaults).
-  const [scanMode, setScanMode] = useState(""); // "" | verified | heuristic | aggressive
-  const [authUsername, setAuthUsername] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
+  // Optional per-scan ScanConfig overrides. Keyed by the backend field name;
+  // any key left blank/absent falls back to the backend default. `scan_mode`
+  // is just another config key here.
+  const [config, setConfig] = useState({});
+  const setConfigField = useCallback((key, value) => {
+    setConfig((prev) => {
+      if (value === "" || value === undefined || value === null) {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return { ...prev, [key]: value };
+    });
+  }, []);
+
+  // Optional test-account credentials for authenticated / IDOR testing. Shape:
+  // { main: {username, password, ...}, second: {...}, admin: {...} }.
+  const [credentials, setCredentials] = useState({});
+  const setCredentialField = useCallback((role, key, value) => {
+    setCredentials((prev) => {
+      const account = { ...(prev[role] || {}) };
+      if (value === "" || value === undefined || value === null) {
+        delete account[key];
+      } else {
+        account[key] = value;
+      }
+      const next = { ...prev };
+      if (Object.keys(account).length) next[role] = account;
+      else delete next[role];
+      return next;
+    });
+  }, []);
 
   // Live scan state.
   const [scanning, setScanning] = useState(false);
@@ -73,9 +100,8 @@ function useScan(onComplete) {
         crawlMode,
         authorizationConfirmed: consent,
         authorizationText: authText,
-        scanMode,
-        authUsername,
-        authPassword,
+        config,
+        credentials,
       });
       setScanId(res.scan_id);
       setStatus(res.status || "queued");
@@ -94,9 +120,8 @@ function useScan(onComplete) {
     url,
     crawlMode,
     authText,
-    scanMode,
-    authUsername,
-    authPassword,
+    config,
+    credentials,
     pushLog,
   ]);
 
@@ -196,12 +221,10 @@ function useScan(onComplete) {
     touched,
     setTouched,
     // advanced overrides
-    scanMode,
-    setScanMode,
-    authUsername,
-    setAuthUsername,
-    authPassword,
-    setAuthPassword,
+    config,
+    setConfigField,
+    credentials,
+    setCredentialField,
     // live state
     scanning,
     status,
