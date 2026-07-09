@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     # N contexts means N× the request rate at the target — browser traffic
     # bypasses the httpx scan semaphore — so keep this conservative.
     crawl_browser_workers: int = Field(default=4, alias="CRAWL_BROWSER_WORKERS")
+    # Playwright per-action default timeout (ms) for the crawl context. Bounds any
+    # locator op that is not given an explicit timeout (get_attribute/evaluate/…)
+    # so it can never inherit Playwright's 30s default and orphan a 30s future
+    # after ``_bounded`` cancels it. Keep well below the per-route budget.
+    crawl_browser_action_timeout_ms: float = Field(default=2000.0, alias="CRAWL_BROWSER_ACTION_TIMEOUT_MS")
     # Block non-essential resources (images/media/fonts/stylesheets + known
     # trackers) during browser crawl/auth to speed up settle. Never blocks
     # same-origin script/xhr/fetch/document. Disable if a target renders needed

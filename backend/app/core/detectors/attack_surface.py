@@ -168,6 +168,12 @@ class AttackSurface:
         for candidate in candidates:
             if cls._is_transport_layer_url(candidate.url):
                 continue
+            if cls._url_has_route_fragment(candidate.url):
+                # A hash-route URL (``/#/address/create``) never reaches the
+                # server as anything but ``/`` (the SPA shell); injecting into it
+                # tests static index.html. The real endpoint is captured via the
+                # observed ``/api/…`` XHR, which flows through as a separate target.
+                continue
             if cls._has_unresolved_path_placeholder(candidate.url) and not cls._candidate_resolves_own_path(candidate):
                 # A path-location candidate legitimately carries its own placeholder
                 # (the injection point). Keep it only when filling that parameter
@@ -352,6 +358,28 @@ class AttackSurface:
     # Maximum synthesized leaf targets per endpoint (bounds combinatorial growth).
     _SYNTH_LEAF_CAP = 25
 
+    @staticmethod
+    def _url_has_route_fragment(url: str) -> bool:
+        """True when ``url`` carries a client-side route fragment (``…/#/path``).
+
+        A URL fragment (everything after ``#``) is NEVER transmitted over HTTP —
+        the server only ever sees the part before it. So a target whose URL is a
+        hash route (``http://host/#/address/create``) resolves on the wire to a
+        request against ``/`` (the SPA shell), which returns static index.html and
+        exercises no application logic. Such a target is pure wasted budget: every
+        payload lands on the shell. Framework-agnostic — any hash-routed SPA
+        (Angular ``useHash``, Vue hash history, React ``HashRouter``) expresses its
+        routes this way, and a bare in-page anchor (``#section``) is not route-like
+        so it is not matched. The real endpoint for these forms is captured
+        separately via network observation (an ``/api/…`` XHR), which is unaffected.
+        """
+        try:
+            fragment = urlparse(url).fragment
+        except Exception:
+            return False
+        # Route fragments begin with ``/`` or ``!/`` (hashbang); ``#section`` does not.
+        return fragment.startswith("/") or fragment.startswith("!/")
+
     @classmethod
     def _synthesize_body_targets(
         cls,
@@ -491,6 +519,14 @@ class AttackSurface:
                 continue
             url = str(getattr(form, "action", "") or getattr(form, "page_url", "") or "")
             if not url or cls._has_unresolved_path_placeholder(url):
+                continue
+            if cls._url_has_route_fragment(url):
+                # SPA clusters have no real ``action`` so this falls back to the
+                # route URL (``/#/address/create``). That fragment is stripped on
+                # the wire, so a POST here only hits the shell — the synthesized
+                # body tests nothing. Skip: the cluster's genuine value is the real
+                # XHR its live submit fires, which is captured via network
+                # observation and emitted as a proper ``/api/…`` target elsewhere.
                 continue
             # A cluster submitted from an SPA is a mutation (login, register,
             # create). The DOM method defaults to GET on orphan clusters that have

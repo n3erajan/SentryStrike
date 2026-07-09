@@ -26,6 +26,7 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
 from app.core.crawler.models import ParameterLocation
+from app.core.crawler.url_parser import is_static_asset
 from app.core.detectors.attack_surface import AttackTarget
 from app.core.detectors.base_detector import Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
@@ -153,11 +154,18 @@ class XSSVerifier(BaseVerifier):
 
     @classmethod
     def select_stored_probe_urls(cls, urls: list[str]) -> list[str]:
-        """Return a deduplicated, capped list of URLs worth probing for stored XSS."""
+        """Return a deduplicated, capped list of URLs worth probing for stored XSS.
+
+        Static assets (js/css/txt/images/…) are excluded: a stored XSS payload is
+        reflected into an HTML page's DOM, never into a plain-text/binary asset, so
+        re-fetching ``robots.txt``/``main.js`` as a stored sink only wastes budget.
+        """
         bare_urls: list[str] = []
         seen: set[str] = set()
         for url in urls:
             bare = url.split("?")[0]
+            if is_static_asset(bare):
+                continue
             if bare not in seen:
                 seen.add(bare)
                 bare_urls.append(bare)

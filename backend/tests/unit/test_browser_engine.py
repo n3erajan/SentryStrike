@@ -930,7 +930,21 @@ async def test_capture_forms_returns_structured_forms():
         {
             "action": "http://spa.test/submit",
             "method": "POST",
-            "inputs": [{"name": "email", "type": "email", "field_id": "0:0", "named": True}],
+            "inputs": [
+                {
+                    "name": "email",
+                    "type": "email",
+                    "field_id": "0:0",
+                    "named": True,
+                    "hint": "",
+                    "required": False,
+                    "maxlength": None,
+                    "minlength": None,
+                    "pattern": None,
+                    "min": None,
+                    "max": None,
+                }
+            ],
             "cluster_id": 0,
             "has_form": True,
             "file_inputs": 0,
@@ -941,8 +955,32 @@ async def test_capture_forms_returns_structured_forms():
             "action": "http://spa.test/upload",
             "method": "POST",
             "inputs": [
-                {"name": "avatar", "type": "file", "field_id": "1:0", "named": True},
-                {"name": "bio", "type": "text", "field_id": "1:1", "named": True},
+                {
+                    "name": "avatar",
+                    "type": "file",
+                    "field_id": "1:0",
+                    "named": True,
+                    "hint": "",
+                    "required": False,
+                    "maxlength": None,
+                    "minlength": None,
+                    "pattern": None,
+                    "min": None,
+                    "max": None,
+                },
+                {
+                    "name": "bio",
+                    "type": "text",
+                    "field_id": "1:1",
+                    "named": True,
+                    "hint": "",
+                    "required": False,
+                    "maxlength": None,
+                    "minlength": None,
+                    "pattern": None,
+                    "min": None,
+                    "max": None,
+                },
             ],
             "cluster_id": 1,
             "has_form": False,
@@ -1320,6 +1358,9 @@ class _SubmitFakePage:
     async def evaluate(self, script, *args):
         return None
 
+    async def wait_for_timeout(self, ms):
+        return None
+
     async def goto(self, url, wait_until=None, timeout=None):
         self.url = url
 
@@ -1658,6 +1699,87 @@ def test_hash_routed_targets_canonicalize_path_routes_and_dedupe():
     )
 
 
+def test_runtime_hash_hint_converts_flat_seed_routes_to_hash():
+    """Flat routes mined from a JS bundle (``/login``) must be seeded as hash
+    routes (``/#/login``) once a runtime probe reports the app is hash-routed —
+    otherwise the bare path only ever loads the SPA shell and the real page's
+    forms/XHR never fire. The static heuristic cannot see this because every
+    seed string is a bare path with no fragment."""
+    engine = BrowserDiscoveryEngine()
+    flat_routes = ["/login", "/register", "/search", "/administration"]
+
+    # Without the runtime hint the static heuristic sees no ``#/`` and leaves
+    # the routes as bare paths (the pre-fix behaviour).
+    static = engine._browser_targets("http://spa.test/", flat_routes)
+    assert "http://spa.test/login" in static
+    assert "http://spa.test/#/login" not in static
+
+    # With the runtime hint every flat route is canonicalized into hash form.
+    hashed = engine._browser_targets("http://spa.test/", flat_routes, hash_routed=True)
+    for route in ("login", "register", "search", "administration"):
+        assert f"http://spa.test/#/{route}" in hashed
+        assert f"http://spa.test/{route}" not in hashed
+
+
+@pytest.mark.asyncio
+async def test_detect_hash_routing_from_root_redirect(monkeypatch):
+    """The probe returns True when loading the root leaves the URL on a
+    route-bearing fragment (the app rewrote ``/`` into ``#/``)."""
+
+    class _RootRedirectPage(_FakePage):
+        async def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            # App boots and the router rewrites the root into a hash route.
+            self.url = url.rstrip("/") + "/#/"
+
+        async def evaluate(self, script, *args):
+            return []
+
+    page = _RootRedirectPage()
+    engine = BrowserDiscoveryEngine()
+    assert await engine._detect_hash_routing(page, "http://spa.test/") is True
+
+
+@pytest.mark.asyncio
+async def test_detect_hash_routing_from_nav_links(monkeypatch):
+    """The probe returns True when the app's own same-origin links are route
+    fragments (``#/login``), even if the root URL itself did not change."""
+
+    class _HashLinkPage(_FakePage):
+        async def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            self.url = url  # no root rewrite
+
+        async def evaluate(self, script, *args):
+            if "routerLink" in script:  # DOM_LINK_SCRIPT
+                return ["http://spa.test/#/login", "http://spa.test/#/register"]
+            return []
+
+    page = _HashLinkPage()
+    engine = BrowserDiscoveryEngine()
+    assert await engine._detect_hash_routing(page, "http://spa.test/") is True
+
+
+@pytest.mark.asyncio
+async def test_detect_hash_routing_false_for_path_router(monkeypatch):
+    """A path-routed app neither rewrites the root into a ``#/`` fragment nor
+    links via route fragments, so the probe reports False (bare-path seeding)."""
+
+    class _PathRouterPage(_FakePage):
+        async def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            self.url = url
+
+        async def evaluate(self, script, *args):
+            if "routerLink" in script:  # DOM_LINK_SCRIPT
+                return ["http://spa.test/login", "http://spa.test/about#section"]
+            return []
+
+    page = _PathRouterPage()
+    engine = BrowserDiscoveryEngine()
+    assert await engine._detect_hash_routing(page, "http://spa.test/") is False
+
+
 def test_runtime_request_classifier_records_concrete_drop_reasons():
     engine = BrowserDiscoveryEngine()
 
@@ -1762,6 +1884,12 @@ class _FallbackFillPage:
         if "data-sentry-field" in selector:
             raise RuntimeError("element not found (re-rendered)")
         self.filled[selector] = "checked"
+
+    async def evaluate(self, script, *args):
+        return None
+
+    async def wait_for_timeout(self, ms):
+        return None
 
 
 @pytest.mark.asyncio

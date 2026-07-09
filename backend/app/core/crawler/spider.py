@@ -24,27 +24,15 @@ from app.core.crawler.browser_engine import BrowserDiscoveryEngine
 from app.core.crawler.models import ApiEndpoint, CrawlState, ParameterCandidate, RouteCandidate, RouteSource
 from app.core.crawler.param_discovery import ParamDiscovery
 from app.core.crawler.spa import SpaFallbackDetector
-from app.core.crawler.url_parser import normalize_url, same_domain, normalize_for_dedupe
+from app.core.crawler.url_parser import STATIC_EXTENSIONS, normalize_url, same_domain, normalize_for_dedupe
 from app.utils.http_logging import make_httpx_response_logger
 from app.utils.scan_http import create_scan_client
 
 logger = logging.getLogger(__name__)
 
-STATIC_EXTENSIONS = {
-    # Stylesheets & scripts
-    ".css", ".js", ".map",
-    # Images
-    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-    ".webp", ".bmp", ".tiff",
-    # Fonts
-    ".woff", ".woff2", ".ttf", ".eot", ".otf",
-    # Media
-    ".mp4", ".mp3", ".ogg", ".webm", ".avi",
-    # Documents & data (not web endpoints)
-    ".pdf", ".xml", ".json", ".csv", ".xls", ".xlsx",
-    # Archives
-    ".zip", ".tar", ".gz",
-}
+# STATIC_EXTENSIONS is the shared static-asset set (now includes ``.txt``) and
+# lives in url_parser so the crawler and the detectors classify assets the same
+# way. Imported above and re-exported here for existing references.
 
 
 @dataclass
@@ -319,28 +307,52 @@ class WebSpider:
                             queue.task_done()
                             break
 
+                        # Detect the SPA shell fallback for EVERY discovery source
+                        # and even file-like paths (``allow_file_like_path=True``).
+                        # In a SPA the server returns the same ``index.html`` shell
+                        # for any path with no distinct resource — client routes
+                        # (``/login``, ``/accounting``, ``/order-completion/:id``),
+                        # dead brute-force guesses (``/.env``, ``/.git``), and
+                        # mistyped file paths all render byte-identical HTML. Such a
+                        # URL is NOT a distinct HTTP resource: it must never enter
+                        # ``discovered_urls`` or every detector re-tests the same
+                        # shell under dozens of different URLs (the ``/.env``,
+                        # ``/accounting`` … stored-XSS noise). The default
+                        # ``allow_file_like_path=False`` skipped extensioned paths,
+                        # so shell-returning guesses like ``/.env`` slipped through.
                         fallback_signal = spa_detector.detect(
                             url,
                             response.status_code,
                             response.headers.get("content-type", ""),
                             response.text if "text/html" in response.headers.get("content-type", "") else "",
+                            allow_file_like_path=True,
                         )
                         if url == root_url and "text/html" in response.headers.get("content-type", ""):
                             spa_detector.configure_root(root_url, response.text)
                             spa_root_html = response.text
                             self._is_spa = self._is_spa or spa_detector.root_looks_like_spa()
 
-                        if fallback_signal.is_fallback and url != root_url and source == RouteSource.brute_force:
-                            route = RouteCandidate(
-                                url=url,
-                                source=source,
-                                priority=0,
-                                depth=depth,
-                                evidence=fallback_signal.reason,
-                                is_spa_fallback=True,
-                                is_dead=True,
-                            )
-                            dead_routes.append(route)
+                        if fallback_signal.is_fallback and url != root_url:
+                            # A shell fallback is kept OUT of the HTTP-testable URL
+                            # set regardless of source. Brute-force guesses were
+                            # probes for a resource that does not exist, so they are
+                            # additionally recorded as dead (reported/suppressed).
+                            # Real client routes (js/html/sitemap) are NOT dead —
+                            # they remain in ``crawl_state.routes`` so the browser
+                            # engine still visits them via SPA navigation; they are
+                            # only excluded from the raw-HTTP detector surface.
+                            if source == RouteSource.brute_force:
+                                dead_routes.append(
+                                    RouteCandidate(
+                                        url=url,
+                                        source=source,
+                                        priority=0,
+                                        depth=depth,
+                                        evidence=fallback_signal.reason,
+                                        is_spa_fallback=True,
+                                        is_dead=True,
+                                    )
+                                )
                             queue.task_done()
                             continue
 
@@ -353,13 +365,11 @@ class WebSpider:
                     if "text/html" not in response.headers.get("content-type", ""):
                         queue.task_done()
                         continue
-                    
-                    if fallback_signal.is_fallback and url != root_url:
-                        # Skip parsing the HTML of fallback/shell pages again to avoid duplicate links/forms,
-                        # but we still kept the URL in discovered_urls/routes for the browser crawl.
-                        queue.task_done()
-                        continue
-                    
+
+                    # Note: SPA shell fallbacks (any source) already `continue`d
+                    # above, so they never reach HTML parsing here — no duplicate
+                    # link/form extraction from identical shells.
+
                     async with lock:
                         # Update cookies in case session updated
                         self.session_cookies.update(self._snapshot_cookies(client.cookies))

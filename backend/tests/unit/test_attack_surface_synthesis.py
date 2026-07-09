@@ -345,7 +345,7 @@ def test_build_skips_parameter_candidates_with_unresolved_path_placeholders():
 
 def _browser_cluster_form(action, inputs, method="GET"):
     return HtmlForm(
-        page_url="http://x/#/register",
+        page_url="http://x/register",
         action=action,
         method=method,
         inputs=[FormInput(name=n, input_type=t) for n, t in inputs],
@@ -355,7 +355,7 @@ def _browser_cluster_form(action, inputs, method="GET"):
 
 def test_build_synthesizes_form_synth_json_targets_from_browser_cluster():
     form = _browser_cluster_form(
-        "http://x/#/register",
+        "http://x/register",
         [("email", "text"), ("password", "password")],
     )
     targets = AttackSurface.build([], [form])
@@ -374,7 +374,7 @@ def test_build_synthesizes_form_synth_json_targets_from_browser_cluster():
 
 def test_form_synth_respects_filter_fn():
     form = _browser_cluster_form(
-        "http://x/#/register",
+        "http://x/register",
         [("email", "text"), ("password", "password")],
     )
     targets = AttackSurface.build([], [form], filter_fn=lambda name: name == "email")
@@ -384,12 +384,31 @@ def test_form_synth_respects_filter_fn():
 
 def test_form_synth_skips_non_injectable_input_types():
     form = _browser_cluster_form(
-        "http://x/#/register",
+        "http://x/register",
         [("email", "text"), ("csrf", "hidden"), ("go", "submit"), ("avatar", "file")],
     )
     targets = AttackSurface.build([], [form])
     synth = [t for t in targets if t.source_confidence == "form_synth"]
     assert {t.parameter for t in synth} == {"email"}
+
+
+def test_form_synth_dropped_for_hash_route_cluster_url():
+    """A cluster whose only URL is a client-side hash route (``/#/register``)
+    must NOT produce any target: the ``#/…`` fragment is stripped on the wire, so
+    a POST there only hits the SPA shell and tests nothing. The real endpoint is
+    captured separately via the observed XHR. Framework-agnostic guard."""
+    form = HtmlForm(
+        page_url="http://x/#/register",
+        action="http://x/#/register",
+        method="POST",
+        inputs=[FormInput(name="email", input_type="text"),
+                FormInput(name="mat-input-16", input_type="text")],
+        source="browser_cluster",
+    )
+    targets = AttackSurface.build([], [form])
+    # No target may point at the hash-route URL, regardless of source.
+    assert all("/#/" not in t.url for t in targets)
+    assert all(t.source_confidence != "form_synth" for t in targets)
 
 
 def test_form_synth_only_fires_for_browser_clusters_not_html_forms():
@@ -408,7 +427,7 @@ def test_form_synth_only_fires_for_browser_clusters_not_html_forms():
 
 def test_form_synth_deduped_and_coexists_with_observed_form_target():
     form = _browser_cluster_form(
-        "http://x/#/register",
+        "http://x/register",
         [("email", "text")],
     )
     targets = AttackSurface.build([], [form])

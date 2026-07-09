@@ -25,6 +25,58 @@ def test_auth_result_carries_full_storage_state():
     assert AuthResult().storage_state is None
 
 
+class _FakeSessionPage:
+    """Minimal page stub exposing sessionStorage + origin via evaluate()."""
+
+    def __init__(self, session: dict, origin: str = "http://spa.test"):
+        self._session = session
+        self._origin = origin
+
+    async def evaluate(self, script):
+        import json as _json
+
+        if "sessionStorage" in script:
+            return _json.dumps(self._session)
+        if "location.origin" in script:
+            return self._origin
+        return None
+
+
+@pytest.mark.asyncio
+async def test_merge_session_storage_attaches_to_matching_origin():
+    """Playwright storage_state drops sessionStorage; the merge re-attaches it to
+    the matching origin so the crawler can re-seed session-scoped ids (cart id,
+    CSRF token) that button-triggered mutations need."""
+    from app.core.crawler.auth_manager import _merge_session_storage
+
+    blob = {
+        "cookies": [{"name": "sid", "value": "abc"}],
+        "origins": [
+            {"origin": "http://spa.test", "localStorage": [{"name": "jwt", "value": "t"}]}
+        ],
+    }
+    page = _FakeSessionPage({"bid": "6", "csrf": "xyz"})
+    merged = await _merge_session_storage(blob, page)
+    origin = next(o for o in merged["origins"] if o["origin"] == "http://spa.test")
+    names = {e["name"]: e["value"] for e in origin["sessionStorage"]}
+    assert names == {"bid": "6", "csrf": "xyz"}
+    # localStorage on the same origin is preserved (merge, not replace).
+    assert origin["localStorage"] == [{"name": "jwt", "value": "t"}]
+
+
+@pytest.mark.asyncio
+async def test_merge_session_storage_noop_when_empty_or_invalid():
+    from app.core.crawler.auth_manager import _merge_session_storage
+
+    # Empty sessionStorage leaves the blob unchanged (no empty origin added).
+    blob = {"origins": [{"origin": "http://spa.test", "localStorage": []}]}
+    page = _FakeSessionPage({})
+    merged = await _merge_session_storage(blob, page)
+    assert all("sessionStorage" not in o for o in merged["origins"])
+    # A non-dict storage_state (capture failed) is returned untouched.
+    assert await _merge_session_storage(None, page) is None
+
+
 class MockSettings:
     def __init__(self):
         self.authentication_cookie = None

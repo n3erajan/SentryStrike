@@ -27,6 +27,14 @@ SAFE_SUBMIT_LABEL_RE = re.compile(
     r"\b(login|log in|sign in|register|sign up|submit|send|save|search|reset|upload|continue|next)\b",
     re.I,
 )
+# A control that navigates away / abandons a form rather than submitting it.
+# Clicking one during form submission fires no mutating request AND leaves the
+# route, wasting budget and losing the form — so it is never treated as a submit
+# control. Generic across stacks (Back/Cancel/Close/Previous/Skip/Dismiss).
+NON_SUBMIT_CONTROL_RE = re.compile(
+    r"\b(back|cancel|close|dismiss|previous|prev|skip|abort|discard|return|go\s*back|nav\s*before|navigate_before|arrow_back)\b",
+    re.I,
+)
 # Confirm/repeat fields (password-confirm, retype-email, …). A generic
 # equality-validator satisfier: a field whose name matches this echoes the value
 # just filled into the primary same-type field so "must match" validators pass,
@@ -45,6 +53,31 @@ REQUEST_SUBMIT_JS = (
     "if (form.requestSubmit) { form.requestSubmit(); } else { form.submit(); } "
     "return true; }"
 )
+# Click the nearest ENABLED, submit-like control for a cluster whose own scope
+# holds no submit button (fields and action button live in separate containers).
+# Climbs a few ancestor levels and prefers a type=submit, then a submit-labelled
+# button; never clicks a back/cancel/nav control. Generic across SPA layouts.
+CLICK_ANCESTOR_SUBMIT_JS = r"""
+(cid) => {
+  const root = document.querySelector("[data-sentry-cluster='" + cid + "']");
+  if (!root) return false;
+  const NON = /\b(back|cancel|close|dismiss|previous|prev|skip|abort|discard|return|navigate_before|arrow_back)\b/i;
+  const SUB = /\b(submit|send|save|post|create|add|register|sign\s*up|sign\s*in|log\s*in|login|continue|confirm|apply|update|search|upload|order|pay|checkout|next)\b/i;
+  const vis = (b) => { try { const s = getComputedStyle(b), r = b.getBoundingClientRect(); return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0; } catch (e) { return false; } };
+  const label = (b) => (b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + (b.getAttribute('value') || '');
+  const ok = (b) => !b.disabled && vis(b) && !NON.test(label(b));
+  let node = root;
+  for (let i = 0; i < 6 && node; i++) {
+    const btns = [...node.querySelectorAll('button, input[type=submit], input[type=button], [role=button]')].filter(ok);
+    const typed = btns.find((b) => (b.getAttribute('type') || '').toLowerCase() === 'submit');
+    const labelled = btns.find((b) => SUB.test(label(b)));
+    const target = typed || labelled;
+    if (target) { target.click(); return true; }
+    node = node.parentElement;
+  }
+  return false;
+}
+"""
 # A dropdown option whose visible text is a generic placeholder maps to no real
 # value and leaves a required field invalid. Skipped when a real option exists.
 _PLACEHOLDER_OPTION_RE = re.compile(
@@ -135,7 +168,7 @@ def _parses_as_json(body: Any) -> bool:
 # replaceState / hashchange / popstate) are captured into a global array the
 # engine polls. Framework-agnostic (React Router, Vue Router, Angular, Next).
 SPA_ROUTE_HOOK_SCRIPT = """
-() => {
+(() => {
   try {
     window.__sentry_routes = window.__sentry_routes || [];
     const push = (u) => { try { window.__sentry_routes.push(String(u || location.href)); } catch (e) {} };
@@ -151,7 +184,7 @@ SPA_ROUTE_HOOK_SCRIPT = """
     window.addEventListener('hashchange', () => push(location.href));
     window.addEventListener('popstate', () => push(location.href));
   } catch (e) {}
-}
+})();
 """
 
 # Returns strictly `true` when a blocking full-viewport overlay intercepts the
@@ -172,11 +205,232 @@ OVERLAY_DETECT_SCRIPT = """
       const zi = parseInt(s.zIndex || '0', 10) || 0;
       const cls = (node.className && node.className.toString) ? node.className.toString() : '';
       const modal = node.getAttribute && (node.getAttribute('role') === 'dialog' || node.getAttribute('aria-modal') === 'true');
-      if ((fixed && big && zi >= 1) || modal || /overlay|backdrop|modal/i.test(cls)) return true;
+      // A genuine click-blocking overlay layers ABOVE app content with a high
+      // stacking order. SPA layout shells (mat-sidenav-container, app-root
+      // wrappers) are also position:absolute + full-viewport but sit at a low
+      // z-index (0-2) purely to establish a stacking context — they do NOT block
+      // interaction. A low z-index threshold here mis-flags that structural shell
+      // as an overlay on EVERY route, forcing an expensive (~1.8s) dismiss pass
+      // each interaction and throttling the crawl to ~1 click per route. Real
+      // framework modals/backdrops (z-index 1000+) remain covered by this rule,
+      // and any labelled dialog is caught by the role/class rules regardless of z.
+      if ((fixed && big && zi >= 100) || modal || /overlay|backdrop|modal/i.test(cls)) return true;
       node = node.parentElement;
     }
     return false;
   } catch (e) { return false; }
+}
+"""
+
+# Detect whether a modal/dialog is currently open AND contains interactive
+# content (forms, inputs, links, or buttons). Returns a structured descriptor
+# the engine uses to decide whether to explore the modal (capture its forms and
+# links) before dismissing it, versus treating it as a non-interactive blocker
+# (cookie banner, loading spinner) that should be dismissed immediately.
+# Framework-agnostic: keys on role=dialog/aria-modal and common modal class
+# names (Angular Material, Bootstrap, custom), plus the generic overlay
+# detection from OVERLAY_DETECT_SCRIPT.
+MODAL_CONTENT_SCRIPT = """
+() => {
+  try {
+    const candidates = document.querySelectorAll(
+      '[role=dialog], [aria-modal=true], .mat-mdc-dialog, .modal-dialog, ' +
+      '.modal, [class*=dialog], [class*=modal], [class*=overlay]'
+    );
+    let modal = null;
+    for (const el of candidates) {
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      if (r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden') {
+        modal = el;
+        break;
+      }
+    }
+    if (!modal) return null;
+    const hasInputs = modal.querySelectorAll('input:not([type=hidden]),textarea,select').length > 0;
+    const hasLinks = modal.querySelectorAll('a[href]').length > 0;
+    const hasButtons = modal.querySelectorAll('button,[role=button]').length > 0;
+    const hasForms = modal.querySelectorAll('form').length > 0;
+    const isInteractive = hasInputs || hasLinks || hasButtons || hasForms;
+    const links = [];
+    modal.querySelectorAll('a[href]').forEach((a) => { if (a.href) links.push(a.href); });
+    return {
+      isInteractive: isInteractive,
+      hasForms: hasForms,
+      hasInputs: hasInputs,
+      hasLinks: hasLinks,
+      links: links,
+    };
+  } catch (e) { return null; }
+}
+"""
+
+# Expand hidden/collapsed interactive containers so their forms and links become
+# visible and capturable. Framework-agnostic: clicks on ARIA tab headers,
+# accordion/collapsible panel headers (aria-expanded=false), and "show
+# more"/"load more"/"expand" style **buttons** (never ``a[href]`` — anchors can
+# navigate away from the current route, losing the form the expansion was
+# meant to reveal). Excludes dropdown/menu/combobox triggers (aria-haspopup,
+# mat-select, role=combobox) which open transient panels that intercept
+# subsequent form interactions. Returns the number of elements expanded.
+EXPAND_HIDDEN_SCRIPT = """
+() => {
+  let expanded = 0;
+  try {
+    const DestructiveRe = /\\b(delete|remove|destroy|purchase|checkout|pay|confirm|transfer|withdraw|subscribe|unsubscribe|logout|log ?out|sign ?out|sign ?off)\\b/i;
+    const isVisible = (el) => {
+      const s = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return s && s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
+    };
+    const isDropdown = (el) => {
+      const tag = el.tagName.toLowerCase();
+      const role = el.getAttribute('role') || '';
+      const hasPopup = el.getAttribute('aria-haspopup') || '';
+      const cls = (el.className || '').toString();
+      return tag === 'mat-select' || role === 'combobox' || role === 'listbox'
+        || hasPopup === 'menu' || hasPopup === 'listbox' || hasPopup === 'true'
+        || /mat-select|dropdown|menu-trigger|combobox/i.test(cls);
+    };
+    const tryClick = (el) => {
+      if (!isVisible(el)) return false;
+      if (isDropdown(el)) return false;
+      const txt = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+      if (DestructiveRe.test(txt)) return false;
+      try { el.click(); expanded++; return true; } catch (e) { return false; }
+    };
+    // Tab headers: switch to each inactive tab
+    document.querySelectorAll('[role=tab]').forEach((tab) => {
+      if (!isVisible(tab)) return;
+      const selected = tab.getAttribute('aria-selected');
+      if (selected !== 'true') tryClick(tab);
+    });
+    // Accordion/collapsible headers: aria-expanded=false => expand, but only
+    // non-dropdown containers (accordions, panels, disclosure widgets).
+    document.querySelectorAll('[aria-expanded=false]').forEach((el) => {
+      if (isDropdown(el)) return;
+      const role = el.getAttribute('role') || '';
+      // Only expand containers, not arbitrary elements.
+      if (role === 'button' || role === 'tab' || role === 'heading'
+          || role === 'link' || el.tagName === 'BUTTON' || el.tagName === 'A') {
+        tryClick(el);
+      }
+    });
+    // Generic "show more"/"load more"/"expand" controls — buttons only, never
+    // a[href] (anchors can navigate away from the current route).
+    document.querySelectorAll('button, [role=button]').forEach((el) => {
+      if (!isVisible(el)) return;
+      if (el.tagName === 'A' || el.hasAttribute('href')) return;
+      if (isDropdown(el)) return;
+      const txt = (el.innerText || '').trim().toLowerCase();
+      if (txt.length < 60 && /\\b(show|load|view|expand|more|all|see)\\b/.test(txt) && !DestructiveRe.test(txt)) {
+        if (el.getAttribute('data-sentry-expanded') !== '1') {
+          try { el.setAttribute('data-sentry-expanded', '1'); } catch (e) {}
+          tryClick(el);
+        }
+      }
+    });
+    // Close any stray dropdown panels that might intercept form interaction.
+    document.querySelectorAll('.mat-mdc-menu-panel, .cdk-overlay-pane, [role=menu], [role=listbox]').forEach((panel) => {
+      const r = panel.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        try { panel.click(); } catch (e) {}
+      }
+    });
+  } catch (e) {}
+  return expanded;
+}
+"""
+
+# Open navigation menus (hamburger/sidebar menus, dropdown menus, dropdown
+# buttons) so their links become visible in the DOM for route discovery.
+# Framework-agnostic: targets hamburger menu triggers (aria-label containing
+# menu), dropdown triggers (aria-haspopup=menu, [data-bs-toggle=dropdown]),
+# and menu/nav toggle buttons. Returns the count of menus opened.
+OPEN_NAV_MENUS_SCRIPT = """
+() => {
+  let opened = 0;
+  try {
+    const isVisible = (el) => {
+      const s = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return s && s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
+    };
+    // Hamburger / menu toggle buttons
+    document.querySelectorAll('button, [role=button]').forEach((el) => {
+      if (!isVisible(el)) return;
+      const label = (el.getAttribute('aria-label') || el.innerText || el.getAttribute('title') || '').toLowerCase();
+      if (label.includes('menu') || label.includes('navigation') || label.includes('nav')) {
+        if (el.getAttribute('data-sentry-nav-opened') !== '1') {
+          try { el.setAttribute('data-sentry-nav-opened', '1'); } catch (e) {}
+          try { el.click(); opened++; } catch (e) {}
+        }
+      }
+    });
+    // Dropdown menu triggers
+    document.querySelectorAll('[aria-haspopup=menu], [data-bs-toggle=dropdown], .dropdown-toggle').forEach((el) => {
+      if (!isVisible(el)) return;
+      if (el.getAttribute('data-sentry-nav-opened') !== '1') {
+        try { el.setAttribute('data-sentry-nav-opened', '1'); } catch (e) {}
+        try { el.click(); opened++; } catch (e) {}
+      }
+    });
+    // mat-menu / nav menu triggers (Angular Material)
+    document.querySelectorAll('[mat-menu-trigger-for], [matmenuitemstriggerfor], [aria-haspopup=menu], [class*=menu-trigger]').forEach((el) => {
+      if (!isVisible(el)) return;
+      if (el.getAttribute('data-sentry-nav-opened') !== '1') {
+        try { el.setAttribute('data-sentry-nav-opened', '1'); } catch (e) {}
+        try { el.click(); opened++; } catch (e) {}
+      }
+    });
+  } catch (e) {}
+  return opened;
+}
+"""
+
+# Click safe, mutating "action" buttons (add-to-cart/basket, save, create,
+# apply, post/comment, rate, redeem, generate, …) in one pass. Many SPA
+# mutations are fired by a plain button click — NOT a <form> submit — so the
+# form-submission path never reaches them (e.g. an add-to-basket button that
+# POSTs a cart item). The generic interaction loop treats these as low-priority
+# fallbacks and, with a short per-route budget, usually never clicks them. This
+# pass finds them by accessible label, skips destructive (delete/checkout/pay/…)
+# and navigation (back/cancel/logout) controls, de-duplicates by label so a grid
+# of N identical buttons fires once, and clicks up to a small cap via native
+# DOM click (which frameworks' click handlers honour). Resulting XHRs are picked
+# up by the page request observer. Returns the labels clicked (telemetry/debug).
+SAFE_ACTION_CLICK_SCRIPT = r"""
+() => {
+  try {
+    const LIMIT = 8;
+    const NON = /\b(back|cancel|close|dismiss|previous|prev|skip|abort|discard|return|logout|log\s*out|sign\s*out|sign\s*off|show|view|open|toggle|expand|collapse)\b/i;
+    const DESTRUCTIVE = /\b(delete|remove|destroy|purchase|checkout|pay|buy|order|transfer|withdraw|subscribe|unsubscribe)\b/i;
+    // Action VERBS only. A bare noun ("basket", "cart", "bag") also appears on
+    // navigation controls ("Your Basket", "Show the shopping cart") which merely
+    // route away — clicking one aborts the whole in-page pass and fires no XHR.
+    // Requiring a verb keeps "Add to Basket" (has "add") while rejecting the cart
+    // nav button, and excludes purchase-completing verbs (buy/order/checkout/pay,
+    // in DESTRUCTIVE) so the pass never completes an irreversible transaction.
+    const ACTION = /\b(add|apply|create|save|update|send|post|comment|review|rate|redeem|generate|calculate|book|reserve|insert|upload|submit|register)\b/i;
+    const vis = (b) => { try { const s = getComputedStyle(b), r = b.getBoundingClientRect(); return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0; } catch (e) { return false; } };
+    const label = (b) => ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + (b.getAttribute('value') || '')).trim();
+    const btns = [...document.querySelectorAll('button, [role=button], input[type=button], input[type=submit]')];
+    const seen = new Set();
+    const clicked = [];
+    for (const b of btns) {
+      if (clicked.length >= LIMIT) break;
+      const l = label(b);
+      if (!l) continue;
+      if (DESTRUCTIVE.test(l) || NON.test(l)) continue;
+      if (!ACTION.test(l)) continue;
+      if (b.disabled || !vis(b)) continue;
+      const key = l.toLowerCase().slice(0, 40);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      try { b.click(); clicked.push(key); } catch (e) {}
+    }
+    return clicked;
+  } catch (e) { return []; }
 }
 """
 
@@ -205,13 +459,29 @@ SPA_SHELL_PROBE_SCRIPT = """
 """
 
 # Collect in-DOM navigation targets: anchors plus framework router directives.
+# Also scans the Angular CDK overlay container (where mat-menu / mat-select
+# items render dynamically outside the normal DOM tree) so links from open
+# dropdown menus are captured before the menu closes.
 DOM_LINK_SCRIPT = """
 () => {
   const out = [];
   try {
     document.querySelectorAll('a[href]').forEach((a) => { if (a.href) out.push(a.href); });
-    document.querySelectorAll('[routerLink],[data-href],[ng-reflect-router-link]').forEach((el) => {
-      const v = el.getAttribute('routerLink') || el.getAttribute('data-href') || el.getAttribute('ng-reflect-router-link');
+    // Framework router directives (case-insensitive: Angular uses routerLink,
+    // but the DOM serializes it as routerlink on some setups).
+    document.querySelectorAll('[routerLink],[routerlink],[data-href],[ng-reflect-router-link]').forEach((el) => {
+      const v = el.getAttribute('routerLink') || el.getAttribute('routerlink')
+        || el.getAttribute('data-href') || el.getAttribute('ng-reflect-router-link');
+      if (v) out.push(v);
+    });
+    // Angular CDK overlay container: mat-menu items, dialog content, and
+    // select options render here when a menu/dialog is open. Collect their
+    // links before the overlay closes.
+    document.querySelectorAll('.cdk-overlay-container a[href]').forEach((a) => {
+      if (a.href) out.push(a.href);
+    });
+    document.querySelectorAll('.cdk-overlay-container [routerLink], .cdk-overlay-container [routerlink]').forEach((el) => {
+      const v = el.getAttribute('routerLink') || el.getAttribute('routerlink');
       if (v) out.push(v);
     });
   } catch (e) {}
@@ -239,11 +509,35 @@ FORM_CAPTURE_SCRIPT = """
       } catch (e) { return false; }
     };
     const fieldName = (el) => (
-      el.getAttribute('name') || el.getAttribute('id') || el.getAttribute('formcontrolname') ||
+      el.getAttribute('name') || el.getAttribute('formcontrolname') ||
       el.getAttribute('ng-reflect-name') || el.getAttribute('data-testid') ||
-      el.getAttribute('placeholder') || el.getAttribute('aria-label') || ''
+      el.getAttribute('id') || el.getAttribute('placeholder') || el.getAttribute('aria-label') || ''
     );
     const fieldType = (el) => (el.getAttribute('type') || el.tagName.toLowerCase() || 'text').toLowerCase();
+    // Human-readable semantic hint used to pick a realistic value (phone, zip,
+    // captcha, quantity, ...). Framework-agnostic: associated <label>, an
+    // ancestor label element (mat-label, [class*=label]), aria-label, then
+    // placeholder/name. NOT used as the field's addressable name.
+    const labelText = (el) => {
+      try {
+        if (el.id) {
+          const l = document.querySelector("label[for='" + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id) + "']");
+          if (l && l.innerText) return l.innerText.trim();
+        }
+      } catch (e) {}
+      let node = el;
+      for (let i = 0; i < 4 && node.parentElement; i++) {
+        node = node.parentElement;
+        const l = node.querySelector('label, mat-label, [class*="label"]');
+        if (l && l.innerText && l.innerText.trim()) return l.innerText.trim();
+      }
+      return '';
+    };
+    const semanticHint = (el) => (
+      el.getAttribute('aria-label') || el.getAttribute('placeholder') ||
+      labelText(el) || el.getAttribute('formcontrolname') ||
+      el.getAttribute('name') || el.getAttribute('id') || ''
+    );
     let cid = 0;
     const emit = (root, fieldEls, action, method, hasForm) => {
       const inputs = [];
@@ -259,7 +553,19 @@ FORM_CAPTURE_SCRIPT = """
         // pre-hydration on SPAs), fall back to the stable positional field_id so
         // the field remains addressable for fill + body synthesis.
         const resolvedName = fieldName(el) || ('field_' + fieldId.replace(':', '_'));
-        inputs.push({ name: resolvedName, type: type, field_id: fieldId, named: !!fieldName(el) });
+        inputs.push({
+          name: resolvedName,
+          type: type,
+          field_id: fieldId,
+          named: !!fieldName(el),
+          hint: semanticHint(el),
+          required: !!(el.required || el.getAttribute('aria-required') === 'true'),
+          maxlength: el.getAttribute('maxlength'),
+          minlength: el.getAttribute('minlength'),
+          pattern: el.getAttribute('pattern'),
+          min: el.getAttribute('min'),
+          max: el.getAttribute('max'),
+        });
         fieldIndex++;
       });
       if (!inputs.length) return;
@@ -331,21 +637,38 @@ FORM_CAPTURE_SCRIPT = """
 # is natively valid) and, if not, enumerate the still-invalid required controls
 # so the filler can target them. DOM-anchored on ``data-sentry-cluster`` /
 # ``data-sentry-field`` so it survives framework re-renders.
-_CLUSTER_VALIDITY_SCRIPT = """
+_CLUSTER_VALIDITY_SCRIPT = r"""
 (cid) => {
   const out = { submittable: false, invalid_fields: [] };
   try {
     const root = document.querySelector("[data-sentry-cluster='" + cid + "']");
     if (!root) return out;
     const SUBMIT = 'button[type=submit],input[type=submit],button:not([type]),button,[role=button]';
+    // A control's accessible label, used to exclude Back/Cancel/nav controls: an
+    // enabled Back button must NEVER make a form look submittable, else the
+    // submit path clicks it and navigates away without firing the app POST.
+    const NON_SUBMIT = /\b(back|cancel|close|dismiss|previous|prev|skip|abort|discard|return|go\s*back|navigate_before|arrow_back)\b/i;
+    const ctlLabel = (c) => (
+      (c.innerText || '') + ' ' + (c.getAttribute('aria-label') || '') + ' ' +
+      (c.getAttribute('title') || '')
+    );
     const controls = [...root.querySelectorAll(SUBMIT)];
-    const anyEnabled = controls.some((c) => !c.disabled);
+    // Only a SUBMIT-like control counts as "the form can be submitted": exclude
+    // explicit type=submit=false navigation controls. A type=submit is always a
+    // submit; any other button that is NOT labelled back/cancel/nav qualifies.
+    const submitControls = controls.filter((c) => {
+      const t = (c.getAttribute('type') || '').toLowerCase();
+      if (t === 'submit') return true;
+      if (t === 'reset') return false;
+      return !NON_SUBMIT.test(ctlLabel(c));
+    });
+    const anyEnabled = submitControls.some((c) => !c.disabled);
     let formValid = true;
     const form = root.tagName === 'FORM' ? root : root.closest('form');
     if (form && typeof form.checkValidity === 'function') {
       try { formValid = form.checkValidity(); } catch (e) { formValid = true; }
     }
-    // Submittable when a control is enabled AND (no form or the form is valid).
+    // Submittable when a SUBMIT control is enabled AND (no form or form valid).
     out.submittable = anyEnabled && formValid;
     if (out.submittable) return out;
     const fields = [...root.querySelectorAll('input,textarea,select')];
@@ -355,11 +678,34 @@ _CLUSTER_VALIDITY_SCRIPT = """
       let invalid = false;
       try { invalid = typeof el.checkValidity === 'function' ? !el.checkValidity() : false; } catch (e) { invalid = false; }
       const empty = !(el.value && String(el.value).length);
-      if (invalid || (el.required && empty)) {
+      // Framework-invalid detection: Angular/React reactive forms use custom
+      // validators, so the NATIVE checkValidity() returns true even when the
+      // control is invalid. The framework marks it via the ng-invalid class or
+      // aria-invalid, which are the only generic runtime signals of "this field
+      // is blocking submit". Without this the filler can never learn WHICH field
+      // to re-fill and the form stays stuck.
+      const frameworkInvalid = el.classList.contains('ng-invalid') ||
+        el.getAttribute('aria-invalid') === 'true';
+      if (invalid || frameworkInvalid || (el.required && empty)) {
         out.invalid_fields.push({
-          name: el.getAttribute('name') || el.getAttribute('id') || el.getAttribute('formcontrolname') || '',
+          name: el.getAttribute('name') || el.getAttribute('formcontrolname') ||
+                el.getAttribute('id') || '',
           type: type,
           field_id: el.getAttribute('data-sentry-field') || '',
+        });
+      }
+    });
+    // Also check custom dropdown widgets (mat-select, role=combobox) that are
+    // not native <select> — reactive forms gate submit on their value too.
+    root.querySelectorAll('mat-select, [role=combobox], [role=listbox]').forEach((el) => {
+      const required = el.getAttribute('aria-required') === 'true';
+      const value = (el.innerText || '').trim();
+      const disabled = el.getAttribute('aria-disabled') === 'true';
+      if (!disabled && required && !value) {
+        out.invalid_fields.push({
+          name: el.getAttribute('name') || el.id || el.getAttribute('formcontrolname') || '',
+          type: 'select-custom',
+          field_id: '',
         });
       }
     });
@@ -442,6 +788,24 @@ class BrowserDiscoveryEngine:
         else:
             context = await browser.new_context()
 
+        # Cap Playwright's per-action default timeout. Every locator op that is
+        # NOT given an explicit ``timeout=`` (get_attribute, evaluate, inner_text,
+        # fill on a field that never resolves, …) otherwise inherits Playwright's
+        # 30s default. Our ``_bounded`` wrapper cancels the awaiting task after a
+        # few hundred ms, but cancellation does not stop Playwright's underlying
+        # protocol call — it keeps running to ITS timeout and then rejects into a
+        # future nobody awaits ("Future exception was never retrieved"). With a
+        # 30s default that orphan lingers for 30s and any genuinely-unwrapped op
+        # blocks a worker for 30s, which on a form-heavy SPA drags the whole crawl
+        # to its budget ceiling. A small default makes both bound out in ~2s.
+        # Explicit per-call timeouts (the fill/click cascade) still override this.
+        try:
+            context.set_default_timeout(
+                float(getattr(self.settings, "crawl_browser_action_timeout_ms", 2000))
+            )
+        except Exception:
+            pass
+
         # Abort non-essential resource loads (images/media/fonts/stylesheets +
         # known trackers) so every navigation settles faster. Never blocks
         # same-origin script/xhr/fetch/document (those can drive SPA data loads).
@@ -454,11 +818,77 @@ class BrowserDiscoveryEngine:
         except Exception:
             pass
 
+        # Restore per-origin sessionStorage. Playwright's ``storage_state`` only
+        # seeds cookies + localStorage — sessionStorage is silently dropped, yet
+        # SPAs routinely keep session-scoped state there (cart/basket ids, CSRF
+        # tokens, wizard progress). Without it a token-seeded context boots
+        # authenticated but cannot fire flows that need that state (e.g. an
+        # add-to-basket POST that attaches a sessionStorage basket id), so a whole
+        # class of mutating requests is unreachable. Re-seed it generically via an
+        # init script that primes the matching origin before its scripts run.
+        if storage_state:
+            session_script = self._session_storage_init_script(storage_state)
+            if session_script:
+                try:
+                    await context.add_init_script(session_script)
+                except Exception:
+                    pass
+
         if auth_cookie_entries:
             await context.add_cookies(auth_cookie_entries)
         if auth_headers:
             await context.set_extra_http_headers(auth_headers)
         return context
+
+    @staticmethod
+    def _session_storage_init_script(storage_state: dict | None) -> str | None:
+        """Build an init script that restores per-origin ``sessionStorage``.
+
+        Reads the ``origins[].sessionStorage`` entries from a Playwright-style
+        ``storage_state`` blob (a list of ``{"name", "value"}`` pairs per origin)
+        and emits JS that, on each navigation, writes those key/values into
+        ``sessionStorage`` **only when the page's own origin matches** — so one
+        worker context can hold several origins' state without cross-seeding.
+        Existing keys are not overwritten (the live app may have set a fresher
+        value). Returns ``None`` when no origin carries sessionStorage, so the
+        common cookies+localStorage-only blob adds no script.
+        """
+        if not isinstance(storage_state, dict):
+            return None
+        by_origin: dict[str, list[dict[str, str]]] = {}
+        for origin in storage_state.get("origins", []) or []:
+            if not isinstance(origin, dict):
+                continue
+            entries = origin.get("sessionStorage")
+            origin_url = origin.get("origin")
+            if not origin_url or not isinstance(entries, list) or not entries:
+                continue
+            clean = [
+                {"name": str(e["name"]), "value": str(e.get("value", ""))}
+                for e in entries
+                if isinstance(e, dict) and e.get("name") is not None
+            ]
+            if clean:
+                by_origin[str(origin_url)] = clean
+        if not by_origin:
+            return None
+        payload = json.dumps(by_origin)
+        # The map is keyed by origin; the script self-selects the matching origin
+        # at runtime so it is safe to install once on the whole context. It must
+        # be a self-invoking IIFE: Playwright's add_init_script injects the source
+        # verbatim, so a bare ``() => {}`` expression would be defined but never
+        # called (the same trap that had silently disabled the route hook).
+        return (
+            "(() => { try {"
+            f"  const byOrigin = {payload};"
+            "  const entries = byOrigin[location.origin];"
+            "  if (!entries) return;"
+            "  for (const e of entries) {"
+            "    try { if (sessionStorage.getItem(e.name) === null)"
+            "      sessionStorage.setItem(e.name, e.value); } catch (err) {}"
+            "  }"
+            "} catch (err) {} })();"
+        )
 
     def _wire_page_observers(
         self,
@@ -723,8 +1153,20 @@ class BrowserDiscoveryEngine:
 
         def _suppress_target_closed(active_loop: Any, context: dict) -> None:
             exc = context.get("exception")
-            if exc is not None and type(exc).__name__ == "TargetClosedError":
-                return
+            if exc is not None:
+                exc_name = type(exc).__name__
+                exc_module = getattr(type(exc), "__module__", "") or ""
+                # Benign teardown artefact: a bounded ``fill``/``evaluate``/… whose
+                # awaiting task ``_bounded`` already cancelled still leaves
+                # Playwright's underlying protocol call running; it later rejects
+                # with a Playwright ``TimeoutError`` (or ``TargetClosedError`` when
+                # the context closed first) into a future nobody awaits. The result
+                # was already handled via ``_BOUNDED_FAILED``, so swallow ONLY these
+                # Playwright-origin orphans; every other error still propagates.
+                if exc_name == "TargetClosedError":
+                    return
+                if exc_name == "TimeoutError" and exc_module.startswith("playwright"):
+                    return
             if previous_handler is not None:
                 previous_handler(active_loop, context)
             else:
@@ -744,6 +1186,16 @@ class BrowserDiscoveryEngine:
                 storage_state=storage_state,
             )
         finally:
+            # A hard-deadline truncation cancels workers mid-``fill``, orphaning
+            # Playwright protocol futures that reject with ``TargetClosedError``
+            # once the browser closes. Their "never retrieved" warning fires at
+            # GC time — which otherwise lands AFTER the handler below is restored,
+            # leaking the flood. Force collection now, while the suppressor is
+            # still installed, so those benign futures are swallowed at their
+            # ``__del__`` rather than by the caller's default handler.
+            import gc
+
+            gc.collect()
             loop.set_exception_handler(previous_handler)
 
     async def _crawl_into_impl(
@@ -818,9 +1270,41 @@ class BrowserDiscoveryEngine:
                 heapq.heappush(heap, (-score_route_surface(url, evidence), counter, url))
                 counter += 1
 
+            # Probe the live app once to learn its routing mode before seeding.
+            # Static route strings mined from JS bundles are bare paths
+            # (``/login``); a hash-routed SPA only renders them at ``/#/login``,
+            # so seeding the bare path navigates the shell and the real page —
+            # with its forms and XHR calls — never loads. The probe reuses a
+            # seeded context (so an auth-gated root still renders) and is bounded;
+            # on failure it returns None and the static heuristic stands in.
+            #
+            # Only worth running when there ARE static routes to canonicalize and
+            # the budget is not already spent: with no seed routes the routing
+            # mode changes nothing (browser-discovered routes arrive as absolute
+            # URLs already), so the probe navigation would be pure overhead.
+            hash_routed_hint: bool | None = None
+            budget_ok = deadline is None or (deadline - loop.time()) > 5.0
+            if (routes or []) and budget_ok:
+                try:
+                    probe_context = await self._create_seeded_context(
+                        browser, storage_state, auth_cookie_entries, auth_headers
+                    )
+                    try:
+                        probe_page = await probe_context.new_page()
+                        hash_routed_hint = await self._detect_hash_routing(probe_page, root_url)
+                    finally:
+                        await probe_context.close()
+                except Exception as exc:
+                    logger.debug("hash-routing preflight failed; using static heuristic: %s", exc)
+                if hash_routed_hint is not None:
+                    logger.info(
+                        "browser discovery routing mode for %s: hash_routed=%s (runtime probe)",
+                        root_url, hash_routed_hint,
+                    )
+
             # Seed known static routes before the crawl starts (no contention yet,
             # single task) so even a short budget reaches them.
-            for target in self._browser_targets(root_url, routes or []):
+            for target in self._browser_targets(root_url, routes or [], hash_routed=hash_routed_hint):
                 _enqueue(target, evidence="seed")
 
             # Effective budget scaled to route count: small apps finish fast, large
@@ -958,6 +1442,10 @@ class BrowserDiscoveryEngine:
                             # per-route budget first and the submit path (which fires
                             # the app's real POST/PUT/PATCH XHR that on_request
                             # captures as a replayable body) is starved on truncation.
+                            # Expand hidden/collapsed interactive containers (tabs,
+                            # accordions, "show more" controls) so their forms and
+                            # links become visible and capturable before form capture.
+                            await self._expand_hidden_content(page)
                             # Count forms/file inputs from structural clusters (RC-1):
                             # runs on every route, not gated on literal <form>s.
                             captured_forms = await self._capture_forms(page, target_url)
@@ -965,8 +1453,15 @@ class BrowserDiscoveryEngine:
                             # resolved no real framework name (pre-hydration SPA
                             # capture), let the framework settle and capture once
                             # more so late-bound names (formcontrolname etc.) land.
-                            if self._forms_need_hydration_recapture(captured_forms):
-                                await self._settle_inflight(page, inflight, cap_ms=1200.0)
+                            # ALSO recapture when zero forms were captured: an SPA
+                            # shell always renders at least a search/navigation
+                            # form, so zero forms means the component has not
+                            # hydrated yet. Without this, late-rendering route
+                            # forms (register, forgot-password, etc.) are never
+                            # captured because the recapture trigger only fired on
+                            # forms with unnamed fields, not on empty results.
+                            if not captured_forms or self._forms_need_hydration_recapture(captured_forms):
+                                await self._settle_inflight(page, inflight, cap_ms=1500.0)
                                 recaptured = await self._capture_forms(page, target_url)
                                 if recaptured:
                                     captured_forms = recaptured
@@ -1007,6 +1502,7 @@ class BrowserDiscoveryEngine:
                             wstate.browser_forms_submitted += await self._submit_discovered_forms(
                                 page, new_forms, root_url, target_url, set(),
                                 inflight=inflight,
+                                deadline=effective_deadline, loop=loop,
                             )
                             await self._drain_observer_tasks(pending_observers)
                             # Blind interaction runs last, on whatever budget the
@@ -1025,13 +1521,32 @@ class BrowserDiscoveryEngine:
                                     )
                                 if interaction_budget > 0.0:
                                     workflow_stats = await self._exercise_page(
-                                        page, max_seconds=interaction_budget
+                                        page,
+                                        max_seconds=interaction_budget,
+                                        inflight=inflight,
+                                        pending_observers=pending_observers,
+                                        wstate=wstate,
+                                        submitted_form_keys=submitted_form_keys,
+                                        root_url=root_url,
+                                        page_url=target_url,
                                     )
                                     wstate.workflow_states_visited += workflow_stats.get("states", 0)
                                 await self._drain_observer_tasks(pending_observers)
                             # Enqueue newly-discovered same-origin routes (scored),
                             # then wake any idle workers to pick them up.
+                            # Open hamburger/sidebar/dropdown menus so their route
+                            # links become visible in the DOM. Collect links
+                            # IMMEDIATELY after opening menus — a scroll or any
+                            # interaction can close a dropdown (mat-menu,
+                            # cdk-overlay) and its dynamically-rendered route links
+                            # vanish from the DOM. Then scroll for lazy-loaded
+                            # content and collect again.
+                            await self._open_navigation_menus(page)
                             discovered = await self._discover_routes(page, root_url)
+                            await self._scroll_for_lazy_content(page, inflight)
+                            # Collect again after scroll: lazy-loaded content may
+                            # have rendered new links (pagination, infinite scroll).
+                            discovered.extend(await self._discover_routes(page, root_url))
                             async with lock:
                                 for new_route in discovered:
                                     _enqueue(new_route, evidence="browser_discovered")
@@ -1355,6 +1870,136 @@ class BrowserDiscoveryEngine:
             await self._bounded(keyboard.press("Escape"), 500)
         await self._dismiss_common_dialogs(page)
 
+    async def _explore_modal_if_open(
+        self,
+        page: Any,
+        page_url: str,
+        inflight: dict[str, int],
+        pending_observers: set[asyncio.Task],
+        wstate: CrawlState,
+        submitted_form_keys: set[tuple[str, str, tuple[str, ...]]],
+        root_url: str,
+    ) -> list[str]:
+        """If a modal/dialog is open, capture its forms and links before
+        dismissing it. Returns any same-origin route links discovered inside
+        the modal.
+
+        A modal opened by a click (product details, settings dialog, login
+        overlay) often contains forms and navigation links that are invisible
+        while the modal is closed. Dismissing it via :meth:`_clear_blocking_overlays`
+        loses that surface entirely. This method runs the modal-content probe;
+        when the modal is interactive (has inputs/forms/links), it re-runs form
+        capture (which tags clusters inside the modal), submits any new forms,
+        and collects links — all before dismissing the modal. Non-interactive
+        overlays (cookie banners, spinners) are dismissed immediately.
+        """
+        modal_info = await self._bounded(page.evaluate(MODAL_CONTENT_SCRIPT), 800)
+        if not isinstance(modal_info, dict) or not modal_info.get("isInteractive"):
+            # Non-interactive overlay — dismiss immediately.
+            keyboard = getattr(page, "keyboard", None)
+            if keyboard is not None:
+                await self._bounded(keyboard.press("Escape"), 500)
+            await self._dismiss_common_dialogs(page)
+            return []
+        # Interactive modal: capture forms, submit, collect links.
+        captured = await self._capture_forms(page, page_url)
+        wstate.browser_forms_discovered += len(captured)
+        for form in captured:
+            wstate.add_browser_form(form)
+        # Submit new (non-duplicate) forms inside the modal. The dedup sets
+        # are shared with the main crawl loop so a modal form is submitted
+        # once globally.
+        async def _noop_lock():
+            pass
+        new_forms: list[dict[str, Any]] = []
+        for form in captured:
+            key = CrawlState._form_key(form)
+            sig = self._form_structural_signature(form)
+            if key in submitted_form_keys or sig in submitted_form_keys:
+                continue
+            submitted_form_keys.add(key)
+            submitted_form_keys.add(sig)
+            new_forms.append(form)
+        if new_forms:
+            wstate.browser_forms_submitted += await self._submit_discovered_forms(
+                page, new_forms, root_url, page_url, submitted_form_keys,
+                inflight=inflight,
+            )
+            await self._drain_observer_tasks(pending_observers)
+        # Collect links from the modal before dismissing.
+        links: list[str] = []
+        modal_links = modal_info.get("links")
+        if isinstance(modal_links, list):
+            links.extend(str(l) for l in modal_links if l)
+        # Dismiss the modal so subsequent interaction targets the main page.
+        keyboard = getattr(page, "keyboard", None)
+        if keyboard is not None:
+            await self._bounded(keyboard.press("Escape"), 500)
+        await self._dismiss_common_dialogs(page)
+        await self._bounded(page.wait_for_timeout(200), 400)
+        return links
+
+    async def _expand_hidden_content(self, page: Any) -> int:
+        """Click inactive tab headers, collapsed accordions, and "show more"
+        controls so their forms and links become visible and capturable.
+
+        Returns the number of elements expanded. Bounded and best-effort: any
+        element that won't engage is skipped without cost. Framework-agnostic:
+        keys on ARIA roles (tab, aria-expanded) and generic expand/show-more
+        labels, never on framework-specific class names.
+        """
+        before_url = self._current_url(page, "")
+        expanded = await self._bounded(page.evaluate(EXPAND_HIDDEN_SCRIPT), 1000)
+        if isinstance(expanded, int) and expanded > 0:
+            await self._bounded(page.wait_for_timeout(300), 500)
+        # If a tab/accordion click accidentally navigated (some SPAs route on
+        # tab change), navigate back so form capture targets the intended page.
+        after_url = self._current_url(page, "")
+        if after_url != before_url:
+            try:
+                await self._bounded(
+                    page.evaluate("() => history.back()"), 500
+                )
+                await self._bounded(page.wait_for_timeout(200), 400)
+            except Exception:
+                pass
+        return expanded if isinstance(expanded, int) else 0
+
+    async def _open_navigation_menus(self, page: Any) -> int:
+        """Open hamburger/sidebar/dropdown menus so their links become visible.
+
+        Returns the count of menus opened. Many SPAs hide their entire route
+        space behind a collapsed hamburger menu or dropdown trigger; without
+        expanding them, route discovery only sees the handful of links rendered
+        in the main content area.
+        """
+        opened = await self._bounded(page.evaluate(OPEN_NAV_MENUS_SCRIPT), 1000)
+        if isinstance(opened, int) and opened > 0:
+            await self._bounded(page.wait_for_timeout(300), 500)
+        return opened if isinstance(opened, int) else 0
+
+    async def _scroll_for_lazy_content(self, page: Any, inflight: dict[str, int]) -> None:
+        """Scroll the page in steps to trigger lazy-loaded content, then settle.
+
+        Many SPAs infinite-scroll or lazy-load components on scroll. Without
+        scrolling, the forms, links, and interactive elements below the fold
+        are never rendered and thus never captured. Bounded to a few scroll
+        steps with settle between each so new XHR content is observed.
+        """
+        for _ in range(4):
+            at_bottom = await self._bounded(
+                page.evaluate(
+                    "() => { const before = window.scrollY; "
+                    "window.scrollTo(0, document.body.scrollHeight); "
+                    "return window.scrollY === before && "
+                    "window.innerHeight + window.scrollY >= document.body.scrollHeight - 5; }"
+                ),
+                500,
+            )
+            await self._settle_inflight(page, inflight, quiet_ms=200.0, cap_ms=1000.0)
+            if at_bottom is True:
+                break
+
     async def _capture_forms(self, page: Any, page_url: str) -> list[dict[str, Any]]:
         """Return structured input clusters rendered on the page.
 
@@ -1381,6 +2026,16 @@ class BrowserDiscoveryEngine:
                     # True when a real framework name resolved (not a positional
                     # field_id fallback). Drives hydration-aware recapture.
                     "named": bool(i.get("named", True)),
+                    # Semantic hint (label/placeholder/aria) + validation
+                    # constraints drive realistic, validator-satisfying values so
+                    # reactive forms enable submit and fire their POST.
+                    "hint": str(i.get("hint", "") or ""),
+                    "required": bool(i.get("required", False)),
+                    "maxlength": i.get("maxlength"),
+                    "minlength": i.get("minlength"),
+                    "pattern": i.get("pattern"),
+                    "min": i.get("min"),
+                    "max": i.get("max"),
                 }
                 for i in inputs
                 if isinstance(i, dict)
@@ -1478,6 +2133,8 @@ class BrowserDiscoveryEngine:
         route_url: str,
         submitted_keys: set[tuple[str, str, tuple[str, ...]]],
         inflight: dict[str, int] | None = None,
+        deadline: float | None = None,
+        loop: Any = None,
     ) -> int:
         """Actively submit non-destructive forms to generate real request bodies.
 
@@ -1506,6 +2163,19 @@ class BrowserDiscoveryEngine:
         inflight_counter = inflight if inflight is not None else {"count": 0}
         submitted = 0
         for form in forms:
+            # Stop cleanly at the overall crawl deadline. Each form runs an
+            # expensive chain (re-capture + fill + fill-to-valid + settle), and a
+            # form-heavy route entered near the budget would otherwise run minutes
+            # PAST the deadline — the cause of the crawl overrunning its clean
+            # internal deadline into the much larger hard-safety timeout, leaving a
+            # long silent tail. Unsubmitted forms are simply left for a future run;
+            # coverage already streamed is never lost.
+            if deadline is not None and loop is not None and loop.time() >= deadline:
+                logger.debug(
+                    "form submission stopped at deadline on %s: %d form(s) left unsubmitted",
+                    route_url, len(forms) - submitted,
+                )
+                break
             key = CrawlState._form_key(form)
             if key in submitted_keys:
                 continue
@@ -1759,11 +2429,19 @@ class BrowserDiscoveryEngine:
         for entry in inputs:
             name = str(entry.get("name", "") or "")
             itype = str(entry.get("type", "text") or "text").lower()
-            if itype in ("hidden", "submit", "button", "file", "image", "reset"):
+            if itype in ("hidden", "submit", "button", "image", "reset"):
                 continue
             nth = type_seen.get(itype, 0)
             type_seen[itype] = nth + 1
-            value = self._synthetic_value(name, itype)
+            if itype == "file":
+                # File inputs can't be filled with ``fill`` — they need
+                # ``set_input_files``. A form with a required file input stays
+                # invalid and never fires its POST without this, so the complaint/
+                # upload forms (common in SPAs) are silently never submitted.
+                if await self._fill_file_input_in_cluster(page, entry, scope, nth):
+                    filled = True
+                continue
+            value = self._synthetic_value(name, itype, str(entry.get("hint", "") or ""), entry)
             # A confirm/repeat field must equal the value already entered into
             # the primary field of the same type; echo it when we have one.
             if CONFIRM_FIELD_RE.search(name) and itype in last_value_by_type:
@@ -1780,7 +2458,97 @@ class BrowserDiscoveryEngine:
         # way to make such forms submittable, framework-agnostically.
         if await self._engage_aria_comboboxes(page, scope):
             filled = True
+        # Arithmetic-CAPTCHA satisfaction: a form gated on a "what is X+Y?" style
+        # challenge stays invalid until the correct answer is entered, so its POST
+        # never fires. Solve it generically (parse the expression from the DOM,
+        # compute, fill the answer field) — a very common SPA pattern.
+        if await self._solve_arithmetic_captcha(page, scope, inputs):
+            filled = True
+        # Dispatch blur on the active element after filling so reactive
+        # frameworks (Angular Material, React, Vue) run change detection and
+        # update their submit control's disabled state. Without this, a filled
+        # field retains focus, the framework's ngModel/formControl update is
+        # deferred, and the submit button stays disabled even though the
+        # underlying native input is valid.
+        await self._bounded(
+            page.evaluate("() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); }"),
+            300,
+        )
+        await self._bounded(page.wait_for_timeout(100), 200)
         return filled
+
+    async def _solve_arithmetic_captcha(
+        self, page: Any, scope: str, inputs: list[dict[str, Any]]
+    ) -> bool:
+        """Detect an arithmetic CAPTCHA in ``scope`` and fill the correct answer.
+
+        Generic across apps that render a simple math challenge ("3 + 7 = ?",
+        "What is 5 x 2?") beside an answer field: the challenge text is read from
+        the cluster (or the page, since the prompt sometimes sits just outside the
+        form container), the expression is evaluated in Python (never ``eval`` of
+        page content), and the result is typed into the captcha answer input. Only
+        fires when the cluster actually has a captcha-like field, so non-captcha
+        forms pay nothing. Returns True when an answer was filled.
+        """
+        captcha_entry = next(
+            (
+                e for e in inputs
+                if re.search(
+                    r"captcha|result of the|are you human|what is|solve",
+                    f"{e.get('name','')} {e.get('hint','')}".lower(),
+                )
+            ),
+            None,
+        )
+        if captcha_entry is None:
+            return False
+        # Read candidate challenge text: the cluster first, then the page.
+        texts: list[str] = []
+        try:
+            if scope:
+                loc = page.locator(scope.strip())
+                cluster_text = await self._bounded(loc.first.inner_text(timeout=300), 500)
+                if isinstance(cluster_text, str):
+                    texts.append(cluster_text)
+            body_text = await self._bounded(
+                page.evaluate("() => document.body ? document.body.innerText : ''"), 400
+            )
+            if isinstance(body_text, str):
+                texts.append(body_text)
+        except Exception:
+            return False
+        answer = None
+        for text in texts:
+            answer = self._eval_arithmetic_challenge(text)
+            if answer is not None:
+                break
+        if answer is None:
+            return False
+        name = str(captcha_entry.get("name", "") or "")
+        itype = str(captcha_entry.get("type", "text") or "text").lower()
+        return await self._fill_single_input(
+            page, captcha_entry, scope, name, itype, 0, value=str(answer)
+        )
+
+    @staticmethod
+    def _eval_arithmetic_challenge(text: str) -> int | None:
+        """Find and evaluate a simple two-operand arithmetic expression in ``text``.
+
+        Supports ``+ - * x ×`` between two integers (the dominant math-CAPTCHA
+        form). Returns the integer result, or ``None`` when no expression is
+        present. Pure Python arithmetic — the page string is parsed, never eval'd.
+        """
+        if not text:
+            return None
+        match = re.search(r"(\d{1,4})\s*([+\-*x×])\s*(\d{1,4})", text)
+        if not match:
+            return None
+        a, op, b = int(match.group(1)), match.group(2), int(match.group(3))
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        return a * b  # * x ×
 
     async def _engage_aria_comboboxes(self, page: Any, scope: str) -> bool:
         """Open each custom dropdown in ``scope`` and pick its first real option.
@@ -1887,7 +2655,14 @@ class BrowserDiscoveryEngine:
         if cluster_id is None:
             return False
         scope = f"[data-sentry-cluster='{cluster_id}'] "
-        for _ in range(max_rounds):
+        # Map captured field name -> semantic hint so re-fills of still-invalid
+        # fields reuse the label/placeholder value logic (the validity probe only
+        # returns name/type/field_id).
+        hint_by_name = {
+            str(i.get("name", "") or ""): str(i.get("hint", "") or "")
+            for i in (form.get("inputs") or [])
+        }
+        for round_index in range(max_rounds):
             state = await self._bounded(
                 page.evaluate(_CLUSTER_VALIDITY_SCRIPT, str(cluster_id)), 800
             )
@@ -1906,7 +2681,7 @@ class BrowserDiscoveryEngine:
                     continue
                 name = str(field.get("name", "") or "")
                 itype = str(field.get("type", "text") or "text").lower()
-                if itype in ("hidden", "submit", "button", "file", "image", "reset"):
+                if itype in ("hidden", "submit", "button", "image", "reset"):
                     continue
                 nth = type_seen.get(itype, 0)
                 type_seen[itype] = nth + 1
@@ -1914,10 +2689,39 @@ class BrowserDiscoveryEngine:
                     "name": name,
                     "type": itype,
                     "field_id": str(field.get("field_id", "") or ""),
+                    "hint": hint_by_name.get(name, "") or str(field.get("hint", "") or ""),
                 }
-                value = self._synthetic_value(name, itype)
+                if itype == "file":
+                    if await self._fill_file_input_in_cluster(page, entry, scope, nth):
+                        filled_any = True
+                    continue
+                # A field still invalid after the first fill failed its validator
+                # with the initial value (e.g. a numeric field with an unexposed
+                # ``min``, a too-short string). Escalate to an alternative value
+                # keyed on round + type so re-filling with the SAME rejected value
+                # is not a no-op. Generic: no field- or app-specific knowledge.
+                value = self._escalated_value(name, itype, str(entry.get("hint", "") or ""), entry, round_index)
                 if await self._fill_single_input(page, entry, scope, name, itype, nth, value=value):
                     filled_any = True
+            # Re-solve an arithmetic captcha whose answer field was flagged invalid
+            # (a fresh challenge may have rendered on re-validation).
+            if await self._solve_arithmetic_captcha(
+                page, scope, [{"name": f.get("name", ""), "type": f.get("type", "text"),
+                               "hint": hint_by_name.get(str(f.get("name", "") or ""), "")}
+                              for f in invalid if isinstance(f, dict)]
+            ):
+                filled_any = True
+            # Re-engage comboboxes: a mat-select whose options hadn't loaded on
+            # the first pass may now be ready, and a newly-filled dependent
+            # field may have unlocked a cascaded dropdown.
+            if await self._engage_aria_comboboxes(page, scope):
+                filled_any = True
+            # Blur after re-filling so framework change detection runs.
+            await self._bounded(
+                page.evaluate("() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); }"),
+                300,
+            )
+            await self._bounded(page.wait_for_timeout(100), 200)
             if not filled_any:
                 return False
         # Final validity check after the last fill round.
@@ -1925,6 +2729,57 @@ class BrowserDiscoveryEngine:
             page.evaluate(_CLUSTER_VALIDITY_SCRIPT, str(cluster_id)), 800
         )
         return bool(isinstance(state, dict) and state.get("submittable"))
+
+    async def _fill_file_input_in_cluster(
+        self, page: Any, entry: dict[str, Any], scope: str, nth: int
+    ) -> bool:
+        """Fill a ``<input type=file>`` inside a cluster with benign upload files.
+
+        Uses the same selector cascade as :meth:`_fill_single_input` (field tag,
+        cluster-scoped positional, identifier attributes) to locate the input,
+        then ``set_input_files`` with the benign upload set. A form with a
+        required file input stays invalid without this, so the POST never fires.
+        """
+        name = str(entry.get("name", "") or "")
+        field_id = str(entry.get("field_id", "") or "")
+        candidates: list[str] = []
+        if field_id:
+            candidates.append(f"[data-sentry-field='{field_id}']")
+        if scope:
+            candidates.append(f"{scope}input[type=file] >> nth={nth}")
+        safe_name = name if name and "'" not in name and "\\" not in name else ""
+        if safe_name:
+            for attr in ("name", "id", "formcontrolname", "data-testid", "aria-label"):
+                prefix = scope if scope else ""
+                candidates.append(f"{prefix}input[{attr}='{safe_name}']")
+        default_files = self._benign_upload_files()
+        for selector in candidates:
+            try:
+                loc = page.locator(selector).first
+                # Honour the input's accept constraint: a mismatched type fails the
+                # field's format validator and blocks a validity-gated submit. Pick
+                # a library file matching accept; if accept is set but unmatched and
+                # the field is optional, skip it rather than break the form.
+                accept = await self._bounded(loc.get_attribute("accept"), 300)
+                accept = accept if isinstance(accept, str) else None
+                typed = self._upload_file_for_accept(accept)
+                if typed is not None:
+                    files: list[dict[str, Any]] = [typed]
+                elif accept and accept.strip():
+                    if not entry.get("required"):
+                        return False
+                    files = default_files
+                else:
+                    files = default_files
+                multiple = await self._bounded(loc.get_attribute("multiple"), 300)
+                await self._bounded(
+                    loc.set_input_files(files if multiple is not None else files[0], timeout=1000),
+                    1200,
+                )
+                return True
+            except Exception:
+                continue
+        return False
 
     async def _fill_single_input(
         self,
@@ -2038,29 +2893,130 @@ class BrowserDiscoveryEngine:
             return f"input[type={itype}]"
         return "input"
 
-    def _synthetic_value(self, name: str, itype: str) -> str:
-        """Type-appropriate placeholder for a captured input (name+type only).
+    def _synthetic_value(
+        self, name: str, itype: str, hint: str = "", entry: dict[str, Any] | None = None
+    ) -> str:
+        """Realistic value for a captured input, keyed on its semantic hint,
+        type, and validation constraints.
 
-        Uses the configured scan credentials for password/identity fields so an
-        auth cluster submits with real creds (capturing the request body is the
-        goal even if they are rejected), else the generic name-keyed baseline.
+        Modern SPA reactive forms reject trivial values (a single ``1`` in a
+        phone field, a random string where a ZIP/number is expected), which
+        leaves the form invalid and its submit disabled — so the app never fires
+        its POST XHR and no body is captured. The semantic ``hint`` (an input's
+        label/placeholder/aria-label captured by :data:`FORM_CAPTURE_SCRIPT`)
+        drives a value that satisfies common domain validators generically
+        (phone, ZIP, quantity, card, name, address, …), then falls back to a
+        type-appropriate value and finally the name-keyed baseline. The result
+        is clamped to any captured ``minlength``/``maxlength``. All checks are on
+        generic English field semantics — no target- or framework-specific keys.
         """
-        joined = f"{name} {itype}".lower()
+        joined = f"{name} {hint} {itype}".lower()
+        value = self._value_from_semantics(joined, name, itype)
+        return self._apply_length_constraints(value, entry)
+
+    def _value_from_semantics(self, joined: str, name: str, itype: str) -> str:
+        """Pick a domain-appropriate value from a lowercased hint string."""
+        has = lambda *toks: any(t in joined for t in toks)
         if "password" in joined and self.settings.authentication_password:
             return self.settings.authentication_password
-        if self.settings.authentication_username and any(
-            token in joined for token in ("email", "username", "user", "login", "account")
+        if self.settings.authentication_username and has(
+            "email", "e-mail", "username", "user name", "login", "account"
         ):
             return self.settings.authentication_username
-        # Format-valid value keyed on the input TYPE. Reactive/HTML5 validators
-        # reject a generic string in a date/number/url/tel field, which leaves
-        # the form invalid and its submit control disabled — so an app never
-        # fires its POST XHR and no body is captured. A type-appropriate value
-        # keeps such fields valid. Name-based hints still win for plain text.
+        # Domain semantics (generic English field names/labels/placeholders).
+        if has("phone", "mobile", "tel", "cell", "contact number", "whatsapp"):
+            return "5551234567"
+        if has("zip", "postal", "postcode", "post code", "pincode", "pin code"):
+            return "12345"
+        if has("captcha", "are you human", "result of the", "solve"):
+            # Solved to the real arithmetic answer separately; a digit keeps a
+            # numeric-pattern field valid until the solver overwrites it.
+            return "0"
+        if has("card number", "cardnumber", "cc number", "credit card", "cardnum"):
+            return "4111111111111111"
+        if has("cvv", "cvc", "security code", "card code"):
+            return "123"
+        if has("expir", "valid thru", "valid until"):
+            return "2030-12" if itype == "month" else "12/2030"
+        if has("year",):
+            return "2030"
+        # Geographic / identity nouns BEFORE the quantity check: "country"
+        # contains the substring "count", "city" is short, etc., so these must
+        # win to avoid a numeric value landing in a text field.
+        if has("country",):
+            return "Testland"
+        if has("city", "town"):
+            return "Springfield"
+        if has("state", "province", "region"):
+            return "California"
+        if has("street", "address", "addr", "line 1", "line1"):
+            return "123 Test Street"
+        if has("quantity", "qty", "liter", "litre", "number of", "how many", "in litres", "in liters"):
+            return "5"
+        if has("first name", "firstname", "given name"):
+            return "Scanner"
+        if has("last name", "lastname", "surname", "family name"):
+            return "Tester"
+        if has("company", "organisation", "organization"):
+            return "Scanner Inc"
+        if has("name", "author", "customer", "requestor", "requester", "full name", "recipient"):
+            return "Scanner Test"
+        if has("subject", "title"):
+            return "Scanner test subject"
+        if has("message", "comment", "feedback", "description", "review", "complaint", "note"):
+            return "Scanner automated test submission."
+        # Format-valid value keyed on the input TYPE (date/number/url/tel/...).
         typed = self._typed_placeholder(itype)
         if typed is not None:
             return typed
         return str(ApiExtractor._baseline_for_name(name))
+
+    def _escalated_value(
+        self, name: str, itype: str, hint: str, entry: dict[str, Any] | None, round_index: int
+    ) -> str:
+        """Alternative value for a field that stayed invalid after the base fill.
+
+        The first round uses the normal semantic value; later rounds escalate to
+        cover common hidden validators the base value can trip: a numeric field
+        with an unexposed ``min`` (a quantity that must exceed a threshold), or a
+        text field needing more length. Purely generic — driven by input type and
+        round index, never by app- or field-specific knowledge.
+        """
+        if round_index <= 0:
+            return self._synthetic_value(name, itype, hint, entry)
+        if itype in ("number", "range", "tel"):
+            ladder = ["50", "100", "1000", "10000"]
+            return self._apply_length_constraints(
+                ladder[min(round_index - 1, len(ladder) - 1)], entry
+            )
+        base = self._synthetic_value(name, itype, hint, entry)
+        # Lengthen a text value in case a minlength-style validator rejected it.
+        return self._apply_length_constraints(base + " Test Value 1234567890", entry)
+
+    @staticmethod
+    def _apply_length_constraints(value: str, entry: dict[str, Any] | None) -> str:
+        """Clamp ``value`` to a field's captured min/maxlength so it satisfies
+        length validators (pad a too-short value, truncate a too-long one)."""
+        if not entry:
+            return value
+        def _int(key: str) -> int | None:
+            raw = entry.get(key)
+            try:
+                n = int(str(raw))
+                return n if n >= 0 else None
+            except (TypeError, ValueError):
+                return None
+        maxlen = _int("maxlength")
+        minlen = _int("minlength")
+        if maxlen is not None and maxlen > 0 and len(value) > maxlen:
+            value = value[:maxlen]
+        if minlen is not None and len(value) < minlen:
+            # Pad with a digit/char that keeps a numeric value numeric.
+            pad = "0" if value.isdigit() else "x"
+            deficit = minlen - len(value)
+            if maxlen is None or minlen <= maxlen:
+                value = value + pad * deficit
+        return value
 
     @staticmethod
     def _typed_placeholder(itype: str) -> str | None:
@@ -2112,8 +3068,24 @@ class BrowserDiscoveryEngine:
             ),
         ):
             return True
-        # No enabled submit control (all disabled, or none present). Literal
-        # <form>: ask the browser to submit it directly.
+        # Submit control rendered OUTSIDE the tight input cluster (a common SPA
+        # layout: fields in one container, the action button in a sibling/parent
+        # card/dialog footer). Climb from the cluster to nearby ancestors and
+        # click the nearest ENABLED, submit-like control (type=submit or a
+        # submit-labelled button), never a back/cancel/nav control. A real click
+        # is tried BEFORE ``requestSubmit`` because reactive frameworks bind their
+        # handler to the button's ``click`` (or the form's ``ngSubmit``, which a
+        # click triggers) — ``requestSubmit`` frequently reports success yet fires
+        # no app request, which then counts a no-op as a submission and starves
+        # this reliable path.
+        if cluster_id is not None:
+            clicked = await self._bounded(
+                page.evaluate(CLICK_ANCESTOR_SUBMIT_JS, str(cluster_id)), 1000
+            )
+            if clicked is not _BOUNDED_FAILED and clicked:
+                return True
+        # No clickable submit control found. Literal <form>: ask the browser to
+        # submit it directly (honours HTML validity) as a last-resort fallback.
         if form.get("has_form", True):
             selector = (
                 f"[data-sentry-cluster='{cluster_id}']" if cluster_id is not None else "form"
@@ -2136,12 +3108,19 @@ class BrowserDiscoveryEngine:
         return False
 
     async def _click_first_enabled(self, page: Any, selectors: tuple[str, ...]) -> bool:
-        """Click the first ENABLED control matching any of ``selectors``.
+        """Click the first ENABLED, SUBMIT-like control matching any ``selectors``.
 
         Disabled controls are skipped via a fast ``is_enabled`` probe rather than
         clicked-and-timed-out, so an invalid reactive form costs milliseconds
         (not seconds) and never counts as a submission. Only a few matches per
-        selector are probed so a page full of buttons cannot blow the budget."""
+        selector are probed so a page full of buttons cannot blow the budget.
+
+        A control labelled back/cancel/close/previous (:data:`NON_SUBMIT_CONTROL_RE`)
+        is never clicked: a form's action row routinely pairs an enabled Back/Cancel
+        button with a (disabled-until-valid) Submit, and clicking the enabled Back
+        both fires no app request and navigates off the route — the reason many
+        "submitted" forms produced no body. Such controls are skipped so the click
+        only ever lands on a real submit."""
         for selector in selectors:
             loc = page.locator(selector)
             count = await self._bounded(loc.count(), 400)
@@ -2151,6 +3130,9 @@ class BrowserDiscoveryEngine:
                 item = loc.nth(index)
                 enabled = await self._bounded(item.is_enabled(timeout=200), 400)
                 if enabled is not True:
+                    continue
+                label = await self._bounded(self._control_label(item), 400)
+                if isinstance(label, str) and NON_SUBMIT_CONTROL_RE.search(label):
                     continue
                 clicked = await self._bounded(item.click(timeout=800), 1000)
                 if clicked is not _BOUNDED_FAILED:
@@ -2189,7 +3171,18 @@ class BrowserDiscoveryEngine:
             result.append(absolute)
         return result
 
-    async def _exercise_page(self, page: Any, max_seconds: float | None = None) -> dict[str, int]:
+    async def _exercise_page(
+        self,
+        page: Any,
+        max_seconds: float | None = None,
+        *,
+        inflight: dict[str, int] | None = None,
+        pending_observers: set[asyncio.Task] | None = None,
+        wstate: CrawlState | None = None,
+        submitted_form_keys: set[tuple[str, str, tuple[str, ...]]] | None = None,
+        root_url: str = "",
+        page_url: str = "",
+    ) -> dict[str, int]:
         """Blind-interact with the page to surface dynamic state/requests.
 
         ``max_seconds`` caps the wall-clock time spent here (RC2): the interaction
@@ -2197,16 +3190,35 @@ class BrowserDiscoveryEngine:
         ``max_interactions`` controls were tried, so a single deep page never
         consumes the budget owed to unvisited routes. ``None`` preserves the
         legacy count-only bound (used by direct-call tests).
+
+        When ``wstate``/``inflight``/``submitted_form_keys`` are provided (the
+        crawl worker loop), the loop becomes modal-aware: after each click, if a
+        modal/dialog appeared, its forms and links are captured and submitted
+        before the modal is dismissed. Scrolling and hidden-content expansion
+        also run so lazy-loaded and tabbed/accordion content is surfaced.
         """
         seen_states: set[str] = set()
         attempted_controls: set[str] = set()
         forms_seen = 0
         file_inputs_seen = 0
+        modal_aware = wstate is not None and inflight is not None
 
         loop = asyncio.get_running_loop()
         start = loop.time()
 
         await self._clear_blocking_overlays(page)
+        # Expand hidden content (tabs, accordions, "show more") so interaction
+        # and form capture can reach tabbed/accordion controls.
+        if modal_aware:
+            await self._expand_hidden_content(page)
+            # Fire mutating action buttons (add-to-cart/basket, save, create,
+            # post, rate, …) up front. These POST/PUT via a plain button click,
+            # not a <form> submit, so the form path never reaches them and the
+            # generic loop below rarely clicks them before the per-route budget
+            # expires. Doing this once per route surfaces a whole class of
+            # otherwise-unreachable API calls; resulting XHRs stream into the
+            # request observer, and a settle lets them complete.
+            await self._click_safe_action_buttons(page, inflight)
         for _ in range(self.max_interactions):
             if max_seconds is not None and (loop.time() - start) >= max_seconds:
                 break
@@ -2233,7 +3245,24 @@ class BrowserDiscoveryEngine:
                 await self._clear_blocking_overlays(page)
                 await self._bounded(self._force_click(element), 900)
             await self._wait_after_interaction(page)
-            await self._clear_blocking_overlays(page)
+            if modal_aware:
+                # After each click, check if a modal/dialog opened and explore
+                # its content (forms, links) before dismissing it. This captures
+                # forms and routes that only exist inside modals — a major source
+                # of missed surface on modal-heavy SPAs.
+                modal_links = await self._explore_modal_if_open(
+                    page, page_url, inflight, pending_observers or set(),
+                    wstate, submitted_form_keys or set(), root_url,
+                )
+                if modal_links:
+                    async with asyncio.Lock():
+                        pass  # Links enqueued by _discover_routes later
+                # Periodically scroll to reveal lazy-loaded content.
+                if _ % 5 == 4:
+                    await self._scroll_for_lazy_content(page, inflight)
+                    await self._expand_hidden_content(page)
+            else:
+                await self._clear_blocking_overlays(page)
 
         return {
             "states": len(seen_states),
@@ -2318,6 +3347,77 @@ class BrowserDiscoveryEngine:
                 "buffer": b"\x89PNG\r\n\x1a\n",
             },
         ]
+
+    # Minimal valid files keyed by extension, used when a file input constrains
+    # its ``accept`` type: uploading a mismatched type fails the field's format
+    # validator and, for a form gating submit on validity, blocks the app POST.
+    # Generic across apps — a small library of the common document/media types.
+    _TYPED_UPLOAD_FILES: dict[str, dict[str, Any]] = {
+        ".pdf": {"name": "sentry.pdf", "mimeType": "application/pdf",
+                 "buffer": b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF"},
+        ".xml": {"name": "sentry.xml", "mimeType": "application/xml",
+                 "buffer": b"<?xml version='1.0'?><order><canary>SENTRY</canary></order>"},
+        ".zip": {"name": "sentry.zip", "mimeType": "application/zip",
+                 "buffer": b"PK\x05\x06" + b"\x00" * 18},
+        ".csv": {"name": "sentry.csv", "mimeType": "text/csv", "buffer": b"a,b\n1,2\n"},
+        ".png": {"name": "sentry.png", "mimeType": "image/png",
+                 "buffer": b"\x89PNG\r\n\x1a\n"},
+        ".jpg": {"name": "sentry.jpg", "mimeType": "image/jpeg", "buffer": b"\xff\xd8\xff\xe0"},
+        ".gif": {"name": "sentry.gif", "mimeType": "image/gif", "buffer": b"GIF89a"},
+        ".txt": {"name": "sentry.txt", "mimeType": "text/plain", "buffer": b"SENTRY_UPLOAD_TEST_CANARY"},
+        ".json": {"name": "sentry.json", "mimeType": "application/json",
+                  "buffer": b'{"canary":"SENTRY"}'},
+        ".yaml": {"name": "sentry.yaml", "mimeType": "text/yaml", "buffer": b"canary: SENTRY\n"},
+    }
+
+    @classmethod
+    def _upload_file_for_accept(cls, accept: str | None) -> dict[str, Any] | None:
+        """Pick a benign file whose type satisfies a file input's ``accept``.
+
+        ``accept`` is a comma list of extensions (``.pdf``) and/or MIME types
+        (``application/pdf``, ``image/*``). Returns the first library file that
+        matches, or ``None`` when ``accept`` is set but nothing matches (caller
+        then skips an optional field rather than invalidating it). ``None``/empty
+        ``accept`` means "any type" and is handled by the caller's default set.
+        """
+        if not accept or not accept.strip():
+            return None
+        tokens = [t.strip().lower() for t in accept.split(",") if t.strip()]
+        for token in tokens:
+            if token.startswith("."):
+                f = cls._TYPED_UPLOAD_FILES.get(token)
+                if f:
+                    return f
+            elif "/" in token:
+                major = token.split("/")[0]
+                subtype = token.split("/")[1]
+                for ext, f in cls._TYPED_UPLOAD_FILES.items():
+                    mt = f["mimeType"]
+                    if token == mt or (subtype == "*" and mt.startswith(major + "/")):
+                        return f
+        return None
+
+    async def _click_safe_action_buttons(
+        self, page: Any, inflight: dict[str, int] | None = None
+    ) -> list[str]:
+        """Click safe, mutating action buttons in one in-page pass, then settle.
+
+        Runs :data:`SAFE_ACTION_CLICK_SCRIPT` (add-to-cart/basket, save, create,
+        post, rate, redeem, … — destructive and navigation controls excluded,
+        de-duplicated by label) so button-triggered POST/PUT XHRs fire even
+        though no ``<form>`` wraps them. All matching is done inside the page in a
+        single evaluate (one round-trip, not N×attribute reads), so it stays cheap
+        even on control-dense grids. After the clicks, in-flight requests are
+        allowed to drain so the observer captures the resulting bodies. Returns
+        the list of clicked labels (best-effort; empty on any failure)."""
+        clicked = await self._bounded(page.evaluate(SAFE_ACTION_CLICK_SCRIPT), 1500)
+        if not isinstance(clicked, list) or not clicked:
+            return []
+        if inflight is not None:
+            await self._settle_inflight(page, inflight, cap_ms=2000.0)
+        else:
+            await self._bounded(page.wait_for_timeout(500), 700)
+        return [str(c) for c in clicked]
 
     async def _next_interaction(self, page: Any, attempted: set[str]) -> tuple[Any | None, str | None]:
         controls = page.locator(INTERACTIVE_SELECTOR)
@@ -2566,9 +3666,18 @@ class BrowserDiscoveryEngine:
             return BrowserDiscoveryEngine._is_root_api_path(path)
         return BrowserDiscoveryEngine._is_root_api_path(f"/{path}")
 
-    def _browser_targets(self, root_url: str, routes: list[str]) -> list[str]:
+    def _browser_targets(
+        self, root_url: str, routes: list[str], *, hash_routed: bool | None = None
+    ) -> list[str]:
         root_origin = self._origin(root_url)
-        hash_routed = self._looks_hash_routed(root_url, routes)
+        # ``hash_routed`` may be determined at runtime (a live probe of how the
+        # app's own router rewrites the URL / renders its nav links) and passed
+        # in; that is authoritative because static route strings mined from a JS
+        # bundle are bare paths (``/login``) with no fragment, so the static
+        # heuristic alone cannot tell a hash-routed SPA from a path-routed one.
+        # Fall back to the static heuristic when no runtime signal is supplied.
+        if hash_routed is None:
+            hash_routed = self._looks_hash_routed(root_url, routes)
         targets = [root_url]
         seen = {self._normalize_for_seen(root_url)}
         # Seed all known static routes up to the route cap (Task B): high-value
@@ -2589,6 +3698,56 @@ class BrowserDiscoveryEngine:
             if len(targets) >= seed_cap:
                 break
         return targets
+
+    async def _detect_hash_routing(self, page: Any, root_url: str) -> bool | None:
+        """Probe a live page to decide whether the app uses hash-based routing.
+
+        Framework-agnostic: instead of matching any framework's router config,
+        it observes the two runtime behaviours every hash-routed SPA exhibits,
+        regardless of whether it is Angular (``useHash``), Vue (hash history),
+        React (``HashRouter``), or hand-rolled:
+
+        1. Loading the app root leaves the URL carrying a route-bearing fragment
+           (``…/#/`` or ``…/#/home``) — the router rewrote ``/`` into the hash.
+        2. The app's own same-origin navigation links are expressed as route
+           fragments (``#/login``) rather than real paths (``/login``).
+
+        Either signal alone is decisive: a path-routed app never rewrites its
+        root into a ``#/`` fragment and never links via ``#/`` route fragments
+        (a bare ``#section`` in-page anchor is not a route fragment and is
+        ignored by :meth:`_route_fragment`). Returns ``None`` when the probe
+        could not run (navigation failed) so the caller keeps the static
+        heuristic rather than asserting a wrong answer.
+        """
+        try:
+            landed = await self._bounded(
+                page.goto(root_url, wait_until="domcontentloaded", timeout=15000), 16000
+            )
+        except Exception as exc:
+            logger.debug("hash-routing probe navigation failed for %s: %s", root_url, exc)
+            return None
+        if landed is _BOUNDED_FAILED:
+            return None
+        # Let the client router run so the root redirect (``/`` -> ``#/``) and
+        # the initial nav links render before we sample them.
+        await settle_page(page, quiet_ms=400.0, cap_ms=4000.0)
+
+        # Signal 1: the router rewrote the root into a route-bearing fragment.
+        if self._route_fragment(urlparse(self._current_url(page, "")).fragment):
+            return True
+
+        # Signal 2: the app's own same-origin links use route fragments.
+        links = await self._bounded(page.evaluate(DOM_LINK_SCRIPT), 1000)
+        if isinstance(links, list):
+            root_origin = self._origin(root_url)
+            for raw in links:
+                candidate = urljoin(root_url, str(raw))
+                if self._origin(candidate) != root_origin:
+                    continue
+                if self._route_fragment(urlparse(candidate).fragment):
+                    return True
+        return False
+
 
     def _dedupe_observations(self, observations: Any) -> list[RequestObservation]:
         deduped: dict[tuple[str, str, str | None, tuple[str, ...]], RequestObservation] = {}
