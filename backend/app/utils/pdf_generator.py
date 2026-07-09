@@ -753,7 +753,7 @@ def build_executive_summary(data: dict, styles: dict) -> list:
         ["Authorization Confirmed", "Yes" if (d.get("authorization") or {}).get("confirmed") else "No"],
         ["Authorization Confirmed At", _fmt_dt((d.get("authorization") or {}).get("confirmed_at"))],
         ["Generated At", date_str],
-        ["Risk Score",   f"{d.get('risk_score', 0):.2f} / 100"],
+        ["Risk Score",   f"{d.get('risk_score', 0):.2f} / 100" + (f" ({d.get('risk_level')})" if d.get('risk_level') else "")],
         ["Classification", "CONFIDENTIAL"],
     ]
     tbl = Table(
@@ -1081,7 +1081,10 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
             detail_row("Auth Context", _clean_enum(auth_context)),
             detail_row("CVSS Vector", v.get("cvss_vector", "N/A")),
             detail_row("URL",         loc.get("url", "N/A")),
-            detail_row("Parameter",   loc.get("parameter") or "N/A"),
+            detail_row(
+                "Parameters" if len(loc.get("parameters") or []) > 1 else "Parameter",
+                ", ".join(loc.get("parameters") or []) or loc.get("parameter") or "N/A",
+            ),
             detail_row("Parameter Location", _clean_enum(loc.get("parameter_location") or "N/A")),
             detail_row("HTTP Method", loc.get("http_method", "N/A")),
             detail_row("Detection Method", ev.get("detection_method") or "N/A"),

@@ -29,6 +29,26 @@ class ApiExtractor:
         r"""(?:http|HttpClient)\s*\.\s*(?P<method>get|post|put|patch|delete)\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""",
         re.I,
     )
+    # A verb call whose URL is a base-variable concat/template rather than a bare
+    # string literal: ``.post(this.host + "/x", body)`` or ``.put(`${base}/x/${id}`)``.
+    # The literal path tail is captured; the base var is resolved separately (see
+    # ``_resolve_base_vars``) so ``/api``-style prefixes are recovered. Matching
+    # both the fetch/axios and Angular ``HttpClient`` chains generically.
+    BASE_CONCAT_VERB_RE = re.compile(
+        r"""\.\s*(?P<method>get|post|put|patch|delete)\s*\(\s*"""
+        r"""(?:`\$\{\s*(?P<tvar>[A-Za-z_$][\w$.]*)\s*\}(?P<ttail>[^`]*)`"""
+        r"""|(?P<cvar>[A-Za-z_$][\w$.]*)\s*\+\s*["'](?P<ctail>[^"']*)["'])""",
+        re.I,
+    )
+    # Assignment of a base-URL-ish variable to a string literal, optionally
+    # prefixed by another base expression (``host = this.hostServer + "/api"``).
+    # Only names that themselves look like a base/host/api var are considered.
+    BASE_VAR_ASSIGN_RE = re.compile(
+        r"""(?:(?:const|let|var)\s+|this\.)?(?P<name>[A-Za-z_$][\w$]*)\s*[:=]\s*"""
+        r"""(?:(?P<base>[A-Za-z_$][\w$.]*)\s*\+\s*)?"""
+        r"""["'`](?P<lit>[^"'`]*)["'`]""",
+        re.I,
+    )
     JS_TEMPLATE_RE = re.compile(r"\$\{\s*(?P<expr>[^}]+?)\s*\}")
     ROUTE_ARRAY_RE = re.compile(r"""path\s*:\s*["'`](?P<path>/[^"'`]+)["'`]""", re.I)
     REACT_ROUTER_RE = re.compile(r"""<Route[^>]+path\s*=\s*["'`](?P<path>/[^"'`]+)["'`]""", re.I)
@@ -145,6 +165,35 @@ class ApiExtractor:
                     path,
                     match.group("method").upper(),
                     evidence="angular-http",
+                    request_body=body,
+                    content_type=content_type,
+                )
+
+        # Base-variable concat/template calls (body-coverage #3). A minified/dev
+        # build often writes ``http.post(this.api + "/Feedbacks", body)`` or
+        # ``http.put(`${base}/user/${id}`)`` where the literal tail alone carries
+        # no /api|/rest token and so is dropped by the string-literal passes above.
+        # Resolve the base var to its literal path prefix (only when unambiguous)
+        # and reconstruct the full path so the endpoint is recovered. Bodies are
+        # NOT invented here — a bare-variable body stays None (see plan #3).
+        base_vars = cls._resolve_base_vars(script_text)
+        if base_vars:
+            for match in cls.BASE_CONCAT_VERB_RE.finditer(script_text):
+                var = match.group("tvar") or match.group("cvar") or ""
+                tail = match.group("ttail")
+                if tail is None:
+                    tail = match.group("ctail") or ""
+                prefix = base_vars.get(var) or base_vars.get(var.rsplit(".", 1)[-1])
+                if prefix is None:
+                    continue
+                joined = prefix + (tail if tail.startswith("/") else f"/{tail}" if tail else "")
+                if not cls._looks_api_path(joined):
+                    continue
+                body, content_type = cls._infer_request_schema_near(script_text, match.start())
+                add_endpoint(
+                    joined,
+                    match.group("method").upper(),
+                    evidence="base-concat",
                     request_body=body,
                     content_type=content_type,
                 )
@@ -455,6 +504,48 @@ class ApiExtractor:
         return lowered in {"baseurl", "apiurl", "host", "server", "hostserver"} or any(
             token in lowered for token in ("base", "api", "host", "server", "origin")
         )
+
+    @classmethod
+    def _resolve_base_vars(cls, script_text: str) -> dict[str, str]:
+        """Map base-URL-ish variable names to their resolved literal *path* prefix.
+
+        Recovers the common ``const API = "/api"`` / ``this.baseUrl = "/rest"``
+        pattern so a later ``http.post(API + "/Feedbacks", …)`` call can be emitted
+        as ``/api/Feedbacks`` instead of being dropped. A base var may itself be a
+        concat of another base var and a literal (``host = this.hostServer +
+        "/api"``); those are resolved to just their literal tail's path so the tail
+        segment (``/api``) is preserved.
+
+        Framework-agnostic and deliberately conservative: a name is kept ONLY when
+        every assignment to it across the whole script agrees on the same literal.
+        Minified per-class fields frequently reuse a name (e.g. ``host`` bound to a
+        different resource path in each service) — resolving an ambiguous name
+        would fabricate wrong endpoints, so ambiguous names are dropped entirely.
+        Only path-shaped literals (leading ``/`` or a bare ``api``/``rest``-style
+        segment) are kept; absolute ``http(s)://`` origins collapse to their path.
+        """
+        candidates: dict[str, set[str]] = {}
+        for match in cls.BASE_VAR_ASSIGN_RE.finditer(script_text):
+            name = match.group("name")
+            if not name or not cls._looks_like_base_expression(name):
+                continue
+            literal = match.group("lit")
+            if literal is None:
+                continue
+            # Absolute origin → keep only its path portion (may be empty).
+            if literal.startswith(("http://", "https://", "//")):
+                literal = urlparse(literal if "//" not in literal[:2] else "https:" + literal if literal.startswith("//") else literal).path
+            if not literal:
+                continue
+            # Path-shaped only: a leading slash, or a bare api/rest-style segment.
+            if not literal.startswith("/") and not cls.ROOT_RELATIVE_API_RE.match(literal):
+                continue
+            prefix = literal if literal.startswith("/") else f"/{literal}"
+            prefix = prefix.rstrip("/")
+            if prefix:
+                candidates.setdefault(name, set()).add(prefix)
+        # Keep only unambiguous names (single agreed literal across the script).
+        return {name: next(iter(vals)) for name, vals in candidates.items() if len(vals) == 1}
 
     @classmethod
     def _infer_request_schema_near(cls, script_text: str, start: int) -> tuple[Any, str | None]:

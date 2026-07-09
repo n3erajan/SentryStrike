@@ -12,6 +12,10 @@ class Finding:
     severity: SeverityLevel
     url: str
     parameter: str | None = None
+    # All vulnerable parameters on this (route, vuln-type) after deduplication grouping.
+    # Populated by FindingDeduplicator; the single `parameter` above stays as the primary
+    # (highest-confidence) one for backward compatibility.
+    affected_parameters: list[str] = field(default_factory=list)
     method: str = "GET"
     payload: str | None = None
     evidence: str | None = None

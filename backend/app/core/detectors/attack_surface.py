@@ -316,6 +316,13 @@ class AttackSurface:
                         )
                     )
 
+        cls._synthesize_update_targets_from_creates(
+            requests or [],
+            targets,
+            seen,
+            filter_fn,
+        )
+
         cls._synthesize_body_targets(
             api_endpoints or [],
             requests or [],
@@ -379,6 +386,146 @@ class AttackSurface:
             return False
         # Route fragments begin with ``/`` or ``!/`` (hashbang); ``#section`` does not.
         return fragment.startswith("/") or fragment.startswith("!/")
+
+    # Response keys (priority order) that carry a newly-created resource's id, and
+    # a shape check for the id value. Purely structural — no app-specific names.
+    _CREATED_ID_KEYS: tuple[str, ...] = ("id", "_id", "uuid", "uid", "ID", "Id", "UUID")
+    _OBJECT_ID_SEGMENT_RE = re.compile(
+        r"^(?:\d+"                                   # integer id
+        r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"  # UUID
+        r"|[0-9a-fA-F]{16,}"                          # long hex (ObjectId/SHA)
+        r"|(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{6,})$"  # opaque token containing a digit
+    )
+
+    @classmethod
+    def _looks_like_object_id(cls, segment: str) -> bool:
+        return bool(segment) and bool(cls._OBJECT_ID_SEGMENT_RE.match(segment))
+
+    @classmethod
+    def _extract_created_id(cls, response_snippet: str | None) -> str | None:
+        """Recover a server-assigned resource id from a create's response body.
+
+        Handles the bare ``{"id": …}`` object and the common ``{"data": {"id": …}}``
+        envelope. Returns ``None`` (never a fabricated id) when no id-shaped value
+        is present, so update synthesis only runs on a genuinely created resource."""
+        if not response_snippet:
+            return None
+        data = cls._parse_json(response_snippet)
+        objects: list[dict] = []
+        if isinstance(data, dict):
+            objects.append(data)
+            inner = data.get("data")
+            if isinstance(inner, dict):
+                objects.append(inner)
+        for obj in objects:
+            for key in cls._CREATED_ID_KEYS:
+                if key in obj:
+                    value = obj[key]
+                    if isinstance(value, bool):
+                        continue
+                    if isinstance(value, int):
+                        return str(value)
+                    if isinstance(value, str) and cls._looks_like_object_id(value):
+                        return value
+        return None
+
+    @classmethod
+    def _synthesize_update_targets_from_creates(
+        cls,
+        requests: list[RequestObservation],
+        targets: list[AttackTarget],
+        seen: set[tuple[str, str, str, str, str]],
+        filter_fn: Callable[[str], bool] | None,
+    ) -> None:
+        """Create → update target synthesis (universal REST convention).
+
+        An observed ``POST /collection`` that returns a created resource id implies
+        an id-scoped ``PUT``/``PATCH /collection/{id}`` accepting the same body
+        shape. Detectors then exercise the *update* path — a distinct endpoint the
+        crawler never navigates to — against a REAL, self-created id with a real,
+        authenticated body, so these targets are replayable rather than synthetic.
+
+        Purely structural: keys on the HTTP verb, a collection-shaped path (final
+        segment is not itself an id), and an id in the response. No framework- or
+        business-specific strings, so it applies to any RESTish API (comments,
+        profiles, records, settings, …), not just shopping resources."""
+        observed_keys = {
+            (request.url, request.method.upper())
+            for request in requests
+            if getattr(request, "post_data", None)
+        }
+        for request in requests:
+            if str(getattr(request, "method", "")).upper() != "POST":
+                continue
+            status = getattr(request, "response_status", None)
+            if status is None or not (200 <= int(status) < 300):
+                continue
+            body = cls._parse_json(getattr(request, "post_data", None))
+            if not isinstance(body, dict) or not body:
+                continue
+            parsed = urlparse(request.url)
+            segments = [segment for segment in parsed.path.split("/") if segment]
+            # A collection endpoint's final path segment is a noun, not an id. When
+            # the POST already targets an item path (…/42), it is not a create.
+            if not segments or cls._looks_like_object_id(segments[-1]):
+                continue
+            created_id = cls._extract_created_id(getattr(request, "response_snippet", None))
+            if created_id is None:
+                continue
+            item_path = parsed.path.rstrip("/") + "/" + created_id
+            item_url = urlunparse(parsed._replace(path=item_path))
+            content_type = getattr(request, "request_content_type", None) or "application/json"
+            headers = {
+                key: value
+                for key, value in (getattr(request, "request_headers", {}) or {}).items()
+                if key.lower() != "content-length"
+            }
+            cookies = dict(getattr(request, "request_cookies", {}) or {})
+            for method in ("PUT", "PATCH"):
+                if (item_url, method) in observed_keys:
+                    continue
+                update_endpoint = ApiEndpoint(
+                    url=item_url,
+                    method=method,
+                    content_type=content_type,
+                    request_body=body,
+                )
+                for parameter in ApiExtractor.parameters_from_endpoint(update_endpoint):
+                    if parameter.location not in {
+                        ParameterLocation.json_body,
+                        ParameterLocation.graphql_variable,
+                    }:
+                        continue
+                    if filter_fn and not filter_fn(parameter.name):
+                        continue
+                    key = (
+                        parameter.url,
+                        method,
+                        parameter.name,
+                        parameter.location.value,
+                        parameter.parent_path or "",
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    targets.append(
+                        AttackTarget(
+                            url=item_url,
+                            parameter=parameter.name,
+                            method=method,
+                            value=parameter.baseline_value,
+                            location=parameter.location,
+                            parent_path=parameter.parent_path,
+                            source="derived_update",
+                            content_type=content_type,
+                            json_template=body,
+                            headers=headers,
+                            cookies=cookies,
+                            security_relevance=set(parameter.security_relevance),
+                            replayable=True,
+                            source_confidence="derived_update",
+                        )
+                    )
 
     @classmethod
     def _synthesize_body_targets(
@@ -615,6 +762,9 @@ class AttackSurface:
             ),
             "static_synth_body_targets": sum(
                 1 for target in targets if target.source_confidence == "static_synth"
+            ),
+            "derived_update_body_targets": sum(
+                1 for target in targets if target.source_confidence == "derived_update"
             ),
             "skipped_unresolved_body_targets": cls._count_unresolved_static_body_targets(
                 api_endpoints,

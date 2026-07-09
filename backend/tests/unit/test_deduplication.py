@@ -125,6 +125,158 @@ def test_deduplicate_groups_csrf_forms_by_endpoint() -> None:
     assert "Email form accepted tampered token." in deduped[0].evidence
 
 
+def test_deduplicate_collapses_idor_params_on_same_route() -> None:
+    """IDOR is a route-level missing-authorization flaw: mutating any object-reference
+    field (UserId, AddressId, message, ...) hits the same broken check, so all fields on
+    one route collapse into a single finding that lists every vulnerable parameter."""
+    findings = [
+        Finding(
+            category=OwaspCategory.a01,
+            vuln_type="Insecure Direct Object Reference (IDOR)",
+            severity=SeverityLevel.high,
+            url="http://localhost:3000/api/Recycles/",
+            parameter="UserId",
+            method="POST",
+            payload="25",
+            evidence="Horizontal IDOR confirmed: second user accessed 'UserId'=25.",
+            confidence_score=95.0,
+            detection_method="second_user_idor",
+            verified=True,
+        ),
+        Finding(
+            category=OwaspCategory.a01,
+            vuln_type="Insecure Direct Object Reference (IDOR)",
+            severity=SeverityLevel.high,
+            url="http://localhost:3000/api/Recycles/",
+            parameter="AddressId",
+            method="POST",
+            payload="8",
+            evidence="Horizontal IDOR confirmed: second user accessed 'AddressId'=8.",
+            confidence_score=90.0,
+            detection_method="second_user_idor",
+            verified=True,
+        ),
+    ]
+
+    deduped = FindingDeduplicator.deduplicate(findings)
+
+    assert len(deduped) == 1
+    assert deduped[0].vuln_type == "Insecure Direct Object Reference (IDOR)"
+    # Highest-confidence param is primary and first in the list.
+    assert deduped[0].parameter == "UserId"
+    assert deduped[0].affected_parameters == ["UserId", "AddressId"]
+    assert "'UserId'=25" in deduped[0].evidence
+    assert "'AddressId'=8" in deduped[0].evidence
+
+
+def test_deduplicate_groups_sqli_params_on_same_route() -> None:
+    """Login page with both email and password SQL-injectable becomes one finding that
+    lists both vulnerable parameters (the user's canonical example)."""
+    findings = [
+        Finding(
+            category=OwaspCategory.a05,
+            vuln_type="SQL Injection (Error-Based)",
+            severity=SeverityLevel.critical,
+            url="http://localhost:3000/rest/user/login",
+            parameter="email",
+            method="POST",
+            payload="' OR '1'='1",
+            evidence="SQL error triggered via email.",
+            confidence_score=90.0,
+            detection_method="error_based",
+            verified=True,
+        ),
+        Finding(
+            category=OwaspCategory.a05,
+            vuln_type="SQL Injection (Error-Based)",
+            severity=SeverityLevel.critical,
+            url="http://localhost:3000/rest/user/login",
+            parameter="password",
+            method="POST",
+            payload="' OR '1'='1",
+            evidence="SQL error triggered via password.",
+            confidence_score=85.0,
+            detection_method="error_based",
+            verified=True,
+        ),
+    ]
+
+    deduped = FindingDeduplicator.deduplicate(findings)
+
+    assert len(deduped) == 1
+    assert deduped[0].affected_parameters == ["email", "password"]
+    assert "SQL error triggered via email." in deduped[0].evidence
+    assert "SQL error triggered via password." in deduped[0].evidence
+
+
+def test_deduplicate_keeps_idor_findings_on_distinct_routes() -> None:
+    """Collapsing is per-route: different endpoints remain separate findings."""
+    findings = [
+        Finding(
+            category=OwaspCategory.a01,
+            vuln_type="Insecure Direct Object Reference (IDOR)",
+            severity=SeverityLevel.high,
+            url="http://localhost:3000/api/Recycles/",
+            parameter="UserId",
+            method="POST",
+            evidence="IDOR on Recycles.",
+            confidence_score=95.0,
+            verified=True,
+        ),
+        Finding(
+            category=OwaspCategory.a01,
+            vuln_type="Insecure Direct Object Reference (IDOR)",
+            severity=SeverityLevel.high,
+            url="http://localhost:3000/api/Complaints/",
+            parameter="UserId",
+            method="POST",
+            evidence="IDOR on Complaints.",
+            confidence_score=95.0,
+            verified=True,
+        ),
+    ]
+
+    deduped = FindingDeduplicator.deduplicate(findings)
+
+    assert len(deduped) == 2
+
+
+def test_deduplicate_keeps_vertical_and_horizontal_idor_separate() -> None:
+    """Vertical privilege escalation (critical) is a distinct family from horizontal
+    IDOR (high) even on the same route, so it is not merged away."""
+    findings = [
+        Finding(
+            category=OwaspCategory.a01,
+            vuln_type="Insecure Direct Object Reference (IDOR)",
+            severity=SeverityLevel.high,
+            url="http://localhost:3000/api/Recycles/",
+            parameter="UserId",
+            method="POST",
+            evidence="Horizontal IDOR.",
+            confidence_score=95.0,
+            verified=True,
+        ),
+        Finding(
+            category=OwaspCategory.a01,
+            vuln_type="Vertical Privilege Escalation (IDOR)",
+            severity=SeverityLevel.critical,
+            url="http://localhost:3000/api/Recycles/",
+            parameter="UserId",
+            method="POST",
+            evidence="Vertical priv-esc.",
+            confidence_score=90.0,
+            verified=True,
+        ),
+    ]
+
+    deduped = FindingDeduplicator.deduplicate(findings)
+
+    assert len(deduped) == 2
+    severities = {f.severity for f in deduped}
+    assert SeverityLevel.critical in severities
+    assert SeverityLevel.high in severities
+
+
 def test_deduplicate_collapses_repeated_verbose_sql_error_evidence() -> None:
     findings = [
         Finding(

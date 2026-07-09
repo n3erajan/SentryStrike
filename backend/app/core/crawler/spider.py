@@ -86,6 +86,8 @@ class CrawlResult:
     workflow_states_visited: int = 0
     browser_forms_discovered: int = 0
     browser_forms_submitted: int = 0
+    buttons_clicked: int = 0
+    button_mutations_fired: int = 0
     file_inputs_discovered: int = 0
     browser_forms: list[dict[str, object]] = field(default_factory=list)
 
@@ -484,6 +486,8 @@ class WebSpider:
             workflow_states_visited=crawl_state.workflow_states_visited,
             browser_forms_discovered=crawl_state.browser_forms_discovered,
             browser_forms_submitted=crawl_state.browser_forms_submitted,
+            buttons_clicked=crawl_state.buttons_clicked,
+            button_mutations_fired=crawl_state.button_mutations_fired,
             file_inputs_discovered=crawl_state.file_inputs_discovered,
             browser_forms=list(crawl_state.browser_forms),
         )
@@ -745,6 +749,8 @@ class WebSpider:
         target.workflow_states_visited += source.workflow_states_visited
         target.browser_forms_discovered += source.browser_forms_discovered
         target.browser_forms_submitted += source.browser_forms_submitted
+        target.buttons_clicked += source.buttons_clicked
+        target.button_mutations_fired += source.button_mutations_fired
         target.file_inputs_discovered += source.file_inputs_discovered
         for form in source.browser_forms:
             target.add_browser_form(form)
@@ -789,7 +795,8 @@ class WebSpider:
         logger.info(
             "crawler finished for %s: urls=%d routes=%d api_endpoints=%d parameters=%d "
             "forms=%d dead_routes=%d assets=%d | browser_available=%s "
-            "browser_forms_captured=%d browser_forms_submitted=%d file_inputs=%d "
+            "browser_forms_captured=%d browser_forms_submitted=%d "
+            "buttons_clicked=%d button_mutations=%d file_inputs=%d "
             "requests=%d post_bodies=%d json_bodies=%d browser_error=%s",
             root_url,
             len(result.urls),
@@ -802,6 +809,8 @@ class WebSpider:
             getattr(result, "browser_available", None),
             getattr(result, "browser_forms_discovered", 0),
             getattr(result, "browser_forms_submitted", 0),
+            getattr(result, "buttons_clicked", 0),
+            getattr(result, "button_mutations_fired", 0),
             getattr(result, "file_inputs_discovered", 0),
             len(requests),
             len(post_bodies),

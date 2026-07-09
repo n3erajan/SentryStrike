@@ -400,9 +400,10 @@ OPEN_NAV_MENUS_SCRIPT = """
 # DOM click (which frameworks' click handlers honour). Resulting XHRs are picked
 # up by the page request observer. Returns the labels clicked (telemetry/debug).
 SAFE_ACTION_CLICK_SCRIPT = r"""
-() => {
+(opts) => {
   try {
-    const LIMIT = 8;
+    const o = opts || {};
+    const LIMIT = (typeof o.limit === 'number' && o.limit > 0) ? o.limit : 15;
     const NON = /\b(back|cancel|close|dismiss|previous|prev|skip|abort|discard|return|logout|log\s*out|sign\s*out|sign\s*off|show|view|open|toggle|expand|collapse)\b/i;
     const DESTRUCTIVE = /\b(delete|remove|destroy|purchase|checkout|pay|buy|order|transfer|withdraw|subscribe|unsubscribe)\b/i;
     // Action VERBS only. A bare noun ("basket", "cart", "bag") also appears on
@@ -415,7 +416,10 @@ SAFE_ACTION_CLICK_SCRIPT = r"""
     const vis = (b) => { try { const s = getComputedStyle(b), r = b.getBoundingClientRect(); return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0; } catch (e) { return false; } };
     const label = (b) => ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + (b.getAttribute('value') || '')).trim();
     const btns = [...document.querySelectorAll('button, [role=button], input[type=button], input[type=submit]')];
-    const seen = new Set();
+    // Seed the de-dup set with labels already clicked on prior passes/routes so a
+    // stable site-wide widget (e.g. a header "Search"/"Save" control) is exercised
+    // once globally, never re-fired each pass (which would loop and burn budget).
+    const seen = new Set(Array.isArray(o.priorKeys) ? o.priorKeys : []);
     const clicked = [];
     for (const b of btns) {
       if (clicked.length >= LIMIT) break;
@@ -1049,6 +1053,8 @@ class BrowserDiscoveryEngine:
         target.workflow_states_visited += source.workflow_states_visited
         target.browser_forms_discovered += source.browser_forms_discovered
         target.browser_forms_submitted += source.browser_forms_submitted
+        target.buttons_clicked += source.buttons_clicked
+        target.button_mutations_fired += source.button_mutations_fired
         target.file_inputs_discovered += source.file_inputs_discovered
         for observation in source.requests:
             key = BrowserDiscoveryEngine._observation_key(
@@ -1239,6 +1245,10 @@ class BrowserDiscoveryEngine:
             heap: list[tuple[int, int, str]] = []
             seen_routes: set[str] = set()
             submitted_form_keys: set[tuple[str, str, tuple[str, ...]]] = set()
+            # Crawl-wide dedup of safe action-button labels already clicked, so a
+            # site-wide widget (header "Save"/"Add") is exercised once globally
+            # rather than re-fired on every route (body-coverage #1).
+            clicked_action_keys: set[str] = set()
             counter = 0
             lock = asyncio.Lock()
             cond = asyncio.Condition(lock)
@@ -1442,69 +1452,123 @@ class BrowserDiscoveryEngine:
                             # per-route budget first and the submit path (which fires
                             # the app's real POST/PUT/PATCH XHR that on_request
                             # captures as a replayable body) is starved on truncation.
-                            # Expand hidden/collapsed interactive containers (tabs,
-                            # accordions, "show more" controls) so their forms and
-                            # links become visible and capturable before form capture.
-                            await self._expand_hidden_content(page)
-                            # Count forms/file inputs from structural clusters (RC-1):
-                            # runs on every route, not gated on literal <form>s.
-                            captured_forms = await self._capture_forms(page, target_url)
-                            # Hydration-aware recapture: if any cluster's fields
-                            # resolved no real framework name (pre-hydration SPA
-                            # capture), let the framework settle and capture once
-                            # more so late-bound names (formcontrolname etc.) land.
-                            # ALSO recapture when zero forms were captured: an SPA
-                            # shell always renders at least a search/navigation
-                            # form, so zero forms means the component has not
-                            # hydrated yet. Without this, late-rendering route
-                            # forms (register, forgot-password, etc.) are never
-                            # captured because the recapture trigger only fired on
-                            # forms with unnamed fields, not on empty results.
-                            if not captured_forms or self._forms_need_hydration_recapture(captured_forms):
-                                await self._settle_inflight(page, inflight, cap_ms=1500.0)
-                                recaptured = await self._capture_forms(page, target_url)
-                                if recaptured:
-                                    captured_forms = recaptured
-                            wstate.browser_forms_discovered += len(captured_forms)
-                            wstate.file_inputs_discovered += sum(
-                                int(form.get("file_inputs", 0)) for form in captured_forms
+                            #
+                            # Workflow chaining (body-coverage #2): the whole
+                            # body-producing pass (expand → capture → submit → click)
+                            # repeats while a prior in-page action revealed NEW
+                            # interactive controls (e.g. add-to-basket surfaces a
+                            # checkout form; opening the basket surfaces a coupon
+                            # field). Three independent stops prevent runaway: the
+                            # ``crawl_browser_workflow_depth`` cap, the control-
+                            # signature ceasing to change, and the crawl deadline.
+                            # Cross-pass dedup (``submitted_form_keys`` /
+                            # ``clicked_action_keys``) guarantees each pass only fires
+                            # genuinely-new forms/buttons.
+                            workflow_depth = max(
+                                1, int(getattr(self.settings, "crawl_browser_workflow_depth", 2) or 2)
                             )
-                            for form in captured_forms:
-                                wstate.add_browser_form(form)
-                            # Atomically claim un-submitted form keys under the lock
-                            # so two workers never submit the same form; then submit
-                            # outside the lock (slow) against a throwaway dedup set.
-                            async with lock:
-                                new_forms = []
+                            prev_control_sig: str | None = None
+                            for _wf_pass in range(workflow_depth):
+                                if effective_deadline is not None and loop.time() >= effective_deadline:
+                                    break
+                                # Expand hidden/collapsed interactive containers (tabs,
+                                # accordions, "show more" controls) so their forms and
+                                # links become visible and capturable before capture.
+                                await self._expand_hidden_content(page)
+                                # Count forms/file inputs from structural clusters
+                                # (RC-1): runs on every route, not gated on literal
+                                # <form>s.
+                                captured_forms = await self._capture_forms(page, target_url)
+                                # Hydration-aware recapture: if any cluster's fields
+                                # resolved no real framework name (pre-hydration SPA
+                                # capture), let the framework settle and capture once
+                                # more so late-bound names (formcontrolname etc.) land.
+                                # ALSO recapture when zero forms were captured: an SPA
+                                # shell always renders at least a search/navigation
+                                # form, so zero forms means the component has not
+                                # hydrated yet. Without this, late-rendering route
+                                # forms (register, forgot-password, etc.) are never
+                                # captured because the recapture trigger only fired on
+                                # forms with unnamed fields, not on empty results.
+                                if not captured_forms or self._forms_need_hydration_recapture(captured_forms):
+                                    await self._settle_inflight(page, inflight, cap_ms=1500.0)
+                                    recaptured = await self._capture_forms(page, target_url)
+                                    if recaptured:
+                                        captured_forms = recaptured
+                                # Discovery counters are delta-based (count each form
+                                # once via the deduping ``add_browser_form``) so a
+                                # chained re-capture of the same DOM never inflates
+                                # the metric; a form revealed by a later pass is still
+                                # counted when it first appears.
+                                before_forms = len(wstate.browser_forms)
                                 for form in captured_forms:
-                                    key = CrawlState._form_key(form)
-                                    # A site-wide widget (e.g. the header search box)
-                                    # is captured on EVERY route with a per-route
-                                    # action, so its ``_form_key`` differs each time
-                                    # and it would be re-submitted on every page —
-                                    # each attempt firing a useless GET and burning
-                                    # ~1-2s of the budget owed to unreached form
-                                    # routes. Dedup a second time on a route-independent
-                                    # structural signature (method + field names) so
-                                    # such a widget is exercised once globally. Two
-                                    # genuinely-distinct forms sharing a signature
-                                    # yield the same body schema anyway, which is what
-                                    # downstream detectors consume.
-                                    sig = self._form_structural_signature(form)
-                                    if key in submitted_form_keys or sig in submitted_form_keys:
-                                        continue
-                                    submitted_form_keys.add(key)
-                                    submitted_form_keys.add(sig)
-                                    new_forms.append(form)
-                            # Active form submission (Task B): fire the app's real
-                            # POST/PUT/PATCH XHR so on_request captures a replayable
-                            # observation. Skips destructive forms.
-                            wstate.browser_forms_submitted += await self._submit_discovered_forms(
-                                page, new_forms, root_url, target_url, set(),
-                                inflight=inflight,
-                                deadline=effective_deadline, loop=loop,
-                            )
-                            await self._drain_observer_tasks(pending_observers)
+                                    wstate.add_browser_form(form)
+                                newly_seen = wstate.browser_forms[before_forms:]
+                                wstate.browser_forms_discovered += len(newly_seen)
+                                wstate.file_inputs_discovered += sum(
+                                    int(form.get("file_inputs", 0)) for form in newly_seen
+                                )
+                                # Atomically claim un-submitted form keys under the
+                                # lock so two workers never submit the same form; then
+                                # submit outside the lock (slow) against a throwaway
+                                # dedup set.
+                                async with lock:
+                                    new_forms = []
+                                    for form in captured_forms:
+                                        key = CrawlState._form_key(form)
+                                        # A site-wide widget (e.g. the header search
+                                        # box) is captured on EVERY route with a
+                                        # per-route action, so its ``_form_key`` differs
+                                        # each time and it would be re-submitted on
+                                        # every page — each attempt firing a useless GET
+                                        # and burning ~1-2s of the budget owed to
+                                        # unreached form routes. Dedup a second time on
+                                        # a route-independent structural signature
+                                        # (method + field names) so such a widget is
+                                        # exercised once globally. Two genuinely-distinct
+                                        # forms sharing a signature yield the same body
+                                        # schema anyway, which is what downstream
+                                        # detectors consume.
+                                        sig = self._form_structural_signature(form)
+                                        if key in submitted_form_keys or sig in submitted_form_keys:
+                                            continue
+                                        submitted_form_keys.add(key)
+                                        submitted_form_keys.add(sig)
+                                        new_forms.append(form)
+                                # Active form submission (Task B): fire the app's real
+                                # POST/PUT/PATCH XHR so on_request captures a replayable
+                                # observation. Skips destructive forms.
+                                wstate.browser_forms_submitted += await self._submit_discovered_forms(
+                                    page, new_forms, root_url, target_url, set(),
+                                    inflight=inflight,
+                                    deadline=effective_deadline, loop=loop,
+                                )
+                                await self._drain_observer_tasks(pending_observers)
+                                # Button-driven mutation capture (body-coverage #1):
+                                # fire safe action buttons (add/save/create/rate/…)
+                                # that POST/PUT via a plain click with no <form>, so
+                                # on_request captures their bodies too. Runs here as a
+                                # first-class high-yield step — right after form submit,
+                                # before the blind interaction loop can spend the
+                                # budget — and is deadline/dedup-bounded so it never
+                                # starves route coverage. Only clicks that fire a
+                                # mutating XHR are counted as valuable.
+                                if allow_interaction:
+                                    await self._exercise_action_buttons(
+                                        page, wstate, clicked_action_keys,
+                                        inflight=inflight,
+                                        deadline=effective_deadline, loop=loop,
+                                    )
+                                    await self._drain_observer_tasks(pending_observers)
+                                # Chaining stop: end the route's body-producing work as
+                                # soon as no new interactive surface appeared since the
+                                # last pass (or the signature could not be read).
+                                if workflow_depth <= 1:
+                                    break
+                                control_sig = await self._interactive_control_signature(page)
+                                if not control_sig or control_sig == prev_control_sig:
+                                    break
+                                prev_control_sig = control_sig
                             # Blind interaction runs last, on whatever budget the
                             # high-yield submit path left, so it can never starve
                             # form submission or route coverage.
@@ -1527,6 +1591,7 @@ class BrowserDiscoveryEngine:
                                         pending_observers=pending_observers,
                                         wstate=wstate,
                                         submitted_form_keys=submitted_form_keys,
+                                        clicked_action_keys=clicked_action_keys,
                                         root_url=root_url,
                                         page_url=target_url,
                                     )
@@ -1595,13 +1660,16 @@ class BrowserDiscoveryEngine:
                 ]
                 logger.info(
                     "browser discovery finished for %s: routes_visited=%d requests=%d "
-                    "forms_captured=%d forms_submitted=%d file_inputs=%d "
+                    "forms_captured=%d forms_submitted=%d buttons_clicked=%d "
+                    "button_mutations=%d file_inputs=%d "
                     "post_bodies=%d replayable_bodies=%d json_bodies=%d error=%s",
                     root_url,
                     routes_visited,
                     len(state.requests),
                     state.browser_forms_discovered,
                     state.browser_forms_submitted,
+                    state.buttons_clicked,
+                    state.button_mutations_fired,
                     state.file_inputs_discovered,
                     len(post_bodies),
                     len(replayable_bodies),
@@ -3180,6 +3248,7 @@ class BrowserDiscoveryEngine:
         pending_observers: set[asyncio.Task] | None = None,
         wstate: CrawlState | None = None,
         submitted_form_keys: set[tuple[str, str, tuple[str, ...]]] | None = None,
+        clicked_action_keys: set[str] | None = None,
         root_url: str = "",
         page_url: str = "",
     ) -> dict[str, int]:
@@ -3217,8 +3286,17 @@ class BrowserDiscoveryEngine:
             # generic loop below rarely clicks them before the per-route budget
             # expires. Doing this once per route surfaces a whole class of
             # otherwise-unreachable API calls; resulting XHRs stream into the
-            # request observer, and a settle lets them complete.
-            await self._click_safe_action_buttons(page, inflight)
+            # request observer, and a settle lets them complete. The worker loop
+            # already ran the first-class button pass (body-coverage #1) with the
+            # same ``clicked_action_keys`` set, so when it is provided this call
+            # dedups against it and only fires controls revealed since (e.g. by
+            # expand_hidden_content) — no double-click, no double-count.
+            action_result = await self._click_safe_action_buttons(
+                page, inflight, clicked_action_keys
+            )
+            if wstate is not None:
+                wstate.buttons_clicked += len(action_result.get("clicked") or [])
+                wstate.button_mutations_fired += int(action_result.get("mutations", 0) or 0)
         for _ in range(self.max_interactions):
             if max_seconds is not None and (loop.time() - start) >= max_seconds:
                 break
@@ -3398,8 +3476,11 @@ class BrowserDiscoveryEngine:
         return None
 
     async def _click_safe_action_buttons(
-        self, page: Any, inflight: dict[str, int] | None = None
-    ) -> list[str]:
+        self,
+        page: Any,
+        inflight: dict[str, int] | None = None,
+        clicked_action_keys: set[str] | None = None,
+    ) -> dict[str, Any]:
         """Click safe, mutating action buttons in one in-page pass, then settle.
 
         Runs :data:`SAFE_ACTION_CLICK_SCRIPT` (add-to-cart/basket, save, create,
@@ -3408,16 +3489,97 @@ class BrowserDiscoveryEngine:
         though no ``<form>`` wraps them. All matching is done inside the page in a
         single evaluate (one round-trip, not N×attribute reads), so it stays cheap
         even on control-dense grids. After the clicks, in-flight requests are
-        allowed to drain so the observer captures the resulting bodies. Returns
-        the list of clicked labels (best-effort; empty on any failure)."""
-        clicked = await self._bounded(page.evaluate(SAFE_ACTION_CLICK_SCRIPT), 1500)
-        if not isinstance(clicked, list) or not clicked:
-            return []
-        if inflight is not None:
-            await self._settle_inflight(page, inflight, cap_ms=2000.0)
-        else:
-            await self._bounded(page.wait_for_timeout(500), 700)
-        return [str(c) for c in clicked]
+        allowed to drain so the observer captures the resulting bodies.
+
+        ``clicked_action_keys`` is the crawl-wide set of labels already clicked; it
+        is seeded into the in-page de-dup set (so a site-wide widget fires once
+        globally) and updated with this pass's clicks. A transient request watcher
+        counts how many clicks fired a real *mutating* request (non
+        GET/HEAD/OPTIONS) — the value-producing signal, mirroring
+        :meth:`_submit_and_detect_fire`.
+
+        Returns ``{"clicked": [labels], "mutations": int}`` (empty/zero on any
+        failure)."""
+        prior_keys = sorted(clicked_action_keys) if clicked_action_keys else []
+        limit = int(getattr(self.settings, "crawl_browser_action_click_limit", 15) or 15)
+        saw = {"mutations": 0}
+
+        def _watch(request: Any) -> None:
+            try:
+                method = str(getattr(request, "method", "GET")).upper()
+            except Exception:
+                return
+            if method not in ("GET", "HEAD", "OPTIONS"):
+                saw["mutations"] += 1
+
+        attached = False
+        if hasattr(page, "on"):
+            try:
+                page.on("request", _watch)
+                attached = True
+            except Exception:
+                attached = False
+        try:
+            clicked = await self._bounded(
+                page.evaluate(SAFE_ACTION_CLICK_SCRIPT, {"priorKeys": prior_keys, "limit": limit}),
+                1500,
+            )
+            if not isinstance(clicked, list) or not clicked:
+                return {"clicked": [], "mutations": 0}
+            labels = [str(c) for c in clicked]
+            if clicked_action_keys is not None:
+                clicked_action_keys.update(labels)
+            if inflight is not None:
+                await self._settle_inflight(page, inflight, cap_ms=2000.0)
+            else:
+                await self._bounded(page.wait_for_timeout(500), 700)
+            return {"clicked": labels, "mutations": saw["mutations"]}
+        finally:
+            if attached and hasattr(page, "remove_listener"):
+                try:
+                    page.remove_listener("request", _watch)
+                except Exception:
+                    pass
+
+    async def _exercise_action_buttons(
+        self,
+        page: Any,
+        wstate: CrawlState,
+        clicked_action_keys: set[str],
+        inflight: dict[str, int] | None = None,
+        *,
+        deadline: float | None = None,
+        loop: Any = None,
+    ) -> None:
+        """First-class per-route button-mutation step (body-coverage #1).
+
+        Most SPA mutations fire on a plain button click with no ``<form>``
+        (add-to-cart, save, create, rate, redeem, top-up). The form path never
+        reaches them and the blind interaction loop rarely clicks them before the
+        per-route budget expires — so their POST/PUT body is never observed. This
+        runs the safe action-click pass up-front, like form submission, and
+        repeats it while genuinely-new labelled controls keep appearing (SPA
+        re-render / lazy content), bounded by ``crawl_browser_action_click_passes``
+        and the crawl deadline. Cross-route dedup (``clicked_action_keys``) keeps a
+        stable widget from being re-fired. Updates ``wstate.buttons_clicked`` /
+        ``wstate.button_mutations_fired``. Destructive/navigation labels are never
+        clicked (enforced in :data:`SAFE_ACTION_CLICK_SCRIPT`)."""
+        passes = int(getattr(self.settings, "crawl_browser_action_click_passes", 2) or 2)
+        for _pass in range(max(1, passes)):
+            if deadline is not None and loop is not None and loop.time() >= deadline:
+                break
+            result = await self._click_safe_action_buttons(page, inflight, clicked_action_keys)
+            clicked = result.get("clicked") or []
+            if not clicked:
+                # No new safe action control fired this pass — nothing left to do
+                # on this route; stop instead of spinning to the pass cap.
+                break
+            wstate.buttons_clicked += len(clicked)
+            wstate.button_mutations_fired += int(result.get("mutations", 0) or 0)
+            logger.debug(
+                "action buttons clicked on %s: %d clicked, %d mutating XHR fired",
+                self._current_url(page, ""), len(clicked), result.get("mutations", 0),
+            )
 
     async def _next_interaction(self, page: Any, attempted: set[str]) -> tuple[Any | None, str | None]:
         controls = page.locator(INTERACTIVE_SELECTOR)
@@ -3491,6 +3653,39 @@ class BrowserDiscoveryEngine:
                     await self._wait_after_interaction(page)
             except Exception:
                 continue
+
+    async def _interactive_control_signature(self, page: Any) -> str:
+        """Cheap, order-insensitive fingerprint of the page's interactive surface.
+
+        Used by workflow chaining (body-coverage #2) to decide whether a prior
+        in-page action revealed NEW controls (a checkout form after add-to-basket,
+        a coupon field after opening the basket). A single ``evaluate`` returns
+        counts of visible forms/inputs/buttons plus the app's structural cluster
+        count; when this fingerprint stops changing between passes there is no new
+        surface to exercise and the chain stops. Framework-agnostic (counts DOM
+        shape, not app strings). Returns ``""`` on failure so a transient eval
+        error simply ends the chain rather than aborting the route."""
+        sig = await self._bounded(
+            page.evaluate(
+                """() => {
+                    const vis = (el) => {
+                        try {
+                            const s = getComputedStyle(el), r = el.getBoundingClientRect();
+                            return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
+                        } catch (e) { return false; }
+                    };
+                    const count = (sel) => [...document.querySelectorAll(sel)].filter(vis).length;
+                    return [
+                        count('form'),
+                        count('input,textarea,select'),
+                        count('button,[role=button],input[type=submit],input[type=button]'),
+                        document.querySelectorAll('[data-sentry-cluster]').length,
+                    ].join(':');
+                }"""
+            ),
+            1000,
+        )
+        return sig if isinstance(sig, str) else ""
 
     async def _ui_state_signature(self, page: Any) -> str:
         try:

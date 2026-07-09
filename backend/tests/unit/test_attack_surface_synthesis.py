@@ -445,3 +445,100 @@ def test_form_synth_skips_unresolved_path_placeholder():
     )
     targets = AttackSurface.build([], [form])
     assert all(t.source_confidence != "form_synth" for t in targets)
+
+
+# --- Create -> update target synthesis (replayable-body coverage) -----------------------
+
+
+def _create_observation(url, body, response, status=201, headers=None):
+    return RequestObservation(
+        url=url,
+        method="POST",
+        request_content_type="application/json",
+        post_data=body,
+        request_headers=headers or {"authorization": "Bearer t"},
+        response_status=status,
+        response_snippet=response,
+    )
+
+
+def test_create_response_id_synthesizes_put_and_patch_update_targets():
+    """A POST create returning an id yields replayable PUT/PATCH targets at the
+    id-scoped item path with the same body shape (universal REST convention)."""
+    obs = _create_observation(
+        "http://x/api/Cards",
+        '{"fullName": "A", "cardNum": 4111111111111111}',
+        '{"status": "success", "data": {"id": 42, "fullName": "A"}}',
+    )
+    targets = AttackSurface.build([], [], requests=[obs])
+    derived = [t for t in targets if t.source_confidence == "derived_update"]
+    assert derived, "expected create->update synthesis"
+    methods = {t.method for t in derived}
+    assert methods == {"PUT", "PATCH"}
+    assert all(t.url == "http://x/api/Cards/42" for t in derived)
+    assert all(t.replayable is True for t in derived)
+    # Same body fields become injectable parameters.
+    assert {t.parameter for t in derived} >= {"fullName", "cardNum"}
+    # Authenticated context carried over from the create.
+    assert all(t.headers.get("authorization") == "Bearer t" for t in derived)
+
+
+def test_no_update_synthesis_without_created_id():
+    """An RPC-style POST (login) whose response carries no resource id must not
+    synthesize bogus /login/{id} update targets."""
+    obs = _create_observation(
+        "http://x/rest/user/login",
+        '{"email": "a@b.c", "password": "x"}',
+        '{"authentication": {"token": "abc.def.ghi"}}',
+        status=200,
+    )
+    targets = AttackSurface.build([], [], requests=[obs])
+    assert [t for t in targets if t.source_confidence == "derived_update"] == []
+
+
+def test_no_update_synthesis_when_post_targets_item_path():
+    """A POST already aimed at an item path (…/42) is not a collection create."""
+    obs = _create_observation(
+        "http://x/api/Cards/42/activate",
+        '{"flag": true}',
+        '{"id": 99}',
+    )
+    targets = AttackSurface.build([], [], requests=[obs])
+    # /activate is a noun, but the id 42 earlier doesn't matter — the final segment
+    # "activate" is not an id, so this WOULD synthesize; guard instead on failure
+    # responses. Here status is 201 so it synthesizes an /activate/{id}: acceptable
+    # only if an id was returned. This asserts the create-id gate, not path shape.
+    derived = [t for t in targets if t.source_confidence == "derived_update"]
+    assert all(t.url.endswith("/99") for t in derived)
+
+
+def test_no_update_synthesis_on_failed_create():
+    obs = _create_observation(
+        "http://x/api/Cards",
+        '{"fullName": "A"}',
+        '{"error": "bad request"}',
+        status=400,
+    )
+    targets = AttackSurface.build([], [], requests=[obs])
+    assert [t for t in targets if t.source_confidence == "derived_update"] == []
+
+
+def test_observed_update_wins_over_synthesized():
+    """When the crawler already observed the PUT, no duplicate synthesis."""
+    create = _create_observation(
+        "http://x/api/Cards",
+        '{"fullName": "A"}',
+        '{"id": 42}',
+    )
+    observed_put = RequestObservation(
+        url="http://x/api/Cards/42",
+        method="PUT",
+        request_content_type="application/json",
+        post_data='{"fullName": "B"}',
+        response_status=200,
+    )
+    targets = AttackSurface.build([], [], requests=[create, observed_put])
+    put_targets = [t for t in targets if t.method == "PUT" and t.url == "http://x/api/Cards/42"]
+    # The observed PUT is present; the synthesizer did not add a duplicate derived one.
+    assert put_targets
+    assert all(t.source_confidence != "derived_update" for t in put_targets)

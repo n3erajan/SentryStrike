@@ -56,6 +56,25 @@ class Settings(BaseSettings):
     # so it can never inherit Playwright's 30s default and orphan a 30s future
     # after ``_bounded`` cancels it. Keep well below the per-route budget.
     crawl_browser_action_timeout_ms: float = Field(default=2000.0, alias="CRAWL_BROWSER_ACTION_TIMEOUT_MS")
+    # Max safe action buttons clicked per in-page pass during button-driven
+    # mutation capture (body-coverage #1). Buttons that POST/PUT via a plain
+    # click with no <form> (add-to-cart, save, create, rate, redeem, …) are
+    # otherwise never exercised. Destructive/navigation labels are always
+    # excluded regardless of this cap. Keep modest so a control-dense grid can
+    # never dominate the per-route budget.
+    crawl_browser_action_click_limit: int = Field(default=15, alias="CRAWL_BROWSER_ACTION_CLICK_LIMIT")
+    # How many action-click passes to run per route. A pass re-runs only when the
+    # previous one clicked genuinely-new controls (SPA re-render / lazy content);
+    # a static page stops after one pass. Cross-route dedup + the crawl deadline
+    # are the other two independent stops, so this cannot loop.
+    crawl_browser_action_click_passes: int = Field(default=2, alias="CRAWL_BROWSER_ACTION_CLICK_PASSES")
+    # Workflow chaining depth (body-coverage #2). Some endpoints only fire after a
+    # prerequisite in-page action (add-to-basket → checkout; create address →
+    # select at checkout). After the first form+button pass on a route, if new
+    # interactive controls appeared, re-run the body-producing pass — up to this
+    # many total passes, or until the control signature stops changing, or the
+    # deadline hits. 1 disables chaining (single pass, same cost as before).
+    crawl_browser_workflow_depth: int = Field(default=2, alias="CRAWL_BROWSER_WORKFLOW_DEPTH")
     # Block non-essential resources (images/media/fonts/stylesheets + known
     # trackers) during browser crawl/auth to speed up settle. Never blocks
     # same-origin script/xhr/fetch/document. Disable if a target renders needed
@@ -76,6 +95,24 @@ class Settings(BaseSettings):
     # pathological fan-out (e.g. the header-stored XSS explosion) is capped.
     scanner_per_detector_request_cap: int = Field(default=6000, alias="SCANNER_PER_DETECTOR_REQUEST_CAP")
     scanner_per_parameter_request_cap: int = Field(default=600, alias="SCANNER_PER_PARAMETER_REQUEST_CAP")
+
+    # Authorization testing of STATE-CHANGING requests (universal, framework/
+    # business-agnostic). When on, the access-control detector probes id-bearing
+    # mutating endpoints (DELETE/PUT/PATCH /x/:id) under each auth context using a
+    # SYNTHETIC NON-EXISTENT object id, reading only the authorization verdict
+    # (401/403 = enforced; processed = missing auth). No real record is ever
+    # modified — safe against any target.
+    access_control_probe_mutating_methods: bool = Field(
+        default=True, alias="ACCESS_CONTROL_PROBE_MUTATING_METHODS"
+    )
+    # Opt-in higher-fidelity confirmation: additionally fire the mutating method
+    # against a REAL object id that OUR OWN session created/observed, to confirm
+    # an actual state change (true object-level BOLA). This performs real
+    # mutations (only on self-observed data) so it is OFF by default and must be
+    # enabled explicitly per authorized engagement.
+    allow_destructive_authz_confirmation: bool = Field(
+        default=False, alias="ALLOW_DESTRUCTIVE_AUTHZ_CONFIRMATION"
+    )
 
     # Verification / Scanning Settings
     scan_mode: str = Field(default="verified", alias="SCAN_MODE")  # verified / heuristic / aggressive

@@ -219,7 +219,11 @@ async def test_csrf_shell_guard_suppresses_finding_for_shell_response(monkeypatc
 @pytest.mark.asyncio
 async def test_csrf_finding_on_real_mutating_api(monkeypatch):
     """P0-4: an observed mutating XHR (real API) that accepts a tampered,
-    foreign-Origin submission with a non-shell response is a genuine CSRF finding."""
+    foreign-Origin submission with a non-shell response is a genuine CSRF finding.
+
+    The observed request is form-encoded, so it is genuinely cross-site
+    forgeable (a JSON body would not be — see test_csrf_suppressed_on_json_api).
+    """
     from app.core.crawler.models import RequestObservation
 
     monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
@@ -229,9 +233,9 @@ async def test_csrf_finding_on_real_mutating_api(monkeypatch):
         RequestObservation(
             url="http://spa.test/api/profile",
             method="POST",
-            request_content_type="application/json",
-            post_data='{"displayName":"x"}',
-            body_kind="json",
+            request_content_type="application/x-www-form-urlencoded",
+            post_data="displayName=x",
+            body_kind="form",
             body_schema=["displayName"],
         )
     ]
@@ -280,7 +284,7 @@ async def test_csrf_builds_candidate_from_mutating_api_schema(monkeypatch):
     endpoint = ApiEndpoint(
         url="http://spa.test/api/profile",
         method="POST",
-        content_type="application/json",
+        content_type="application/x-www-form-urlencoded",
         body_schema=["displayName"],
     )
 
@@ -299,9 +303,11 @@ async def test_csrf_builds_candidate_from_mutating_api_schema(monkeypatch):
 
     assert findings, "expected CSRF finding from generic mutating API schema"
     assert calls
-    assert calls[0]["json_body"] == {"displayName": "sentry_test_val"}
-    assert calls[0]["data"] is None
-    assert calls[0]["headers"] == {"Content-Type": "application/json"}
+    # Form-encoded endpoint → sent as a urlencoded body (data=), no JSON body,
+    # and no forced Content-Type header (the client sets it for form data).
+    assert calls[0]["data"] == {"displayName": "sentry_test_val"}
+    assert calls[0]["json_body"] is None
+    assert calls[0]["headers"] is None
 
 
 @pytest.mark.asyncio
@@ -336,3 +342,77 @@ async def test_csrf_skips_mutating_api_schema_with_unresolved_path(monkeypatch):
     )
 
     assert findings == []
+
+
+@pytest.mark.asyncio
+async def test_csrf_suppressed_on_json_api(monkeypatch):
+    """JSON APIs requiring application/json are not cross-site forgeable (HTML
+    forms cannot set that Content-Type; fetch() triggers a blocked CORS
+    preflight). The detector must skip them — no false CSRF on JSON endpoints."""
+    from app.core.crawler.models import RequestObservation
+
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
+
+    detector = CSRFDetector()
+    observed = [
+        RequestObservation(
+            url="http://spa.test/api/profile",
+            method="POST",
+            request_content_type="application/json",
+            post_data='{"displayName":"x"}',
+            body_kind="json",
+            body_schema=["displayName"],
+        )
+    ]
+
+    findings = await detector.detect(
+        ["http://spa.test/"],
+        [],
+        session_cookies={"session": "abc123"},
+        auth_headers={},
+        browser_forms=[],
+        requests=observed,
+    )
+
+    assert findings == [], "JSON API must not be flagged as classic ambient-cookie CSRF"
+
+
+@pytest.mark.asyncio
+async def test_csrf_suppressed_on_login_endpoint(monkeypatch):
+    """Login/authenticate endpoints accept anonymous callers by design. A forged
+    login is the separate, weaker 'login CSRF' class with no ambient session to
+    abuse — skip them uniformly. Structural path detection -> framework-agnostic."""
+    from app.core.crawler.models import RequestObservation
+
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
+
+    detector = CSRFDetector()
+    observed = [
+        RequestObservation(
+            url="http://app.test/auth/login",
+            method="POST",
+            request_content_type="application/x-www-form-urlencoded",
+            post_data="username=u&password=p",
+            body_kind="form",
+            body_schema=["username", "password"],
+        ),
+        RequestObservation(
+            url="http://app.test/api/authenticate",
+            method="POST",
+            request_content_type="application/x-www-form-urlencoded",
+            post_data="email=e&password=p",
+            body_kind="form",
+            body_schema=["email", "password"],
+        ),
+    ]
+
+    findings = await detector.detect(
+        ["http://app.test/"],
+        [],
+        session_cookies={"session": "abc123"},
+        auth_headers={},
+        browser_forms=[],
+        requests=observed,
+    )
+
+    assert findings == [], "login/authenticate endpoints must be suppressed"

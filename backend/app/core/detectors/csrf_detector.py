@@ -224,6 +224,48 @@ class CSRFDetector(BaseDetector):
                 return True
         return False
 
+    # Content types a cross-origin HTML form can natively produce. Anything else
+    # (application/json, application/graphql, …) forces a CORS preflight, so a
+    # cross-site page cannot silently forge the request.
+    _SIMPLE_REQUEST_CONTENT_TYPES = (
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+        "text/plain",
+    )
+
+    @classmethod
+    def _candidate_is_cross_site_forgeable(cls, candidate: tuple) -> bool:
+        """True when a browser could emit this request from a cross-site page.
+
+        Static/browser <form> candidates carry no explicit location and default
+        to form-encoding — natively forgeable. Observed-XHR and spec candidates
+        carry (location, content_type); only a simple (form/text) body is
+        forgeable. A JSON/GraphQL body is not, so it can never be classic
+        ambient-cookie CSRF regardless of what our same-site client observes.
+        """
+        location = candidate[5] if len(candidate) > 5 else ParameterLocation.form
+        content_type = str(candidate[6] if len(candidate) > 6 else "").lower()
+        if location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
+            return False
+        if content_type and not any(
+            simple in content_type for simple in cls._SIMPLE_REQUEST_CONTENT_TYPES
+        ):
+            return False
+        return True
+
+    def _candidate_is_auth_endpoint(self, candidate: tuple) -> bool:
+        """True when the candidate URL path is an authentication endpoint.
+
+        Login / signin / authenticate / token routes accept anonymous callers by
+        design; a forged login is the separate, weaker "login CSRF" class with no
+        ambient session to abuse. Structural path match → framework-agnostic.
+        """
+        try:
+            path = urlparse(candidate[0]).path.lower()
+        except Exception:
+            return False
+        return any(tok in path for tok in self.login_indicators)
+
     def _token_auth_posture(self, form_candidates: list[tuple]) -> list[Finding]:
         """Informational posture note for header/bearer-token apps.
 
@@ -512,7 +554,34 @@ class CSRFDetector(BaseDetector):
                     logger.error("CSRF verification failed for %s: %s", form_url, e)
             return cand_findings
 
-        tasks = [verify_csrf(c) for c in form_candidates]
+        # Framework-agnostic CSRF preconditions, applied uniformly to every
+        # candidate source (static form, SPA form, observed XHR, spec endpoint)
+        # before any active verification. Classic ambient-cookie CSRF is only
+        # possible when a browser will actually emit the state-changing request
+        # cross-site, so we require BOTH:
+        #   1. A cross-site-forgeable body. Only "simple" request bodies
+        #      (application/x-www-form-urlencoded, multipart/form-data,
+        #      text/plain, or empty) can be produced by a cross-origin HTML form.
+        #      A JSON or GraphQL body cannot — an attacker page can't set that
+        #      Content-Type on a form, and a cross-site fetch() of it triggers a
+        #      CORS preflight the target must approve. Such endpoints are NOT
+        #      forgeable, so replaying them from our own same-site client and
+        #      seeing 200 is not evidence of CSRF.
+        #   2. A non-authentication endpoint. Login / signin / authenticate /
+        #      token routes are meant to accept anonymous, session-less callers;
+        #      "login CSRF" is a separate, far weaker class with no ambient
+        #      session to abuse.
+        # This is what turns "our client replayed it and got 200" into a real
+        # cross-site claim, and it generalises to any framework — no app-specific
+        # paths or content types are hard-coded.
+        verifiable_candidates = [
+            c
+            for c in form_candidates
+            if self._candidate_is_cross_site_forgeable(c)
+            and not self._candidate_is_auth_endpoint(c)
+        ]
+
+        tasks = [verify_csrf(c) for c in verifiable_candidates]
         results = await asyncio.gather(*tasks)
         for res in results:
             findings.extend(res)

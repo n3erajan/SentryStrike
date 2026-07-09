@@ -513,9 +513,15 @@ class FindingDeduplicator:
     @staticmethod
     def deduplicate(findings: list[Finding]) -> list[Finding]:
         """
-        Merge duplicate findings (same url+parameter+vuln_type).
+        Merge findings that share a (route, vulnerability-type) into one finding.
 
-        Keeps finding with highest confidence and merges evidence.
+        A vulnerability is reported per endpoint + vuln-type, not per parameter: if several
+        parameters on the same route are vulnerable in the same way (e.g. ``username`` and
+        ``password`` both SQL-injectable, or ``UserId`` and ``AddressId`` both IDOR-able),
+        they collapse into a single finding whose ``affected_parameters`` lists every
+        vulnerable parameter. The surviving finding keeps the highest confidence and merges
+        evidence. Distinct vuln-types on the same route (e.g. vertical vs horizontal IDOR)
+        stay separate because their families differ.
 
         Args:
             findings: List of findings
@@ -526,15 +532,14 @@ class FindingDeduplicator:
         if not findings:
             return []
 
-        # Group by canonical URL, parameter, and normalized vulnerability family.
+        # Group by canonical URL and normalized vulnerability family only. Parameter is
+        # deliberately excluded from the key so all vulnerable parameters on one route
+        # for a given vuln-type land in the same group.
         groups: dict[tuple, list[Finding]] = {}
         for finding in findings:
             canonical_url = FindingDeduplicator._canonical_url(finding.url)
             family = FindingDeduplicator._dedupe_family(finding.vuln_type)
-            parameter = finding.parameter
-            if family in {"csrf", "admin_or_sensitive_endpoint", "transport_security", "exception_disclosure", "auth_rate_limit"}:
-                parameter = None
-            key = (canonical_url, parameter, family)
+            key = (canonical_url, family)
             if key not in groups:
                 groups[key] = []
             groups[key].append(finding)
@@ -545,6 +550,15 @@ class FindingDeduplicator:
             # Sort by confidence score descending
             sorted_group = sorted(group, key=lambda f: f.confidence_score, reverse=True)
             best = sorted_group[0]
+
+            # Collect every vulnerable parameter on this route, primary (highest-confidence)
+            # first, preserving order and dropping blanks/duplicates.
+            affected_parameters: list[str] = []
+            for f in sorted_group:
+                param = (f.parameter or "").strip()
+                if param and param not in affected_parameters:
+                    affected_parameters.append(param)
+            best.affected_parameters = affected_parameters
 
             # Merge evidence from all findings
             all_evidence = {}

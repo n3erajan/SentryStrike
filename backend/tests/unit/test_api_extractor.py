@@ -97,3 +97,50 @@ def test_relative_api_paths_resolve_from_origin_root_not_frontend_route():
     assert "https://example.test/api/orders" in urls
     assert "https://example.test/rest/user/profile" in urls
     assert all("/shop/cart/api/" not in url and "/shop/cart/rest/" not in url for url in urls)
+
+
+def test_base_variable_concat_calls_are_resolved_to_full_path():
+    """body-coverage #3: a call whose URL is ``base + "/tail"`` or a template
+    ``\\`${base}/tail\\``` — where the literal tail alone carries no /api|/rest
+    token — is recovered by resolving the base var to its literal path prefix."""
+    script = """
+        class Feedback {
+          constructor() { this.host = "/api"; }
+          save(b) { return this.http.post(this.host + "/Feedbacks", b); }
+          update(id, b) { return this.http.put(`${this.host}/Users/${id}`, b); }
+        }
+    """
+    _, endpoints = ApiExtractor.extract_from_javascript("https://example.test/", script)
+    by = {(e.method, e.url) for e in endpoints}
+    assert ("POST", "https://example.test/api/Feedbacks") in by
+    assert ("PUT", "https://example.test/api/Users/{id}") in by
+    # These came from the base-concat pass.
+    assert any(e.evidence == "base-concat" for e in endpoints)
+
+
+def test_template_base_call_recovers_rest_path():
+    """A ``\\`${base}/rest/user/reset-password\\``` template resolves to the full
+    /rest path even when the base var is only an origin/empty prefix."""
+    script = """
+        const base = "https://api.example.test";
+        fetch(`${base}/rest/user/reset-password`, { method: 'POST' });
+    """
+    _, endpoints = ApiExtractor.extract_from_javascript("https://example.test/", script)
+    urls = {e.url for e in endpoints}
+    assert any(u.endswith("/rest/user/reset-password") for u in urls)
+
+
+def test_ambiguous_base_variable_is_not_resolved():
+    """A base name bound to different literals in different scopes (the minified
+    per-class field pattern) MUST NOT resolve — resolving it would fabricate
+    wrong endpoints. Ambiguous names are dropped entirely."""
+    script = """
+        class A { h = "/api/BasketItems"; f(b){ return this.http.post(this.h + "/x", b); } }
+        class B { h = "/api/Cards"; g(b){ return this.http.post(this.h + "/y", b); } }
+    """
+    assert ApiExtractor._resolve_base_vars(script) == {}
+    _, endpoints = ApiExtractor.extract_from_javascript("https://example.test/", script)
+    # No fabricated /api/BasketItems/x or /api/Cards/y from the concat pass.
+    assert not any(e.evidence == "base-concat" for e in endpoints)
+    assert not any(u.endswith(("/x", "/y")) for u in {e.url for e in endpoints})
+

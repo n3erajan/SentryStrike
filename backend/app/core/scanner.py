@@ -343,8 +343,8 @@ class ScanOrchestrator:
                 if is_same_origin(target_url, getattr(f, "action", "")) or is_same_origin(target_url, getattr(f, "page_url", ""))
             ]
 
-            scan.statistics.total_urls_crawled = len(crawl_result.urls)
-            await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {len(crawl_result.urls)} URL(s) discovered")
+            scan.statistics.total_urls_crawled = self._count_discovered_surface(crawl_result)
+            await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {scan.statistics.total_urls_crawled} URL(s) discovered")
             await self._check_cancelled(scan_id)
 
             await self._set_progress(scan, 25, ScanPhase.technology_detection, "Detecting technology stack and known CVEs")
@@ -757,26 +757,9 @@ class ScanOrchestrator:
             scan.statistics.severity_breakdown.low = len([v for v in vulnerabilities if v.severity.value == "Low"])
             scan.statistics.severity_breakdown.info = len([v for v in vulnerabilities if v.severity.value == "Info"])
 
-            active = [v for v in vulnerabilities if not v.is_false_positive]
-
-            if active:
-                total_weighted_score = 0.0
-                total_weight = 0.0
-                for v in active:
-                    w = 1.0 if v.evidence.verified else 0.7
-                    total_weighted_score += v.cvss_score * w
-                    total_weight += w
-
-                avg_cvss = total_weighted_score / total_weight if total_weight > 0 else 0.0
-
-                # Volume amplification with logarithmic diminishing returns.
-                # More findings → higher risk, but each additional finding adds less.
-                n = len(active)
-                volume_mult = 1.0 + (0.15 * math.log(n) if n > 1 else 0.0)
-
-                scan.overall_risk_score = min(100.0, round(avg_cvss * 10 * volume_mult, 2))
-            else:
-                scan.overall_risk_score = 0.0
+            scan.overall_risk_score, scan.overall_risk_level = self._calculate_aggregate_risk(
+                vulnerabilities
+            )
 
             # PHASE 3: Generate final report from analyzed findings
             logger.info("phase 3 starting: generating report")
@@ -1775,6 +1758,10 @@ class ScanOrchestrator:
             location=LocationInfo(
                 url=finding.url,
                 parameter=finding.parameter,
+                parameters=(
+                    list(getattr(finding, "affected_parameters", None) or [])
+                    or ([finding.parameter] if finding.parameter else [])
+                ),
                 http_method=finding.method,
                 parameter_location=(getattr(finding, "parameter_location", None) or None),
             ),
@@ -1793,6 +1780,122 @@ class ScanOrchestrator:
             auth_context=auth_context,
             detected_at=datetime.now(timezone.utc),
         )
+
+    @staticmethod
+    def _calculate_aggregate_risk(vulnerabilities: list[Vulnerability]) -> tuple[float, str]:
+        """Aggregate per-vulnerability CVSS into one 0-100 posture score + qualitative band.
+
+        Standards-aligned design. CVSS base scores are per-vulnerability severity metrics
+        and must NOT be averaged: averaging dilutes the worst finding, and an attacker only
+        needs to exploit a single vulnerability (FIRST CVSS guidance; OWASP Risk Rating).
+        Instead:
+
+          * anchor  — worst-case. The highest verified-weighted CVSS, scaled to 0-100.
+                      This dominates, so a single confirmed Critical reads as Critical and
+                      is never diluted by lower-severity noise.
+          * breadth — a bounded, saturating bonus for the *additional* attack surface,
+                      severity-weighted (Critical > High > Medium > Low) so many low
+                      findings can never outweigh one severe one. It can fill at most
+                      ``BREADTH_CAP`` of the headroom above the anchor, with diminishing
+                      returns, so the score stays anchored and does not trivially saturate
+                      at 100 the way a volume multiplier did.
+
+        Verified findings weigh 1.0, unverified 0.7 (applied to both anchor and breadth).
+        The band label reuses the CVSS severity thresholds via ``CvssCalculator.get_severity``.
+
+        Returns ``(score 0-100, band)`` where band is Critical/High/Medium/Low/Info.
+        """
+        active = [v for v in vulnerabilities if not v.is_false_positive]
+        if not active:
+            return 0.0, CvssCalculator.get_severity(0.0)
+
+        # Severity → breadth weight: many low findings must never outweigh one severe one.
+        tier_weight = {
+            SeverityLevel.critical: 1.0,
+            SeverityLevel.high: 0.6,
+            SeverityLevel.medium: 0.3,
+            SeverityLevel.low: 0.1,
+            SeverityLevel.info: 0.0,
+        }
+        BREADTH_CAP = 0.5   # breadth fills at most 50% of the headroom above the anchor
+        BREADTH_K = 0.35    # saturation rate of the breadth bonus vs. severity-weighted volume
+
+        weighted_cvss: list[float] = []
+        sev_weight_sum = 0.0
+        for v in active:
+            w = 1.0 if v.evidence.verified else 0.7
+            weighted_cvss.append(v.cvss_score * w)
+            sev_weight_sum += tier_weight.get(v.severity, 0.3) * w
+
+        anchor = max(weighted_cvss) * 10.0                      # worst-case, 0-100
+        headroom = 100.0 - anchor
+        breadth = headroom * BREADTH_CAP * (1.0 - math.exp(-BREADTH_K * sev_weight_sum))
+
+        score = round(min(100.0, anchor + breadth), 2)
+        return score, CvssCalculator.get_severity(score / 10.0)
+
+    @staticmethod
+    def _count_discovered_surface(crawl_result) -> int:
+        """Distinct discovered URLs across the HTTP spider, SPA routes, and API endpoints.
+
+        ``crawl_result.urls`` alone only holds the HTTP-spider seed surface — for a
+        browser-crawled SPA that is often just the shell (1 URL), which badly understates
+        coverage. The honest "URLs crawled" figure is the deduplicated union of the pages
+        navigated (``routes``) and the API endpoints discovered (``api_endpoints``) plus
+        the HTTP URLs. Same-origin/dead-route filtering has already been applied upstream.
+        """
+        discovered: set[str] = set()
+        for url in getattr(crawl_result, "urls", []) or []:
+            if url:
+                discovered.add(url)
+        for route in getattr(crawl_result, "routes", []) or []:
+            url = getattr(route, "url", "")
+            if url:
+                discovered.add(url)
+        for endpoint in getattr(crawl_result, "api_endpoints", []) or []:
+            url = getattr(endpoint, "url", "")
+            if url:
+                discovered.add(url)
+        return len(discovered)
+
+    @staticmethod
+    def _count_protected_targets_verified(crawl_result) -> int:
+        """Distinct data endpoints the authenticated session actually reached with
+        an authorized (2xx) response.
+
+        Under a verified session every observed browser request carries the
+        session, so a 2xx response to a genuine data endpoint (a JSON/data body,
+        or any state-changing method) is a protected resource we confirmed
+        authenticated access to. Static assets and the HTML shell are excluded so
+        the figure reflects real application surface, not page chrome. Replaces the
+        former hardcoded ``1`` placeholder with a truthful, framework-agnostic
+        count (keyed on HTTP shape only, no app-specific paths). Returns 0 when the
+        crawl observed no such responses (e.g. a static site with no XHR)."""
+        from urllib.parse import urlparse
+
+        from app.core.crawler.url_parser import is_static_asset
+
+        verified: set[tuple[str, str]] = set()
+        for observation in getattr(crawl_result, "requests", []) or []:
+            status = getattr(observation, "response_status", None)
+            try:
+                status_int = int(status) if status is not None else 0
+            except (TypeError, ValueError):
+                continue
+            if not (200 <= status_int < 300):
+                continue
+            url = str(getattr(observation, "url", "") or "")
+            if not url or is_static_asset(url):
+                continue
+            method = str(getattr(observation, "method", "GET") or "GET").upper()
+            content_type = str(getattr(observation, "response_content_type", "") or "").lower()
+            is_data = "json" in content_type or method in {"POST", "PUT", "PATCH", "DELETE"}
+            if not is_data:
+                continue
+            # Collapse query strings so ?id=1 vs ?id=2 count as one protected target.
+            path_key = urlparse(url)._replace(query="", fragment="").geturl()
+            verified.add((method, path_key))
+        return len(verified)
 
     def _update_crawl_metadata(self, scan: 'Scan', crawl_result, crawl_context: dict | None = None) -> None:
         auth_state = getattr(crawl_result, "auth_state", "unauthenticated")
@@ -1847,6 +1950,7 @@ class ScanOrchestrator:
             observed_json_body_targets=body_target_telemetry["observed_json_body_targets"],
             observed_form_body_targets=body_target_telemetry["observed_form_body_targets"],
             static_synth_body_targets=body_target_telemetry["static_synth_body_targets"],
+            derived_update_body_targets=body_target_telemetry.get("derived_update_body_targets", 0),
             skipped_unresolved_body_targets=body_target_telemetry["skipped_unresolved_body_targets"],
             post_bodies=post_bodies,
             workflow_states_visited=int(getattr(crawl_result, "workflow_states_visited", 0) or 0),
@@ -1855,11 +1959,18 @@ class ScanOrchestrator:
             file_inputs_discovered=int(getattr(crawl_result, "file_inputs_discovered", 0) or 0),
             dynamic_status=dynamic_status,
         )
+        # Authenticated surface actually scanned. ``crawl_result.urls`` alone holds
+        # only the HTTP-spider seed surface — for a browser-crawled SPA that is
+        # often just the shell (1 URL), which badly understates coverage. Use the
+        # deduplicated union of pages navigated + API endpoints reached, exactly as
+        # ``total_urls_crawled`` does, so the auth-coverage figure is truthful.
+        scanned_surface = self._count_discovered_surface(crawl_result)
+        protected_verified = self._count_protected_targets_verified(crawl_result) if verified else 0
         scan.report_metadata.auth_coverage = AuthCoverage(
             state=auth_state_value,
-            authenticated_url_count=len(getattr(crawl_result, "urls", []) or []) if verified else 0,
-            unauthenticated_url_count=0 if verified else len(getattr(crawl_result, "urls", []) or []),
-            protected_targets_verified=1 if verified else 0,
+            authenticated_url_count=scanned_surface if verified else 0,
+            unauthenticated_url_count=0 if verified else scanned_surface,
+            protected_targets_verified=protected_verified,
             auth_headers_present=has_headers,
             session_cookies_present=has_session,
         )
