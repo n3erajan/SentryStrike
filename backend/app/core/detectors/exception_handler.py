@@ -67,6 +67,11 @@ _MEDIUM_PATTERNS: list[re.Pattern] = [
     for p in [
         r"traceback \(most recent call last\)",         # Python
         r"at \w[\w\.]+\([\w\.]+\.(?:java|kt):\d+\)",   # Java / Kotlin stack frame
+        # Node.js / JavaScript / TypeScript stack frames (CWE-550). Two shapes:
+        #   at <fn> (/app/file.js:line:col) | at <fn> (node:internal/...:line:col)
+        #   at /app/file.js:line:col                     | at node:internal/...:line:col
+        r"at \w[\w\.\[\] ]*\s*\([^)]*\.(?:js|mjs|cjs|ts|jsx|tsx):\d+:\d+\)",
+        r"at (?:/[\w./-]+|node:[\w/-]+):\d+:\d+",
         r"system\.exception",                           # .NET
         r"unhandled exception",                         # .NET / generic
         r"microsoft\.aspnetcore",                       # ASP.NET Core
@@ -128,6 +133,8 @@ _STACK_TRACE_CORROBORATORS: list[re.Pattern] = [
         r"caught exception:",
         r"traceback \(most recent call last\)",
         r"at \w[\w\.]+\([\w\.]+\.(?:java|kt):\d+\)",
+        r"at \w[\w\.\[\] ]*\s*\([^)]*\.(?:js|mjs|cjs|ts|jsx|tsx):\d+:\d+\)",
+        r"at (?:/[\w./-]+|node:[\w/-]+):\d+:\d+",
         r"fatal error:",
         r"warning:\s+mysql(?:i)?_",
         r"pdoexception",
@@ -680,19 +687,21 @@ class ExceptionHandlingDetector(BaseDetector):
         severity = _reclassify_severity(matched)
 
         sensitive_hdrs = _sensitive_headers_present(headers, http_status=status)
-        is_bare_500 = status == 500 and not matched
 
-        if require_body_match and not matched:
-            return None
-
-        if not matched and not is_bare_500:
+        # A response is "verbose error handling" only when its BODY discloses
+        # internal detail — a stack trace, server file path, SQL echo, or a
+        # framework exception (all captured by the pattern sets). A bare error
+        # status with a generic message (``{"message":"internal error"}``) leaks
+        # nothing actionable and is NOT a finding, even when the response carries
+        # tech-fingerprint headers (``x-powered-by`` …): those are a host-global
+        # concern owned by the security-header detector, not a per-endpoint
+        # verbose-error signal. Reporting one such 500 per fuzzed parameter was
+        # the primary source of low-value error-handling noise.
+        if not matched:
             return None
 
         if not severity:
             severity = SeverityLevel.low
-
-        if is_bare_500 and sensitive_hdrs:
-            severity = SeverityLevel.medium
 
         evidence = _build_evidence(
             url=url, method=method, status=status, body=body,

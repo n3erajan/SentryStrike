@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from uuid import uuid4
 from urllib.parse import urlparse
@@ -65,6 +66,7 @@ from app.models.vulnerability import (
     AiAnalysisStatus,
 )
 from app.utils.cvss_calculator import CvssCalculator
+from app.utils.redaction import redact_secrets
 from app.utils.scan_metrics import begin_request_counting, end_request_counting, snapshot_request_counts
 from app.core.request_governor import begin_governor, end_governor, denied_snapshot
 
@@ -724,7 +726,10 @@ class ScanOrchestrator:
             self._log_detector_coverage(detector_metrics)
 
             # PHASE 1: Detect all vulnerabilities
-            vulnerabilities = [self._to_vulnerability(f) for f in findings]
+            redaction_secrets = self._collect_redaction_secrets(submitted_accounts)
+            vulnerabilities = [
+                self._to_vulnerability(f, extra_secrets=redaction_secrets) for f in findings
+            ]
             logger.info("phase 1 complete: detected %d vulnerabilities", len(vulnerabilities))
 
             # PHASE 2: Analyze all findings with AI
@@ -1732,7 +1737,7 @@ class ScanOrchestrator:
                 
         return chains
 
-    def _to_vulnerability(self, finding: Finding) -> Vulnerability:
+    def _to_vulnerability(self, finding: Finding, extra_secrets: Iterable[str] = ()) -> Vulnerability:
         evidence_strength = self._classify_evidence_strength(finding)
         auth_context = self._classify_auth_context(finding)
         cvss_score = 0.0
@@ -1766,9 +1771,11 @@ class ScanOrchestrator:
                 parameter_location=(getattr(finding, "parameter_location", None) or None),
             ),
             evidence=Evidence(
-                payload=finding.payload,
-                request_snippet=getattr(finding, "verification_request_snippet", None),
-                response_snippet=self._finding_response_snippet(finding),
+                payload=redact_secrets(finding.payload, extra_secrets),
+                request_snippet=redact_secrets(
+                    getattr(finding, "verification_request_snippet", None), extra_secrets
+                ),
+                response_snippet=redact_secrets(self._finding_response_snippet(finding), extra_secrets),
                 verified=getattr(finding, "verified", False),
                 confidence_score=float(getattr(finding, "confidence_score", 0.0) or 0.0),
                 detection_method=getattr(finding, "detection_method", None),
@@ -1778,8 +1785,25 @@ class ScanOrchestrator:
             ),
             evidence_strength=evidence_strength,
             auth_context=auth_context,
-            detected_at=datetime.now(timezone.utc),
         )
+
+    @staticmethod
+    def _collect_redaction_secrets(accounts: list | None) -> list[str]:
+        """Plaintext account passwords used by this scan, for evidence redaction.
+
+        ``redact_secrets`` already masks auth headers, cookies, JWTs, and
+        credential-labeled JSON fields by structure. The one blind spot is a
+        plaintext password echoed outside a ``password:``-labeled field (e.g.
+        in a response body); passing the exact password values closes that
+        gap. Usernames are excluded so reviewers can still see which identity a
+        finding pertains to.
+        """
+        secrets: list[str] = []
+        for account in accounts or []:
+            password = getattr(account, "password", None)
+            if password:
+                secrets.append(str(password))
+        return secrets
 
     @staticmethod
     def _calculate_aggregate_risk(vulnerabilities: list[Vulnerability]) -> tuple[float, str]:

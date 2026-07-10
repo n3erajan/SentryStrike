@@ -358,7 +358,7 @@ from app.core.detectors.access_control import _MatrixTarget, _ResponseProfile  #
 from app.core.detectors.attack_surface import PreparedAttackRequest as _PAR  # noqa: E402
 
 
-def _profile(sensitive=frozenset(), identifiers=frozenset(), item_count=0):
+def _profile(sensitive=frozenset(), identifiers=frozenset(), item_count=0, secret=frozenset()):
     return _ResponseProfile(
         status_code=200,
         content_type="application/json",
@@ -367,28 +367,47 @@ def _profile(sensitive=frozenset(), identifiers=frozenset(), item_count=0):
         json_shape=frozenset({"version"}),
         identifiers=identifiers,
         sensitive_fields=sensitive,
+        secret_fields=secret,
         item_count=item_count,
         body_length=32,
     )
 
 
 def test_admin_like_url_alone_is_not_data_exposure():
-    """An /admin/* URL returning a bare public value (no sensitive fields, no
-    identifiers, no records) is NOT a data leak — the URL substring is not
-    evidence. Prevents e.g. {"version":"x"} on /rest/admin/* being flagged."""
+    """An /admin/* URL returning a bare public value (no secret fields, no
+    object-scoped data) is NOT a data leak — the URL substring is not evidence.
+    Prevents e.g. {"version":"x"} on /rest/admin/* being flagged.
+
+    A bare public collection (a record list or stable identifiers) is likewise
+    NOT, on its own, evidence of a leak when the request is not object-scoped:
+    product/feedback/language listings are public on most sites. Only genuine
+    secret material, or object-scoped data, qualifies at this gate (the
+    public-endpoint suppression then further filters object-scoped responses
+    that are identical across auth states)."""
     det = AccessControlDetector()
     req = _PAR(url="http://t/rest/admin/application-version", method="GET")
     target = _MatrixTarget(request=req, source="browser_request", admin_like=True)
-    empty = _profile()  # no sensitive fields, no ids, no records
+    empty = _profile()  # no secret fields, no ids, no records
     assert det._profile_exposes_nonpublic_data(target, empty) is False
-    # Real sensitive data on the same admin URL still qualifies.
+    # Genuine secret material on the same admin URL still qualifies.
     assert det._profile_exposes_nonpublic_data(
-        target, _profile(sensitive=frozenset({"password"}))
+        target, _profile(secret=frozenset({"password"}))
     ) is True
-    # A record collection or stable identifiers also qualify.
-    assert det._profile_exposes_nonpublic_data(target, _profile(item_count=5)) is True
+    # A bare collection / identifiers WITHOUT object scoping is public, not a leak.
+    assert det._profile_exposes_nonpublic_data(target, _profile(item_count=5)) is False
     assert det._profile_exposes_nonpublic_data(
         target, _profile(identifiers=frozenset({"id=1"}))
+    ) is False
+    # The same data on an object-scoped request (id in path/query/body) qualifies
+    # as a candidate (subject to public-endpoint suppression downstream).
+    scoped = _MatrixTarget(
+        request=_PAR(url="http://t/api/users/1", method="GET"),
+        source="browser_request",
+        has_object_reference=True,
+    )
+    assert det._profile_exposes_nonpublic_data(scoped, _profile(item_count=5)) is True
+    assert det._profile_exposes_nonpublic_data(
+        scoped, _profile(identifiers=frozenset({"id=1"}))
     ) is True
 
 

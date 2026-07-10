@@ -4,7 +4,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qsl, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
 
 from app.config import get_settings
 from app.core.crawler.spa import SpaFallbackDetector
@@ -47,6 +47,11 @@ class _ResponseProfile:
     json_shape: frozenset[str] = field(default_factory=frozenset)
     identifiers: frozenset[str] = field(default_factory=frozenset)
     sensitive_fields: frozenset[str] = field(default_factory=frozenset)
+    # Narrow subset of sensitive_fields that carry genuinely secret material
+    # (credentials, tokens, keys, crypto seeds). Unlike broad PII field names
+    # (email/username/role), a secret field in an anonymous response is an
+    # unambiguous leak regardless of whether the endpoint is otherwise public.
+    secret_fields: frozenset[str] = field(default_factory=frozenset)
     item_count: int = 0
     body_length: int = 0
 
@@ -1128,18 +1133,42 @@ class AccessControlDetector(BaseDetector):
         # unauthorized data leak.
         is_auth_endpoint = self._request_carries_credentials(request)
 
+        # PUBLIC-ENDPOINT SUPPRESSION (framework-agnostic).
+        # An endpoint that returns a response structurally identical to what an
+        # authenticated identity receives is *public by design*: identity does
+        # not change the result, so there is no authorization boundary being
+        # bypassed (product catalogues, language lists, public config, captcha,
+        # feedback walls, …). This is the single largest source of noise — a bare
+        # 200 JSON collection is not, on its own, a data leak. Only genuine secret
+        # material in the anonymous body overrides this, because such values must
+        # never be world-readable regardless of the endpoint's intended audience.
+        serves_secret = bool(unauth_profile.secret_fields)
+        authed_states = [
+            (profile, body)
+            for profile, body in (
+                (low_profile, low.body),
+                (second_profile, second.body if second is not None else ""),
+                (privileged_profile, privileged.body if privileged is not None else ""),
+            )
+            if profile is not None and profile.success
+        ]
+        serves_public_data = not serves_secret and any(
+            self._profiles_compatible(unauth_profile, profile, unauth.body, body)
+            for profile, body in authed_states
+        )
+
         if (
             unauth_success
             and unauth_sensitive
             and not is_auth_endpoint
+            and not serves_public_data
             and not _looks_like_error_page(unauth.body)
-            and (not protected_low or self._profiles_compatible(unauth_profile, low_profile, unauth.body, low.body))
         ):
             findings.append(
                 Finding(
                     category=OwaspCategory.a01,
                     vuln_type="Unauthenticated API Data Exposure",
-                    severity=SeverityLevel.high if target.admin_like or unauth_profile.sensitive_fields else SeverityLevel.medium,
+                    severity=SeverityLevel.high if unauth_profile.secret_fields else SeverityLevel.medium,
                     url=request.url,
                     parameter=target.parameter,
                     method=request.method,
@@ -1809,6 +1838,7 @@ class AccessControlDetector(BaseDetector):
         json_shape: set[str] = set()
         identifiers: set[str] = set()
         sensitive_fields: set[str] = set()
+        secret_fields: set[str] = set()
         item_count = 0
 
         def walk(value: Any, path: str = "") -> None:
@@ -1820,6 +1850,8 @@ class AccessControlDetector(BaseDetector):
                     lowered = key.lower()
                     if self._is_sensitive_field(lowered):
                         sensitive_fields.add(child_path)
+                    if self._is_secret_field(lowered):
+                        secret_fields.add(child_path)
                     if self._is_idor_param(key) and isinstance(child, (str, int)):
                         child_value = str(child)
                         if _is_valid_id_value(child_value):
@@ -1841,6 +1873,7 @@ class AccessControlDetector(BaseDetector):
             json_shape=frozenset(json_shape),
             identifiers=frozenset(identifiers),
             sensitive_fields=frozenset(sensitive_fields),
+            secret_fields=frozenset(secret_fields),
             item_count=item_count,
             body_length=len(response.body or ""),
         )
@@ -1907,13 +1940,26 @@ class AccessControlDetector(BaseDetector):
 
     @staticmethod
     def _profile_exposes_nonpublic_data(target: _MatrixTarget, profile: _ResponseProfile) -> bool:
-        # Exposure must be evidenced by the response BODY carrying non-public
-        # data: sensitive fields, stable object identifiers, or a record
-        # collection. An admin-looking URL is NOT itself evidence — a public
-        # ``{"version": "x.y.z"}`` served from an ``/admin/*`` path is not a data
-        # leak. The admin-like signal only elevates severity (see the finding
-        # construction) when real data is actually present in the response.
-        return bool(profile.sensitive_fields or profile.identifiers or profile.item_count > 0)
+        # Non-public exposure must be evidenced by the anonymous response BODY
+        # carrying data that is not meant to be world-readable. Two structural,
+        # framework-agnostic signals qualify:
+        #   1. Secret material — passwords, tokens, API keys, crypto seeds, etc.
+        #      A secret in an anonymous response is a leak regardless of design.
+        #   2. Object-scoped data — the request targets a specific object (id in
+        #      path/query/body) and the response returns that record. Whether it
+        #      is truly a leak is then decided by the public-endpoint suppression
+        #      in ``_verify_matrix_target`` (a public detail page is identical
+        #      across auth states and is dropped there).
+        # A bare public collection (a product/feedback/language list with no
+        # secret fields and no object scoping) is NOT, on its own, evidence of a
+        # leak — such listings are public on the overwhelming majority of sites.
+        # An admin-looking URL is likewise not evidence: a public
+        # ``{"version": "x.y.z"}`` under ``/admin/*`` is not a data leak.
+        if profile.secret_fields:
+            return True
+        if target.has_object_reference and (profile.identifiers or profile.item_count > 0):
+            return True
+        return False
 
     @staticmethod
     def _is_sensitive_field(name: str) -> bool:
@@ -1939,6 +1985,38 @@ class AccessControlDetector(BaseDetector):
                 "apikey",
             )
         )
+
+    # Narrow secret-material tokens. Deliberately excludes broad PII names
+    # (email/username/role/address/phone) that legitimately appear in public
+    # listings: those are not, by themselves, a secret disclosure. A field whose
+    # name carries one of these tokens holds a credential, key, or crypto seed
+    # whose presence in an anonymous response is an unambiguous leak.
+    _SECRET_FIELD_TOKENS: tuple[str, ...] = (
+        "password",
+        "passwd",
+        "passwrd",
+        "pwd",
+        "secret",
+        "token",
+        "apikey",
+        "api_key",
+        "accesskey",
+        "access_key",
+        "privatekey",
+        "private_key",
+        "jwt",
+        "ssn",
+        "cvv",
+        "seed",
+        "mnemonic",
+        "passphrase",
+        "otp",
+        "totp",
+    )
+
+    @classmethod
+    def _is_secret_field(cls, name: str) -> bool:
+        return any(token in name for token in cls._SECRET_FIELD_TOKENS)
 
     def _target_has_access_control_relevance(self, target: AttackTarget) -> bool:
         if "access_control" in target.security_relevance:
@@ -2002,8 +2080,33 @@ class AccessControlDetector(BaseDetector):
             and not _looks_like_error_page(response.body)
         )
 
+    @staticmethod
+    def _has_placeholder_segment(url: str) -> bool:
+        """True when a URL path still contains an unresolved template/placeholder
+        segment rather than a concrete value.
+
+        Crawlers frequently capture route templates before the SPA binds real
+        data — ``/rest/track-order/:id``, ``/rest/track-order/undefined``,
+        ``/api/orders/{orderId}`` — and these are not real, replayable endpoints.
+        Detection is structural (segment shape), so it holds for any framework or
+        client router, and covers URL-encoded ``:`` (``%3A``) which the simple
+        ``/:`` literal check misses.
+        """
+        path = unquote(urlparse(url).path)
+        for segment in path.split("/"):
+            if not segment:
+                continue
+            lowered = segment.lower()
+            if lowered in {"undefined", "null", "nan", "none"}:
+                return True
+            if segment[0] in ":{[" or segment[-1] in "}]":
+                return True
+        return False
+
     def _is_replayable_matrix_request(self, request: PreparedAttackRequest) -> bool:
         if not request.url or "{" in request.url or re.search(r"/:[A-Za-z_]", request.url):
+            return False
+        if self._has_placeholder_segment(request.url):
             return False
         method = request.method.upper()
         if method in {"OPTIONS", "HEAD"}:

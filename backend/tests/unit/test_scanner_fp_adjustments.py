@@ -59,6 +59,57 @@ def test_to_vulnerability_preserves_detector_verification_metadata() -> None:
     assert vulnerability.evidence.detection_evidence == {"timing_delta_ms": 5100}
 
 
+def test_to_vulnerability_redacts_credentials_in_evidence() -> None:
+    """Evidence snippets must never persist real auth tokens, cookies, or the
+    scan account password — they would leak durable credentials into the stored
+    report and PDF, outliving the scan session."""
+    secret_password = "#Yatra@9821"
+    jwt = (
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9."
+        "eyJzdGF0dXMiOiJzdWNjZXNzIn0.sigpart"
+    )
+    finding = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="SQL Injection (Error-Based)",
+        severity=SeverityLevel.critical,
+        url="http://localhost:3000/rest/products/search",
+        parameter="q",
+        payload="' OR 1=1--",
+        evidence=f"Verbose error echoed credential: {secret_password}",
+        verification_request_snippet=(
+            "POST /rest/user/login HTTP/1.1\r\n"
+            "Host: localhost:3000\r\n"
+            f"Authorization: Bearer {jwt}\r\n"
+            "Cookie: language=en; token=opaque-session-xyz\r\n"
+            f'{{"email":"admin@test","password":"{secret_password}"}}'
+        ),
+        verified=True,
+    )
+
+    vuln = _orchestrator()._to_vulnerability(finding, extra_secrets=[secret_password])
+
+    req = vuln.evidence.request_snippet or ""
+    resp = vuln.evidence.response_snippet or ""
+    # Real secrets are scrubbed from both snippets ...
+    assert secret_password not in req
+    assert secret_password not in resp
+    assert jwt not in req
+    assert "opaque-session-xyz" not in req
+    # ... while structure and benign context survive for reviewers.
+    assert "Authorization:" in req
+    assert "Cookie:" in req
+    assert "language=en" in req
+    assert "admin@test" in req
+    assert "[REDACTED]" in req
+
+
+def test_vulnerability_no_longer_carries_detected_at() -> None:
+    """detected_at was identical across every finding (stamped at assembly time,
+    not real detection time) and carried no signal beyond the report's
+    generated_at — removed to avoid a misleading field."""
+    assert "detected_at" not in Vulnerability.model_fields
+
+
 def test_static_spa_coverage_warning_is_deterministic() -> None:
     class CrawlResult:
         is_spa = True

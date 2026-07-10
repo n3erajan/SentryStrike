@@ -55,6 +55,31 @@ def test_plain_env_without_secret_pattern_is_not_classified_as_sensitive():
     assert matched is False
 
 
+def test_application_data_field_named_scoreboard_is_not_debug_metrics():
+    # The Apache mod_status marker is the whole word "Scoreboard:"; an
+    # application data field whose name merely contains the substring (e.g.
+    # {"key":"scoreBoardChallenge"}) is not a debug/metrics endpoint. Word
+    # boundaries keep the marker precise without hardcoding any app's schema.
+    detector = SensitivePathsDetector()
+    body = '{"status":"success","data":[{"id":75,"key":"scoreBoardChallenge","name":"Score Board"}]}'
+
+    matched, *_ = detector._classify_content("/api/Challenges/", body, "application/json")
+
+    assert matched is False
+
+
+def test_apache_server_status_scoreboard_is_still_debug_metrics():
+    detector = SensitivePathsDetector()
+    body = "Apache Server Status for localhost\nScoreboard: _W_W..CC____\n"
+
+    matched, vuln_type, _evidence, _severity = detector._classify_content(
+        "/server-status", body, "text/html"
+    )
+
+    assert matched is True
+    assert vuln_type == "Debug / Metrics Endpoint Exposed"
+
+
 def test_spa_fallback_context_is_metadata_not_vulnerability():
     detector = SensitivePathsDetector()
     route = RouteCandidate(

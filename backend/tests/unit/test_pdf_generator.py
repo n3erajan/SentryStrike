@@ -259,7 +259,6 @@ def test_pdf_detailed_findings_include_evidence_strength_and_auth_context() -> N
                     "cvss_score": 9.0,
                     "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
                     "review_status": "ReviewStatus.confirmed",
-                    "detected_at": "2026-06-08T09:10:17",
                     "evidence_strength": "confirmed_exploit",
                     "auth_context": "authenticated",
                     "location": {
@@ -341,7 +340,6 @@ def test_pdf_builds_with_full_long_response_snippet() -> None:
                     "cvss_score": 5.5,
                     "cvss_vector": "N/A",
                     "review_status": "ReviewStatus.confirmed",
-                    "detected_at": "2026-06-08T09:10:17",
                     "location": {
                         "url": "http://target.test/xss",
                         "parameter": "q",
@@ -400,7 +398,6 @@ def test_pdf_escapes_dynamic_markup_in_ai_text() -> None:
                     "cvss_score": 5.5,
                     "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
                     "review_status": "ReviewStatus.confirmed",
-                    "detected_at": "2026-06-08T09:10:17",
                     "location": {
                         "url": "http://target.test/search?q=<script>",
                         "parameter": "q<script>",

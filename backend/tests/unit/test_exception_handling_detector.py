@@ -141,3 +141,71 @@ def test_exception_detector_only_analyzes_response_snippet() -> None:
     )
     findings = detector.findings_from_observed_evidence([source_finding])
     assert findings == []
+
+
+def test_bare_500_without_disclosure_is_not_verbose_error() -> None:
+    # A 500 whose body carries a generic message (no stack trace, file path,
+    # SQL echo or framework exception) is not "verbose error handling" — even
+    # when the response ships tech-fingerprint headers. Reporting one such 500
+    # per fuzzed parameter was the dominant error-handling noise source.
+    detector = ExceptionHandlingDetector()
+    finding = detector._analyse_response(
+        url="https://example.test/api/Recycles/",
+        method="POST",
+        status=500,
+        body='{"message":"internal error","errors":["SQLITE_CONSTRAINT: FOREIGN KEY constraint failed"]}',
+        headers=httpx.Headers({"content-type": "application/json", "x-powered-by": "Express"}),
+        trigger="json_body fuzz - single quote",
+        parameter="UserId",
+        payload="'",
+    )
+    assert finding is None
+
+
+def test_500_with_stack_trace_is_still_reported() -> None:
+    # A genuine internal disclosure (a language stack trace / SQL echo) is still
+    # reported — the tightening only drops content-free error statuses.
+    detector = ExceptionHandlingDetector()
+    finding = detector._analyse_response(
+        url="https://example.test/api/search",
+        method="POST",
+        status=500,
+        body=(
+            '{"error":{"message":"boom","stack":"Error\n'
+            "    at Query.run SELECT id FROM Users WHERE name = ''"
+            '"}}'
+        ),
+        headers=httpx.Headers({"content-type": "application/json"}),
+        trigger="json_body fuzz - single quote",
+        parameter="name",
+        payload="'",
+    )
+    assert finding is not None
+    assert finding.vuln_type == "Verbose Error Handling"
+
+
+def test_node_stack_trace_500_is_reported() -> None:
+    # A Node/Express stack trace is a server-generated error message containing
+    # sensitive information (CWE-550) — it leaks file paths and framework
+    # internals — and belongs to A10 regardless of language. The bare-500 noise
+    # drop must not swallow a genuine stack trace of any stack.
+    detector = ExceptionHandlingDetector()
+    finding = detector._analyse_response(
+        url="https://example.test/api/Cards/8",
+        method="PATCH",
+        status=500,
+        body=(
+            '{"error":{"message":"Cannot read property \\"foo\\" of undefined",'
+            '"stack":"TypeError: Cannot read property \'foo\' of undefined\\n'
+            "    at /app/routes/cards.js:45:17\\n"
+            "    at Layer.handle [as handle_request] "
+            "(/node_modules/express/lib/router/layer.js:95:5)\\n"
+            '    at processTicksAndRejections (node:internal/process/task_queues:77:11)"}}'
+        ),
+        headers=httpx.Headers({"content-type": "application/json"}),
+        trigger="json_body fuzz - single quote",
+        parameter="cardId",
+        payload="'",
+    )
+    assert finding is not None
+    assert finding.vuln_type == "Verbose Error Handling"

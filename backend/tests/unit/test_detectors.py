@@ -188,6 +188,10 @@ async def test_access_control_tests_path_template_idor_targets() -> None:
 
 @pytest.mark.asyncio
 async def test_access_control_matrix_flags_sensitive_unauthenticated_api_exposure() -> None:
+    # A genuine unauthenticated exposure: the anonymous response carries secret
+    # material (a token). Such data must never be world-readable regardless of
+    # whether authenticated identities receive the same body, so the
+    # public-endpoint suppression does NOT apply — the secret path fires.
     detector = AccessControlDetector()
     request = RequestObservation(
         url="https://example.com/api/profile",
@@ -195,6 +199,10 @@ async def test_access_control_matrix_flags_sensitive_unauthenticated_api_exposur
         request_headers={"authorization": "Bearer browser-token"},
     )
     seen_headers: list[dict | None] = []
+    secret_body = (
+        '{"userId":1,"email":"alice@example.com","role":"user",'
+        '"apiToken":"sk_live_9f8e7d6c5b4a3210"}'
+    )
 
     async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
         seen_headers.append(kwargs.get("headers"))
@@ -203,7 +211,7 @@ async def test_access_control_matrix_flags_sensitive_unauthenticated_api_exposur
             return ResponseData(
                 200,
                 {"content-type": "application/json"},
-                '{"userId":1,"email":"alice@example.com","role":"user"}',
+                secret_body,
                 1.0,
                 request_snippet=f"{method} {url}",
                 response_snippet="HTTP/1.1 200 OK",
@@ -212,7 +220,7 @@ async def test_access_control_matrix_flags_sensitive_unauthenticated_api_exposur
             return ResponseData(
                 200,
                 {"content-type": "application/json"},
-                '{"userId":1,"email":"alice@example.com","role":"user"}',
+                secret_body,
                 1.0,
             )
         return ResponseData(404, {"content-type": "application/json"}, '{"error":"not found"}', 1.0)
@@ -244,6 +252,40 @@ async def test_access_control_matrix_does_not_flag_public_catalog_ids_without_se
 
     with patch.object(HttpVerifier, "send_request", send_request):
         findings = await detector.detect(urls=[], forms=[], requests=[request])
+
+    assert not any(f.vuln_type == "Unauthenticated API Data Exposure" for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_access_control_matrix_does_not_flag_public_endpoint_identical_across_auth_states() -> None:
+    # Regression guard for the dominant real-world false positive: a public
+    # endpoint (e.g. an app-configuration route) that returns a byte-identical
+    # response to anonymous, low-privilege and second-user requests. Identity
+    # does not change the result, so there is no authorization boundary being
+    # bypassed — even though the body contains a field name that trips the broad
+    # "sensitive" heuristic (``privacyContactEmail``). It must NOT be flagged.
+    detector = AccessControlDetector()
+    request = RequestObservation(
+        url="https://example.com/rest/admin/application-configuration",
+        method="GET",
+    )
+    public_config = (
+        '{"config":{"application":{"name":"Shop",'
+        '"privacyContactEmail":"donotreply@shop.example","altcoinName":"Coin"}}}'
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        # Same public body regardless of which auth state (unauth/low/second) asks.
+        return ResponseData(200, {"content-type": "application/json"}, public_config, 1.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[],
+            forms=[],
+            requests=[request],
+            auth_headers={"Authorization": "Bearer low-user"},
+            second_user_headers={"Authorization": "Bearer second-user"},
+        )
 
     assert not any(f.vuln_type == "Unauthenticated API Data Exposure" for f in findings)
 

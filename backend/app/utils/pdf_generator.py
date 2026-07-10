@@ -1090,7 +1090,6 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
             detail_row("Detection Method", ev.get("detection_method") or "N/A"),
             detail_row("Detector Verified", _display_value(ev.get("verified"))),
             detail_row("Review Status", _clean_status(v.get("review_status") or "N/A")),
-            detail_row("Detected At",  _fmt_dt(v.get("detected_at"))),
         ]
         det_tbl = Table(details, colWidths=[35*mm, None])
         det_tbl.setStyle(TableStyle([

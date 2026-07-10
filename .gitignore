@@ -93,3 +93,4 @@ playwright/.auth/
 .roo/
 .continue/
 .agents/
+.playwright-mcp/

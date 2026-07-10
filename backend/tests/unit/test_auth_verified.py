@@ -8,6 +8,8 @@ from unittest.mock import patch
 from app.config import get_settings
 from app.core.crawler.models import ApiEndpoint, RequestObservation
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
+from app.core.detectors.base_detector import Finding
+from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.core.verification.response_analyzer import ResponseData
 from app.core.verification.verification_framework import HttpVerifier
 
@@ -346,3 +348,51 @@ async def test_bearer_token_reuse_after_logout_is_reported_when_replay_still_suc
 
     assert phases == ["token_reuse_baseline", "logout_revoke", "token_reuse_after_logout"]
     assert any(f.vuln_type == "Bearer Token Accepted After Logout" for f in findings)
+
+
+def test_credential_disclosure_ignores_reflected_sql_query_echo() -> None:
+    # A SQLi/LFI source finding surfaces a DB error that echoes the app's own
+    # query (``... WHERE email = '<payload>' AND password = '<hash>' ...``). The
+    # ``password =`` there is a SQL comparison in a reflected statement, not a
+    # disclosed credential — it must NOT be re-reported as credential disclosure.
+    detector = AuthenticationFailuresDetector()
+    source = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="SQL Injection (Error-Based)",
+        severity=SeverityLevel.critical,
+        url="https://example.test/rest/user/login",
+        method="POST",
+        payload="' AND extractvalue(1,concat(0x7e,(SELECT @@version)))--",
+        verification_response_snippet=(
+            "SQLITE_ERROR: unrecognized token: \"@\" | "
+            "SELECT * FROM Users WHERE email = 'a@b' AND password = "
+            "'35fddb24066434f0a68b74fa50b9be61' AND deletedAt IS NULL"
+        ),
+        verified=True,
+    )
+    findings = detector.findings_from_observed_evidence([source])
+    assert not any(
+        f.vuln_type == "Credential / Config Disclosure in Response Body" for f in findings
+    )
+
+
+def test_credential_disclosure_still_flags_config_key_leak() -> None:
+    # A genuine config/credential key leaked outside any SQL statement is still
+    # reported — the guard only strips reflected SQL comparisons.
+    detector = AuthenticationFailuresDetector()
+    source = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="Local File Inclusion",
+        severity=SeverityLevel.high,
+        url="https://example.test/download?file=../.env",
+        method="GET",
+        payload="../.env",
+        verification_response_snippet=(
+            "DB_PASSWORD=sup3rs3cr3t\nAPP_KEY=base64:abcdef\nMAIL_HOST=smtp"
+        ),
+        verified=True,
+    )
+    findings = detector.findings_from_observed_evidence([source])
+    assert any(
+        f.vuln_type == "Credential / Config Disclosure in Response Body" for f in findings
+    )

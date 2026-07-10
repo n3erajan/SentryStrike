@@ -72,7 +72,7 @@ class SensitivePathsDetector(BaseDetector):
             r"\"heapUsed\"|\"rss\"|\"uptime\"|\"pid\"",
             r"debug\s*=\s*true|app_debug|environment\s*:\s*(dev|debug|local)",
             r"phpinfo\(\)|configuration file \(php\.ini\) path",
-            r"server-status|apache server status|scoreboard",
+            r"apache server status|\bserver-status\b|\bscoreboard\b",
         ]
     ]
 
