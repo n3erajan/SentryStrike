@@ -1,12 +1,12 @@
 from datetime import datetime, timezone
 
-from app.analyzers.ai_client import OllamaClient
+from app.analyzers.ai_client import AIClient
 from app.models.scan import AuthCoverage, DetectorCoverageMetric, EvidenceStrengthBreakdown, Scan, SpaApiCoverage
 
 
 class AiReportGenerator:
     def __init__(self) -> None:
-        self.client = OllamaClient()
+        self.client = AIClient()
 
     async def generate(self, scan: Scan) -> dict:
         technologies = getattr(scan, "technology_stack", []) or []

@@ -159,6 +159,73 @@ class XSSDetector(BaseDetector):
             stored_probe_urls, session_cookies,
         )
 
+        # ── Phase 0: Batch stored-XSS discovery ─────────────────────────────────
+        # Group body-parameter candidates by (url, method) and inject a unique
+        # canary into every parameter of each group in a single request, then
+        # probe each display URL once. This discovers which (param, display_url)
+        # pairs reflect *before* the per-payload fan-out, collapsing the stored
+        # probe from O(params × payloads × urls) to O(1 injection + urls).
+        # Only body/form/json candidates batch; query/path/header candidates are
+        # tested individually by the per-candidate verify loop below.
+        stored_display_overrides: dict[str, set[str]] = {}
+        batch_groups: dict[tuple[str, str], list[AttackTarget]] = {}
+        for cand in candidates:
+            if not isinstance(cand, AttackTarget):
+                continue
+            if cand.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable, ParameterLocation.form}:
+                key = (cand.url, cand.method.upper())
+                batch_groups.setdefault(key, []).append(cand)
+
+        # Run batch discovery for groups with 2+ body parameters — single-param
+        # groups get no batching benefit and are handled by the normal per-candidate
+        # verify loop. Run all batches concurrently.
+        async def run_batch_discovery(
+            group_key: tuple[str, str], group_cands: list[AttackTarget],
+        ) -> dict[str, set[str]]:
+            batch_verifier = XSSVerifier()
+            batch_verifier.http_verifier.cookies = session_cookies
+            if auth_headers:
+                batch_verifier.http_verifier.headers = {
+                    **batch_verifier.http_verifier.headers, **auth_headers,
+                }
+            try:
+                return await batch_verifier._batch_stored_discovery(
+                    group_cands,
+                    stored_probe_urls,
+                    stored_baselines=shared_baselines,
+                )
+            except Exception as e:
+                logger.debug("Batch stored discovery failed for %s: %s", group_key[0], e)
+                return {}
+            finally:
+                await batch_verifier.close()
+
+        batchable_groups = {
+            key: cands for key, cands in batch_groups.items() if len(cands) >= 2
+        }
+        if batchable_groups:
+            logger.debug(
+                "XSSDetector: running batch stored discovery for %d groups (%d total params)",
+                len(batchable_groups),
+                sum(len(c) for c in batchable_groups.values()),
+            )
+            batch_results = await asyncio.gather(
+                *(run_batch_discovery(k, c) for k, c in batchable_groups.items()),
+                return_exceptions=True,
+            )
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    logger.debug("Batch stored discovery group failed: %s", result)
+                    continue
+                for param, display_urls in result.items():
+                    stored_display_overrides.setdefault(param, set()).update(display_urls)
+
+            if stored_display_overrides:
+                logger.debug(
+                    "XSSDetector: batch discovery confirmed %d stored parameter(s)",
+                    len(stored_display_overrides),
+                )
+
         # ── Phase 1: HTTP-only scanning ───────────────────────────────────────────
         pending_browser_jobs: list[PendingBrowserVerification] = []
 
@@ -194,6 +261,7 @@ class XSSDetector(BaseDetector):
                     stored_display_urls=stored_probe_urls,
                     stored_baselines=shared_baselines,
                     target=target,
+                    stored_display_overrides=stored_display_overrides if stored_display_overrides else None,
                 )
                 pending: list[PendingBrowserVerification] = []
                 if result.evidence.get("browser_verification_pending"):
@@ -298,7 +366,7 @@ class XSSDetector(BaseDetector):
         if max_jobs == 0 or budget <= 0:
             return []
 
-        jobs = self._select_dom_reflection_jobs(targets, existing_findings, max_jobs)
+        jobs = self._select_dom_reflection_jobs(targets, existing_findings, max_jobs, routes=routes)
         if not jobs:
             return []
 
@@ -402,12 +470,21 @@ class XSSDetector(BaseDetector):
         targets: list[AttackTarget],
         existing_findings: list[Finding],
         max_jobs: int,
+        routes: list[object] | None = None,
     ) -> list[tuple[str, str, str]]:
         """Pick a bounded, prioritised set of (route_url, param, location) probes.
 
         Priority: params the HTTP phase already echoed (partial reflection), then
-        classic reflective names. Only query/fragment-reachable GET targets are
-        eligible — SPAs read these from location.search/hash.
+        classic reflective names, then everything else. Only query/fragment-
+        reachable GET targets are eligible — SPAs read these from
+        location.search/hash.
+
+        Jobs come from two sources: replayable GET attack targets AND the query
+        parameters carried on discovered SPA routes. The latter matters because a
+        hash route such as ``/#/search?q=x`` is deliberately dropped from the HTTP
+        attack surface (its fragment never reaches the server), so its ``q``
+        parameter would otherwise never be probed for DOM XSS even though the SPA
+        reads it client-side from ``location.hash``.
         """
         echoed_params = {
             f.parameter for f in existing_findings if getattr(f, "parameter", None)
@@ -415,20 +492,16 @@ class XSSDetector(BaseDetector):
         prioritized: list[tuple[str, str, str]] = []
         fallback: list[tuple[str, str, str]] = []
         seen: set[tuple[str, str]] = set()
-        for target in targets:
-            if not isinstance(target, AttackTarget):
-                continue
-            if target.method.upper() != "GET":
-                continue
-            if target.location not in (ParameterLocation.query, ParameterLocation.path):
-                continue
-            param = target.parameter
-            key = (target.url, param)
+
+        def consider(url: str, param: str) -> None:
+            if not url or not param:
+                return
+            key = (url, param)
             if key in seen:
-                continue
+                return
             seen.add(key)
             # SPAs read from both search and hash; probe both.
-            entry = (target.url, param, "both")
+            entry = (url, param, "both")
             param_lower = param.lower()
             reflective = (
                 param_lower in self.reflective_param_names
@@ -440,8 +513,52 @@ class XSSDetector(BaseDetector):
                 prioritized.append(entry)
             else:
                 fallback.append(entry)
+
+        for target in targets:
+            if not isinstance(target, AttackTarget):
+                continue
+            if target.method.upper() != "GET":
+                continue
+            if target.location not in (ParameterLocation.query, ParameterLocation.path):
+                continue
+            consider(target.url, target.parameter)
+
+        # Route-derived jobs: query params on discovered SPA routes (including the
+        # fragment query of hash routes) that the target sweep above did not cover.
+        for route in routes or []:
+            route_url = getattr(route, "url", None) or (route if isinstance(route, str) else None)
+            if not route_url:
+                continue
+            for param in self._route_query_params(route_url):
+                consider(route_url, param)
+
         ordered = prioritized + fallback
         return ordered[:max_jobs]
+
+    @staticmethod
+    def _route_query_params(url: str) -> list[str]:
+        """Query-parameter names carried on a route URL.
+
+        Reads both the ordinary query string (``?a=1``) and the query embedded in
+        a client-side route fragment (``/#/search?q=x`` → ``q``), so hash-router
+        parameters become DOM-XSS probe candidates.
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        names: list[str] = []
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return names
+        parts = [parsed.query]
+        fragment = parsed.fragment or ""
+        if "?" in fragment:
+            parts.append(fragment.split("?", 1)[1])
+        for part in parts:
+            for name in parse_qs(part, keep_blank_values=True):
+                if name and name not in names:
+                    names.append(name)
+        return names
 
     @staticmethod
     def _static_dom_findings(kwargs: dict[str, object]) -> list[Finding]:

@@ -40,6 +40,46 @@ def test_select_dom_reflection_jobs_prioritises_and_caps():
     assert capped == [("http://x/#/post", "comment", "both")]
 
 
+def test_select_dom_reflection_jobs_mines_hash_route_query_params():
+    """A hash route with a fragment query (/#/search?q=x) is dropped from the HTTP
+    attack surface, so its param must still become a DOM job from the route list."""
+    detector = XSSDetector()
+    from types import SimpleNamespace
+
+    routes = [
+        SimpleNamespace(url="http://x/#/search?q=seed"),        # fragment query
+        SimpleNamespace(url="http://x/results?keyword=abc"),     # ordinary query
+        SimpleNamespace(url="http://x/#/about"),                 # no params
+    ]
+    jobs = detector._select_dom_reflection_jobs([], [], max_jobs=10, routes=routes)
+    params = {param for _, param, _ in jobs}
+    assert "q" in params            # from the hash fragment query
+    assert "keyword" in params      # from the ordinary query
+    # Both are emitted as "probe both surfaces" jobs.
+    assert all(location == "both" for _, _, location in jobs)
+    # The reflective 'keyword'/'q' names sort ahead of nothing here; route with
+    # no params contributes no job.
+    assert ("http://x/#/about", "", "both") not in jobs
+
+
+def test_select_dom_reflection_jobs_dedupes_route_and_target_params():
+    detector = XSSDetector()
+    from types import SimpleNamespace
+
+    targets = [_qtarget("http://x/search", "q")]
+    routes = [SimpleNamespace(url="http://x/search?q=seed")]
+    jobs = detector._select_dom_reflection_jobs(targets, [], max_jobs=10, routes=routes)
+    # The (url, param) pair appears once despite being in both sources.
+    assert jobs.count(("http://x/search", "q", "both")) == 1
+
+
+def test_route_query_params_reads_search_and_fragment_query():
+    detector = XSSDetector()
+    assert detector._route_query_params("http://x/#/search?q=1&lang=en") == ["q", "lang"]
+    assert detector._route_query_params("http://x/p?a=1&b=2") == ["a", "b"]
+    assert detector._route_query_params("http://x/#/about") == []
+
+
 def test_reflection_surface_probes_covers_query_hash_and_fragment():
     verifier = XSSVerifier()
     payload = "<img src=x onerror=1>"

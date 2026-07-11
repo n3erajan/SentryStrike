@@ -542,3 +542,32 @@ def test_observed_update_wins_over_synthesized():
     # The observed PUT is present; the synthesizer did not add a duplicate derived one.
     assert put_targets
     assert all(t.source_confidence != "derived_update" for t in put_targets)
+
+
+def test_request_with_unresolved_path_placeholder_yields_no_body_targets():
+    """An observed request whose URL still carries a route template (:addressId)
+    is a crawler artifact, not a replayable XHR — it must not emit body targets
+    that would each 404 against a non-existent object."""
+    req = RequestObservation(
+        url="http://x/api/Addresss/:addressId",
+        method="PUT",
+        request_content_type="application/json",
+        post_data='{"fullName": "x", "city": "y"}',
+    )
+    targets = AttackSurface.build([], [], requests=[req])
+    assert not any(
+        t.location == ParameterLocation.json_body and ":addressId" in t.url
+        for t in targets
+    )
+
+
+def test_request_with_concrete_id_still_yields_body_targets():
+    """The guard above must not suppress a genuinely-observed concrete-id XHR."""
+    req = RequestObservation(
+        url="http://x/api/Addresss/42",
+        method="PUT",
+        request_content_type="application/json",
+        post_data='{"fullName": "x"}',
+    )
+    targets = AttackSurface.build([], [], requests=[req])
+    assert any(t.location == ParameterLocation.json_body for t in targets)

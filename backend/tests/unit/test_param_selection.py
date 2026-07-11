@@ -124,12 +124,34 @@ def test_file_candidate(name, value, expected):
         ("callbackUrl", "1", True),  # substring "url"
         ("image", "http://127.0.0.1/", True),  # generic name, url value
         ("avatar", "//evil.test", True),
+        ("image", "photo.png", True),  # profile-image-by-URL sink, name only
+        ("avatar", "cat", True),  # name token even with non-url value
+        ("webhook", "x", True),  # webhook fetch sink
+        ("endpoint", "x", True),
+        ("callback", "x", True),
+        ("imageWidth", "800", False),  # not an exact token, no url value
         ("id", "42", False),
         ("name", "alice", False),
     ],
 )
 def test_ssrf_candidate(name, value, expected):
     assert ssrf_candidate(name, value) is expected
+
+
+@pytest.mark.parametrize(
+    "name, value, expected",
+    [
+        ("to", "x", True),  # exact generic redirect name
+        ("uri", "x", True),
+        ("redirect", "1", True),
+        ("returnUrl", "1", True),  # substring
+        ("goto", "x", True),
+        ("id", "42", False),
+        ("page", "1", False),
+    ],
+)
+def test_redirect_candidate_name_tokens(name, value, expected):
+    assert redirect_candidate(name, value) is expected
 
 
 def test_no_hardcoded_target_specifics():

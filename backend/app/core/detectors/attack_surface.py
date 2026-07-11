@@ -221,6 +221,13 @@ class AttackSurface:
         for request in requests or []:
             if not request.post_data:
                 continue
+            if cls._has_unresolved_path_placeholder(request.url):
+                # A genuinely-observed XHR always carries a concrete id in its
+                # path; a URL still holding a route template (``:addressId``,
+                # ``{id}``) is a crawler artifact (Angular route table scraped as
+                # an observation). Replaying it only produces 404 noise — the leaf
+                # body params would each be fired against a non-existent object.
+                continue
             content_type = cls._request_content_type(request)
             body = cls._parse_json(request.post_data)
             if not isinstance(body, (dict, list)):

@@ -8,13 +8,14 @@ browser validation to preserve performance while eliminating false positives.
 """
 
 import asyncio
+import copy
 import json
 import html
 import logging
 import random
 import re
 import string
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse, quote
 
 # Import Playwright's async framework smoothly
@@ -27,7 +28,7 @@ except ImportError:
 
 from app.core.crawler.models import ParameterLocation
 from app.core.crawler.url_parser import is_static_asset
-from app.core.detectors.attack_surface import AttackTarget
+from app.core.detectors.attack_surface import AttackTarget, _set_json_path
 from app.core.detectors.base_detector import Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
 from app.core.verification.verification_framework import (
@@ -175,6 +176,129 @@ class XSSVerifier(BaseVerifier):
         capped = sinks + others[: cls._STORED_PROBE_URL_CAP]
         return list(dict.fromkeys(capped))
 
+    async def _batch_stored_discovery(
+        self,
+        candidates: list[AttackTarget],
+        stored_display_urls: list[str],
+        stored_baselines: dict[str, ResponseData] | None = None,
+    ) -> dict[str, set[str]]:
+        """Inject unique canaries into all params of a route in one request,
+        then probe each display URL once to discover which (param, display_url)
+        pairs reflect.
+
+        Returns a mapping of ``parameter → {display_url, ...}`` for parameters
+        whose canary was found in at least one display URL's response. The
+        per-parameter canary mapping is stored in ``self._batch_canaries`` for
+        downstream use by ``_test_payload`` (so it can restrict stored probing
+        to only confirmed display URLs instead of fanning out to all of them).
+
+        This collapses the stored-XSS discovery phase from ``params × payloads ×
+        probe_urls`` to ``1 injection + probe_urls``, an O(n²) → O(n) reduction.
+        """
+        if not candidates or not stored_display_urls:
+            return {}
+
+        self._stored_baselines = dict(stored_baselines or {})
+        self._batch_canaries: dict[str, str] = {}
+
+        # Build one request that injects a unique canary into every parameter
+        # of the batch. For JSON-body targets, each canary goes into its own
+        # path within the same template. For form targets, each canary replaces
+        # its parameter's value. For query targets, each canary is appended.
+        canary_map: dict[str, str] = {}
+        primary_target = candidates[0]
+
+        # All candidates in a batch share the same url+method, so we use the
+        # first as the template carrier and inject every canary through it.
+        # For JSON-body targets, we merge canaries into one body copy.
+        merged_json_body: Any = None
+        merged_form_data: dict[str, str] = {}
+        merged_params: dict[str, str] = {}
+
+        for cand in candidates:
+            canary = ResponseAnalyzer.generate_probe_canary()
+            canary_map[cand.parameter] = canary
+            self._batch_canaries[cand.parameter] = canary
+
+            if cand.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
+                if merged_json_body is None:
+                    merged_json_body = copy.deepcopy(cand.json_template) if cand.json_template else {}
+                _set_json_path(merged_json_body, cand.parent_path or cand.parameter, canary)
+            elif cand.location == ParameterLocation.form and cand.form_inputs is not None:
+                merged_form_data[cand.parameter] = canary
+            elif cand.location == ParameterLocation.query:
+                merged_params[cand.parameter] = canary
+            else:
+                # path/header/cookie locations don't batch — skip them here;
+                # they're handled by the normal per-candidate verify loop.
+                pass
+
+        # Send the single batch injection request
+        try:
+            batch_url = primary_target.url
+            batch_method = primary_target.method
+            batch_headers = dict(primary_target.headers or {})
+            batch_cookies = dict(primary_target.cookies or {})
+
+            if merged_json_body is not None:
+                batch_headers.setdefault("Content-Type", "application/json")
+                batch_resp = await self._send(
+                    batch_url, batch_method, None, None,
+                    headers=batch_headers, cookies=batch_cookies,
+                    json_body=merged_json_body,
+                    test_phase="batch_stored_inject",
+                )
+            elif merged_form_data:
+                batch_resp = await self._send(
+                    batch_url, batch_method, None, merged_form_data,
+                    headers=batch_headers, cookies=batch_cookies,
+                    test_phase="batch_stored_inject",
+                )
+            elif merged_params:
+                batch_resp = await self._send(
+                    batch_url, batch_method, merged_params, None,
+                    headers=batch_headers, cookies=batch_cookies,
+                    test_phase="batch_stored_inject",
+                )
+            else:
+                return {}
+        except Exception as e:
+            logger.debug("Batch stored injection failed for %s: %s", primary_target.url, e)
+            return {}
+
+        # If the injection itself was rejected (e.g. 400 validation error),
+        # we can't determine stored reflection — fall back to per-param testing.
+        if getattr(batch_resp, "status_code", 200) in {400, 422}:
+            logger.debug(
+                "Batch stored injection rejected (status=%s) for %s; "
+                "falling back to per-parameter canary probing",
+                batch_resp.status_code, primary_target.url,
+            )
+            return {}
+
+        # Probe each display URL once and check for ANY canary
+        confirmed: dict[str, set[str]] = {}
+        for probe_url in stored_display_urls:
+            try:
+                if hasattr(self, "_stored_baselines") and probe_url in self._stored_baselines:
+                    baseline_resp = self._stored_baselines[probe_url]
+                else:
+                    baseline_resp = await self._send(
+                        probe_url, "GET", test_phase="stored_pre_test_baseline",
+                    )
+                    self._stored_baselines[probe_url] = baseline_resp
+
+                resp = await self._send(probe_url, "GET", test_phase="batch_stored_check")
+                body = resp.body or ""
+
+                for param, canary in canary_map.items():
+                    if canary in body:
+                        confirmed.setdefault(param, set()).add(probe_url)
+            except Exception as e:
+                logger.debug("Batch stored probe failed for %s: %s", probe_url, e)
+
+        return confirmed
+
     def _build_attack_request(
         self,
         url: str,
@@ -219,8 +343,16 @@ class XSSVerifier(BaseVerifier):
             stored_display_urls: Optional[list[str]] = None,
             stored_baselines: Optional[dict[str, ResponseData]] = None,
             target: Optional[object] = None,
+            stored_display_overrides: Optional[dict[str, set[str]]] = None,
         ) -> VerificationResult:
-            """Verify XSS vulnerability safely utilizing integrated hybrid checks."""
+            """Verify XSS vulnerability safely utilizing integrated hybrid checks.
+
+            ``stored_display_overrides`` carries the result of batch stored-XSS
+            discovery: a mapping of ``parameter → {display_url, ...}`` for
+            parameters whose canary was confirmed stored. When present, the
+            stored-reflection probe narrows to only those display URLs instead
+            of fanning out to every discovered URL.
+            """
             
             self._begin_verification(parameter)
             findings: list[Finding] = []
@@ -290,11 +422,43 @@ class XSSVerifier(BaseVerifier):
                         )
 
                         if not is_canary_reflected or method.upper() == "POST":
-                            reflected_in_stored = await self._check_stored_reflection(
-                                canary_payload, url, stored_display_urls, canary=canary
-                            )
-                            if reflected_in_stored:
-                                is_canary_reflected = True
+                            # Use batch stored-discovery results when available to
+                            # narrow the probe fan-out to only confirmed display URLs.
+                            # This replaces the broken O(params × payloads × urls)
+                            # fan-out with a targeted O(1) probe of the single
+                            # display URL where the canary was confirmed stored.
+                            batch_stored_urls: list[str] | None = None
+                            if stored_display_overrides and parameter in stored_display_overrides:
+                                batch_stored_urls = list(stored_display_overrides[parameter])
+
+                            if batch_stored_urls is not None:
+                                # Narrowed: probe only confirmed display URLs.
+                                for probe_url in batch_stored_urls:
+                                    try:
+                                        if hasattr(self, "_stored_baselines") and probe_url in self._stored_baselines:
+                                            baseline_resp = self._stored_baselines[probe_url]
+                                        else:
+                                            baseline_resp = await self._send(
+                                                probe_url, "GET", test_phase="stored_pre_test_baseline",
+                                            )
+                                            self._stored_baselines[probe_url] = baseline_resp
+                                        resp = await self._send(probe_url, "GET", test_phase="canary_stored_check")
+                                        is_ref, locs, was_enc = self._detect_reflection(canary_payload, resp.body)
+                                        if is_ref:
+                                            is_canary_reflected = True
+                                            break
+                                    except Exception as e:
+                                        logger.debug("Narrowed stored probe failed for %s: %s", probe_url, e)
+                            else:
+                                # No batch override: fall back to the existing
+                                # per-candidate stored probe (now correctly
+                                # calling _probe_stored, not the nonexistent
+                                # _check_stored_reflection).
+                                stored_reflected, _, _, _, _ = await self._probe_stored(
+                                    canary_payload, url, stored_display_urls, canary=canary,
+                                )
+                                if stored_reflected:
+                                    is_canary_reflected = True
 
                         if not is_canary_reflected:
                             return VerificationResult(
@@ -319,6 +483,7 @@ class XSSVerifier(BaseVerifier):
                 result = await self._test_payload(
                     url, parameter, method, value, payload, payload_type,
                     form_inputs, stored_display_urls, pre_test_baseline, target=target,
+                    stored_display_overrides=stored_display_overrides,
                 )
                 
                 if result.is_vulnerable:
@@ -430,8 +595,15 @@ class XSSVerifier(BaseVerifier):
         self, url: str, parameter: str, method: str, value: str, payload: str, payload_type: str,
         form_inputs: Optional[list], stored_display_urls: Optional[list[str]], pre_test_baseline: ResponseData,
         target: Optional[object] = None,
+        stored_display_overrides: Optional[dict[str, set[str]]] = None,
     ) -> VerificationResult:
-        """Test a single XSS payload using rapid static check followed by safe dynamic execution fallback."""
+        """Test a single XSS payload using rapid static check followed by safe dynamic execution fallback.
+
+        ``stored_display_overrides`` narrows the stored-reflection probe: when
+        batch discovery confirmed this parameter is stored, probe only the
+        confirmed display URLs; when batch discovery confirmed it is *not*
+        stored (absent from the map), skip the stored probe entirely.
+        """
         try:
             is_header = method.upper().startswith("HEADER:")
             canary = ResponseAnalyzer.generate_probe_canary()
@@ -478,19 +650,66 @@ class XSSVerifier(BaseVerifier):
             # single reflected-header check above (one request per header per
             # payload at the origin) still runs.
             skip_stored = is_header and getattr(self, "spa_mode", False)
+
+            # Batch stored-discovery override: when available, use the confirmed
+            # display URLs instead of fanning out to every discovered URL. If
+            # batch discovery ran and this parameter is absent from the map,
+            # the canary was not stored — skip the probe entirely (this is the
+            # primary request-savings path for non-stored POST params).
+            batch_overrides_present = stored_display_overrides is not None
+            batch_confirmed_urls: list[str] | None = None
+            if batch_overrides_present:
+                batch_confirmed_urls = list(stored_display_overrides.get(parameter, set()))
+
             if (not is_reflected or method.upper() == "POST") and not skip_stored:
-                await asyncio.sleep(0.1)
-                stored_reflected, stored_locations, stored_was_encoded, stored_resp, stored_evidence = (
-                    await self._probe_stored(
-                        injected_payload,
-                        url,
-                        stored_display_urls,
-                        canary=canary,
-                        is_header_injection=is_header,
+                if batch_overrides_present and not batch_confirmed_urls:
+                    # Batch discovery confirmed this param is not stored — skip
+                    # the per-payload stored probe fan-out entirely.
+                    pass
+                elif batch_confirmed_urls:
+                    # Narrowed: probe only confirmed display URLs.
+                    await asyncio.sleep(0.1)
+                    for probe_url in batch_confirmed_urls:
+                        try:
+                            if hasattr(self, "_stored_baselines") and probe_url in self._stored_baselines:
+                                baseline_resp = self._stored_baselines[probe_url]
+                            else:
+                                baseline_resp = await self._send(
+                                    probe_url, "GET", test_phase="stored_pre_test_baseline",
+                                )
+                                self._stored_baselines[probe_url] = baseline_resp
+                            resp = await self._send(probe_url, "GET", test_phase="stored_check")
+                            is_ref, locs, was_enc = self._detect_reflection(injected_payload, resp.body)
+                            if is_ref:
+                                verified, stored_evidence = ResponseAnalyzer.verify_reflection(
+                                    injected_payload, resp.body,
+                                    baseline_body=baseline_resp.body, canary=canary,
+                                )
+                                if verified:
+                                    is_reflected = True
+                                    locations = locs
+                                    was_encoded = was_enc
+                                    injected = resp
+                                    is_stored = True
+                                    reflection_evidence = stored_evidence
+                                    break
+                        except Exception as e:
+                            logger.debug("Narrowed stored payload probe failed for %s: %s", probe_url, e)
+                else:
+                    # No batch override: fall back to the existing per-payload
+                    # stored probe fan-out (correctly calling _probe_stored).
+                    await asyncio.sleep(0.1)
+                    stored_reflected, stored_locations, stored_was_encoded, stored_resp, stored_evidence = (
+                        await self._probe_stored(
+                            injected_payload,
+                            url,
+                            stored_display_urls,
+                            canary=canary,
+                            is_header_injection=is_header,
+                        )
                     )
-                )
-                if stored_reflected:
-                    is_reflected, locations, was_encoded, injected, is_stored, reflection_evidence = True, stored_locations, stored_was_encoded, stored_resp, True, stored_evidence
+                    if stored_reflected:
+                        is_reflected, locations, was_encoded, injected, is_stored, reflection_evidence = True, stored_locations, stored_was_encoded, stored_resp, True, stored_evidence
 
             if not is_reflected:
                 return VerificationResult(is_vulnerable=False, confidence_score=0.0, detection_method=payload_type, findings=[], evidence={"reflected": False})

@@ -1182,7 +1182,8 @@ class AccessControlDetector(BaseDetector):
                     confidence_score=88.0,
                     detection_method="authorization_matrix",
                     detection_evidence=self._matrix_evidence(
-                        unauth_profile, low_profile, second_profile, privileged_profile, target
+                        unauth_profile, low_profile, second_profile, privileged_profile, target,
+                        serves_public_data=serves_public_data,
                     ),
                     verified=True,
                     verification_request_snippet=unauth.request_snippet,
@@ -1885,12 +1886,19 @@ class AccessControlDetector(BaseDetector):
         second: _ResponseProfile | None,
         privileged: _ResponseProfile | None,
         target: _MatrixTarget,
+        *,
+        serves_public_data: bool | None = None,
     ) -> dict[str, Any]:
         return {
             "source": target.source,
             "parameter_location": target.parameter_location,
             "has_object_reference": target.has_object_reference,
             "admin_like": target.admin_like,
+            # The key discriminative signal for the AI: whether anonymous and
+            # authenticated responses are identical (public by design). When
+            # True, the endpoint has no authorization boundary — the AI should
+            # flag it as a false positive.
+            "serves_public_data": serves_public_data,
             "states": {
                 "unauthenticated": self._profile_summary(unauth),
                 "low": self._profile_summary(low),
@@ -1908,6 +1916,7 @@ class AccessControlDetector(BaseDetector):
             "json_shape": sorted(profile.json_shape)[:20],
             "identifiers": sorted(profile.identifiers)[:20],
             "sensitive_fields": sorted(profile.sensitive_fields)[:20],
+            "secret_fields": sorted(profile.secret_fields)[:20],
             "item_count": profile.item_count,
         }
 

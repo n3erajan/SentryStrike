@@ -27,7 +27,7 @@ REDIRECT_NAME_TOKENS = frozenset(
     {
         "next", "return", "return_to", "return_url", "redirect", "redirect_to",
         "redirect_url", "redirect_uri", "callback", "callback_url", "continue",
-        "url", "target", "dest", "destination", "goto", "back",
+        "url", "uri", "target", "dest", "destination", "goto", "back", "to",
     }
 )
 REDIRECT_NAME_SUBSTRINGS = ("redirect", "return", "callback", "next")
@@ -43,10 +43,11 @@ FILE_NAME_SUBSTRINGS = ("file", "page", "path", "inc")
 SSRF_NAME_TOKENS = frozenset(
     {
         "url", "link", "src", "dest", "redirect", "fetch", "load", "uri",
-        "path", "domain", "host", "proxy", "site",
+        "path", "domain", "host", "proxy", "site", "image", "avatar",
+        "callback", "webhook", "endpoint",
     }
 )
-SSRF_NAME_SUBSTRINGS = ("url", "link", "redirect")
+SSRF_NAME_SUBSTRINGS = ("url", "link", "redirect", "webhook", "callback")
 
 # Common file extensions that mark a value as a filename/path rather than a
 # bare hostname. Deliberately excludes TLD-like tokens (``com``/``net``/...) so

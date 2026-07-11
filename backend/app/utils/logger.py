@@ -1,4 +1,5 @@
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -9,6 +10,16 @@ def configure_logging() -> None:
     settings = get_settings()
     log_dir = Path(settings.log_file).parent
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Windows consoles default to cp1252, which cannot encode symbols like "≥"
+    # used in verifier log messages. Force UTF-8 so logging never crashes on
+    # Unicode; fall back to "replace" so a legacy terminal degrades gracefully
+    # instead of raising UnicodeEncodeError.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -22,7 +33,9 @@ def configure_logging() -> None:
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
 
-    file_handler = RotatingFileHandler(settings.log_file, maxBytes=2_000_000, backupCount=3)
+    file_handler = RotatingFileHandler(
+        settings.log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    )
     file_handler.setFormatter(formatter)
 
     root_logger.addHandler(console_handler)
@@ -35,3 +48,14 @@ def configure_logging() -> None:
     # httpx logs bare URLs without scan context; sentry.http provides detail.
     for noisy_logger in ("httpx", "httpcore"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+    # pymongo topology / connection debug chatter is high-volume and rarely
+    # actionable during scans. Keep it at INFO even when the root logger is
+    # set to DEBUG so it doesn't drown out scan-relevant log lines.
+    for noisy_logger in (
+        "pymongo",
+        "pymongo.connection",
+        "pymongo.topology",
+        "pymongo.serverSelection",
+    ):
+        logging.getLogger(noisy_logger).setLevel(logging.INFO)

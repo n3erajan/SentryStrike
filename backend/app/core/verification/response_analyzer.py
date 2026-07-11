@@ -39,6 +39,31 @@ class ResponseData:
         return self.status_code == -1
 
 
+# Baseline status codes that mean the target is unreachable/unauthorized as sent,
+# so there is no exploitable differential to measure. When the UNMODIFIED baseline
+# returns one of these, firing the full payload matrix only produces 4xx noise
+# (observed as ~27% of scan traffic against Juice Shop). 401/403 = auth wall,
+# 404 = dead endpoint or non-existent object, 405 = wrong method for this URL.
+# Deliberately excludes 400 (a validation error an injection may still flip) and
+# 500 (error-based injection's signal), and login-style flows are unaffected
+# because their baseline is a healthy 200 — only the deliberate false-payload
+# returns 401.
+_DEAD_BASELINE_STATUSES = frozenset({401, 403, 404, 405})
+
+
+def is_dead_baseline(response: "ResponseData | None") -> bool:
+    """True when an unmodified baseline response is structurally unexploitable.
+
+    Used by injection verifiers to abort a target before spending the payload
+    budget on a URL that returned 401/403/404/405 to the plain baseline. A
+    ``None`` or governor-denied (``not_tested``) baseline is NOT dead — the probe
+    simply never ran, which is handled separately.
+    """
+    if response is None or response.not_tested:
+        return False
+    return response.status_code in _DEAD_BASELINE_STATUSES
+
+
 @dataclass
 class DifferentialAnalysis:
     """Results of comparing baseline vs injected response."""

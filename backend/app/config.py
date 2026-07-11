@@ -21,11 +21,22 @@ class Settings(BaseSettings):
     auth_cookie_secure: bool = Field(default=False, alias="AUTH_COOKIE_SECURE")
     auth_cookie_samesite: str = Field(default="lax", alias="AUTH_COOKIE_SAMESITE")
 
-    ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
-    ollama_model: str = Field(default="gemma4-e4b-8k", alias="OLLAMA_MODEL")
-    ollama_timeout_seconds: float = Field(default=120.0, alias="OLLAMA_TIMEOUT_SECONDS")
+    # AI / LLM — single OpenAI-compatible client. Works with any provider that
+    # speaks the Chat Completions API: local Ollama (set AI_BASE_URL to its /v1
+    # endpoint, leave AI_API_KEY empty), OpenAI, Groq, Together, OpenRouter,
+    # DeepSeek, Mistral, vLLM, LM Studio, llama.cpp, … Just change the base URL,
+    # model, and (for hosted providers) the API key.
+    ai_base_url: str = Field(default="http://localhost:11434/v1", alias="AI_BASE_URL")
+    ai_model: str = Field(default="gemma4-e4b-8k", alias="AI_MODEL")
+    # API key. Optional — local Ollama / unauthenticated local servers need none.
+    ai_api_key: str | None = Field(default=None, alias="AI_API_KEY")
+    ai_timeout_seconds: float = Field(default=120.0, alias="AI_TIMEOUT_SECONDS")
     ai_max_retries: int = Field(default=3, alias="AI_MAX_RETRIES")
     ai_batch_size: int = Field(default=1, alias="AI_BATCH_SIZE")
+    # Send response_format={"type":"json_object"} (OpenAI JSON mode). Most
+    # providers support this; disable if yours rejects it — the client still
+    # extracts JSON from plain text.
+    ai_json_mode: bool = Field(default=True, alias="AI_JSON_MODE")
 
     crawl_depth: int = Field(default=3, alias="CRAWL_DEPTH")
     crawl_max_urls: int = Field(default=200, alias="CRAWL_MAX_URLS")
@@ -85,6 +96,12 @@ class Settings(BaseSettings):
     # never dominate a scan.
     xss_browser_dom_max_jobs: int = Field(default=12, alias="XSS_BROWSER_DOM_MAX_JOBS")
     xss_browser_dom_budget_seconds: float = Field(default=60.0, alias="XSS_BROWSER_DOM_BUDGET_SECONDS")
+    # Bounds for the open-redirect browser-navigation sweep. Client-side SPA
+    # redirects (``#/redirect?to=…`` that set window.location in JS) leave no HTTP
+    # 302 to observe, so they are confirmed by navigating a real browser and
+    # checking the final origin. Same shape/caps as the XSS DOM sweep.
+    open_redirect_browser_max_jobs: int = Field(default=10, alias="OPEN_REDIRECT_BROWSER_MAX_JOBS")
+    open_redirect_browser_budget_seconds: float = Field(default=45.0, alias="OPEN_REDIRECT_BROWSER_BUDGET_SECONDS")
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     scanner_concurrency: int = Field(default=8, alias="SCANNER_CONCURRENCY")
     sensitive_paths_permutation_cap: int = Field(default=200, alias="SENSITIVE_PATHS_PERMUTATION_CAP")

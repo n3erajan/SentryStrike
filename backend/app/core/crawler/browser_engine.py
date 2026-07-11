@@ -462,6 +462,44 @@ SPA_SHELL_PROBE_SCRIPT = """
 }
 """
 
+# Rendered-route content signature (framework-agnostic). A hash-routed SPA serves
+# ONE index.html for every ``#/…`` route, so HTTP status can never tell a live
+# route from a client-side 404/redirect-to-home — only the RENDERED DOM can. This
+# probe returns a stable signature of the router-outlet's visible content: the
+# page title, the visible text length bucket, and the sorted set of structural
+# component tags (custom elements + landmark roles). Two routes that render the
+# SAME component tree (e.g. every unknown route falling through to the app's
+# not-found/home component) yield the SAME signature; a genuinely distinct route
+# yields a different one. Volatile text is excluded (only a coarse length bucket
+# and component structure are used) so timestamps/counters don't defeat the match.
+ROUTE_CONTENT_SIGNATURE_SCRIPT = """
+() => {
+  try {
+    const title = (document.title || '').trim().toLowerCase();
+    const body = document.body;
+    if (!body) return 'nobody';
+    // Structural component tags: custom elements (with a dash) + ARIA landmark
+    // roles. These describe WHICH component rendered, independent of its data.
+    const tags = new Set();
+    const nodes = body.querySelectorAll('*');
+    let visibleTextLen = 0;
+    for (const el of nodes) {
+      const tag = el.tagName.toLowerCase();
+      if (tag.includes('-')) tags.add(tag);
+      const role = el.getAttribute && el.getAttribute('role');
+      if (role) tags.add('role:' + role.toLowerCase());
+    }
+    // Visible text length, bucketed to the nearest 200 chars so minor dynamic
+    // differences (a username, a count) never change the signature.
+    const txt = (body.innerText || '').replace(/\\s+/g, ' ').trim();
+    visibleTextLen = Math.round(txt.length / 200);
+    const structural = [...tags].sort().join(',');
+    return title + '|' + visibleTextLen + '|' + structural;
+  } catch (e) { return 'err'; }
+}
+"""
+
+
 # Collect in-DOM navigation targets: anchors plus framework router directives.
 # Also scans the Angular CDK overlay container (where mat-menu / mat-select
 # items render dynamically outside the normal DOM tree) so links from open
@@ -1293,6 +1331,7 @@ class BrowserDiscoveryEngine:
             # mode changes nothing (browser-discovered routes arrive as absolute
             # URLs already), so the probe navigation would be pure overhead.
             hash_routed_hint: bool | None = None
+            not_found_signature: str | None = None
             budget_ok = deadline is None or (deadline - loop.time()) > 5.0
             if (routes or []) and budget_ok:
                 try:
@@ -1302,6 +1341,17 @@ class BrowserDiscoveryEngine:
                     try:
                         probe_page = await probe_context.new_page()
                         hash_routed_hint = await self._detect_hash_routing(probe_page, root_url)
+                        # Capture the app's client-side not-found fallback signature
+                        # so dead hash routes (``#/wp-admin``, brute-force wordlist
+                        # paths that all render the same catch-all component) can be
+                        # suppressed during the crawl. Uses the resolved routing mode.
+                        not_found_signature = await self._capture_not_found_signature(
+                            probe_page,
+                            root_url,
+                            hash_routed=bool(hash_routed_hint)
+                            if hash_routed_hint is not None
+                            else self._looks_hash_routed(root_url, routes or []),
+                        )
                     finally:
                         await probe_context.close()
                 except Exception as exc:
@@ -1438,9 +1488,40 @@ class BrowserDiscoveryEngine:
                                     state.browser_error = (
                                         "authenticated session did not persist into browser context"
                                     )
+                            # Dead client-side route suppression. A hash-routed SPA
+                            # serves one index.html for every ``#/…`` route, so a
+                            # brute-force wordlist path (``#/wp-admin``, ``#/.env``)
+                            # renders the app's not-found/catch-all component with an
+                            # HTTP 200 — indistinguishable from a live route except by
+                            # the RENDERED DOM. When the route's rendered signature
+                            # matches the not-found fallback captured at preflight,
+                            # record it as dead and skip all form/interaction work
+                            # (which would otherwise fire useless submits/clicks on the
+                            # 404 component and pollute the surface with dead routes).
+                            landed_url = self._current_url(page, target_url)
+                            if not_found_signature and not is_root:
+                                route_sig = await self._route_content_signature(page)
+                                if self._is_dead_spa_route(
+                                    landed_url, root_url, route_sig, not_found_signature
+                                ):
+                                    logger.debug(
+                                        "suppressing dead client-side route (not-found fallback): %s",
+                                        target_url,
+                                    )
+                                    wstate.add_route(
+                                        RouteCandidate(
+                                            url=landed_url,
+                                            source=RouteSource.browser,
+                                            priority=10,
+                                            evidence="browser_not_found_fallback",
+                                            is_spa_fallback=True,
+                                            is_dead=True,
+                                        )
+                                    )
+                                    continue
                             wstate.add_route(
                                 RouteCandidate(
-                                    url=self._current_url(page, target_url),
+                                    url=landed_url,
                                     source=RouteSource.browser,
                                     priority=75,
                                     evidence="browser_navigation",
@@ -1807,6 +1888,82 @@ class BrowserDiscoveryEngine:
             return page.url or fallback
         except Exception:
             return fallback
+
+    # A route token that no real application route will match, used to render the
+    # app's client-side "not found" / catch-all fallback for fingerprinting.
+    _NOT_FOUND_PROBE_TOKEN = "sentrystrike-nonexistent-probe-a1b2c3d4"
+
+    async def _route_content_signature(self, page: Any) -> str | None:
+        """Stable signature of the currently-rendered route's component tree.
+
+        Returns ``None`` when the probe could not run. See
+        ``ROUTE_CONTENT_SIGNATURE_SCRIPT`` for what the signature captures.
+        """
+        sig = await self._bounded(page.evaluate(ROUTE_CONTENT_SIGNATURE_SCRIPT), 800)
+        if sig is _BOUNDED_FAILED or not isinstance(sig, str) or not sig:
+            return None
+        return sig
+
+    async def _capture_not_found_signature(
+        self, page: Any, root_url: str, *, hash_routed: bool
+    ) -> str | None:
+        """Render a guaranteed-nonexistent route and fingerprint the fallback.
+
+        A hash-routed SPA serves the same ``index.html`` for every ``#/…`` route,
+        so a dead route (``#/wp-admin``) renders the app's client-side not-found /
+        catch-all component — indistinguishable from a live route by HTTP status.
+        Capturing that fallback's rendered signature lets the crawl suppress any
+        later route whose rendered component tree is identical to it. Best-effort:
+        returns ``None`` on any failure so the crawl proceeds without suppression.
+        """
+        try:
+            if hash_routed:
+                probe_url = f"{root_url.rstrip('/')}/#/{self._NOT_FOUND_PROBE_TOKEN}"
+            else:
+                probe_url = f"{root_url.rstrip('/')}/{self._NOT_FOUND_PROBE_TOKEN}"
+            landed = await self._bounded(
+                page.goto(probe_url, wait_until="domcontentloaded", timeout=12000), 13000
+            )
+            if landed is _BOUNDED_FAILED:
+                return None
+            # For a path-routed app a nonexistent path yields a real HTTP 404 whose
+            # body is NOT the SPA shell — never fingerprint that as a route fallback.
+            if not hash_routed:
+                status = None
+                try:
+                    status = landed.status if landed is not None else None
+                except Exception:
+                    status = None
+                if status is not None and status != 200:
+                    return None
+            await settle_page(page, quiet_ms=400.0, cap_ms=3000.0)
+            signature = await self._route_content_signature(page)
+            if signature:
+                logger.info(
+                    "browser discovery captured not-found route signature for %s", root_url
+                )
+            return signature
+        except Exception as exc:
+            logger.debug("not-found signature capture failed for %s: %s", root_url, exc)
+            return None
+
+    def _is_dead_spa_route(
+        self, current_url: str, root_url: str, signature: str | None, not_found_signature: str | None
+    ) -> bool:
+        """True when a navigated route rendered the app's not-found fallback.
+
+        Compares the route's rendered component signature to the not-found
+        signature captured at preflight. The root itself is never dead (it
+        bootstraps the shell). Conservative: requires an EXACT signature match, so
+        only routes rendering an identical component tree to the confirmed 404 are
+        suppressed — a genuinely distinct route always survives.
+        """
+        if not not_found_signature or not signature:
+            return False
+        if self._normalize_for_seen(current_url) == self._normalize_for_seen(root_url):
+            return False
+        return signature == not_found_signature
+
 
     @staticmethod
     async def _force_click(element: Any) -> None:

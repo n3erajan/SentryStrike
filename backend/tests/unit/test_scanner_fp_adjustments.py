@@ -545,7 +545,10 @@ def test_verified_time_based_sqli_is_not_auto_suppressed_by_high_ai_fp_probabili
     assert vulnerability.review_status == ReviewStatus.confirmed
     assert vulnerability.cvss_score == 9.1
     assert vulnerability.severity == SeverityLevel.critical
-    assert vulnerability.ai_analysis.false_positive_probability == 0.05
+    # timing_strong proof type: ceiling is 0.15 (not 0.05) — the proof is
+    # strong but indirect (time delta, not output), so the AI has slightly
+    # more room than for error_echo/active_output.
+    assert vulnerability.ai_analysis.false_positive_probability == 0.15
 
 
 def test_unverified_high_fp_finding_is_still_suppressed() -> None:

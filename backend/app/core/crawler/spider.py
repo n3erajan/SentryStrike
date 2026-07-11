@@ -421,10 +421,21 @@ class WebSpider:
                 await asyncio.gather(*workers, return_exceptions=True)
 
             if self._should_run_browser(self._is_spa or spa_detector.root_looks_like_spa()):
+                # Brute-force wordlist guesses that HTTP-resolved to the SPA shell
+                # are dead (``/wp-admin``, ``/.env`` → index.html). They are recorded
+                # in ``dead_routes`` but the ORIGINAL enqueued RouteCandidate in
+                # ``crawl_state.routes`` keeps ``is_dead=False``, so without this set
+                # they would still be canonicalised to ``#/wp-admin`` and navigated
+                # as live SPA routes — wasting budget on the app's not-found
+                # component. A correctly-guessed real route (``/administration`` →
+                # ``#/administration``) never HTTP-resolves to the shell, so it is
+                # NOT in ``dead_urls`` and is still browser-seeded.
+                dead_urls = {route.url for route in dead_routes}
                 browser_routes = [
-                    route.url for route in crawl_state.routes 
+                    route.url for route in crawl_state.routes
                     if route.source in (RouteSource.javascript, RouteSource.html, RouteSource.sitemap, RouteSource.brute_force)
                     and not getattr(route, "is_dead", False)
+                    and route.url not in dead_urls
                 ]
                 await self._run_browser_discovery(crawl_state, root_url, browser_routes)
 

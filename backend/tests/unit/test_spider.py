@@ -456,6 +456,34 @@ async def test_crawl_marks_spa_fallback_common_paths_dead(monkeypatch):
         get_settings.cache_clear()
 
 
+def test_browser_route_seed_excludes_http_dead_brute_paths():
+    """A brute-force guess that HTTP-resolved to the SPA shell (recorded in
+    ``dead_routes``) must NOT be seeded to the browser as a live SPA route —
+    otherwise it is canonicalised to ``#/wp-admin`` and navigated into the app's
+    not-found component. A correctly-guessed real route (never in ``dead_routes``)
+    is still seeded."""
+    from app.core.crawler.models import RouteCandidate, RouteSource
+
+    routes = [
+        RouteCandidate(url="http://h/wp-admin", source=RouteSource.brute_force),   # dead guess
+        RouteCandidate(url="http://h/administration", source=RouteSource.brute_force),  # real route
+        RouteCandidate(url="http://h/login", source=RouteSource.javascript),        # real JS route
+    ]
+    dead_routes = [
+        RouteCandidate(url="http://h/wp-admin", source=RouteSource.brute_force, is_dead=True),
+    ]
+    dead_urls = {route.url for route in dead_routes}
+    browser_routes = [
+        route.url for route in routes
+        if route.source in (RouteSource.javascript, RouteSource.html, RouteSource.sitemap, RouteSource.brute_force)
+        and not getattr(route, "is_dead", False)
+        and route.url not in dead_urls
+    ]
+    assert "http://h/wp-admin" not in browser_routes
+    assert "http://h/administration" in browser_routes
+    assert "http://h/login" in browser_routes
+
+
 @pytest.mark.asyncio
 async def test_sensitive_paths_ignores_spa_shell_fallbacks_but_keeps_real_files(monkeypatch):
     monkeypatch.setenv("REQUEST_TIMEOUT_SECONDS", "5")

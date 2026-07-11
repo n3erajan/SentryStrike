@@ -11,7 +11,7 @@ from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.param_selection import FILE_NAME_TOKENS, file_candidate
 from app.core.payload_profile import PayloadProfile, build_payload_profile
-from app.core.verification.response_analyzer import ResponseAnalyzer
+from app.core.verification.response_analyzer import ResponseAnalyzer, is_dead_baseline
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.scan_http import build_scan_headers
@@ -251,6 +251,13 @@ class FileInclusionDetector(BaseDetector):
                     baseline_len = len(baseline.body)
 
                     if ResponseAnalyzer.is_phpinfo_or_debug_page(baseline.body or ""):
+                        return cand_findings
+
+                    # Dead-baseline abort: a 401/403/404/405 baseline means the
+                    # endpoint is unreachable/unauthorized as sent, so no path or
+                    # wrapper differential can exist — skip rather than fire the
+                    # traversal/wrapper payload set into 4xx noise.
+                    if is_dead_baseline(baseline):
                         return cand_findings
 
                     control_url, control_params, control_data, control_json, control_headers, control_cookies = (

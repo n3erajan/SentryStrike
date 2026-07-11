@@ -7,6 +7,7 @@ from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.param_selection import SSRF_NAME_TOKENS, ssrf_candidate
 from app.core.verification.oast import OastClient
+from app.core.verification.response_analyzer import is_dead_baseline
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.scan_http import build_scan_headers
@@ -236,6 +237,13 @@ class SSRFDetector(BaseDetector):
                         json_body=baseline_json,
                         test_phase="baseline",
                     )
+
+                    # Dead-baseline abort: 401/403/404/405 to the plain baseline
+                    # means the sink is unreachable/unauthorized as sent, so the
+                    # reflection/OAST/in-band probes cannot yield a differential —
+                    # skip rather than spend the SSRF payload budget on 4xx noise.
+                    if is_dead_baseline(baseline):
+                        return cand_findings
 
                     for payload, regex_pattern, desc in self.SSRF_PAYLOADS:
                         # Make sure baseline doesn't already trigger the signature

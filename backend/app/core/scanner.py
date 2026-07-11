@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from app.config import get_settings
 
-from app.analyzers.ai_client import OllamaClient
+from app.analyzers.ai_client import AIClient
 from app.analyzers.report_generator import AiReportGenerator
 from app.core.crawler.account_session import provision_secondary_session, resolve_account_session
 from app.core.crawler.spider import WebSpider
@@ -45,11 +45,12 @@ def _normalize_llm_string(value: object) -> str | None:
     return str(value)
 
 
-from app.core.evidence_grader import EvidenceGrader
+from app.core.evidence_grader import EvidenceGrade, EvidenceGrader
 from app.database.repositories.scan_repository import ScanRepository
 from app.integrations.cve_database import CveDatabaseService
 from app.integrations.sslyze_wrapper import SslAnalyzer
 from app.integrations.wappalyzer import TechnologyDetector
+from app.integrations import error_fingerprints
 from app.models.scan import CrawlMode, Scan, ScanPhase, ScanStatus
 from app.models.scan import AuthCoverage, DetectorCoverageMetric, EvidenceStrengthBreakdown, SpaApiCoverage
 from app.models.vulnerability import (
@@ -61,6 +62,7 @@ from app.models.vulnerability import (
     OwaspCategory,
     ReviewStatus,
     SeverityLevel,
+    TechnologyComponent,
     Vulnerability,
     normalize_exploitability,
     AiAnalysisStatus,
@@ -105,7 +107,7 @@ class ScanOrchestrator:
         self.cve_service = CveDatabaseService()
         self.ssl_analyzer = SslAnalyzer()
 
-        self.ai_client = OllamaClient()
+        self.ai_client = AIClient()
         self.ai_report = AiReportGenerator()
         self.evidence_grader = EvidenceGrader()
 
@@ -350,7 +352,13 @@ class ScanOrchestrator:
             await self._check_cancelled(scan_id)
 
             await self._set_progress(scan, 25, ScanPhase.technology_detection, "Detecting technology stack and known CVEs")
-            technologies = await self.technology_detector.detect(scan.target_url)
+            technologies = await self.technology_detector.detect(
+                scan.target_url,
+                crawl_result=crawl_result,
+                browser_available=getattr(crawl_result, "browser_available", False),
+                storage_state=getattr(crawl_result, "auth_storage_state", None),
+                session_cookies=getattr(crawl_result, "session_cookies", {}),
+            )
             scan.technology_stack = await self.cve_service.enrich_components(technologies)
             await self._set_progress(scan, 35, ScanPhase.technology_detection, f"Technology analysis complete: {len(scan.technology_stack)} component(s) identified")
             await self._check_cancelled(scan_id)
@@ -593,6 +601,16 @@ class ScanOrchestrator:
 
             await self._set_progress(scan, 60, ScanPhase.vulnerability_detection, f"Detector phase complete: {len(findings)} raw finding(s)")
             await self._check_cancelled(scan_id)
+
+            # Enrich the technology stack from error responses the detectors just
+            # triggered. Stack traces / DB errors leak the framework, ORM, DB
+            # engine and language (often with versions) that header/HTML/runtime
+            # fingerprinting at scan start could not see. Best-effort: never fail
+            # the scan over fingerprint enrichment.
+            try:
+                await self._enrich_tech_from_errors(scan, findings)
+            except Exception as exc:
+                logger.debug("error-based technology enrichment failed: %s", exc)
 
             # DEDUPLICATION PHASE: Merge duplicate findings from different detectors
             # Findings with same (url, parameter, vuln_type) are consolidated
@@ -1190,18 +1208,23 @@ class ScanOrchestrator:
                     len(vulnerabilities),
                 )
 
+                # Pre-grade findings BEFORE the AI call — the proof characterization
+                # (proof_type, ceiling, brief) is needed to build the discriminative
+                # evidence brief in the prompt.
+                batch_grades = [self.evidence_grader.grade(v) for v in batch]
+
                 results = []
                 try:
                     if BATCH_SIZE == 1:
-                        result = await self._analyze_single(batch[0], tech_stack_str)
+                        result = await self._analyze_single(batch[0], tech_stack_str, batch_grades[0])
                         results = [result]
                     else:
-                        results = await self._analyze_batch(batch, tech_stack_str)
+                        results = await self._analyze_batch(batch, tech_stack_str, batch_grades)
                 except Exception as e:
                     logger.warning("Analysis call failed, falling back to individual processing: %s: %s", type(e).__name__, e)
-                    for vuln in batch:
+                    for i, vuln in enumerate(batch):
                         try:
-                            res = await self._analyze_single(vuln, tech_stack_str)
+                            res = await self._analyze_single(vuln, tech_stack_str, batch_grades[i])
                             results.append(res)
                         except Exception as single_e:
                             logger.warning("Single analysis failed for %s: %s", vuln.id, single_e)
@@ -1209,11 +1232,10 @@ class ScanOrchestrator:
 
                 # Apply AI results back to each vulnerability
                 for idx, (vuln, result) in enumerate(zip(batch, results), start=batch_start + 1):
-                    # Pre-grade the finding deterministically BEFORE applying AI output
-                    grade = self.evidence_grader.grade(vuln)
+                    grade = batch_grades[idx - batch_start - 1]
                     logger.info(
-                        "Evidence grade: vuln_type=%r grade=%s fp_ceiling=%.2f reason=%r url=%s",
-                        vuln.vuln_type, grade.grade, grade.fp_ceiling, grade.reason, vuln.location.url,
+                        "Evidence grade: vuln_type=%r proof_type=%s grade=%s fp_ceiling=%.2f url=%s",
+                        vuln.vuln_type, grade.proof_type, grade.grade, grade.fp_ceiling, vuln.location.url,
                     )
 
                     if result.get("ai_analysis_status") == "failed" or "results" in result:
@@ -1233,27 +1255,32 @@ class ScanOrchestrator:
                             vuln.cvss_score = cvss.score
                             vuln.cvss_vector = cvss.vector
                             vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
-                            # Even on AI failure, apply the grader ceiling
-                            vuln.ai_analysis.false_positive_probability = grade.fp_ceiling
+                            # When AI fails: undeniable proof stays confirmed (low FP),
+                            # interpretive proof goes to needs_review (can't verify
+                            # without AI judgment — don't blindly confirm or suppress).
+                            if grade.proof_type in ("auth_differential", "pattern_match", "heuristic", "timing_weak"):
+                                vuln.ai_analysis.false_positive_probability = 0.5
+                            else:
+                                vuln.ai_analysis.false_positive_probability = grade.fp_ceiling
                             vuln.ai_analysis.evidence_grade = grade.grade
                             vuln.ai_analysis.evidence_grade_reason = grade.reason
                             analyzed.append(vuln)
                             continue
 
-                    fallback = self._get_fallback_for(vuln.vuln_type, scan.technology_stack)
+                    fallback = self._get_fallback_for(vuln.vuln_type, scan.technology_stack, proof_type=grade.proof_type)
                     confidence = float(result.get("confidence", fallback["confidence"]))
 
-                    # AI FP output is advisory: clamp to grader ceiling.
-                    # AI can LOWER the FP probability (confirm a finding) but
-                    # never RAISE it above what the evidence grade allows.
+                    # AI FP output is clamped to the proof-type ceiling.
+                    # For active_output/error_echo/structural/timing_strong: low ceiling
+                    # (the proof is undeniable — AI cannot dismiss it).
+                    # For auth_differential/pattern_match: ceiling is 1.0 (no cap —
+                    # AI judges freely from the discriminative evidence brief).
                     raw_ai_fp = float(result.get("false_positive_probability", fallback["false_positive_probability"]))
                     fp_prob = min(raw_ai_fp, grade.fp_ceiling)
                     if raw_ai_fp > grade.fp_ceiling:
                         logger.info(
-                            "Clamped AI FP probability: vuln_type=%r ai_fp=%.2f -> ceiling=%.2f "
-                            "grade=%s reason=%r url=%s",
-                            vuln.vuln_type, raw_ai_fp, grade.fp_ceiling,
-                            grade.grade, grade.reason, vuln.location.url,
+                            "Clamped AI FP probability: vuln_type=%r proof_type=%s ai_fp=%.2f -> ceiling=%.2f url=%s",
+                            vuln.vuln_type, grade.proof_type, raw_ai_fp, grade.fp_ceiling, vuln.location.url,
                         )
 
                     impact = 0.9 if vuln.severity.value in {"Critical", "High"} else 0.5
@@ -1291,7 +1318,7 @@ class ScanOrchestrator:
 
             return analyzed
 
-    async def _analyze_batch(self, batch: list[Vulnerability], tech_stack_str: str) -> list[dict]:
+    async def _analyze_batch(self, batch: list[Vulnerability], tech_stack_str: str, grades: list[EvidenceGrade]) -> list[dict]:
         vuln_descriptions = []
         for i, vuln in enumerate(batch):
             req = vuln.evidence.request_snippet or ""
@@ -1299,26 +1326,23 @@ class ScanOrchestrator:
             payload = vuln.evidence.payload or ""
             auth_ctx = "requires_auth" if "cookie" in req.lower() else "unknown_auth"
             auth_ctx = vuln.auth_context.value if getattr(vuln, "auth_context", None) else auth_ctx
-            evidence_strength = vuln.evidence_strength.value if getattr(vuln, "evidence_strength", None) else "possible"
 
-            # Evidence is what the LLM must ground on. Keep it class-agnostic but
-            # include request/response/payload so fp scoring can vary by finding.
-            parsed = urlparse(vuln.location.url)
-            app_hint = parsed.path.split("/")[-1] or parsed.path
+            # Discriminative evidence brief — replaces the old descriptive block
+            # that exposed detector_verified/confidence_score (which caused the
+            # AI to defer to the detector circularly). The brief gives the AI
+            # the proof TYPE, markers, and weaknesses so it can judge the finding
+            # on the evidence itself.
+            evidence_brief = self.evidence_grader.build_evidence_brief(vuln, grades[i])
             evidence_block = (
                 "evidence_block=\n"
                 f"- url={vuln.location.url}\n"
                 f"- http_method={vuln.location.http_method}\n"
                 f"- parameter={vuln.location.parameter or 'none'}\n"
-                f"- detector_verified={vuln.evidence.verified}\n"
-                f"- evidence_strength={evidence_strength}\n"
                 f"- auth_context={auth_ctx}\n"
-                f"- detector_confidence_score={vuln.evidence.confidence_score:.1f}/100\n"
-                f"- detection_method={vuln.evidence.detection_method or 'unknown'}\n"
-                f"- detection_evidence={json.dumps(vuln.evidence.detection_evidence)[:1200] if vuln.evidence.detection_evidence else '{}'}\n"
                 f"- payload={payload or 'n/a'}\n"
                 f"- request_snippet={req[:1600] if req else 'n/a'}\n"
                 f"- response_snippet={resp[:1600] if resp else 'n/a'}\n"
+                f"- {evidence_brief}\n"
             )
 
             vuln_descriptions.append(
@@ -1331,28 +1355,24 @@ class ScanOrchestrator:
         return await self.ai_client.generate_json_list(prompt, expected_count=len(batch))
 
 
-    async def _analyze_single(self, vuln: Vulnerability, tech_stack_str: str) -> dict:
+    async def _analyze_single(self, vuln: Vulnerability, tech_stack_str: str, grade: EvidenceGrade) -> dict:
         req = vuln.evidence.request_snippet or ""
         resp = vuln.evidence.response_snippet or ""
         payload = vuln.evidence.payload or ""
         auth_ctx = "requires_auth" if "cookie" in req.lower() else "unknown_auth"
         auth_ctx = vuln.auth_context.value if getattr(vuln, "auth_context", None) else auth_ctx
-        evidence_strength = vuln.evidence_strength.value if getattr(vuln, "evidence_strength", None) else "possible"
 
+        evidence_brief = self.evidence_grader.build_evidence_brief(vuln, grade)
         evidence_block = (
             "evidence_block=\n"
             f"- url={vuln.location.url}\n"
             f"- http_method={vuln.location.http_method}\n"
             f"- parameter={vuln.location.parameter or 'none'}\n"
-            f"- detector_verified={vuln.evidence.verified}\n"
-            f"- evidence_strength={evidence_strength}\n"
             f"- auth_context={auth_ctx}\n"
-            f"- detector_confidence_score={vuln.evidence.confidence_score:.1f}/100\n"
-            f"- detection_method={vuln.evidence.detection_method or 'unknown'}\n"
-            f"- detection_evidence={json.dumps(vuln.evidence.detection_evidence)[:1200] if vuln.evidence.detection_evidence else '{}'}\n"
             f"- payload={payload or 'n/a'}\n"
             f"- request_snippet={req[:1600] if req else 'n/a'}\n"
             f"- response_snippet={resp[:1600] if resp else 'n/a'}\n"
+            f"- {evidence_brief}\n"
         )
 
         vuln_desc = (
@@ -1419,18 +1439,26 @@ class ScanOrchestrator:
 
         verification_guardrails = (
             "FALSE POSITIVE SCORING RULES:\n"
-            "The detection engine has already pre-scored false_positive_probability based on "
-            "objective evidence markers. Your FP score is ADVISORY ONLY:\n"
-            "- You may LOWER false_positive_probability if you see additional confirming evidence.\n"
-            "- For pattern-match findings (Verbose Error Handling, path disclosure, info leakage): "
-            "you MUST independently evaluate whether the matched text is causally connected to an "
-            "actual error condition. If the match appears only in reflected payload text, navigation "
-            "HTML, or normal page content, you may raise false_positive_probability accordingly.\n"
-            "- For structural findings (missing headers, GET credentials, TLS issues, admin paths), "
-            "the finding itself IS the proof - do NOT mark these as false positives.\n"
-            "- Focus your analysis on remediation specificity, business_impact depth, and "
-            "exploitability_reasoning quality.\n"
-            "- Do NOT invent evidence. If a proof marker is absent, say so in false_positive_reasoning.\n\n"
+            "Each finding's evidence_block includes a PROOF TYPE that tells you what kind "
+            "of evidence demonstrates the vulnerability. Judge the PROOF itself, not the "
+            "detector's verdict:\n"
+            "- active_output / error_echo: the proof is IN the response (command output, "
+            "file contents, DB error string). This is undeniable — do NOT flag as FP.\n"
+            "- structural (missing headers, TLS, admin paths): the observation IS the proof. "
+            "Do NOT flag as FP.\n"
+            "- timing_strong: a large response delay matching the sleep argument is strong. "
+            "Only flag as FP if the delay could plausibly be network noise.\n"
+            "- auth_differential (access-control, IDOR, data exposure): a 200 response is NOT "
+            "proof. You MUST evaluate whether the data is genuinely restricted. If anonymous "
+            "and authenticated responses are identical with no secret fields, the endpoint is "
+            "PUBLIC by design — raise false_positive_probability (this is a false positive).\n"
+            "- pattern_match (verbose error, credential disclosure): a regex hit is NOT proof. "
+            "You MUST evaluate whether the matched text is a genuine error or reflected payload "
+            "/ normal content. If the match is the injected payload echoed back, raise "
+            "false_positive_probability.\n"
+            "- Use the JUDGE THIS question in each evidence_block as your primary criterion.\n"
+            "- Do NOT invent evidence. If a proof marker is absent, say so in "
+            "false_positive_reasoning.\n\n"
         )
 
         # KEY CHANGE 3: Explicit schema with value constraints + anchoring to evidence
@@ -1483,7 +1511,79 @@ class ScanOrchestrator:
                 + "\n".join(vuln_descriptions)
             )
         
-    def _get_fallback_for(self, vuln_type: str, tech_stack: list['TechnologyComponent'] = None) -> dict:
+    async def _enrich_tech_from_errors(self, scan, findings: list) -> None:
+        """Add technologies revealed by error responses to ``scan.technology_stack``.
+
+        Harvests error/stack-trace text from the findings the detectors produced
+        (source-agnostic: any finding that captured an error contributes), maps
+        it to named technologies + versions via the generic error-signature table,
+        merges into the existing stack (filling versions for entries that lacked
+        one), CVE-enriches only the newly discovered components, and appends them.
+        """
+        # 1. Harvest candidate error text from finding evidence fields.
+        texts: list[str] = []
+        for f in findings or []:
+            for attr in ("verification_response_snippet", "evidence"):
+                val = getattr(f, attr, None)
+                if isinstance(val, str) and val:
+                    texts.append(val)
+            det_ev = getattr(f, "detection_evidence", None)
+            if isinstance(det_ev, dict):
+                for v in det_ev.values():
+                    if isinstance(v, str) and v:
+                        texts.append(v)
+        if not texts:
+            return
+
+        # 2. Fingerprint from error text (+ the same text through the markup engine,
+        #    cheaply, in case a normal-markup pattern such as an error-page banner hits).
+        discovered = list(error_fingerprints.match_error_evidence(texts))
+        try:
+            from app.integrations.wappalyzer_engine import Evidence as _TechEvidence, match as engine_match
+
+            markup_hits = engine_match(_TechEvidence(html="\n".join(texts)))
+            discovered.extend(markup_hits)
+        except Exception as exc:
+            logger.debug("markup re-match on error text failed: %s", exc)
+
+        if not discovered:
+            return
+
+        # 3. Merge into the existing stack: skip known names, back-fill missing versions.
+        existing = {c.name.lower(): c for c in (scan.technology_stack or [])}
+        new_components: list[TechnologyComponent] = []
+        seen_new: set[str] = set()
+        for comp in discovered:
+            key = comp.name.lower()
+            if key in existing:
+                if comp.version and not existing[key].version:
+                    existing[key].version = comp.version
+                continue
+            if key in seen_new:
+                continue
+            seen_new.add(key)
+            new_components.append(
+                TechnologyComponent(name=comp.name, version=comp.version, category=comp.category)
+            )
+
+        if not new_components:
+            return
+
+        # 4. CVE-enrich only the newly discovered components, then append.
+        try:
+            enriched = await self.cve_service.enrich_components(new_components)
+        except Exception as exc:
+            logger.debug("CVE enrichment of error-derived components failed: %s", exc)
+            enriched = new_components
+
+        scan.technology_stack = list(scan.technology_stack or []) + enriched
+        logger.info(
+            "error-based tech enrichment: +%d component(s) [%s]",
+            len(enriched),
+            ", ".join(f"{c.name}{'/' + c.version if c.version else ''}" for c in enriched),
+        )
+
+    def _get_fallback_for(self, vuln_type: str, tech_stack: list['TechnologyComponent'] = None, *, proof_type: str = "heuristic") -> dict:
         remediation = "Apply defense-in-depth controls appropriate to this vulnerability class."
         for key, value in self._remediation_fallbacks.items():
             if key.lower() in vuln_type.lower() or vuln_type.lower() in key.lower():
@@ -1515,11 +1615,19 @@ class ScanOrchestrator:
                 remediation = "Use csurf middleware."
             elif "spring" in stack_names or "java" in stack_names:
                 remediation = "Enable Spring Security CSRF protection."
+
+        # Fallback FP probability varies by proof type — when the AI doesn't
+        # provide a value, the fallback should reflect the proof's reliability.
+        # Undeniable proof types get low FP; interpretive types get high FP
+        # (needs_review) since without AI judgment we can't confirm them.
+        _undeniable = {"active_output", "error_echo", "structural", "timing_strong"}
+        fallback_fp = 0.1 if proof_type in _undeniable else 0.4
+
         return {
             "exploitability": "Medium",
             "business_impact": f"Potential security impact from {vuln_type or 'this issue'}.",
             "confidence": 0.8,
-            "false_positive_probability": 0.1,
+            "false_positive_probability": fallback_fp,
             "remediation": remediation,
         }
 
