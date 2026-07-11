@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     ai_timeout_seconds: float = Field(default=120.0, alias="AI_TIMEOUT_SECONDS")
     ai_max_retries: int = Field(default=3, alias="AI_MAX_RETRIES")
     ai_batch_size: int = Field(default=1, alias="AI_BATCH_SIZE")
+    # Master switch for AI/LLM analysis. When False, the scanner and report
+    # generator skip all LLM calls and populate findings with deterministic
+    # fallbacks (faster, no model needed). Useful for CI/tests or offline runs.
+    ai_analysis_enabled: bool = Field(default=True, alias="AI_ANALYSIS_ENABLED")
     # Send response_format={"type":"json_object"} (OpenAI JSON mode). Most
     # providers support this; disable if yours rejects it — the client still
     # extracts JSON from plain text.

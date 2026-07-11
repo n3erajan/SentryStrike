@@ -1235,11 +1235,49 @@ class ScanOrchestrator:
             raise asyncio.CancelledError
 
     async def _analyze_all_findings(self, vulnerabilities: list[Vulnerability], scan: 'Scan') -> list[Vulnerability]:
-            """Analyze findings with AI using optimised local model constraints."""
+            """Analyze findings with AI using optimised local model constraints.
+
+            When ``ai_analysis_enabled`` is False, the LLM is skipped entirely —
+            each finding is populated from deterministic fallbacks (evidence
+            grade, calibrated exploitability, framework-aware remediation).
+            The resulting vulnerabilities have ``ai_analysis_status=skipped``.
+            """
             if not vulnerabilities:
                 return vulnerabilities
 
-            BATCH_SIZE = get_settings().ai_batch_size
+            settings = get_settings()
+            if not settings.ai_analysis_enabled:
+                logger.info(
+                    "AI analysis disabled (AI_ANALYSIS_ENABLED=false); "
+                    "populating %d finding(s) with deterministic fallbacks",
+                    len(vulnerabilities),
+                )
+                for vuln in vulnerabilities:
+                    grade = self.evidence_grader.grade(vuln)
+                    fallback = self._get_fallback_for(
+                        vuln.vuln_type, scan.technology_stack, proof_type=grade.proof_type
+                    )
+                    req_snippet = (vuln.evidence.request_snippet or "").lower()
+                    requires_auth = "cookie" in req_snippet or "authorization" in req_snippet
+                    cvss = CvssCalculator.from_vulnerability_context(
+                        vuln_type=vuln.vuln_type,
+                        requires_auth=requires_auth,
+                        confidence=fallback["confidence"],
+                        impact=0.9 if vuln.severity.value in {"Critical", "High"} else 0.5,
+                    )
+                    vuln.cvss_score = cvss.score
+                    vuln.cvss_vector = cvss.vector
+                    vuln.ai_analysis.exploitability = normalize_exploitability(fallback["exploitability"])
+                    vuln.ai_analysis.business_impact = fallback["business_impact"]
+                    vuln.ai_analysis.false_positive_probability = fallback["false_positive_probability"]
+                    vuln.ai_analysis.evidence_grade = grade.grade
+                    vuln.ai_analysis.evidence_grade_reason = grade.reason
+                    vuln.ai_analysis.remediation = fallback["remediation"]
+                    vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
+                    vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.skipped
+                return vulnerabilities
+
+            BATCH_SIZE = settings.ai_batch_size
             analyzed: list[Vulnerability] = []
 
             tech_stack_str = ", ".join(t.name for t in scan.technology_stack) if scan.technology_stack else "Unknown"
