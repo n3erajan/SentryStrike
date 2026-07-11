@@ -356,6 +356,7 @@ async def test_idor_baseline_never_fires_destructive_method():
 # ---------------------------------------------------------------------------
 from app.core.detectors.access_control import _MatrixTarget, _ResponseProfile  # noqa: E402
 from app.core.detectors.attack_surface import PreparedAttackRequest as _PAR  # noqa: E402
+from app.models.vulnerability import OwaspCategory  # noqa: E402
 
 
 def _profile(sensitive=frozenset(), identifiers=frozenset(), item_count=0, secret=frozenset()):
@@ -409,6 +410,105 @@ def test_admin_like_url_alone_is_not_data_exposure():
     assert det._profile_exposes_nonpublic_data(
         scoped, _profile(identifiers=frozenset({"id=1"}))
     ) is True
+
+
+# ---------------------------------------------------------------------------
+# Cross-identity broken object-level authorization (Phase 4, mass exposure)
+#
+# An object-scoped request (an id names ONE record) that is denied to anonymous
+# callers but returns the SAME substantive record to two DISTINCT authenticated
+# identities is not scoped to its owner: any authenticated user reads another
+# user's object. The id-mutation path drops this (identical values look like a
+# "generic template" under val_sim==1.0); the matrix consumes {unauth, low,
+# second} directly. Generic — keyed on structure, never a Juice Shop path.
+# ---------------------------------------------------------------------------
+
+_BASKET_6 = json.dumps({"id": 6, "userId": 42, "email": "victim@test", "items": ["a", "b"]})
+_BASKET_7 = json.dumps({"id": 7, "userId": 99, "email": "other@test", "items": ["c"]})
+
+
+async def _run_matrix_target(target, *, unauth, low, second, privileged=None):
+    d = AccessControlDetector()
+    return await d._verify_matrix_target(
+        target,
+        _V(default=unauth),
+        _V(default=low),
+        _V(default=second) if second is not None else None,
+        _V(default=privileged) if privileged is not None else None,
+    )
+
+
+def _object_target(url="https://t.test/rest/basket/6", method="GET"):
+    return _MatrixTarget(
+        request=_PAR(url=url, method=method),
+        source="api_endpoint",
+        has_object_reference=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cross_identity_object_exposure_is_flagged():
+    # unauth blocked (401); two DISTINCT identities receive the SAME object -> BOLA.
+    findings = await _run_matrix_target(
+        _object_target(),
+        unauth=(401, '{"error":"unauthorized"}'),
+        low=(200, _BASKET_6),
+        second=(200, _BASKET_6),
+    )
+    hits = [f for f in findings if f.detection_method == "authorization_matrix_cross_identity"]
+    assert hits, "expected a cross-identity object-exposure finding"
+    assert hits[0].vuln_type == "Broken Object-Level Authorization"
+    assert hits[0].category == OwaspCategory.a01
+    assert hits[0].verified is True
+
+
+@pytest.mark.asyncio
+async def test_public_object_is_not_flagged():
+    # unauth already returns the object -> public by design, not an authz bypass.
+    findings = await _run_matrix_target(
+        _object_target(),
+        unauth=(200, _BASKET_6),
+        low=(200, _BASKET_6),
+        second=(200, _BASKET_6),
+    )
+    assert [f for f in findings if f.detection_method == "authorization_matrix_cross_identity"] == []
+
+
+@pytest.mark.asyncio
+async def test_distinct_objects_per_identity_are_not_flagged():
+    # Each identity gets its OWN (different) basket -> proper per-owner scoping.
+    findings = await _run_matrix_target(
+        _object_target(),
+        unauth=(401, '{"error":"unauthorized"}'),
+        low=(200, _BASKET_6),
+        second=(200, _BASKET_7),
+    )
+    assert [f for f in findings if f.detection_method == "authorization_matrix_cross_identity"] == []
+
+
+@pytest.mark.asyncio
+async def test_cross_identity_requires_second_identity():
+    # With no second identity, "same object to everyone" cannot be established.
+    findings = await _run_matrix_target(
+        _object_target(),
+        unauth=(401, '{"error":"unauthorized"}'),
+        low=(200, _BASKET_6),
+        second=None,
+    )
+    assert [f for f in findings if f.detection_method == "authorization_matrix_cross_identity"] == []
+
+
+@pytest.mark.asyncio
+async def test_cross_identity_ignores_error_body():
+    # A soft-200 error page carrying no real object data is not exposure.
+    err = '{"error":"not found"}'
+    findings = await _run_matrix_target(
+        _object_target(),
+        unauth=(401, '{"error":"unauthorized"}'),
+        low=(200, err),
+        second=(200, err),
+    )
+    assert [f for f in findings if f.detection_method == "authorization_matrix_cross_identity"] == []
 
 
 def test_credential_bearing_request_is_recognised_as_auth_endpoint():

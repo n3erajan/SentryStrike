@@ -27,6 +27,7 @@ from app.core.detectors.sql_injection import SQLInjectionDetector
 from app.core.detectors.supply_chain import SupplyChainDetector
 from app.core.detectors.xss_detector import XSSDetector
 from app.core.detectors.command_injection import CommandInjectionDetector
+from app.core.detectors.nosql_injection import NoSqlInjectionDetector
 from app.core.detectors.file_inclusion import FileInclusionDetector
 from app.core.detectors.file_upload import FileUploadDetector
 from app.core.detectors.csrf_detector import CSRFDetector
@@ -78,6 +79,7 @@ ATTACK_SURFACE_BACKED_DETECTORS = frozenset(
     {
         "access_control",
         "injection_sql_command",
+        "nosql_injection",
         "xss",
         "file_inclusion",
         "ssrf",
@@ -120,6 +122,7 @@ class ScanOrchestrator:
             AuthenticationFailuresDetector(),
             ExceptionHandlingDetector(),
             CommandInjectionDetector(),
+            NoSqlInjectionDetector(),
             FileInclusionDetector(),
             CSRFDetector(),
             SSRFDetector(),
@@ -360,6 +363,13 @@ class ScanOrchestrator:
                 session_cookies=getattr(crawl_result, "session_cookies", {}),
             )
             scan.technology_stack = await self.cve_service.enrich_components(technologies)
+            # Back-fill component versions from ecosystem-standard manifests and
+            # version-bearing headers so the supply-chain gate can emit true A03
+            # findings. Best-effort: never fail the scan over version enrichment.
+            try:
+                await self._enrich_tech_from_manifests(scan, crawl_result)
+            except Exception as exc:
+                logger.debug("manifest/header version enrichment failed: %s", exc)
             await self._set_progress(scan, 35, ScanPhase.technology_detection, f"Technology analysis complete: {len(scan.technology_stack)} component(s) identified")
             await self._check_cancelled(scan_id)
 
@@ -742,6 +752,9 @@ class ScanOrchestrator:
 
             scan.report_metadata.detector_coverage = detector_metrics
             self._log_detector_coverage(detector_metrics)
+            scan.report_metadata.coverage_warnings.extend(
+                self._detector_coverage_warnings(detector_metrics)
+            )
 
             # PHASE 1: Detect all vulnerabilities
             redaction_secrets = self._collect_redaction_secrets(submitted_accounts)
@@ -1087,6 +1100,7 @@ class ScanOrchestrator:
             "authentication_failures": ("authentication_failures", "auth"),
             "file_inclusion": ("file_inclusion", "lfi", "rfi"),
             "injection_sql_command": ("injection_sql_command", "sqli"),
+            "nosql_injection": ("nosql_injection", "nosqli"),
         }
         return aliases.get(detector_name, (detector_name,))
 
@@ -1164,6 +1178,37 @@ class ScanOrchestrator:
                 metric.body_targets_skipped_by_reason,
                 metric.skipped_reasons,
             )
+
+    def _detector_coverage_warnings(
+        self, detector_metrics: list[DetectorCoverageMetric]
+    ) -> list[str]:
+        """Surface 0-request detectors as explicit coverage warnings.
+
+        A detector that built candidates but sent 0 requests represents a silent
+        coverage gap — either every candidate was filtered, the budget governor
+        denied everything, or a structural prerequisite was missing. Each of
+        these is already recorded in ``skipped_reasons``; this method lifts the
+        gap to a top-level ``coverage_warning`` so an operator reading the report
+        sees it without drilling into per-detector metrics. Detectors that built
+        0 candidates are not warned here (no gap — there was nothing to test).
+        """
+        warnings: list[str] = []
+        for metric in detector_metrics:
+            if metric.candidates_built > 0 and metric.requests_sent == 0:
+                # Prefer the most informative skip reason when available.
+                reason = (
+                    ", ".join(
+                        f"{k}={v}" for k, v in metric.skipped_reasons.items() if v
+                    )
+                    or "no requests dispatched"
+                )
+                warnings.append(
+                    f"detector '{metric.detector}' built {metric.candidates_built} "
+                    f"candidate(s) but sent 0 requests ({reason}); "
+                    "coverage gap — findings for this class are absent by design, "
+                    "not by confirmation."
+                )
+        return warnings
 
     async def _set_progress(
         self,
@@ -1581,6 +1626,92 @@ class ScanOrchestrator:
             "error-based tech enrichment: +%d component(s) [%s]",
             len(enriched),
             ", ".join(f"{c.name}{'/' + c.version if c.version else ''}" for c in enriched),
+        )
+
+    async def _enrich_tech_from_manifests(self, scan, crawl_result) -> None:
+        """Back-fill component *versions* from manifests and version headers.
+
+        The supply-chain gate needs a version before it can emit an A03 finding.
+        Header/HTML/runtime fingerprinting names technologies but rarely versions
+        them; this harvests the version-bearing surfaces most apps expose —
+        ecosystem-standard package manifests/lockfiles and ``Server`` /
+        ``X-Powered-By`` / ``X-AspNet-Version`` headers — via the generic
+        :mod:`app.integrations.version_probe`.
+
+        Merge semantics mirror :meth:`_enrich_tech_from_errors`: back-fill a
+        missing version onto an existing component, add a genuinely-new versioned
+        component, never overwrite an existing version. Unlike the error path,
+        an existing component whose version *newly resolves* is re-sent to CVE
+        enrichment, because the version determines which CVEs apply.
+        """
+        from app.integrations import version_probe
+        from app.utils.scan_http import build_scan_headers, create_scan_client
+
+        existing_names = [c.name for c in (scan.technology_stack or [])]
+
+        # 1. Version-bearing response headers already captured during the crawl.
+        header_map: dict[str, str] = {}
+        for obs in getattr(crawl_result, "requests", []) or []:
+            for hname, hval in (getattr(obs, "response_headers", {}) or {}).items():
+                header_map.setdefault(str(hname).lower(), str(hval))
+        discovered = list(version_probe.extract_header_versions(header_map))
+
+        # 2. Ecosystem-standard manifests, bounded + only for detected ecosystems.
+        try:
+            auth_headers = getattr(crawl_result, "auth_headers", {}) or {}
+            session_cookies = getattr(crawl_result, "session_cookies", {}) or {}
+            async with create_scan_client(
+                headers=build_scan_headers(auth_headers),
+                cookies=session_cookies or None,
+                follow_redirects=True,
+            ) as client:
+                discovered.extend(
+                    await version_probe.probe_versions(scan.target_url, client, existing_names)
+                )
+        except Exception as exc:
+            logger.debug("manifest version probe failed: %s", exc)
+
+        if not discovered:
+            return
+
+        # 3. Merge: back-fill versions, collect new versioned components, and
+        #    track existing components whose version newly resolved.
+        existing = {c.name.lower(): c for c in (scan.technology_stack or [])}
+        new_components: list[TechnologyComponent] = []
+        resolved_existing: list[TechnologyComponent] = []
+        seen_new: dict[str, TechnologyComponent] = {}
+        for comp in discovered:
+            if not comp.version:
+                continue
+            key = comp.name.lower()
+            if key in existing:
+                if not existing[key].version:
+                    existing[key].version = comp.version
+                    resolved_existing.append(existing[key])
+                continue
+            if key in seen_new:
+                continue
+            new = TechnologyComponent(name=comp.name, version=comp.version, category=comp.category)
+            seen_new[key] = new
+            new_components.append(new)
+
+        to_enrich = resolved_existing + new_components
+        if not to_enrich:
+            return
+
+        # 4. CVE-enrich everything whose version newly resolved (existing + new).
+        try:
+            await self.cve_service.enrich_components(to_enrich)
+        except Exception as exc:
+            logger.debug("CVE enrichment of manifest-derived components failed: %s", exc)
+
+        if new_components:
+            scan.technology_stack = list(scan.technology_stack or []) + new_components
+        logger.info(
+            "manifest/header version enrichment: %d version(s) resolved, +%d new component(s) [%s]",
+            len(resolved_existing),
+            len(new_components),
+            ", ".join(f"{c.name}{'/' + c.version if c.version else ''}" for c in to_enrich),
         )
 
     def _get_fallback_for(self, vuln_type: str, tech_stack: list['TechnologyComponent'] = None, *, proof_type: str = "heuristic") -> dict:

@@ -195,7 +195,11 @@ def _load_db() -> tuple[dict[str, _CompiledTech], int]:
         logger.warning("Fingerprint DB missing at %s; run scripts/update_fingerprints.py", tech_path)
         return {}, 0
 
-    raw_techs = json.loads(tech_path.read_text(encoding="utf-8"))
+    # Tolerate trailing junk after the JSON object (a corrupt regeneration once
+    # appended stray bytes, which made the whole DB fail to load): decode just
+    # the leading JSON document and ignore anything after it. ``lstrip`` mirrors
+    # ``json.loads``'s leading-whitespace tolerance, which ``raw_decode`` lacks.
+    raw_techs, _ = json.JSONDecoder().raw_decode(tech_path.read_text(encoding="utf-8").lstrip())
     categories = json.loads(cat_path.read_text(encoding="utf-8")) if cat_path.exists() else {}
 
     compiled: dict[str, _CompiledTech] = {}

@@ -15,7 +15,7 @@ names, or payloads. Values are percent-decoded before matching so that
 from __future__ import annotations
 
 import re
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 # --- Name allowlists (the "name half" of name-OR-value) -------------------
 #
@@ -212,3 +212,140 @@ def ssrf_candidate(name: object, value: object) -> bool:
     if _name_matches(name, SSRF_NAME_TOKENS, SSRF_NAME_SUBSTRINGS):
         return True
     return looks_like_url(value)
+
+
+# --- Command injection (name OR value OR endpoint-context) -----------------
+#
+# Command injection has no reliable value shape (blind cmdi runs on any string),
+# so name/value/context are all *positive* signals; the detector adds a
+# replayable-timing fallback on top. These token sets are the single source of
+# truth (they mirror the sets the detector previously carried inline).
+
+COMMAND_NAME_TOKENS = frozenset(
+    {
+        "ip", "host", "cmd", "exec", "ping", "command", "run", "args", "query",
+        "target", "addr", "address", "domain", "server", "destination", "uri",
+        "url",
+    }
+)
+COMMAND_NAME_SUBSTRINGS = ("cmd", "command", "exec", "run", "shell", "ping")
+
+# Endpoint-context selection: a generic param name (``target``/``host``/…) on an
+# endpoint whose *path* names a network/diagnostic action is a command sink.
+COMMAND_CONTEXT_PATH_TOKENS = frozenset(
+    {
+        "ping", "trace", "traceroute", "lookup", "nslookup", "dns", "whois",
+        "network", "diagnostic", "command", "exec", "shell", "run", "proxy",
+        "connect",
+    }
+)
+COMMAND_CONTEXT_PARAM_TOKENS = frozenset(
+    {
+        "target", "value", "input", "query", "host", "ip", "addr", "address",
+        "domain", "server", "destination", "url", "uri",
+    }
+)
+
+_SHELL_METACHARS = (";", "|", "&", "$", "`", ">", "<", "\n")
+
+
+def looks_like_command_value(value: object) -> bool:
+    """True when a value already carries shell metacharacters or a host/IP.
+
+    Command sinks take shell strings and host/IP arguments (``ping``/``nslookup``/
+    ``curl``). A baseline value that already contains a shell metacharacter, or
+    that looks like a URL/host, is a positive command-injection signal.
+    """
+    decoded = _decode(value)
+    if not decoded:
+        return False
+    if any(ch in decoded for ch in _SHELL_METACHARS):
+        return True
+    return looks_like_url(decoded)
+
+
+def is_opaque_timing_value(value: object) -> bool:
+    """True when a value is a substantive opaque string worth a blind-timing probe.
+
+    The command-injection timing fallback fires against *any* replayable param
+    (blind cmdi has no value shape), but skips values that make poor probes:
+    empty/one-char strings, booleans/nulls, and bare numeric ids (which mostly
+    add 404/validation noise).
+    """
+    text = str(value if value is not None else "").strip()
+    if len(text) < 2:
+        return False
+    if text.lower() in ("true", "false", "null", "none", "nan"):
+        return False
+    if re.fullmatch(r"\d+", text):
+        return False
+    return True
+
+
+def _url_path_tokens(url: object) -> set[str]:
+    try:
+        path = urlparse(str(url or "")).path.lower()
+    except Exception:
+        return set()
+    return {token for token in path.replace("-", "/").replace("_", "/").split("/") if token}
+
+
+def _command_context_predicate(name: object, value: object, url: object) -> bool:
+    if str(name or "").lower() not in COMMAND_CONTEXT_PARAM_TOKENS:
+        return False
+    return not _url_path_tokens(url).isdisjoint(COMMAND_CONTEXT_PATH_TOKENS)
+
+
+def select(
+    name: object,
+    value: object,
+    url: object = "",
+    *,
+    name_tokens: frozenset[str] = frozenset(),
+    name_substrings: tuple[str, ...] = (),
+    value_predicates: tuple = (),
+    context_predicates: tuple = (),
+) -> bool:
+    """Generic name-OR-value-OR-context candidate selection.
+
+    Qualifies a parameter when **any** of:
+      * its name matches ``name_tokens`` / ``name_substrings``,
+      * any ``value_predicates`` callable ``(value) -> bool`` accepts its value,
+      * any ``context_predicates`` callable ``(name, value, url) -> bool`` accepts it.
+
+    Pure and framework-agnostic; predicate errors are swallowed so one bad
+    predicate can never drop a candidate.
+    """
+    if _name_matches(name, name_tokens, name_substrings):
+        return True
+    for predicate in value_predicates:
+        try:
+            if predicate(value):
+                return True
+        except Exception:
+            pass
+    for predicate in context_predicates:
+        try:
+            if predicate(name, value, url):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def command_candidate(name: object, value: object, url: object = "") -> bool:
+    """Select a parameter for command-injection testing (positive signals only).
+
+    Qualifies on a command-token name, a shell/host-shaped value, or a
+    diagnostic endpoint context. The detector layers a replayable-timing
+    fallback on top for blind command injection (which has no value shape).
+    """
+    return select(
+        name,
+        value,
+        url,
+        name_tokens=COMMAND_NAME_TOKENS,
+        name_substrings=COMMAND_NAME_SUBSTRINGS,
+        value_predicates=(looks_like_command_value,),
+        context_predicates=(_command_context_predicate,),
+    )

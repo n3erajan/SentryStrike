@@ -350,6 +350,195 @@ async def test_bearer_token_reuse_after_logout_is_reported_when_replay_still_suc
     assert any(f.vuln_type == "Bearer Token Accepted After Logout" for f in findings)
 
 
+@pytest.mark.asyncio
+async def test_password_change_enforcement_probe_flags_when_current_password_ignored():
+    """When a change-password body HAS a current-password field, the probe omits it
+    and flags if the server still applies the change (no enforcement)."""
+    detector = AuthenticationFailuresDetector()
+    request = RequestObservation(
+        url="https://example.test/api/account/change-password",
+        method="POST",
+        request_headers={"content-type": "application/json"},
+        post_data='{"currentPassword":"old-pass","newPassword":"new-pass","confirmPassword":"new-pass"}',
+    )
+    sent_bodies: list[dict] = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        sent_bodies.append(kwargs.get("json_body"))
+        return ResponseData(
+            200, {"content-type": "application/json"},
+            '{"success":true,"message":"password changed"}', 5.0,
+            request_snippet=f"{method} {url}", response_snippet="HTTP/1.1 200 OK",
+        )
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[], forms=[], requests=[request],
+            auth_headers={"Authorization": "Bearer low-user-token"},
+        )
+
+    assert any(f.vuln_type == "Password Change API Does Not Enforce Current Password" for f in findings)
+    # The current-password field was actually stripped from the replayed body.
+    assert sent_bodies and "currentPassword" not in sent_bodies[0]
+    assert "newPassword" in sent_bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_password_change_enforcement_probe_no_finding_when_rejected():
+    detector = AuthenticationFailuresDetector()
+    request = RequestObservation(
+        url="https://example.test/api/account/change-password",
+        method="POST",
+        request_headers={"content-type": "application/json"},
+        post_data='{"currentPassword":"old-pass","newPassword":"new-pass"}',
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        return ResponseData(
+            400, {"content-type": "application/json"},
+            '{"error":"current password required"}', 5.0,
+        )
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[], forms=[], requests=[request],
+            auth_headers={"Authorization": "Bearer low-user-token"},
+        )
+
+    assert not any(f.vuln_type == "Password Change API Does Not Enforce Current Password" for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_security_question_weak_recovery_is_flagged():
+    """A reset flow gated only on a security-answer field (no token/OTP) is flagged
+    as weak recovery — a structural finding, no answer is guessed."""
+    detector = AuthenticationFailuresDetector()
+    endpoint = ApiEndpoint(
+        url="https://example.test/api/password/reset",
+        method="POST",
+        request_body={"email": "a@b.test", "securityAnswer": "blue", "newPassword": "x"},
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        # Reject the token-enforcement probe so only the structural finding remains.
+        return ResponseData(400, {"content-type": "application/json"}, '{"error":"invalid"}', 5.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(urls=[], forms=[], api_endpoints=[endpoint])
+
+    assert any(
+        f.vuln_type == "Password Reset Relies on Security Question (Weak Recovery)"
+        for f in findings
+    )
+
+
+@pytest.mark.asyncio
+async def test_security_question_not_flagged_when_token_present():
+    detector = AuthenticationFailuresDetector()
+    endpoint = ApiEndpoint(
+        url="https://example.test/api/password/reset",
+        method="POST",
+        request_body={"securityAnswer": "blue", "newPassword": "x", "resetToken": "abc123"},
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        return ResponseData(400, {"content-type": "application/json"}, '{"error":"invalid"}', 5.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(urls=[], forms=[], api_endpoints=[endpoint])
+
+    assert not any(
+        f.vuln_type == "Password Reset Relies on Security Question (Weak Recovery)"
+        for f in findings
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_jwt_forgery_flagged_when_forged_token_accepted():
+    """Forged alg=none token accepted by a bearer-protected endpoint → verified."""
+    real = _jwt({"alg": "HS256", "typ": "JWT"}, {"sub": "u", "role": "user", "exp": int(time.time()) + 3600})
+    detector = AuthenticationFailuresDetector()
+    oracle_request = RequestObservation(
+        url="https://example.test/api/profile",
+        method="GET",
+        request_headers={"authorization": f"Bearer {real}"},
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase", "")
+        if phase == "jwt_forgery_noauth":
+            return ResponseData(401, {}, "Unauthorized", 5.0)
+        if phase == "jwt_forgery_baseline":
+            return ResponseData(200, {}, '{"user":"u"}', 5.0)
+        if phase == "jwt_forgery_attempt":
+            return ResponseData(200, {}, '{"user":"u"}', 5.0,
+                                request_snippet=f"{method} {url}", response_snippet="HTTP/1.1 200 OK")
+        return ResponseData(200, {}, "", 5.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[], forms=[], requests=[oracle_request],
+            auth_headers={"Authorization": f"Bearer {real}"},
+            root_url="https://example.test/",
+        )
+
+    forgery = [f for f in findings if f.vuln_type == "JWT alg=none Forgery Accepted"]
+    assert forgery, [f.vuln_type for f in findings]
+    assert forgery[0].verified is True
+    assert forgery[0].severity == SeverityLevel.critical
+
+
+@pytest.mark.asyncio
+async def test_active_jwt_forgery_not_flagged_when_forged_token_rejected():
+    real = _jwt({"alg": "HS256", "typ": "JWT"}, {"sub": "u", "exp": int(time.time()) + 3600})
+    detector = AuthenticationFailuresDetector()
+    oracle_request = RequestObservation(
+        url="https://example.test/api/profile",
+        method="GET",
+        request_headers={"authorization": f"Bearer {real}"},
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase", "")
+        if phase == "jwt_forgery_noauth":
+            return ResponseData(401, {}, "Unauthorized", 5.0)
+        if phase == "jwt_forgery_baseline":
+            return ResponseData(200, {}, '{"user":"u"}', 5.0)
+        if phase == "jwt_forgery_attempt":
+            return ResponseData(401, {}, "Unauthorized", 5.0)  # forged rejected
+        return ResponseData(200, {}, "", 5.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[], forms=[], requests=[oracle_request],
+            auth_headers={"Authorization": f"Bearer {real}"},
+            root_url="https://example.test/",
+        )
+
+    assert not any("Forgery Accepted" in f.vuln_type for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_active_jwt_forgery_requires_protected_oracle():
+    """No bearer-protected GET oracle observed → forgery test does not run."""
+    real = _jwt({"alg": "HS256", "typ": "JWT"}, {"sub": "u", "exp": int(time.time()) + 3600})
+    detector = AuthenticationFailuresDetector()
+    sent_phases: list[str] = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        sent_phases.append(kwargs.get("test_phase", ""))
+        return ResponseData(200, {}, "{}", 5.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        await detector.detect(
+            urls=[], forms=[],
+            auth_headers={"Authorization": f"Bearer {real}"},
+            root_url="https://example.test/",
+        )
+
+    assert not any(p.startswith("jwt_forgery") for p in sent_phases)
+
+
 def test_credential_disclosure_ignores_reflected_sql_query_echo() -> None:
     # A SQLi/LFI source finding surfaces a DB error that echoes the app's own
     # query (``... WHERE email = '<payload>' AND password = '<hash>' ...``). The

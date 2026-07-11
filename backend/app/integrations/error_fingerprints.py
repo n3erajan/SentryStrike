@@ -66,10 +66,14 @@ _SIGNATURES: list[_Sig] = [
     _Sig(r"MongoError|MongoServerError|E11000 duplicate key|BSONError|com\.mongodb", "MongoDB", "database"),
 
     # ---- ORMs / data-access layers (from stack file paths + error classes) ----
-    _Sig(r"node_modules[/\\]sequelize|Sequelize(?:Database|Validation|UniqueConstraint|Foreign|Connection)?Error", "Sequelize", "orm"),
-    _Sig(r"node_modules[/\\]typeorm|TypeORMError|QueryFailedError", "TypeORM", "orm"),
+    # pnpm lays packages out as ``node_modules/.pnpm/<pkg>@<version>/node_modules/<pkg>``,
+    # so a stack frame universally embeds the exact installed version of any npm
+    # dependency. That leading alternative captures it; the plain-npm and
+    # error-class alternatives keep existence-only detection working.
+    _Sig(r"node_modules[/\\]\.pnpm[/\\]sequelize@([0-9]+\.[0-9][0-9.]*)|node_modules[/\\]sequelize|Sequelize(?:Database|Validation|UniqueConstraint|Foreign|Connection)?Error", "Sequelize", "orm", 1),
+    _Sig(r"node_modules[/\\]\.pnpm[/\\]typeorm@([0-9]+\.[0-9][0-9.]*)|node_modules[/\\]typeorm|TypeORMError|QueryFailedError", "TypeORM", "orm", 1),
     _Sig(r"node_modules[/\\]@prisma|PrismaClient(?:Known|Unknown|Validation)?RequestError", "Prisma", "orm"),
-    _Sig(r"node_modules[/\\]mongoose|MongooseError|ValidatorError", "Mongoose", "orm"),
+    _Sig(r"node_modules[/\\]\.pnpm[/\\]mongoose@([0-9]+\.[0-9][0-9.]*)|node_modules[/\\]mongoose|MongooseError|ValidatorError", "Mongoose", "orm", 1),
     _Sig(r"org\.hibernate\.|HibernateException|LazyInitializationException", "Hibernate", "orm"),
     _Sig(r"sqlalchemy\.exc\.|site-packages[/\\]sqlalchemy", "SQLAlchemy", "orm"),
     _Sig(r"django\.db\.(?:utils|models)|django\.core\.exceptions\.(?:ObjectDoesNotExist|ValidationError)", "Django ORM", "orm"),
@@ -78,6 +82,11 @@ _SIGNATURES: list[_Sig] = [
 
     # ---- Languages / runtimes (from stack-frame grammar) ----
     _Sig(r"node:internal[/\\]|\bat process\.processTicksAndRejections\b|node_modules[/\\]", "Node.js", "language"),
+    # Node >=15 prints a ``Node.js v<version>`` banner at the tail of any
+    # unhandled-exception dump — a universal runtime marker. Kept as a separate
+    # signature so it back-fills the version even when an earlier stack frame
+    # already matched the existence-only Node.js signature above.
+    _Sig(r"Node\.js v([0-9]+\.[0-9][0-9.]*)", "Node.js", "language", 1),
     _Sig(r"Traceback \(most recent call last\)|site-packages[/\\]|File \"[^\"]+\", line \d+, in ", "Python", "language"),
     _Sig(r"\bat [\w.$]+\([\w.$]+\.java:\d+\)|Exception in thread \"|\bjava\.lang\.[A-Z]\w+Exception", "Java", "language"),
     _Sig(r"Fatal error:|Parse error:|\bStack trace:\n?#0|[/\\]vendor[/\\]composer[/\\]", "PHP", "language"),
@@ -86,7 +95,9 @@ _SIGNATURES: list[_Sig] = [
     _Sig(r"\bgoroutine \d+ \[|\b[\w./-]+\.go:\d+ \+0x|panic: ", "Go", "language"),
 
     # ---- Web frameworks (from error markup / trace signatures) ----
-    _Sig(r"node_modules[/\\]express[/\\]lib|at Layer\.handle \[as handle_request\]|at (?:Route|Router)\.(?:dispatch|handle)", "Express", "framework"),
+    # pnpm layout embeds the exact Express version in the stack file path; the
+    # remaining alternatives keep the existing existence-only markers.
+    _Sig(r"node_modules[/\\]\.pnpm[/\\]express@([0-9]+\.[0-9][0-9.]*)|node_modules[/\\]express[/\\]lib|at Layer\.handle \[as handle_request\]|at (?:Route|Router)\.(?:dispatch|handle)", "Express", "framework", 1),
     _Sig(r"Django Version:\s*([0-9]+\.[0-9][0-9.]*)", "Django", "framework", 1),
     _Sig(r"You're seeing this error because you have <code>DEBUG = True|django\.core\.handlers", "Django", "framework"),
     _Sig(r"\brails \(([0-9]+\.[0-9][0-9.]*)\)", "Ruby on Rails", "framework", 1),
@@ -127,15 +138,27 @@ def match_error_evidence(texts: list[str]) -> list[TechComponent]:
         if not text:
             continue
         for pattern, sig in _COMPILED:
-            m = pattern.search(text)
-            if not m:
-                continue
             version: str | None = None
+            matched = False
             if sig.version_group is not None:
-                try:
-                    version = m.group(sig.version_group)
-                except (IndexError, re.error):
-                    version = None
+                # A signature may match at several offsets (e.g. an error-class
+                # name early, then a version-bearing file path later). Scan all
+                # non-overlapping matches and keep the first that actually
+                # captures a version, so leftmost existence markers never mask
+                # a version that the same technology reveals elsewhere.
+                for m in pattern.finditer(text):
+                    matched = True
+                    try:
+                        captured = m.group(sig.version_group)
+                    except (IndexError, re.error):
+                        captured = None
+                    if captured:
+                        version = captured
+                        break
+            else:
+                matched = pattern.search(text) is not None
+            if not matched:
+                continue
             existing = detected.get(sig.name)
             if existing is None:
                 detected[sig.name] = TechComponent(

@@ -149,15 +149,16 @@ class AttackSurface:
         filter_fn: Callable[[str], bool] | None = None,
     ) -> list[AttackTarget]:
         candidates = list(parameters or [])
+        urls_for_discovery = cls._with_translated_hash_routes(urls)
         if not candidates:
             candidates = ParamDiscovery.build_parameter_inventory(
-                urls,
+                urls_for_discovery,
                 forms,
-                filter_fn=filter_fn,
+                filter_fn=None,
                 api_endpoints=api_endpoints,
             )
         elif filter_fn:
-            candidates = [candidate for candidate in candidates if filter_fn(candidate.name)]
+            candidates = [candidate for candidate in candidates if cls._candidate_matches_filter(filter_fn, candidate)]
 
         endpoint_templates = cls._endpoint_templates(api_endpoints or [])
         endpoint_form_templates = cls._endpoint_form_templates(api_endpoints or [])
@@ -171,8 +172,16 @@ class AttackSurface:
             if cls._url_has_route_fragment(candidate.url):
                 # A hash-route URL (``/#/address/create``) never reaches the
                 # server as anything but ``/`` (the SPA shell); injecting into it
-                # tests static index.html. The real endpoint is captured via the
-                # observed ``/api/…`` XHR, which flows through as a separate target.
+                # tests static index.html. Also try the structurally-derived
+                # server path (``/#/x`` -> ``/x``) as a low-assumption candidate:
+                # this applies to any hash-routed SPA and never hardcodes an app.
+                translated = cls._translate_hash_route_to_server_url(candidate.url)
+                if not translated:
+                    continue
+                candidate = copy.copy(candidate)
+                candidate.url = translated
+                candidate.source = "derived_hash_route"
+            if filter_fn and not cls._candidate_matches_filter(filter_fn, candidate):
                 continue
             if cls._has_unresolved_path_placeholder(candidate.url) and not cls._candidate_resolves_own_path(candidate):
                 # A path-location candidate legitimately carries its own placeholder
@@ -250,7 +259,16 @@ class AttackSurface:
                     ]
                     content_type = "application/x-www-form-urlencoded"
                 for name, value in form_body.items():
-                    if filter_fn and not filter_fn(name):
+                    field_candidate = ParameterCandidate(
+                        name=name,
+                        location=ParameterLocation.form,
+                        url=request.url,
+                        method=request.method.upper(),
+                        baseline_value=value,
+                        source="browser_form_request",
+                        security_relevance=ApiExtractor.classify_parameter(name),
+                    )
+                    if filter_fn and not cls._candidate_matches_filter(filter_fn, field_candidate):
                         continue
                     key = (
                         request.url,
@@ -292,7 +310,7 @@ class AttackSurface:
                     headers=request.request_headers,
                 )
                 for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
-                    if filter_fn and not filter_fn(parameter.name):
+                    if filter_fn and not cls._candidate_matches_filter(filter_fn, parameter):
                         continue
                     key = (
                         parameter.url,
@@ -393,6 +411,65 @@ class AttackSurface:
             return False
         # Route fragments begin with ``/`` or ``!/`` (hashbang); ``#section`` does not.
         return fragment.startswith("/") or fragment.startswith("!/")
+
+    @staticmethod
+    def _translate_hash_route_to_server_url(url: str) -> str | None:
+        """Translate a SPA hash route into the equivalent server path candidate.
+
+        Fragments are not sent over HTTP, so ``https://host/#/ftp/legal.md`` only
+        requests ``/`` on the wire. The structural counterpart
+        ``https://host/ftp/legal.md`` is worth probing separately; this is generic
+        to hash routers and preserves query strings embedded in the route
+        fragment (``/#/search?q=x`` -> ``/search?q=x``). Bare anchors such as
+        ``#section`` are intentionally ignored.
+        """
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return None
+        fragment = parsed.fragment or ""
+        if fragment.startswith("!/"):
+            fragment = fragment[1:]
+        if not fragment.startswith("/"):
+            return None
+        route = urlparse(fragment)
+        path = route.path or "/"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        return urlunparse(
+            parsed._replace(
+                path=path,
+                params="",
+                query=route.query,
+                fragment="",
+            )
+        )
+
+    @classmethod
+    def _with_translated_hash_routes(cls, urls: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for url in urls:
+            for candidate in (url, cls._translate_hash_route_to_server_url(url)):
+                if not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                out.append(candidate)
+        return out
+
+    @staticmethod
+    def _candidate_matches_filter(filter_fn: Callable[[Any], bool] | None, candidate: ParameterCandidate) -> bool:
+        if filter_fn is None:
+            return True
+        try:
+            if bool(filter_fn(candidate)):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(filter_fn(candidate.name))
+        except Exception:
+            return False
 
     # Response keys (priority order) that carry a newly-created resource's id, and
     # a shape check for the id value. Purely structural — no app-specific names.
@@ -503,7 +580,7 @@ class AttackSurface:
                         ParameterLocation.graphql_variable,
                     }:
                         continue
-                    if filter_fn and not filter_fn(parameter.name):
+                    if filter_fn and not cls._candidate_matches_filter(filter_fn, parameter):
                         continue
                     key = (
                         parameter.url,
@@ -606,7 +683,7 @@ class AttackSurface:
                     ParameterLocation.graphql_variable,
                 }:
                     continue
-                if filter_fn and not filter_fn(parameter.name):
+                if filter_fn and not cls._candidate_matches_filter(filter_fn, parameter):
                     continue
                 key = (
                     parameter.url,
@@ -678,9 +755,9 @@ class AttackSurface:
                 # SPA clusters have no real ``action`` so this falls back to the
                 # route URL (``/#/address/create``). That fragment is stripped on
                 # the wire, so a POST here only hits the shell — the synthesized
-                # body tests nothing. Skip: the cluster's genuine value is the real
-                # XHR its live submit fires, which is captured via network
-                # observation and emitted as a proper ``/api/…`` target elsewhere.
+                # body tests nothing. Keep form-cluster robustness for Phase 9;
+                # Phase 3 translates discovered route URLs, not synthetic form
+                # submissions.
                 continue
             # A cluster submitted from an SPA is a mutation (login, register,
             # create). The DOM method defaults to GET on orphan clusters that have
@@ -699,7 +776,17 @@ class AttackSurface:
             template = {name: ApiExtractor._baseline_for_name(name) for name in field_names}
             emitted = 0
             for name in field_names:
-                if filter_fn and not filter_fn(name):
+                field_candidate = ParameterCandidate(
+                    name=name,
+                    location=ParameterLocation.json_body,
+                    url=url,
+                    method=method,
+                    baseline_value=template[name],
+                    parent_path=name,
+                    source="form_synth",
+                    security_relevance=ApiExtractor.classify_parameter(name),
+                )
+                if filter_fn and not cls._candidate_matches_filter(filter_fn, field_candidate):
                     continue
                 key = (url, method, name, ParameterLocation.json_body.value, name)
                 if key in seen:

@@ -130,6 +130,33 @@ def test_template_base_call_recovers_rest_path():
     assert any(u.endswith("/rest/user/reset-password") for u in urls)
 
 
+def test_javascript_url_string_literals_mine_restish_endpoints():
+    script = """
+        const imageUrl = "/profile/image/url";
+        const orderApi = "/b2b/v2/orders";
+        const icon = "/assets/logo.svg";
+    """
+
+    _, endpoints = ApiExtractor.extract_from_javascript("https://example.test/app.js", script)
+    urls = {endpoint.url for endpoint in endpoints}
+
+    assert "https://example.test/profile/image/url" in urls
+    assert "https://example.test/b2b/v2/orders" in urls
+    assert "https://example.test/assets/logo.svg" not in urls
+
+
+def test_javascript_url_string_derives_rest_parent_endpoint():
+    script = 'const userUrl = "/api/users/{userId}"; const byId = "/rest/orders/123";'
+
+    _, endpoints = ApiExtractor.extract_from_javascript("https://example.test/app.js", script)
+    urls = {endpoint.url for endpoint in endpoints}
+
+    assert "https://example.test/api/users/{userId}" in urls
+    assert "https://example.test/api/users" in urls
+    assert "https://example.test/rest/orders/123" in urls
+    assert "https://example.test/rest/orders" in urls
+
+
 def test_ambiguous_base_variable_is_not_resolved():
     """A base name bound to different literals in different scopes (the minified
     per-class field pattern) MUST NOT resolve — resolving it would fabricate

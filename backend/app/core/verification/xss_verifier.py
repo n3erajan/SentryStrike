@@ -1322,7 +1322,117 @@ class XSSVerifier(BaseVerifier):
             if result:
                 return result
 
+        # Browser-aware stored oracle: for SPA targets the HTTP-body oracle
+        # above cannot observe client-rendered stored XSS — the canary is stored
+        # in the database and rendered into the DOM by the SPA, but the display
+        # URL's HTTP body is raw JSON or the SPA shell, never executable HTML.
+        # Navigate the display URL in a real browser with canary hooks installed
+        # and confirm EXECUTION. Falls back to the HTTP check above when no
+        # browser is available (already handled — we only reach here on a clean
+        # HTTP negative). Reuses the existing Playwright plumbing from the DOM
+        # sweep: _new_reflection_context, _install_xss_browser_hooks,
+        # _browser_xss_fired.
+        if (
+            getattr(self, "spa_mode", False)
+            and PLAYWRIGHT_AVAILABLE
+            and canary
+        ):
+            browser_result = await self._browser_stored_execution_probe(
+                urls_to_probe + tier2, canary, origin_url=origin_url,
+            )
+            if browser_result is not None:
+                return browser_result
+
         return False, [], False, None, {}
+
+    async def _browser_stored_execution_probe(
+        self,
+        display_urls: list[str],
+        canary: str,
+        *,
+        origin_url: str = "",
+    ) -> Optional[tuple[bool, list[int], bool, Optional[object], dict]]:
+        """Navigate display URLs in a browser and confirm canary execution.
+
+        For SPA targets where the stored canary is rendered client-side, the
+        HTTP-body oracle cannot observe it. This reuses the existing Playwright
+        canary-hook machinery (also used by the DOM reflection sweep) to navigate
+        each display URL, let the SPA render the stored data, and assert on
+        canary EXECUTION rather than HTTP-body reflection.
+
+        Returns the same tuple shape as :meth:`_probe_stored` on confirmation,
+        or ``None`` when no display URL executed the canary. The reflection
+        evidence is marked ``browser_execution_confirmed=True`` so the downstream
+        finding logic emits a verified Stored XSS rather than an API-reflection
+        note. Bounded to a small number of display URLs and a short per-page
+        wait to keep cost near-zero when nothing fires.
+        """
+        if not display_urls or not canary:
+            return None
+
+        # Bound the browser fan-out: the highest-value stored sinks (comment
+        # walls, profile pages, product reviews) cluster in the first few
+        # display URLs; the rest are low-yield static assets already filtered
+        # by select_stored_probe_urls.
+        probe_urls = display_urls[:5]
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = None
+            try:
+                context = await self._new_reflection_context(
+                    browser, origin_url or (probe_urls[0] if probe_urls else ""),
+                    storage_state=getattr(self, "_auth_storage_state", None),
+                )
+                for probe_url in probe_urls:
+                    page = await context.new_page()
+                    try:
+                        await self._install_xss_browser_hooks(page, canary)
+                        # Navigate the display route; the SPA reads stored data
+                        # from its API and renders it into the DOM. If the
+                        # stored canary is in the rendered output and the
+                        # browser executes it, the hooked hooks fire.
+                        await page.goto(probe_url, wait_until="domcontentloaded", timeout=5000)
+                        # Give the SPA a beat to fetch its data and render.
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=3000)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.35)
+                        fired = bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page)
+                        if fired:
+                            evidence = {
+                                "browser_execution_confirmed": True,
+                                "verification_canary": canary,
+                                "display_url": probe_url,
+                            }
+                            # The HTTP response object isn't the confirmation
+                            # medium here; synthesise a minimal carrier so the
+                            # downstream finding logic has a body to analyse.
+                            carrier = ResponseData(
+                                status_code=200,
+                                headers={},
+                                body=f"<stored xss canary={canary} executed in browser>",
+                                response_time_ms=0.0,
+                                request_snippet=f"GET {probe_url}",
+                                response_snippet=f"browser execution confirmed (canary={canary})",
+                            )
+                            return True, [0], False, carrier, evidence
+                    except Exception as exc:
+                        logger.debug("Browser stored-XSS probe failed for %s: %s", probe_url, exc)
+                    finally:
+                        if not page.is_closed():
+                            await page.close()
+            except Exception as exc:
+                logger.debug("Browser stored-XSS execution probe aborted: %s", exc)
+            finally:
+                if context is not None:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                await browser.close()
+        return None
 
     @staticmethod
     def _detect_reflection(payload: str, body: str) -> tuple[bool, list[int], bool]:

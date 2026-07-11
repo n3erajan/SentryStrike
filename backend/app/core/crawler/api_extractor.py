@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
-from urllib.parse import parse_qs, parse_qsl, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlparse, urlunparse
 
 from app.core.crawler.models import ApiEndpoint, ParameterCandidate, ParameterLocation, RouteSource
 from app.core.crawler.url_parser import normalize_url
@@ -20,6 +20,7 @@ class ApiExtractor:
         r"""(?P<quote>["'`])(?P<path>(?:api|graphql|gql|rest|v[0-9]+|rpc|trpc|auth|oauth|session)/(?:[^"'`\s<>]+))(?P=quote)""",
         re.I,
     )
+    URL_STRING_RE = re.compile(r"""(?P<quote>["'`])(?P<path>/[^"'`\s<>]+)(?P=quote)""")
     FETCH_RE = re.compile(
         r"""(?:(?P<axios>axios)\.(?P<axios_method>get|post|put|patch|delete)|fetch|\.(?P<chain_method>get|post|put|patch|delete))\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""",
         re.I,
@@ -144,6 +145,15 @@ class ApiExtractor:
         for match in cls.RELATIVE_API_PATH_RE.finditer(script_text):
             path = match.group("path")
             add_endpoint(f"/{path}", "POST" if cls._looks_state_changing(path) else "GET")
+
+        for match in cls.URL_STRING_RE.finditer(script_text):
+            path = match.group("path")
+            if not cls._looks_rest_string_path(path):
+                continue
+            add_endpoint(path, "POST" if cls._looks_state_changing(path) else "GET", evidence="js-url-string")
+            parent = cls._rest_parent_path(path)
+            if parent:
+                add_endpoint(parent, "GET", evidence="rest-parent")
 
         for match in cls.FETCH_RE.finditer(script_text):
             path = match.group("path")
@@ -484,6 +494,65 @@ class ApiExtractor:
                 "/orders",
             )
         )
+
+    _STATIC_PATH_EXTENSIONS = {
+        ".css", ".js", ".mjs", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+        ".webp", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".webm",
+        ".pdf", ".txt", ".html", ".htm",
+    }
+    _REST_PARENT_PARAM_RE = re.compile(
+        r"/(?:\{[A-Za-z_][A-Za-z0-9_]*\}|:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[0-9a-fA-F]{16,}|[0-9a-fA-F-]{32,})$"
+    )
+
+    @classmethod
+    def _looks_rest_string_path(cls, path: str) -> bool:
+        """True for server-testable URL string literals found in JS bundles.
+
+        This is deliberately structural: keep same-origin absolute paths that
+        look like REST/API surfaces, and skip assets, templates, and UI routes.
+        It catches endpoints such as ``/profile/image/url`` without hardcoding
+        app-specific paths.
+        """
+        if not path.startswith("/") or path.startswith("//"):
+            return False
+        if any(token in path for token in ("${", "*", " ")):
+            return False
+        parsed = urlparse(path)
+        lowered_path = parsed.path.lower()
+        if not lowered_path or lowered_path == "/":
+            return False
+        if lowered_path.endswith(tuple(cls._STATIC_PATH_EXTENSIONS)):
+            return False
+        segments = [segment for segment in lowered_path.split("/") if segment]
+        if not segments:
+            return False
+        if cls._looks_api_path(path):
+            return True
+        if any(re.fullmatch(r"v[0-9]+", segment) for segment in segments):
+            return True
+        if len(segments) >= 3 and all(cls._is_restish_segment(segment) for segment in segments):
+            return True
+        return False
+
+    @staticmethod
+    def _is_restish_segment(segment: str) -> bool:
+        if not segment:
+            return False
+        if segment.startswith((".", "#")):
+            return False
+        if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", segment):
+            return True
+        if re.fullmatch(r"\{[A-Za-z_][A-Za-z0-9_]*\}|:[A-Za-z_][A-Za-z0-9_]*", segment):
+            return True
+        return False
+
+    @classmethod
+    def _rest_parent_path(cls, path: str) -> str | None:
+        parsed = urlparse(path)
+        parent = cls._REST_PARENT_PARAM_RE.sub("", parsed.path.rstrip("/"))
+        if parent and parent != parsed.path.rstrip("/") and parent != "/":
+            return urlunparse(parsed._replace(path=parent, params="", query="", fragment=""))
+        return None
 
     @staticmethod
     def _placeholder_name(expr: str) -> str:

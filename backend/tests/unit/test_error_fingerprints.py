@@ -81,6 +81,19 @@ _CORPUS = {
         "(/app/node_modules/express/lib/router/layer.js:95:5)",
         {"Express", "Node.js"}, {},
     ),
+    "node-crash-banner": (
+        "Error: connect ECONNREFUSED 127.0.0.1:5432\n"
+        "    at TCPConnectWrap.afterConnect (node:net:1595:16)\n"
+        "Node.js v18.16.0",
+        {"Node.js"}, {"Node.js": "18.16.0"},
+    ),
+    "pnpm-express-sequelize": (
+        "SequelizeDatabaseError at Query.run "
+        "(/app/node_modules/.pnpm/sequelize@6.28.0/node_modules/sequelize/lib/query.js:50) "
+        "at Layer.handle_request "
+        "(/app/node_modules/.pnpm/express@4.18.2/node_modules/express/lib/router/layer.js:95)",
+        {"Sequelize", "Express"}, {"Sequelize": "6.28.0", "Express": "4.18.2"},
+    ),
 }
 
 

@@ -517,6 +517,7 @@ class AccessControlDetector(BaseDetector):
         ("isAdmin", True),
         ("admin", True),
         ("is_admin", True),
+        ("is_staff", True),
         ("permissions", ["admin"]),
     )
 
@@ -1251,6 +1252,64 @@ class AccessControlDetector(BaseDetector):
                     ),
                     confidence_score=92.0,
                     detection_method="authorization_matrix_privileged_baseline",
+                    detection_evidence=self._matrix_evidence(
+                        unauth_profile, low_profile, second_profile, privileged_profile, target
+                    ),
+                    verified=True,
+                    verification_request_snippet=low.request_snippet,
+                    verification_response_snippet=low.response_snippet,
+                    reproducible=True,
+                )
+            )
+
+        # BROKEN OBJECT-LEVEL AUTHORIZATION (cross-identity, framework-agnostic).
+        # An object-scoped request (an id names ONE record) that is denied to
+        # anonymous callers (401/403/login/redirect) but returns the SAME record
+        # to two DISTINCT authenticated identities is not scoped to its owner:
+        # any authenticated user can read another user's object. The id-mutation
+        # path deliberately drops this — identical values across identities look
+        # like a "generic template" under its val_sim==1.0 short-circuit — so the
+        # matrix consumes {unauth, low, second} directly, regardless of val_sim.
+        # The "same record to both" signal is value-level (shared stable object
+        # identifiers), so genuine per-owner objects (different ids per identity)
+        # do not fire. Complements the horizontal check above, which handles the
+        # non-object-scoped (list/collection) case.
+        unauth_denied = (
+            unauth_profile.status_code in (401, 403)
+            or 300 <= unauth_profile.status_code < 400
+            or _looks_like_login_page(unauth.body)
+        )
+        if (
+            second is not None
+            and second_profile is not None
+            and second_profile.success
+            and protected_low
+            and target.has_object_reference
+            and unauth_denied
+            and not is_auth_endpoint
+            and not _looks_like_error_page(low.body)
+            and self._profile_has_sensitive_data(low_profile)
+            and bool(self._shared_identifiers(low_profile, second_profile))
+        ):
+            shared = sorted(self._shared_identifiers(low_profile, second_profile))
+            findings.append(
+                Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Broken Object-Level Authorization",
+                    severity=SeverityLevel.high,
+                    url=request.url,
+                    parameter=target.parameter,
+                    method=request.method,
+                    evidence=(
+                        "API authorization matrix: an object-scoped resource denied to "
+                        f"anonymous callers (HTTP {unauth.status_code}) returned the same "
+                        "object identifiers to two distinct authenticated identities "
+                        f"(low HTTP {low.status_code}, second HTTP {second.status_code}). "
+                        f"Shared identifiers: {', '.join(shared) or 'none'}. "
+                        f"Sensitive fields: {', '.join(sorted(low_profile.sensitive_fields)) or 'none'}."
+                    ),
+                    confidence_score=85.0,
+                    detection_method="authorization_matrix_cross_identity",
                     detection_evidence=self._matrix_evidence(
                         unauth_profile, low_profile, second_profile, privileged_profile, target
                     ),

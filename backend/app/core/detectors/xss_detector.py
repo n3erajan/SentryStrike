@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from urllib.parse import urlsplit
 
 from app.config import get_settings
 from app.core.crawler.models import ParameterLocation
@@ -15,6 +16,60 @@ from app.core.verification.xss_verifier import (
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
+
+
+def _fragment_path(url: str) -> str:
+    """Return the fragment's path portion (``/#/search?q=x`` → ``/search``).
+
+    Empty for non-hash-router URLs — those are server paths the target sweep
+    already covers, so they need no SPA projection.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return ""
+    frag = parts.fragment or ""
+    if not frag:
+        return ""
+    # Strip a leading router token (``#``, ``!/``, ``/``) so ``!/search`` and
+    # ``#/search`` both normalise to a path starting with ``search``.
+    frag = frag.lstrip("#!").lstrip("/")
+    # Drop the fragment's own query string so segment splitting isn't confused.
+    frag = frag.split("?", 1)[0]
+    return frag
+
+
+def _path_segments(url_or_path: str) -> list[str]:
+    """Non-empty, deduplicated path segments in first-seen order.
+
+    ``/rest/products/search?q=x`` → ``["rest", "products", "search"]``;
+    ``/search`` → ``["search"]``. Generic over any path shape.
+    """
+    if not url_or_path:
+        return []
+    try:
+        parts = urlsplit(url_or_path)
+        path = parts.path or url_or_path
+    except Exception:
+        path = url_or_path
+    # If a full URL came in, urlsplit already isolated the path; otherwise
+    # strip any leading scheme/host/query by taking only the path portion.
+    if "://" in path:
+        try:
+            path = urlsplit(path).path
+        except Exception:
+            pass
+    path = path.split("?", 1)[0]
+    seen: set[str] = set()
+    segs: list[str] = []
+    for seg in path.split("/"):
+        seg = seg.strip()
+        if seg and seg not in seen:
+            seen.add(seg)
+            segs.append(seg)
+    return segs
 
 
 class XSSDetector(BaseDetector):
@@ -252,6 +307,12 @@ class XSSDetector(BaseDetector):
             # disable that fan-out and defer the stored-header hypothesis to the
             # browser-DOM sweep instead.
             verifier.spa_mode = is_spa
+            # Phase 5: seed the browser-aware stored oracle with the same
+            # authenticated storage_state the DOM sweep uses, so it can render
+            # authed-only display routes (e.g. a profile page carrying a stored
+            # canary) during stored-XSS execution confirmation.
+            if storage_state:
+                verifier._auth_storage_state = storage_state
             if auth_headers:
                 verifier.http_verifier.headers = {**verifier.http_verifier.headers, **auth_headers}
             try:
@@ -479,12 +540,21 @@ class XSSDetector(BaseDetector):
         reachable GET targets are eligible — SPAs read these from
         location.search/hash.
 
-        Jobs come from two sources: replayable GET attack targets AND the query
-        parameters carried on discovered SPA routes. The latter matters because a
-        hash route such as ``/#/search?q=x`` is deliberately dropped from the HTTP
-        attack surface (its fragment never reaches the server), so its ``q``
-        parameter would otherwise never be probed for DOM XSS even though the SPA
-        reads it client-side from ``location.hash``.
+        Jobs come from three sources:
+
+        1. Replayable GET attack targets — params observed on server-reachable
+           URLs. On an SPA these are typically API endpoints
+           (``/rest/<seg>/search?q=``) whose raw JSON response never executes an
+           injected canary, so navigating the API URL directly yields a clean
+           negative. To recover the dominant DOM-XSS class, each API-observed
+           param is additionally projected onto any discovered SPA route that
+           shares a path segment with the API (``/rest/<seg>/search`` ↔
+           ``/#/<seg>`` or ``/#/<seg>/…``) so the canary is delivered to the
+           route the SPA actually renders.
+        2. The query parameters carried on discovered SPA routes themselves
+           (``/#/search?q=x``) — these are never in the HTTP attack surface.
+        3. API↔SPA segment projection of route-derived params, so a ``q``
+           observed only on an API route still reaches its SPA counterpart.
         """
         echoed_params = {
             f.parameter for f in existing_findings if getattr(f, "parameter", None)
@@ -492,6 +562,24 @@ class XSSDetector(BaseDetector):
         prioritized: list[tuple[str, str, str]] = []
         fallback: list[tuple[str, str, str]] = []
         seen: set[tuple[str, str]] = set()
+
+        # Pre-compute SPA route URLs and their path segments once, so each
+        # API-observed param can be projected onto a rendering SPA route in
+        # O(1) per segment. Only hash-router SPA routes are candidates: a
+        # path-router SPA and a path API share the same server path and need
+        # no projection (the target itself navigates the rendered page).
+        spa_routes: list[str] = []
+        spa_segments: dict[str, list[str]] = {}
+        for route in routes or []:
+            route_url = getattr(route, "url", None) or (route if isinstance(route, str) else None)
+            if not route_url:
+                continue
+            frag = _fragment_path(route_url)
+            if not frag:
+                continue
+            spa_routes.append(route_url)
+            for seg in _path_segments(frag):
+                spa_segments.setdefault(seg, []).append(route_url)
 
         def consider(url: str, param: str) -> None:
             if not url or not param:
@@ -514,6 +602,20 @@ class XSSDetector(BaseDetector):
             else:
                 fallback.append(entry)
 
+        def project_to_spa(api_url: str, param: str) -> None:
+            """Project an API-observed param onto any SPA route sharing a path segment.
+
+            Generic structural association: the last non-empty path segment of
+            the API URL is matched against the segments of every discovered SPA
+            hash route. ``/rest/products/search`` ↔ ``/#/search`` shares
+            ``search``; ``/api/v2/users`` ↔ ``/#/users`` shares ``users``. This
+            is string logic over observed structure — never a hardcoded
+            API↔SPA mapping.
+            """
+            for seg in _path_segments(api_url):
+                for spa_url in spa_segments.get(seg, []):
+                    consider(spa_url, param)
+
         for target in targets:
             if not isinstance(target, AttackTarget):
                 continue
@@ -522,6 +624,9 @@ class XSSDetector(BaseDetector):
             if target.location not in (ParameterLocation.query, ParameterLocation.path):
                 continue
             consider(target.url, target.parameter)
+            # Project the API-observed param onto SPA routes sharing a segment
+            # so the DOM sweep navigates the rendering route, not the raw API.
+            project_to_spa(target.url, target.parameter)
 
         # Route-derived jobs: query params on discovered SPA routes (including the
         # fragment query of hash routes) that the target sweep above did not cover.
@@ -531,6 +636,10 @@ class XSSDetector(BaseDetector):
                 continue
             for param in self._route_query_params(route_url):
                 consider(route_url, param)
+            # An API-style route (e.g. /rest/products/search?q=seed) can appear
+            # in the routes list too; project its params onto SPA counterparts.
+            for param in self._route_query_params(route_url):
+                project_to_spa(route_url, param)
 
         ordered = prioritized + fallback
         return ordered[:max_jobs]

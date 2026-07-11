@@ -14,6 +14,7 @@ BODY_RELEVANT_DETECTORS = frozenset(
         "file_inclusion",
         "file_upload",
         "injection_sql_command",
+        "nosql_injection",
         "ssrf",
         "xss",
     }

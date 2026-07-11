@@ -614,11 +614,22 @@ FORM_CAPTURE_SCRIPT = """
       const actionable = [...root.querySelectorAll(SUBMIT)].filter(isVisible).length;
       const fillable = inputs.filter((i) => !['hidden','submit','button','image','reset'].includes(i.type)).length;
       if (!fillable) return;
-      if (!hasForm && actionable < 1) return;
-      try { root.setAttribute('data-sentry-cluster', String(cid)); } catch (e) {}
       const namedFillable = inputs.filter(
         (i) => i.named && !['hidden','submit','button','image','reset'].includes(i.type)
       ).length;
+      // An orphan cluster normally needs a submit-like control. But framework
+      // forms (and file-upload widgets) frequently submit via change/blur/keyboard
+      // with NO button, so a submit-less cluster is still worth recording when it
+      // is clearly a form by content: a file input (uploads on change), a password
+      // field (auth), or two-plus named fields. A lone unnamed search box stays
+      // dropped, keeping noise out. Generic — keyed on field content, not on any
+      // framework's markup.
+      if (!hasForm && actionable < 1) {
+        const hasFile = fileInputs > 0;
+        const hasPassword = inputs.some((i) => i.type === 'password');
+        if (!hasFile && !hasPassword && namedFillable < 2) return;
+      }
+      try { root.setAttribute('data-sentry-cluster', String(cid)); } catch (e) {}
       clusters.push({
         cluster_id: cid,
         action: action || location.href,
@@ -627,6 +638,7 @@ FORM_CAPTURE_SCRIPT = """
         has_form: !!hasForm,
         file_inputs: fileInputs,
         action_controls: actionable,
+        no_submit: !hasForm && actionable < 1,
         // Hydration signal: true when every fillable field resolved a real
         // framework name (not just a positional fallback). A cluster with
         // zero named fillable fields is a candidate for a post-settle recapture.
@@ -659,9 +671,21 @@ FORM_CAPTURE_SCRIPT = """
       }
       return null;
     };
+    // Fallback container for a cluster with NO submit-bearing ancestor (a
+    // submit-less framework form or a bare file-upload widget): the nearest
+    // ancestor that groups more than one field, else the input's own parent. The
+    // emit() gate still decides whether the resulting cluster is meaningful.
+    const groupRoot = (el) => {
+      let node = el;
+      for (let i = 0; i < 6 && node.parentElement; i++) {
+        node = node.parentElement;
+        if (node.querySelectorAll('input,textarea,select').length > 1) { return node; }
+      }
+      return el.parentElement;
+    };
     const seenRoots = [];
     orphans.forEach((el) => {
-      const root = rootOf(el);
+      const root = rootOf(el) || groupRoot(el);
       if (!root) return;
       if (seenRoots.indexOf(root) !== -1) return;
       seenRoots.push(root);
@@ -2274,7 +2298,15 @@ class BrowserDiscoveryEngine:
             if not fillable_inputs:
                 continue
             if not has_form and action_controls < 1:
-                continue
+                # Mirror the capture script's submit-less gate: keep a button-less
+                # cluster only when it is clearly a form by content — a file upload
+                # (submits on change), a password field (auth), or two-plus named
+                # fields. A lone search box stays dropped so noise is not captured.
+                has_file = any(item["type"].lower() == "file" for item in normalized_inputs)
+                has_password = any(item["type"].lower() == "password" for item in normalized_inputs)
+                named_fillable = sum(1 for item in fillable_inputs if item["named"])
+                if not has_file and not has_password and named_fillable < 2:
+                    continue
             forms.append(
                 {
                     "action": urljoin(page_url, str(entry.get("action") or page_url)),
@@ -2283,6 +2315,7 @@ class BrowserDiscoveryEngine:
                     "cluster_id": entry.get("cluster_id"),
                     "has_form": has_form,
                     "file_inputs": int(entry.get("file_inputs", 0) or 0),
+                    "no_submit": bool(entry.get("no_submit", not has_form and action_controls < 1)),
                     "page_url": page_url,
                     "all_named": bool(entry.get("all_named", True)),
                 }
