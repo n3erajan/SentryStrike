@@ -8,7 +8,7 @@ from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.param_selection import REDIRECT_NAME_TOKENS, redirect_candidate
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
-from app.utils.scan_http import build_scan_headers, same_origin_url
+from app.utils.scan_http import build_scan_headers
 
 try:  # Playwright is optional; the browser sweep no-ops without it.
     from playwright.async_api import async_playwright
@@ -83,9 +83,12 @@ class OpenRedirectDetector(BaseDetector):
             async def verify_candidate(candidate: AttackTarget) -> list[Finding]:
                 async with semaphore:
                     verifier.set_request_context(parameter=candidate.parameter)
-                    baseline_finding = await self._verify_observed_external_redirect(verifier, candidate)
-                    if baseline_finding:
-                        return [baseline_finding]
+                    # A payload that drives the redirect to the scanner marker is
+                    # the only accepted signal: it proves an ATTACKER-controlled
+                    # target (a real open redirect / allowlist bypass). An app that
+                    # merely redirects the observed value to its own allowlisted
+                    # host is NOT reported — that destination is not attacker
+                    # controllable, so flagging it would be a false positive.
                     for payload in self._candidate_payloads(candidate):
                         prepared = candidate.build_request(payload)
                         response = await verifier.send_request(
@@ -110,7 +113,7 @@ class OpenRedirectDetector(BaseDetector):
                                     parameter=candidate.parameter,
                                     method=candidate.method,
                                     payload=payload,
-                                    evidence=f"Parameter redirects to external Location header: {location}",
+                                    evidence=f"Parameter redirects to attacker-controlled Location header: {location}",
                                     confidence_score=90.0,
                                     detection_method="location_header_redirect",
                                     reproducible=True,
@@ -149,17 +152,39 @@ class OpenRedirectDetector(BaseDetector):
     def _candidate_payloads(self, candidate: AttackTarget) -> tuple[str, ...]:
         """Static payload families plus data-driven allowlist-substring bypasses.
 
-        When the parameter's observed value carries an allowed-looking host (the
-        app's own origin or a value that already looks like a URL), craft nested
-        bypass payloads that keep that allowed substring present but resolve, as a
-        browser would, to the scanner marker host. This exercises naive
-        ``startswith``/``contains`` allowlist checks generically — the allowed
-        prefix is taken from the target, never hardcoded.
+        Two data-driven bypass sources, both framework-agnostic and both taken
+        from the target itself (never hardcoded):
+
+        1. The parameter's observed VALUE, when it is an absolute URL the app
+           already emitted (hence a value its allowlist accepts). Embedding that
+           exact string in a marker-resolving URL defeats naive
+           ``includes``/``endsWith`` allowlist checks generically.
+        2. The app's own origin, for apps that allowlist themselves.
+
+        All resolve, the way a browser resolves an authority, to the scanner
+        marker host, so a matched Location proves an attacker-controlled redirect.
         """
         payloads = list(self.payloads)
+        marker = f"https://{self._MARKER_HOST}/open-redirect"
+        # Allowlist-substring bypass seeded from the app's OWN observed value.
+        # When the discovered parameter value is a URL the app already emitted
+        # (e.g. ``/redirect?to=https://github.com/…`` mined from a real link),
+        # that value is — by construction — one the app's allowlist accepts.
+        # Embed it, verbatim, as a substring of a marker-resolving URL: a naive
+        # ``includes``/``endsWith`` allowlist check still sees the allowed string,
+        # yet the authority a browser resolves is the scanner marker. The allowed
+        # substring is taken from the target's own value, never hardcoded.
+        observed = str(candidate.value or "").strip()
+        if self._value_is_external_url(observed):
+            payloads.extend(
+                [
+                    f"{marker}?next={observed}",   # allowed URL as a trailing param
+                    f"{marker}#{observed}",        # allowed URL in the fragment
+                    f"https://{self._MARKER_HOST}/{observed}",  # allowed URL in the path
+                ]
+            )
         allowed = self._allowed_prefix(candidate)
         if allowed:
-            marker = f"https://{self._MARKER_HOST}/open-redirect"
             payloads.extend(
                 [
                     # userinfo confusion carrying the allowed host as userinfo
@@ -472,58 +497,7 @@ class OpenRedirectDetector(BaseDetector):
     def _is_payload_location(cls, location: str) -> bool:
         return cls._effective_redirect_host(location) == cls._MARKER_HOST
 
-    async def _verify_observed_external_redirect(
-        self,
-        verifier: HttpVerifier,
-        candidate: AttackTarget,
-    ) -> Finding | None:
-        if not self._value_is_external_url(candidate.value):
-            return None
-        prepared = candidate.build_request(candidate.value)
-        response = await verifier.send_request(
-            prepared.url,
-            prepared.method,
-            prepared.params,
-            prepared.data,
-            headers=prepared.headers,
-            cookies=prepared.cookies,
-            json_body=prepared.json_body,
-            test_phase="open_redirect_observed",
-            payload=str(candidate.value),
-        )
-        location = self._location_header(response.headers)
-        if response.status_code not in {301, 302, 303, 307, 308}:
-            return None
-        if not self._is_external_to_target(location, candidate.url):
-            return None
-        return Finding(
-            category=OwaspCategory.a01,
-            vuln_type="Open Redirect",
-            severity=SeverityLevel.medium,
-            url=candidate.url,
-            parameter=candidate.parameter,
-            method=candidate.method,
-            payload=str(candidate.value),
-            evidence=f"Observed redirect parameter sends users to external Location header: {location}",
-            confidence_score=92.0,
-            detection_method="observed_external_location_redirect",
-            reproducible=True,
-            verified=True,
-            verification_request_snippet=response.request_snippet,
-            verification_response_snippet=response.response_snippet,
-            detection_evidence={"location": location},
-        )
-
     @staticmethod
     def _value_is_external_url(value: object) -> bool:
         parsed = urlparse(str(value or ""))
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-    @staticmethod
-    def _is_external_to_target(location: str, target_url: str) -> bool:
-        if not location:
-            return False
-        parsed = urlparse(location)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            return False
-        return not same_origin_url(target_url, location)

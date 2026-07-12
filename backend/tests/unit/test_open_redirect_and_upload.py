@@ -35,12 +35,18 @@ async def test_open_redirect_detector_verifies_external_location_header():
 
 
 @pytest.mark.asyncio
-async def test_open_redirect_detector_reports_observed_external_redirect_without_following():
+async def test_open_redirect_detector_ignores_constrained_allowlisted_redirect():
+    """An app that always redirects to a fixed allowlisted host (and never to an
+    attacker-controlled target) is NOT an open redirect. The destination is not
+    attacker-controllable, so no payload reaches the marker host and nothing is
+    reported — this is the false positive we must not raise."""
     detector = OpenRedirectDetector()
     observed_urls: list[str] = []
 
     async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
         observed_urls.append(url)
+        # Whatever the input, the app only ever redirects to its own allowlisted
+        # host — never to the scanner marker. Not attacker-controllable.
         return ResponseData(
             302,
             {"Location": "https://github.com/juice-shop/juice-shop"},
@@ -56,14 +62,8 @@ async def test_open_redirect_detector_reports_observed_external_redirect_without
             forms=[],
         )
 
-    assert len(observed_urls) == 1
-    assert observed_urls[0].startswith("http://target.test/redirect?to=")
-    assert "github.com" in observed_urls[0]
-    assert any(
-        f.vuln_type == "Open Redirect"
-        and f.detection_method == "observed_external_location_redirect"
-        for f in findings
-    )
+    assert observed_urls  # payloads were attempted
+    assert findings == []  # but none reached the marker → no open redirect reported
 
 
 @pytest.mark.asyncio
@@ -116,6 +116,36 @@ def test_open_redirect_payloads_include_allowlist_bypass_from_target_origin():
         p.startswith("https://app.example.test@sentrystrike.invalid") for p in payloads
     )
     # No duplicate payloads.
+    assert len(payloads) == len(set(payloads))
+
+
+def test_open_redirect_payloads_bypass_from_observed_allowlisted_value():
+    """When the discovered param value is a URL the app already emitted (hence an
+    allowlisted target), craft a marker-resolving payload that embeds that exact
+    value as a substring, defeating naive ``includes``/``endsWith`` allowlists.
+    The allowed substring is taken from the target's own value, never hardcoded."""
+    detector = OpenRedirectDetector()
+    from app.core.detectors.attack_surface import AttackTarget
+    from app.core.crawler.models import ParameterLocation
+    from urllib.parse import urlparse
+
+    observed = "https://github.com/juice-shop/juice-shop"
+    target = AttackTarget(
+        url=f"https://app.example.test/redirect?to={observed}",
+        parameter="to",
+        method="GET",
+        value=observed,
+        location=ParameterLocation.query,
+    )
+    payloads = detector._candidate_payloads(target)
+    # At least one payload resolves (as a browser resolves authority) to the
+    # marker host AND retains the observed allowlisted value as a substring.
+    hits = [
+        p for p in payloads
+        if detector._effective_redirect_host(p) == detector._MARKER_HOST
+        and observed in p
+    ]
+    assert hits, payloads
     assert len(payloads) == len(set(payloads))
 
 

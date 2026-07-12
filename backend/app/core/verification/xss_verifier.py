@@ -811,6 +811,17 @@ class XSSVerifier(BaseVerifier):
   }};
   window.__sentry_xss_fired = false;
   window.__sentry_xss_events = [];
+  // EXECUTION-only oracle. A "fire" means our uniquely-canaried JavaScript
+  // actually RAN. Mere reflection of the canary as text or markup in the DOM is
+  // NOT execution: a payload that the app HTML-escapes or strips to inert text
+  // still leaves the canary substring in the page, but nothing executes. We
+  // therefore deliberately do NOT observe DOM mutations for canary presence —
+  // doing so conflates reflection with execution and produces false positives on
+  // any route that sanitises input (e.g. a track/search route that renders the
+  // parameter as escaped text). Every sweep vector invokes
+  // ``window.sentry_hook(canary)`` (or alert/confirm/prompt) from its executing
+  // context (onerror/onload/javascript:/inline script), so a genuine execution
+  // always routes through one of these callbacks — and only those set the flag.
   window.sentry_hook = (value) => {{
     if (!sentryCanary || String(value).includes(sentryCanary)) mark('hook', value);
   }};
@@ -819,31 +830,6 @@ class XSSVerifier(BaseVerifier):
       if (!sentryCanary || String(message || '').includes(sentryCanary)) mark(name, message);
       return name === 'prompt' ? '' : true;
     }};
-  }}
-  const hasCanary = (value) => !!value && String(value).includes(sentryCanary);
-  const scanNode = (node) => {{
-    if (!node) return;
-    if (hasCanary(node.textContent) || hasCanary(node.outerHTML)) mark('dom_mutation', sentryCanary);
-    if (node.tagName && String(node.tagName).toLowerCase() === 'script' && hasCanary(node.textContent)) {{
-      mark('script_canary', sentryCanary);
-    }}
-  }};
-  const startObserver = () => {{
-    try {{
-      new MutationObserver((mutations) => {{
-        for (const mutation of mutations) {{
-          scanNode(mutation.target);
-          for (const node of mutation.addedNodes || []) scanNode(node);
-        }}
-      }}).observe(document.documentElement || document, {{
-        childList: true, subtree: true, attributes: true, characterData: true
-      }});
-    }} catch (err) {{}}
-  }};
-  if (document.readyState === 'loading') {{
-    document.addEventListener('DOMContentLoaded', startObserver, {{once: true}});
-  }} else {{
-    startObserver();
   }}
 }})();
 """
@@ -1120,23 +1106,31 @@ class XSSVerifier(BaseVerifier):
         surfaces.append(("query", urlunparse(parts)))
 
         # 2. Hash-route query: a query scoped to the hash path (``/#/route?p=``).
+        # Parse the hash's own query and REPLACE the parameter's value in place.
+        # A route discovered WITH a seed value (``/#/search?q=seed``) must not
+        # yield a duplicate ``q`` — the SPA resolves a repeated param to the
+        # first (seed) value, so the payload would never render. Preserve the
+        # route path and any sibling hash params.
         parts = list(parsed)
         frag = parts[5]
-        if frag and "?" in frag:
+        if frag:
             base, _, existing_q = frag.partition("?")
-            joiner = "&" if existing_q else ""
-            parts[5] = f"{base}?{existing_q}{joiner}{parameter}={enc}"
-        elif frag:
-            parts[5] = f"{frag}?{parameter}={enc}"
+            hash_query = dict(parse_qsl(existing_q, keep_blank_values=True))
+            hash_query[parameter] = payload
+            parts[5] = f"{base}?{urlencode(hash_query)}"
         else:
-            parts[5] = f"/?{parameter}={enc}"
+            parts[5] = f"/?{urlencode({parameter: payload})}"
         surfaces.append(("hash_query", urlunparse(parts)))
 
-        # 3. Raw fragment (``#p=``).
+        # 3. Raw fragment (``#p=``): some apps read ``location.hash`` as an opaque
+        # value string. Append rather than overwrite so a ``/route`` path in the
+        # fragment is never destroyed (overwriting it would navigate away from the
+        # rendering route and guarantee a false negative).
         parts = list(parsed)
         frag = parts[5]
-        if frag and "=" in frag and "?" not in frag:
-            parts[5] = f"{frag}&{parameter}={enc}"
+        if frag:
+            joiner = "&" if ("?" in frag or "=" in frag) else "?"
+            parts[5] = f"{frag}{joiner}{parameter}={enc}"
         else:
             parts[5] = f"{parameter}={enc}"
         surfaces.append(("fragment", urlunparse(parts)))

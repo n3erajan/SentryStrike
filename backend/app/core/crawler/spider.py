@@ -439,11 +439,11 @@ class WebSpider:
                 ]
                 await self._run_browser_discovery(crawl_state, root_url, browser_routes)
 
-        # P4: browser-navigated routes with query strings hold real parameter
-        # values (e.g. /redirect?to=https://...) that the HTTP worker never saw
-        # because they redirect externally or were visited browser-only. Extend
-        # discovered_urls so ParamDiscovery parses their query parameters and all
-        # detectors (open_redirect, file_inclusion, ssrf, …) receive them.
+        # P4: browser routes reconstructed from a dead hash route hold a real
+        # server URL the HTTP worker never saw — a query-bearing endpoint
+        # (/redirect?to=https://...) or a served file (/ftp/legal.md). Extend
+        # discovered_urls so ParamDiscovery + all detectors (open_redirect,
+        # file_inclusion, ssrf, …) receive them.
         if crawl_state.browser_available:
             _seen_for_p4 = {normalize_for_dedupe(u) for u in discovered_urls}
             for _route in crawl_state.routes:
@@ -451,7 +451,12 @@ class WebSpider:
                     continue
                 if _route.source not in (RouteSource.browser,):
                     continue
-                if "?" not in _route.url:
+                # Only real server paths are HTTP-testable. A ``/#/route``
+                # fragment is never sent over the wire, so skip hash routes;
+                # reconstructed server URLs (query-bearing or a plain file path)
+                # have no route fragment and pass.
+                _frag = urlparse(_route.url).fragment
+                if _frag.startswith("/") or _frag.startswith("!/"):
                     continue
                 # Scope guard: a browser route may have followed a redirect to a
                 # third-party host (e.g. /redirect?to=https://github.com/...).
@@ -716,6 +721,15 @@ class WebSpider:
             max_interactions=self._scan_config.get_val("crawl_browser_max_interactions", self.settings.crawl_browser_max_interactions) if self._scan_config else self.settings.crawl_browser_max_interactions,
             workers=self._scan_config.get_val("crawl_browser_workers", self.settings.crawl_browser_workers) if self._scan_config else self.settings.crawl_browser_workers,
         )
+        # The app's OWN client routes (mined from JS bundles / HTML / sitemap).
+        # Passed so the engine can distinguish a router-defined route that merely
+        # lacks a query parameter (kept alive) from a brute-force guess that
+        # renders the not-found component (recorded dead).
+        client_routes = [
+            r.url for r in crawl_state.routes
+            if getattr(r, "source", None)
+            in (RouteSource.javascript, RouteSource.html, RouteSource.sitemap)
+        ]
         task = asyncio.create_task(
             engine.crawl_into(
                 browser_state,
@@ -725,6 +739,7 @@ class WebSpider:
                 routes=routes,
                 deadline=deadline,
                 storage_state=self._auth_storage_state,
+                client_routes=client_routes,
             )
         )
         safety_timeout = budget + max(30.0, budget * 0.5)

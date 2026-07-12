@@ -222,6 +222,8 @@ class SSRFDetector(BaseDetector):
         oast_callback = scan_config.get_val("oast_callback_base_url", settings.oast_callback_base_url) if scan_config else settings.oast_callback_base_url
         oast_poll = scan_config.get_val("oast_poll_url", settings.oast_poll_url) if scan_config else settings.oast_poll_url
         ssrf_timing_delta = scan_config.get_val("ssrf_inband_timing_delta_ms", settings.ssrf_inband_timing_delta_ms) if scan_config else settings.ssrf_inband_timing_delta_ms
+        oast_poll_attempts = scan_config.get_val("ssrf_oast_poll_attempts", settings.ssrf_oast_poll_attempts) if scan_config else settings.ssrf_oast_poll_attempts
+        oast_poll_interval = scan_config.get_val("ssrf_oast_poll_interval_seconds", settings.ssrf_oast_poll_interval_seconds) if scan_config else settings.ssrf_oast_poll_interval_seconds
         oast = kwargs.get("oast_client")
         if not isinstance(oast, OastClient):
             oast = OastClient(
@@ -358,8 +360,14 @@ class SSRFDetector(BaseDetector):
                             test_phase="ssrf_blind_oast",
                             payload=callback_url,
                         )
-                        await asyncio.sleep(0.2)
-                        interactions = await oast.poll(interaction_id)
+                        # A fire-and-forget server-side fetch may land after the
+                        # injection returns, so poll a bounded number of times.
+                        interactions = []
+                        for _attempt in range(max(1, oast_poll_attempts)):
+                            await asyncio.sleep(oast_poll_interval)
+                            interactions = await oast.poll(interaction_id)
+                            if interactions:
+                                break
                         if interactions:
                             cand_findings.append(
                                 Finding(

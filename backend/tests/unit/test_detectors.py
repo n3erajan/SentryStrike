@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qsl, urlparse
 
-from app.core.crawler.models import ApiEndpoint, RequestObservation
+from app.core.crawler.models import ApiEndpoint, ParameterCandidate, ParameterLocation, RequestObservation
 from app.core.detectors.access_control import AccessControlDetector
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
 from app.core.detectors.crypto_failures import CryptoFailuresDetector
@@ -340,6 +340,67 @@ async def test_access_control_reports_mass_assignment_privilege_field() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mass_assignment_survives_unique_create_collision() -> None:
+    """A replayed registration whose captured email is already taken must still
+    be detected: the detector freshens the unique identity field so the create
+    succeeds instead of aborting on the duplicate-email 400."""
+    detector = AccessControlDetector()
+    original_email = "taken@example.com"
+    request = RequestObservation(
+        url="https://example.com/api/Users",
+        method="POST",
+        request_headers={"content-type": "application/json"},
+        post_data='{"email":"' + original_email + '","password":"pw12345","passwordRepeat":"pw12345"}',
+        request_content_type="application/json",
+        replayable=True,
+    )
+    seen_emails: list[object] = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        body = kwargs.get("json_body")
+        phase = kwargs.get("test_phase", "")
+        email = body.get("email") if isinstance(body, dict) else None
+        seen_emails.append(email)
+        # The app enforces email uniqueness: any replay of the captured email
+        # (already registered) is rejected, exactly like Juice Shop.
+        if email == original_email:
+            return ResponseData(
+                400,
+                {"content-type": "application/json"},
+                '{"message":"Validation error","errors":[{"field":"email","message":"email must be unique"}]}',
+                1.0,
+            )
+        if phase == "mass_assignment_baseline":
+            return ResponseData(
+                201, {"content-type": "application/json"},
+                '{"id":9,"email":"' + str(email) + '","role":"customer"}', 1.0,
+                request_snippet=f"{method} {url}", response_snippet="HTTP/1.1 201 Created",
+            )
+        if phase == "mass_assignment_probe" and isinstance(body, dict) and body.get("role") == "admin":
+            return ResponseData(
+                201, {"content-type": "application/json"},
+                '{"id":9,"email":"' + str(email) + '","role":"admin"}', 1.0,
+                request_snippet=f"{method} {url}",
+                response_snippet="HTTP/1.1 201 Created\n\n{\"role\":\"admin\"}",
+            )
+        return ResponseData(400, {"content-type": "application/json"}, '{"error":"bad request"}', 1.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[], forms=[], requests=[request],
+            auth_headers={"Authorization": "Bearer low-user"},
+        )
+
+    # Mass-assignment replays used freshened unique identities (not the taken
+    # email), so the create succeeded and the probe ran — proving the finding is
+    # produced only because the duplicate-email collision was avoided. (Other
+    # access-control checks share the patched sender and may replay the observed
+    # body verbatim; the freshened create is what unlocks this finding.)
+    assert any(isinstance(e, str) and e.startswith("ss_ma_") for e in seen_emails)
+    assert any(f.vuln_type == "Mass Assignment / Privilege Field Injection" for f in findings)
+
+
+@pytest.mark.asyncio
 async def test_crypto_detector_flags_http() -> None:
     detector = CryptoFailuresDetector()
     urls = ["http://example.com/login"]
@@ -471,3 +532,141 @@ def test_file_inclusion_payloads_keep_php_wrappers_for_php_stack() -> None:
 
     assert any("/etc/passwd" in payload.lower() for payload in payload_values)
     assert any(payload.lower().startswith("php://") for payload in payload_values)
+
+
+# --- Poison-null-byte extension-filter bypass (directory-served files) --------
+
+def test_looks_like_directory_listing() -> None:
+    assert FileInclusionDetector._looks_like_directory_listing(
+        "<html><head><title>listing directory /ftp</title></head><body>...</body></html>"
+    )
+    assert FileInclusionDetector._looks_like_directory_listing(
+        '<a href="../">..</a><a href="a.md">a</a><a href="b.bak">b</a>'
+        '<a href="c.pyc">c</a><a href="d.yml">d</a><a href="e.gg">e</a>'
+    )
+    # A normal application page is not a directory listing.
+    assert not FileInclusionDetector._looks_like_directory_listing(
+        "<html><body><h1>Welcome</h1><a href='/login'>Login</a></body></html>"
+    )
+
+
+class _FakeResp:
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.body = body
+        self.request_snippet = "GET"
+        self.response_snippet = body[:120]
+
+
+class _FakeVerifier:
+    """Serves canned (status, body) by exact URL; everything else is 404."""
+
+    def __init__(self, routes: dict[str, tuple[int, str]]) -> None:
+        self._routes = routes
+
+    def set_request_context(self, **_kw) -> None:
+        pass
+
+    async def send_request(self, url, method, params, data, test_phase=None, payload=None, **_kw):
+        status, body = self._routes.get(url, (404, "Cannot GET"))
+        return _FakeResp(status, body)
+
+    async def close(self) -> None:
+        pass
+
+
+_FTP_LISTING = (
+    "<html><head><title>listing directory /ftp</title></head><body>"
+    '<a href="../">..</a>'
+    '<a href="legal.md">legal.md</a>'
+    '<a href="package.json.bak">package.json.bak</a>'
+    "</body></html>"
+)
+
+
+@pytest.mark.asyncio
+async def test_null_byte_bypass_detects_forbidden_file_read() -> None:
+    """A file forbidden directly (403) but readable via ``%2500.<allowed-ext>``
+    is reported as a poison-null-byte arbitrary file read."""
+    routes = {
+        "http://h/ftp/": (200, _FTP_LISTING),
+        "http://h/ftp/legal.md": (200, "# Legal document, readable and allowed."),
+        "http://h/ftp/package.json.bak": (403, "Error: Only .md and .pdf files are allowed!"),
+        "http://h/ftp/package.json.bak%2500.md": (200, '{"name":"app","secret":"leaked-backup"}'),
+        # control (non-existent sibling) is not in routes -> defaults to 404.
+    }
+    det = FileInclusionDetector()
+    findings = await det._detect_null_byte_filter_bypass(
+        ["http://h/ftp/legal.md"], _FakeVerifier(routes), asyncio.Semaphore(4), ""
+    )
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.url == "http://h/ftp/package.json.bak"
+    assert f.detection_method == "poison_null_byte_extension_bypass"
+    assert f.payload == "http://h/ftp/package.json.bak%2500.md"
+    assert f.verified is True
+    assert f.category == OwaspCategory.a05
+
+
+@pytest.mark.asyncio
+async def test_null_byte_bypass_ignores_catch_all_soft_200() -> None:
+    """When a non-existent-file control returns the SAME 200 body as the injected
+    request, the 200 is a catch-all/SPA shell, not a real read -> no finding."""
+    shell = "<html><body><app-root></app-root></body></html>"
+    routes = {
+        "http://h/ftp/": (200, _FTP_LISTING),
+        "http://h/ftp/legal.md": (200, "# Legal document."),
+        "http://h/ftp/package.json.bak": (403, "Error: Only .md and .pdf files are allowed!"),
+        # Both the injected AND the control return the identical shell.
+        "http://h/ftp/package.json.bak%2500.md": (200, shell),
+        "http://h/ftp/sentry_nx_probe_md%2500.md": (200, shell),
+    }
+    det = FileInclusionDetector()
+    findings = await det._detect_null_byte_filter_bypass(
+        ["http://h/ftp/legal.md"], _FakeVerifier(routes), asyncio.Semaphore(4), ""
+    )
+    assert findings == []
+
+
+@pytest.mark.asyncio
+async def test_ssrf_detector_verifies_blind_via_oast_client():
+    from app.core.detectors.ssrf_detector import SSRFDetector
+    from app.core.verification.oast import OastClient, OastInteraction
+
+    # A fake OAST client: enabled, returns an interaction only on the 3rd poll
+    # (simulates a fire-and-forget callback landing after a short delay).
+    class FakeOast(OastClient):
+        def __init__(self):
+            super().__init__("https://scanner.test/oast", "https://scanner.test/oast/poll")
+            self._polls = 0
+
+        async def poll(self, interaction_id):
+            self._polls += 1
+            if self._polls >= 3:
+                return [OastInteraction(interaction_id=interaction_id, raw="hit")]
+            return []
+
+    detector = SSRFDetector()
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        # Blind sink: constant 302, no reflection, regardless of payload.
+        return ResponseData(
+            302, {"content-type": "text/html"}, "", 1.0,
+            request_snippet=f"{method} {url}", response_snippet="HTTP/1.1 302 Found",
+        )
+
+    param = ParameterCandidate(
+        name="imageUrl",
+        location=ParameterLocation.json_body,
+        url="https://example.com/profile/image/url",
+        method="POST",
+        baseline_value="http://example.com/a.png",
+    )
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=["https://example.com/profile/image/url"],
+            forms=[],
+            parameters=[param],
+            oast_client=FakeOast(),
+        )
+    assert any("Blind Server-Side Request Forgery" in f.vuln_type and f.verified for f in findings)

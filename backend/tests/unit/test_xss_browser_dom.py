@@ -104,6 +104,29 @@ def test_reflection_surface_probes_covers_query_hash_and_fragment():
     assert "q=" in after_hash(urls["fragment"])
 
 
+def test_reflection_surface_probes_replaces_seeded_hash_param():
+    """A route discovered WITH a seed value must not produce a duplicate param.
+
+    Regression: ``/#/search?q=seed`` previously built ``/#/search?q=seed&q=<pay>``
+    for the hash_query surface, and the SPA resolved the repeated ``q`` to the
+    seed, so the injected payload never rendered (false negative). The hash_query
+    surface must carry exactly one ``q`` whose value is the payload, and preserve
+    the route path.
+    """
+    from urllib.parse import parse_qsl, urlsplit
+
+    verifier = XSSVerifier()
+    payload = "<img src=x onerror=1>"
+    surfaces = dict(
+        verifier._reflection_surface_probes("http://x/#/search?q=seed", "q", payload)
+    )
+
+    frag = urlsplit(surfaces["hash_query"]).fragment  # e.g. /search?q=<payload>
+    assert frag.split("?", 1)[0] == "/search"  # route path preserved
+    hash_q = dict(parse_qsl(frag.split("?", 1)[1], keep_blank_values=True))
+    assert hash_q == {"q": payload}  # single q, replaced with the payload
+
+
 def test_reflection_surface_probes_for_plain_path_route():
     verifier = XSSVerifier()
     surfaces = verifier._reflection_surface_probes("http://x/p", "q", "PAY")

@@ -35,6 +35,7 @@ from app.core.detectors.ssrf_detector import SSRFDetector
 from app.core.detectors.open_redirect import OpenRedirectDetector
 from app.core.detectors.sensitive_paths import SensitivePathsDetector
 from app.core.verification.verification_framework import FindingDeduplicator, TestPollutionFilter
+from app.core.verification.oast import OastClient
 
 
 def _normalize_llm_string(value: object) -> str | None:
@@ -402,6 +403,7 @@ class ScanOrchestrator:
             detector_parallelism = max(2, effective_concurrency // 3)
             detector_semaphore = asyncio.Semaphore(detector_parallelism)
             session_cookies = getattr(crawl_result, "session_cookies", {})
+            oast_settings = get_settings()
             crawl_context = {
                 "root_url": scan.target_url,
                 "session_cookies": session_cookies,
@@ -421,6 +423,11 @@ class ScanOrchestrator:
                 "browser_available": getattr(crawl_result, "browser_available", None),
                 "browser_error": getattr(crawl_result, "browser_error", None),
                 "browser_forms": getattr(crawl_result, "browser_forms", []),
+                "oast_client": OastClient(
+                    (scan_config.oast_callback_base_url if scan_config else None) or oast_settings.oast_callback_base_url,
+                    (scan_config.oast_poll_url if scan_config else None) or oast_settings.oast_poll_url,
+                    timeout_seconds=oast_settings.request_timeout_seconds,
+                ),
                 "scan_config": scan_config,
             }
             # Reuse the winning login path from the main account so second/admin

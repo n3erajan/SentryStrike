@@ -171,3 +171,37 @@ def test_ambiguous_base_variable_is_not_resolved():
     assert not any(e.evidence == "base-concat" for e in endpoints)
     assert not any(u.endswith(("/x", "/y")) for u in {e.url for e in endpoints})
 
+
+
+def test_mines_location_navigation_page_paths():
+    from app.core.crawler.api_extractor import ApiExtractor
+    js = 'goToProfilePage(){window.location.replace(J.hostServer+"/profile")}'
+    routes, _endpoints = ApiExtractor.extract_from_javascript("http://t.example/main.js", js)
+    assert "http://t.example/profile" in routes
+
+
+def test_mines_various_navigation_forms():
+    from app.core.crawler.api_extractor import ApiExtractor
+    js = (
+        'location.assign("/account/settings");'
+        'window.location.href="/dashboard";'
+        'location.replace(base+"/billing");'
+    )
+    routes, _ = ApiExtractor.extract_from_javascript("http://t.example/x.js", js)
+    for expected in ("http://t.example/account/settings",
+                     "http://t.example/dashboard",
+                     "http://t.example/billing"):
+        assert expected in routes, expected
+
+
+def test_navigation_mining_rejects_offorigin_and_non_nav_strings():
+    from app.core.crawler.api_extractor import ApiExtractor
+    # A bare single-segment quoted string WITHOUT a navigation call must NOT be
+    # mined as a route (the general filter is unchanged).
+    js = 'const label="/profile"; const x = someObj["/profile"];'
+    routes, _ = ApiExtractor.extract_from_javascript("http://t.example/x.js", js)
+    assert "http://t.example/profile" not in routes
+    # Off-origin absolute URL navigation is not a same-origin path.
+    js2 = 'location.replace("https://evil.example.com/profile")'
+    routes2, _ = ApiExtractor.extract_from_javascript("http://t.example/x.js", js2)
+    assert not any("evil.example.com" in r for r in routes2)

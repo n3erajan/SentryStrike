@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
@@ -581,36 +582,88 @@ class AccessControlDetector(BaseDetector):
             token in str(key).lower() for key in body for token in ("email", "user", "account", "profile")
         )
 
+    # Entire-value email match (a bare address, not free text that mentions one).
+    _BARE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    # Body keys whose values carry a uniqueness constraint on a create.
+    _IDENTITY_KEY_TOKENS: tuple[str, ...] = ("email", "username", "user_name", "login")
+
+    @classmethod
+    def _freshen_unique_identity_fields(cls, body: dict[str, Any]) -> dict[str, Any]:
+        """Return a shallow copy of a create-request body with uniqueness-
+        constrained identity fields replaced by fresh unique values.
+
+        Replaying a captured CREATE (e.g. user registration) verbatim collides
+        with the record it originally created; the server rejects the duplicate
+        identity (``email must be unique``) with a 4xx, which would abort
+        replay-based checks before the real probe runs. Giving each replayed
+        create a unique identity lets it succeed so the actual probe is
+        evaluated. Framework-agnostic: identity fields are matched by common
+        key tokens or a bare-email-shaped value, and each replacement keeps the
+        observed shape (an email stays an email on its original domain).
+        """
+        if not isinstance(body, dict):
+            return body
+        fresh = dict(body)
+        unique = uuid.uuid4().hex[:12]
+        for key, value in list(fresh.items()):
+            if not isinstance(value, str):
+                continue
+            lowered = str(key).lower()
+            key_is_email = "email" in lowered
+            value_is_email = bool(cls._BARE_EMAIL_RE.match(value))
+            if key_is_email or value_is_email:
+                domain = value.split("@", 1)[1] if value_is_email else "sentrystrike.test"
+                fresh[key] = f"ss_ma_{unique}@{domain}"
+            elif any(token in lowered for token in cls._IDENTITY_KEY_TOKENS):
+                fresh[key] = f"ss_ma_{unique}"
+        return fresh
+
     async def _verify_mass_assignment_candidate(
         self,
         verifier: HttpVerifier,
         request: PreparedAttackRequest,
     ) -> list[Finding]:
+        body = request.json_body if request.json_body is not None else request.data
+        if not isinstance(body, dict):
+            return []
+
+        # A replayed CREATE (registration/signup) collides with the record it
+        # originally created — the server rejects the duplicate identity (e.g.
+        # "email must be unique") with a 4xx. That aborts the check before the
+        # privilege-field probe ever runs, producing a false negative. For POST
+        # (create) requests, give each replayed body a fresh unique identity so
+        # the create succeeds and the probe can be evaluated. UPDATE (PUT/PATCH)
+        # replays keep the observed identity (updating a record to its own value
+        # never collides).
+        is_create = request.method.upper() == "POST"
+
+        def _prepare_body(source: dict[str, Any]) -> dict[str, Any]:
+            return self._freshen_unique_identity_fields(source) if is_create else dict(source)
+
+        def _build(new_body: dict[str, Any]) -> PreparedAttackRequest:
+            return PreparedAttackRequest(
+                url=request.url,
+                method=request.method,
+                params=request.params,
+                data=new_body if request.data is not None and request.json_body is None else None,
+                json_body=new_body if request.json_body is not None else None,
+                headers=request.headers,
+                cookies=request.cookies,
+            )
+
         baseline = await self._send_prepared_request(
-            verifier, request, test_phase="mass_assignment_baseline"
+            verifier, _build(_prepare_body(body)), test_phase="mass_assignment_baseline"
         )
         baseline_profile = self._response_profile(baseline)
         if not baseline_profile.success or _looks_like_error_page(baseline.body):
             return []
 
-        body = request.json_body if request.json_body is not None else request.data
-        if not isinstance(body, dict):
-            return []
-
         for field, value in self._MASS_ASSIGNMENT_PROBES:
             if field in body:
                 continue
-            mutated_body = dict(body)
+            mutated_body = _prepare_body(body)
             mutated_body[field] = value
-            mutated = PreparedAttackRequest(
-                url=request.url,
-                method=request.method,
-                params=request.params,
-                data=mutated_body if request.data is not None and request.json_body is None else None,
-                json_body=mutated_body if request.json_body is not None else None,
-                headers=request.headers,
-                cookies=request.cookies,
-            )
+            mutated = _build(mutated_body)
             response = await self._send_prepared_request(
                 verifier,
                 mutated,

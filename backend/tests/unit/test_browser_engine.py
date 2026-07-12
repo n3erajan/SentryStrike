@@ -12,6 +12,60 @@ from app.core.crawler.browser_engine import (
 from app.core.crawler.models import CrawlState, RequestObservation
 
 
+def test_client_route_key_matches_bare_and_hash_forms():
+    """A route mined as a bare path and its rendered hash-router form must key
+    identically, so a router-defined route is recognised at the not-found
+    suppression site and kept alive (not dropped as dead)."""
+    key = BrowserDiscoveryEngine._client_route_key
+    assert key("http://x/#/search") == key("http://x/search") == "/search"
+    assert key("http://x/#/track-result?id=1") == "/track-result"
+    assert key("http://x/#!/login") == key("http://x/login/") == "/login"
+    # Distinct routes stay distinct.
+    assert key("http://x/#/search") != key("http://x/#/administration")
+
+
+def test_server_endpoint_from_dead_route_reconstructs_query_endpoint():
+    """A hash-routed SPA canonicalises a real server anchor (``./redirect?to=X``)
+    into a dead hash route (``#/redirect?to=X``). When that route renders the
+    not-found shell, reconstruct the same-origin HTTP endpoint from the fragment
+    so the HTTP detectors receive its query params (the open-redirect miss)."""
+    recon = BrowserDiscoveryEngine._server_endpoint_from_dead_route
+    got = recon("http://x/#/redirect?to=https://github.com/juice-shop/juice-shop")
+    assert got.startswith("http://x/redirect?")
+    assert "to=" in got
+    # The allowlisted target value round-trips through parse/re-encode.
+    from urllib.parse import parse_qs, urlparse
+    assert parse_qs(urlparse(got).query)["to"] == [
+        "https://github.com/juice-shop/juice-shop"
+    ]
+
+
+def test_server_endpoint_from_dead_route_ignores_paramless_and_api_routes():
+    """A dead route with no query (an ordinary brute-force/client dead route such
+    as ``#/wp-admin``) or a root API path stays dead — never resurrected as an
+    HTTP endpoint."""
+    recon = BrowserDiscoveryEngine._server_endpoint_from_dead_route
+    assert recon("http://x/#/wp-admin") == ""          # no query, no extension
+    assert recon("http://x/#/administration") == ""    # no query, no extension
+    assert recon("http://x/#/api/users?id=1") == ""    # root API path, already covered
+    assert recon("http://x/#/?to=evil") == ""          # empty path
+
+
+def test_server_endpoint_from_dead_route_reconstructs_served_file():
+    """A hash-routed SPA canonicalises a real served-file anchor
+    (``./ftp/legal.md``) into a dead hash route (``#/ftp/legal.md``). A query-less
+    path whose last segment has a file extension is a real static resource the
+    router swallowed — reconstruct its plain server URL (the ``/ftp/:file`` path
+    traversal / arbitrary-file-read discovery miss). A bare route word stays dead."""
+    recon = BrowserDiscoveryEngine._server_endpoint_from_dead_route
+    assert recon("http://x/#/ftp/legal.md") == "http://x/ftp/legal.md"
+    assert recon("http://x/#/ftp/package.json.bak") == "http://x/ftp/package.json.bak"
+    assert recon("http://x/#!/reports/q3.pdf") == "http://x/reports/q3.pdf"
+    # Extension-less client route words are NOT served files → stay dead.
+    assert recon("http://x/#/search") == ""
+    assert recon("http://x/#/order-history") == ""
+
+
 # --- Fake Playwright scaffolding for streaming/truncation tests -------------
 
 

@@ -21,6 +21,17 @@ class ApiExtractor:
         re.I,
     )
     URL_STRING_RE = re.compile(r"""(?P<quote>["'`])(?P<path>/[^"'`\s<>]+)(?P=quote)""")
+    # Client-side navigation sinks: location.assign("/x") / location.replace("/x")
+    # / (window.)location.href = "/x" / window.location = "/x". Captures the quoted
+    # absolute-path literal, tolerating a leading base concat (hostServer+"/x").
+    # These are real server pages the app navigates to — safe to fetch (and parse
+    # their forms) even when single-segment, unlike arbitrary quoted strings.
+    NAV_SINK_RE = re.compile(
+        r"""(?:location\s*\.\s*(?:assign|replace)\s*\(|"""
+        r"""location(?:\s*\.\s*href)?\s*=)"""
+        r"""[^"'`]{0,40}?["'`](?P<path>/[^"'`\s<>]*)["'`]""",
+        re.I,
+    )
     FETCH_RE = re.compile(
         r"""(?:(?P<axios>axios)\.(?P<axios_method>get|post|put|patch|delete)|fetch|\.(?P<chain_method>get|post|put|patch|delete))\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""",
         re.I,
@@ -154,6 +165,15 @@ class ApiExtractor:
             parent = cls._rest_parent_path(path)
             if parent:
                 add_endpoint(parent, "GET", evidence="rest-parent")
+
+        for match in cls.NAV_SINK_RE.finditer(script_text):
+            path = match.group("path")
+            # Same-origin absolute page paths the app navigates to. add_route
+            # resolves against base_url; the spider enforces same_domain, so an
+            # off-origin absolute URL matched here is dropped downstream. Guard
+            # protocol-relative (//host) explicitly since that is cross-origin.
+            if path and path.startswith("/") and not path.startswith("//"):
+                add_route(path)
 
         for match in cls.FETCH_RE.finditer(script_text):
             path = match.group("path")

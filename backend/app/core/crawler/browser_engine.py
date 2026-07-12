@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from app.config import get_settings
 from app.core.crawler.api_extractor import ApiExtractor
@@ -1185,6 +1185,7 @@ class BrowserDiscoveryEngine:
         routes: list[str] | None = None,
         deadline: float | None = None,
         storage_state: dict | None = None,
+        client_routes: list[str] | None = None,
     ) -> CrawlState:
         """Stream browser observations into ``state`` as they arrive.
 
@@ -1252,6 +1253,7 @@ class BrowserDiscoveryEngine:
                 routes=routes,
                 deadline=deadline,
                 storage_state=storage_state,
+                client_routes=client_routes,
             )
         finally:
             # A hard-deadline truncation cancels workers mid-``fill``, orphaning
@@ -1277,6 +1279,7 @@ class BrowserDiscoveryEngine:
         routes: list[str] | None = None,
         deadline: float | None = None,
         storage_state: dict | None = None,
+        client_routes: list[str] | None = None,
     ) -> CrawlState:
         """Body of :meth:`crawl_into` (see its docstring). Split out so the loop
         exception handler that silences the benign ``TargetClosedError`` teardown
@@ -1306,6 +1309,22 @@ class BrowserDiscoveryEngine:
             route_budget = max(1, min(self.settings.crawl_max_urls, self.settings.crawl_browser_route_cap))
             heap: list[tuple[int, int, str]] = []
             seen_routes: set[str] = set()
+            # Route-path keys of the app's OWN client routes (mined from JS bundles,
+            # HTML links, or the sitemap). A router-defined route that renders the
+            # not-found component is almost always just missing a required query
+            # parameter (e.g. ``/#/search`` without ``q``), NOT genuinely dead — so
+            # it must survive suppression as a live route (a brute-force guess that
+            # renders the same IS dead). Keyed by route path so a bare mined path
+            # (``/search``) matches its rendered hash form (``/#/search``).
+            client_route_keys: set[str] = {
+                self._client_route_key(u) for u in (client_routes or [])
+            }
+            # Path keys of routes OBSERVED in the rendered DOM (anchors/router
+            # directives harvested during the crawl). Only these — never a
+            # brute-force wordlist seed — are eligible to be resurrected as a
+            # real HTTP server endpoint when their hash form renders dead (see
+            # the not-found-suppression site). Populated as discovery proceeds.
+            browser_observed_keys: set[str] = set()
             submitted_form_keys: set[tuple[str, str, tuple[str, ...]]] = set()
             # Crawl-wide dedup of safe action-button labels already clicked, so a
             # site-wide widget (header "Save"/"Add") is exercised once globally
@@ -1528,9 +1547,62 @@ class BrowserDiscoveryEngine:
                                 if self._is_dead_spa_route(
                                     landed_url, root_url, route_sig, not_found_signature
                                 ):
+                                    # A router-defined client route that renders the
+                                    # not-found component is kept alive (is_dead=False):
+                                    # it likely just lacks a required query parameter,
+                                    # and it is a valid surface for the XSS DOM sweep to
+                                    # project injectable params onto. Only a route with
+                                    # no client-route provenance (brute-force guess,
+                                    # blind discovery) is recorded as genuinely dead.
+                                    # Either way we skip the interaction work below — an
+                                    # empty not-found render has no forms to exercise.
+                                    is_client_route = (
+                                        self._client_route_key(landed_url) in client_route_keys
+                                    )
+                                    # A dead hash route whose fragment is really a
+                                    # server resource: either a query-bearing endpoint
+                                    # (``#/redirect?to=https://…``, from a
+                                    # ``./redirect?to=…`` anchor) or a served file
+                                    # (``#/ftp/legal.md``, from a ``./ftp/legal.md``
+                                    # anchor). The hash form renders the not-found shell
+                                    # only because the server never sees a fragment —
+                                    # yet it is a real HTTP endpoint the detectors must
+                                    # test (open redirect, SSRF, LFI, path traversal /
+                                    # arbitrary file read). This is the "second chance
+                                    # without #" for a mined route that turned out dead.
+                                    # Record the reconstructed same-origin HTTP URL as a
+                                    # LIVE route; never navigate it in the browser (it
+                                    # renders the shell again). Restricted to routes
+                                    # OBSERVED in the DOM (anchors), so a brute-force
+                                    # wordlist seed is never resurrected. Client routes
+                                    # are handled above.
+                                    is_browser_observed = (
+                                        self._client_route_key(landed_url)
+                                        in browser_observed_keys
+                                    )
+                                    server_route = (
+                                        self._server_endpoint_from_dead_route(landed_url)
+                                        if (not is_client_route and is_browser_observed)
+                                        else None
+                                    )
+                                    if server_route:
+                                        logger.debug(
+                                            "dead hash route %s is a server endpoint; "
+                                            "recording %s for HTTP detectors",
+                                            target_url, server_route,
+                                        )
+                                        wstate.add_route(
+                                            RouteCandidate(
+                                                url=server_route,
+                                                source=RouteSource.browser,
+                                                priority=60,
+                                                evidence="browser_server_endpoint_from_dead_hash",
+                                            )
+                                        )
+                                        continue
                                     logger.debug(
-                                        "suppressing dead client-side route (not-found fallback): %s",
-                                        target_url,
+                                        "not-found fallback render for %s (client_route=%s)",
+                                        target_url, is_client_route,
                                     )
                                     wstate.add_route(
                                         RouteCandidate(
@@ -1539,7 +1611,7 @@ class BrowserDiscoveryEngine:
                                             priority=10,
                                             evidence="browser_not_found_fallback",
                                             is_spa_fallback=True,
-                                            is_dead=True,
+                                            is_dead=not is_client_route,
                                         )
                                     )
                                     continue
@@ -1719,6 +1791,9 @@ class BrowserDiscoveryEngine:
                             discovered.extend(await self._discover_routes(page, root_url))
                             async with lock:
                                 for new_route in discovered:
+                                    browser_observed_keys.add(
+                                        self._client_route_key(new_route)
+                                    )
                                     _enqueue(new_route, evidence="browser_discovered")
                                 cond.notify_all()
                         except Exception as exc:
@@ -4535,6 +4610,67 @@ class BrowserDiscoveryEngine:
         if reason is None:
             reason = "replayable" if observation.replayable else "observed"
         state.request_audit_summary[reason] = state.request_audit_summary.get(reason, 0) + 1
+
+    @staticmethod
+    def _client_route_key(url: str) -> str:
+        """Path-only key identifying a client route regardless of router style.
+
+        A route mined from JS as a bare path (``/search``) and its rendered
+        hash-router form (``/#/search``) must map to the SAME key so a
+        router-defined route can be recognised at the not-found-suppression site.
+        Prefers the hash-route path; falls back to the URL path. Query/fragment
+        query is dropped (a route's identity is its path, not its params).
+        """
+        parsed = urlparse(url)
+        frag = (parsed.fragment or "").lstrip("#!/").split("?", 1)[0]
+        path = frag if frag else (parsed.path or "")
+        return "/" + path.strip("/").lower()
+
+    @staticmethod
+    def _server_endpoint_from_dead_route(url: str) -> str:
+        """Reconstruct a real server-endpoint URL from a dead hash route.
+
+        A hash-routed SPA serves one shell for every ``#/…``, so a genuine
+        server resource linked as an anchor gets canonicalised to a hash route
+        and then renders the app's not-found shell — yet it is a real HTTP
+        endpoint the detectors must test. Two shapes are recovered:
+
+        * **Query-bearing endpoint** (``#/redirect?to=X``, canonicalised from a
+          plain ``./redirect?to=…`` anchor): the query params carry the attack
+          surface (open redirect ``to=``, SSRF ``url=``, LFI ``file=``). Rebuild
+          ``scheme://host/path?query``.
+        * **Served file** (``#/ftp/legal.md``, from an ``./ftp/legal.md``
+          anchor): a query-less path whose last segment has a file extension is
+          a real static resource the router swallowed, never a client route
+          (client routes are extension-less words like ``/search``). Rebuild
+          ``scheme://host/path``.
+
+        This is the "second chance without ``#``" for a browser/JS-mined route
+        that turned out dead: retry it as its plain server path. Returns ``""``
+        for a bare dead client route (``#/wp-admin`` — no query, no extension) or
+        a root API prefix already covered by the HTTP crawler + JS api_extractor.
+        Framework-agnostic: no app-specific paths.
+        """
+        parsed = urlparse(url)
+        frag = parsed.fragment or ""
+        raw_path, _, query = frag.lstrip("#!").partition("?")
+        path = "/" + raw_path.strip("/")
+        if path == "/":
+            return ""
+        if BrowserDiscoveryEngine._is_root_api_path(path):
+            return ""
+        if query:
+            canon_query = urlencode(parse_qsl(query, keep_blank_values=True))
+            if not canon_query:
+                return ""
+            return urlunparse((parsed.scheme, parsed.netloc, path, "", canon_query, ""))
+        # Query-less: only a path whose last segment looks like a served file
+        # (has a file extension) is a real server resource worth retrying; a
+        # bare route word is a client route and stays dead.
+        last_segment = path.rsplit("/", 1)[-1]
+        if not re.search(r"\.[A-Za-z0-9]{1,8}$", last_segment):
+            return ""
+        return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
     def _normalize_for_seen(self, url: str) -> str:
         parsed = urlparse(url)

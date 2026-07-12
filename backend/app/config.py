@@ -163,6 +163,11 @@ class Settings(BaseSettings):
     )
     oast_callback_base_url: str | None = Field(default=None, alias="OAST_CALLBACK_BASE_URL")
     oast_poll_url: str | None = Field(default=None, alias="OAST_POLL_URL")
+    oast_interaction_ttl_seconds: int = Field(default=3600, alias="OAST_INTERACTION_TTL_SECONDS")
+    # Blind-SSRF OAST confirmation: a fire-and-forget server-side fetch may land
+    # slightly after the injection returns, so poll a bounded number of times.
+    ssrf_oast_poll_attempts: int = Field(default=5, alias="SSRF_OAST_POLL_ATTEMPTS")
+    ssrf_oast_poll_interval_seconds: float = Field(default=0.4, alias="SSRF_OAST_POLL_INTERVAL_SECONDS")
     # In-band SSRF fallback: minimum consistent response-time delta (ms) between an
     # internal target and the external control before a probable (unverified) SSRF
     # is reported when no OAST callback is configured.

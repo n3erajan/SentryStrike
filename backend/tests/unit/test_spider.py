@@ -43,6 +43,7 @@ async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch
             routes=None,
             deadline=None,
             storage_state=None,
+            client_routes=None,
         ):
             # Stream a partial observation, mark availability, then blow up —
             # simulating a timeout/exception mid-run.
@@ -109,6 +110,7 @@ async def test_run_browser_discovery_degrades_when_playwright_unavailable(monkey
             routes=None,
             deadline=None,
             storage_state=None,
+            client_routes=None,
         ):
             state.browser_available = False
             state.browser_error = "Playwright import failed: boom"
