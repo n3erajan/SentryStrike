@@ -796,6 +796,12 @@ class BrowserDiscoveryEngine:
         # read from settings at crawl time so a per-scan override can be threaded
         # in by the caller (as the spider does for max_interactions).
         self._workers = workers
+        # Wall-clock grace added on top of the crawl budget before the pool
+        # watchdog force-cancels a worker stuck on an unbounded await (see the
+        # worker-pool join in ``crawl_into``). Large enough that clean per-route
+        # deadline truncation always fires first on a healthy crawl; small
+        # enough that a genuinely wedged worker cannot hang the run for long.
+        self._pool_stuck_grace_s = 20.0
 
     @staticmethod
     async def check_readiness() -> tuple[bool, str | None]:
@@ -1034,10 +1040,15 @@ class BrowserDiscoveryEngine:
             observed.response_headers = headers
             observed.response_content_type = headers.get("content-type")
             observed.redirect_chain = self._redirect_chain(request)
-            try:
-                observed.response_snippet = (await response.text())[:1000]
-            except Exception:
-                observed.response_snippet = None
+            # Bounded: ``response.text()`` has no timeout and — unlike locator
+            # ops — is NOT covered by ``context.set_default_timeout``. On a
+            # streaming / never-closing body (SSE, socket.io long-poll, a chat
+            # stream) it never resolves, wedging this observer task; the worker
+            # then blocks draining it. ``_bounded`` caps it so it always settles.
+            snippet = await self._bounded(response.text(), 3000)
+            observed.response_snippet = (
+                snippet[:1000] if isinstance(snippet, str) else None
+            )
 
         def on_websocket(ws):
             try:
@@ -1091,8 +1102,19 @@ class BrowserDiscoveryEngine:
         # "Future exception was never retrieved" at shutdown. Results are already
         # captured; this only silences the leak. ``return_exceptions`` keeps the
         # gather from re-raising the CancelledError/close error we expect.
+        # Bounded: an observer that resists prompt cancellation must not wedge
+        # the worker here (this runs inline in the route loop). If the cancelled
+        # tasks do not settle in time, abandon them rather than block — the
+        # pool watchdog is the last resort, but this keeps a single stuck
+        # observer from ever reaching it.
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=max(0.05, timeout_s),
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
 
     @staticmethod
     def _merge_worker_state(
@@ -1474,6 +1496,304 @@ class BrowserDiscoveryEngine:
                     root_origin_url,
                 )
                 first = True
+                async def _process_route(target_url):
+                    """Process one route on this worker's page. Runs under a hard
+                    per-route cap at the call site so a route that never loads / an
+                    await that wedges past the per-op bounds cannot stall the worker.
+                    The dead-route paths ``return`` (was ``continue``) to end this route."""
+                    nonlocal first
+                    allow_interaction = self._budget_allows_interaction(effective_deadline, loop)
+                    # Each worker's first navigation is a full load (its
+                    # page starts blank); later same-origin routes prefer
+                    # client-side navigation.
+                    await self._navigate(page, target_url, root_url, allow_spa=not first)
+                    first = False
+                    await self._settle_inflight(page, inflight)
+                    await self._drain_observer_tasks(pending_observers)
+                    await self._clear_blocking_overlays(page)
+                    # Post-auth liveness re-check (generic). On the root a
+                    # logged-out shell means the seeded storage_state never
+                    # persisted (RC-A); on other routes it means interaction
+                    # dropped the session mid-crawl (P1-3). Re-seed cookies
+                    # when we have them rather than crawl unauthenticated.
+                    is_root = self._normalize_for_seen(target_url) == self._normalize_for_seen(root_url)
+                    if (storage_state or auth_cookie_entries) and await self._looks_logged_out(page):
+                        reseeded = await self._reseed_session(context, auth_cookie_entries)
+                        if reseeded:
+                            logger.info(
+                                "browser session looked logged-out on %s; re-seeded auth cookies",
+                                target_url,
+                            )
+                        elif is_root and storage_state and not state.browser_error:
+                            state.browser_error = (
+                                "authenticated session did not persist into browser context"
+                            )
+                    # Dead client-side route suppression. A hash-routed SPA
+                    # serves one index.html for every ``#/…`` route, so a
+                    # brute-force wordlist path (``#/wp-admin``, ``#/.env``)
+                    # renders the app's not-found/catch-all component with an
+                    # HTTP 200 — indistinguishable from a live route except by
+                    # the RENDERED DOM. When the route's rendered signature
+                    # matches the not-found fallback captured at preflight,
+                    # record it as dead and skip all form/interaction work
+                    # (which would otherwise fire useless submits/clicks on the
+                    # 404 component and pollute the surface with dead routes).
+                    landed_url = self._current_url(page, target_url)
+                    if not_found_signature and not is_root:
+                        route_sig = await self._route_content_signature(page)
+                        if self._is_dead_spa_route(
+                            landed_url, root_url, route_sig, not_found_signature
+                        ):
+                            # A router-defined client route that renders the
+                            # not-found component is kept alive (is_dead=False):
+                            # it likely just lacks a required query parameter,
+                            # and it is a valid surface for the XSS DOM sweep to
+                            # project injectable params onto. Only a route with
+                            # no client-route provenance (brute-force guess,
+                            # blind discovery) is recorded as genuinely dead.
+                            # Either way we skip the interaction work below — an
+                            # empty not-found render has no forms to exercise.
+                            is_client_route = (
+                                self._client_route_key(landed_url) in client_route_keys
+                            )
+                            # A dead hash route whose fragment is really a
+                            # server resource: either a query-bearing endpoint
+                            # (``#/redirect?to=https://…``, from a
+                            # ``./redirect?to=…`` anchor) or a served file
+                            # (``#/ftp/legal.md``, from a ``./ftp/legal.md``
+                            # anchor). The hash form renders the not-found shell
+                            # only because the server never sees a fragment —
+                            # yet it is a real HTTP endpoint the detectors must
+                            # test (open redirect, SSRF, LFI, path traversal /
+                            # arbitrary file read). This is the "second chance
+                            # without #" for a mined route that turned out dead.
+                            # Record the reconstructed same-origin HTTP URL as a
+                            # LIVE route; never navigate it in the browser (it
+                            # renders the shell again). Restricted to routes
+                            # OBSERVED in the DOM (anchors), so a brute-force
+                            # wordlist seed is never resurrected. Client routes
+                            # are handled above.
+                            is_browser_observed = (
+                                self._client_route_key(landed_url)
+                                in browser_observed_keys
+                            )
+                            server_route = (
+                                self._server_endpoint_from_dead_route(landed_url)
+                                if (not is_client_route and is_browser_observed)
+                                else None
+                            )
+                            if server_route:
+                                logger.debug(
+                                    "dead hash route %s is a server endpoint; "
+                                    "recording %s for HTTP detectors",
+                                    target_url, server_route,
+                                )
+                                wstate.add_route(
+                                    RouteCandidate(
+                                        url=server_route,
+                                        source=RouteSource.browser,
+                                        priority=60,
+                                        evidence="browser_server_endpoint_from_dead_hash",
+                                    )
+                                )
+                                return
+                            logger.debug(
+                                "not-found fallback render for %s (client_route=%s)",
+                                target_url, is_client_route,
+                            )
+                            wstate.add_route(
+                                RouteCandidate(
+                                    url=landed_url,
+                                    source=RouteSource.browser,
+                                    priority=10,
+                                    evidence="browser_not_found_fallback",
+                                    is_spa_fallback=True,
+                                    is_dead=not is_client_route,
+                                )
+                            )
+                            return
+                    wstate.add_route(
+                        RouteCandidate(
+                            url=landed_url,
+                            source=RouteSource.browser,
+                            priority=75,
+                            evidence="browser_navigation",
+                        )
+                    )
+                    # Form capture + active submission is the highest-yield
+                    # body-producing work, so it runs BEFORE blind
+                    # interaction — otherwise ``_exercise_page`` consumes the
+                    # per-route budget first and the submit path (which fires
+                    # the app's real POST/PUT/PATCH XHR that on_request
+                    # captures as a replayable body) is starved on truncation.
+                    #
+                    # Workflow chaining (body-coverage #2): the whole
+                    # body-producing pass (expand → capture → submit → click)
+                    # repeats while a prior in-page action revealed NEW
+                    # interactive controls (e.g. add-to-basket surfaces a
+                    # checkout form; opening the basket surfaces a coupon
+                    # field). Three independent stops prevent runaway: the
+                    # ``crawl_browser_workflow_depth`` cap, the control-
+                    # signature ceasing to change, and the crawl deadline.
+                    # Cross-pass dedup (``submitted_form_keys`` /
+                    # ``clicked_action_keys``) guarantees each pass only fires
+                    # genuinely-new forms/buttons.
+                    workflow_depth = max(
+                        1, int(getattr(self.settings, "crawl_browser_workflow_depth", 2) or 2)
+                    )
+                    prev_control_sig: str | None = None
+                    for _wf_pass in range(workflow_depth):
+                        if effective_deadline is not None and loop.time() >= effective_deadline:
+                            break
+                        # Expand hidden/collapsed interactive containers (tabs,
+                        # accordions, "show more" controls) so their forms and
+                        # links become visible and capturable before capture.
+                        await self._expand_hidden_content(page)
+                        # Count forms/file inputs from structural clusters
+                        # (RC-1): runs on every route, not gated on literal
+                        # <form>s.
+                        captured_forms = await self._capture_forms(page, target_url)
+                        # Hydration-aware recapture: if any cluster's fields
+                        # resolved no real framework name (pre-hydration SPA
+                        # capture), let the framework settle and capture once
+                        # more so late-bound names (formcontrolname etc.) land.
+                        # ALSO recapture when zero forms were captured: an SPA
+                        # shell always renders at least a search/navigation
+                        # form, so zero forms means the component has not
+                        # hydrated yet. Without this, late-rendering route
+                        # forms (register, forgot-password, etc.) are never
+                        # captured because the recapture trigger only fired on
+                        # forms with unnamed fields, not on empty results.
+                        if not captured_forms or self._forms_need_hydration_recapture(captured_forms):
+                            await self._settle_inflight(page, inflight, cap_ms=1500.0)
+                            recaptured = await self._capture_forms(page, target_url)
+                            if recaptured:
+                                captured_forms = recaptured
+                        # Discovery counters are delta-based (count each form
+                        # once via the deduping ``add_browser_form``) so a
+                        # chained re-capture of the same DOM never inflates
+                        # the metric; a form revealed by a later pass is still
+                        # counted when it first appears.
+                        before_forms = len(wstate.browser_forms)
+                        for form in captured_forms:
+                            wstate.add_browser_form(form)
+                        newly_seen = wstate.browser_forms[before_forms:]
+                        wstate.browser_forms_discovered += len(newly_seen)
+                        wstate.file_inputs_discovered += sum(
+                            int(form.get("file_inputs", 0)) for form in newly_seen
+                        )
+                        # Atomically claim un-submitted form keys under the
+                        # lock so two workers never submit the same form; then
+                        # submit outside the lock (slow) against a throwaway
+                        # dedup set.
+                        async with lock:
+                            new_forms = []
+                            for form in captured_forms:
+                                key = CrawlState._form_key(form)
+                                # A site-wide widget (e.g. the header search
+                                # box) is captured on EVERY route with a
+                                # per-route action, so its ``_form_key`` differs
+                                # each time and it would be re-submitted on
+                                # every page — each attempt firing a useless GET
+                                # and burning ~1-2s of the budget owed to
+                                # unreached form routes. Dedup a second time on
+                                # a route-independent structural signature
+                                # (method + field names) so such a widget is
+                                # exercised once globally. Two genuinely-distinct
+                                # forms sharing a signature yield the same body
+                                # schema anyway, which is what downstream
+                                # detectors consume.
+                                sig = self._form_structural_signature(form)
+                                if key in submitted_form_keys or sig in submitted_form_keys:
+                                    continue
+                                submitted_form_keys.add(key)
+                                submitted_form_keys.add(sig)
+                                new_forms.append(form)
+                        # Active form submission (Task B): fire the app's real
+                        # POST/PUT/PATCH XHR so on_request captures a replayable
+                        # observation. Skips destructive forms.
+                        wstate.browser_forms_submitted += await self._submit_discovered_forms(
+                            page, new_forms, root_url, target_url, set(),
+                            inflight=inflight,
+                            deadline=effective_deadline, loop=loop,
+                        )
+                        await self._drain_observer_tasks(pending_observers)
+                        # Button-driven mutation capture (body-coverage #1):
+                        # fire safe action buttons (add/save/create/rate/…)
+                        # that POST/PUT via a plain click with no <form>, so
+                        # on_request captures their bodies too. Runs here as a
+                        # first-class high-yield step — right after form submit,
+                        # before the blind interaction loop can spend the
+                        # budget — and is deadline/dedup-bounded so it never
+                        # starves route coverage. Only clicks that fire a
+                        # mutating XHR are counted as valuable.
+                        if allow_interaction:
+                            await self._exercise_action_buttons(
+                                page, wstate, clicked_action_keys,
+                                inflight=inflight,
+                                deadline=effective_deadline, loop=loop,
+                            )
+                            await self._drain_observer_tasks(pending_observers)
+                        # Chaining stop: end the route's body-producing work as
+                        # soon as no new interactive surface appeared since the
+                        # last pass (or the signature could not be read).
+                        if workflow_depth <= 1:
+                            break
+                        control_sig = await self._interactive_control_signature(page)
+                        if not control_sig or control_sig == prev_control_sig:
+                            break
+                        prev_control_sig = control_sig
+                    # Blind interaction runs last, on whatever budget the
+                    # high-yield submit path left, so it can never starve
+                    # form submission or route coverage.
+                    if allow_interaction:
+                        # RC2: bound blind clicking to this route's budget
+                        # share so no single page starves route coverage.
+                        interaction_budget = float(
+                            getattr(self.settings, "crawl_browser_per_route_seconds", 6.0)
+                        )
+                        if effective_deadline is not None:
+                            interaction_budget = min(
+                                interaction_budget,
+                                max(0.0, effective_deadline - loop.time()),
+                            )
+                        if interaction_budget > 0.0:
+                            workflow_stats = await self._exercise_page(
+                                page,
+                                max_seconds=interaction_budget,
+                                inflight=inflight,
+                                pending_observers=pending_observers,
+                                wstate=wstate,
+                                submitted_form_keys=submitted_form_keys,
+                                clicked_action_keys=clicked_action_keys,
+                                root_url=root_url,
+                                page_url=target_url,
+                            )
+                            wstate.workflow_states_visited += workflow_stats.get("states", 0)
+                        await self._drain_observer_tasks(pending_observers)
+                    # Enqueue newly-discovered same-origin routes (scored),
+                    # then wake any idle workers to pick them up.
+                    # Open hamburger/sidebar/dropdown menus so their route
+                    # links become visible in the DOM. Collect links
+                    # IMMEDIATELY after opening menus — a scroll or any
+                    # interaction can close a dropdown (mat-menu,
+                    # cdk-overlay) and its dynamically-rendered route links
+                    # vanish from the DOM. Then scroll for lazy-loaded
+                    # content and collect again.
+                    await self._open_navigation_menus(page)
+                    discovered = await self._discover_routes(page, root_url)
+                    await self._scroll_for_lazy_content(page, inflight)
+                    # Collect again after scroll: lazy-loaded content may
+                    # have rendered new links (pagination, infinite scroll).
+                    discovered.extend(await self._discover_routes(page, root_url))
+                    async with lock:
+                        for new_route in discovered:
+                            browser_observed_keys.add(
+                                self._client_route_key(new_route)
+                            )
+                            _enqueue(new_route, evidence="browser_discovered")
+                        cond.notify_all()
+
                 try:
                     while True:
                         # --- Acquire the next route (or terminate) -------------
@@ -1503,299 +1823,22 @@ class BrowserDiscoveryEngine:
                                     return
                                 # Loop back to re-check heap/deadline.
 
-                        # --- Process the route on this worker's own page -------
-                        allow_interaction = self._budget_allows_interaction(effective_deadline, loop)
+                        # --- Process the route under a hard per-route cap ------
+                        # A route that never settles, or an interaction that wedges on
+                        # an await the per-op bounds miss, is abandoned when the cap
+                        # elapses so the worker moves on to the next route rather than
+                        # stalling the whole pool until the watchdog fires.
+                        route_cap = max(
+                            1.0, float(getattr(self.settings, "crawl_browser_route_cap_seconds", 60.0))
+                        )
                         try:
-                            # Each worker's first navigation is a full load (its
-                            # page starts blank); later same-origin routes prefer
-                            # client-side navigation.
-                            await self._navigate(page, target_url, root_url, allow_spa=not first)
-                            first = False
-                            await self._settle_inflight(page, inflight)
-                            await self._drain_observer_tasks(pending_observers)
-                            await self._clear_blocking_overlays(page)
-                            # Post-auth liveness re-check (generic). On the root a
-                            # logged-out shell means the seeded storage_state never
-                            # persisted (RC-A); on other routes it means interaction
-                            # dropped the session mid-crawl (P1-3). Re-seed cookies
-                            # when we have them rather than crawl unauthenticated.
-                            is_root = self._normalize_for_seen(target_url) == self._normalize_for_seen(root_url)
-                            if (storage_state or auth_cookie_entries) and await self._looks_logged_out(page):
-                                reseeded = await self._reseed_session(context, auth_cookie_entries)
-                                if reseeded:
-                                    logger.info(
-                                        "browser session looked logged-out on %s; re-seeded auth cookies",
-                                        target_url,
-                                    )
-                                elif is_root and storage_state and not state.browser_error:
-                                    state.browser_error = (
-                                        "authenticated session did not persist into browser context"
-                                    )
-                            # Dead client-side route suppression. A hash-routed SPA
-                            # serves one index.html for every ``#/…`` route, so a
-                            # brute-force wordlist path (``#/wp-admin``, ``#/.env``)
-                            # renders the app's not-found/catch-all component with an
-                            # HTTP 200 — indistinguishable from a live route except by
-                            # the RENDERED DOM. When the route's rendered signature
-                            # matches the not-found fallback captured at preflight,
-                            # record it as dead and skip all form/interaction work
-                            # (which would otherwise fire useless submits/clicks on the
-                            # 404 component and pollute the surface with dead routes).
-                            landed_url = self._current_url(page, target_url)
-                            if not_found_signature and not is_root:
-                                route_sig = await self._route_content_signature(page)
-                                if self._is_dead_spa_route(
-                                    landed_url, root_url, route_sig, not_found_signature
-                                ):
-                                    # A router-defined client route that renders the
-                                    # not-found component is kept alive (is_dead=False):
-                                    # it likely just lacks a required query parameter,
-                                    # and it is a valid surface for the XSS DOM sweep to
-                                    # project injectable params onto. Only a route with
-                                    # no client-route provenance (brute-force guess,
-                                    # blind discovery) is recorded as genuinely dead.
-                                    # Either way we skip the interaction work below — an
-                                    # empty not-found render has no forms to exercise.
-                                    is_client_route = (
-                                        self._client_route_key(landed_url) in client_route_keys
-                                    )
-                                    # A dead hash route whose fragment is really a
-                                    # server resource: either a query-bearing endpoint
-                                    # (``#/redirect?to=https://…``, from a
-                                    # ``./redirect?to=…`` anchor) or a served file
-                                    # (``#/ftp/legal.md``, from a ``./ftp/legal.md``
-                                    # anchor). The hash form renders the not-found shell
-                                    # only because the server never sees a fragment —
-                                    # yet it is a real HTTP endpoint the detectors must
-                                    # test (open redirect, SSRF, LFI, path traversal /
-                                    # arbitrary file read). This is the "second chance
-                                    # without #" for a mined route that turned out dead.
-                                    # Record the reconstructed same-origin HTTP URL as a
-                                    # LIVE route; never navigate it in the browser (it
-                                    # renders the shell again). Restricted to routes
-                                    # OBSERVED in the DOM (anchors), so a brute-force
-                                    # wordlist seed is never resurrected. Client routes
-                                    # are handled above.
-                                    is_browser_observed = (
-                                        self._client_route_key(landed_url)
-                                        in browser_observed_keys
-                                    )
-                                    server_route = (
-                                        self._server_endpoint_from_dead_route(landed_url)
-                                        if (not is_client_route and is_browser_observed)
-                                        else None
-                                    )
-                                    if server_route:
-                                        logger.debug(
-                                            "dead hash route %s is a server endpoint; "
-                                            "recording %s for HTTP detectors",
-                                            target_url, server_route,
-                                        )
-                                        wstate.add_route(
-                                            RouteCandidate(
-                                                url=server_route,
-                                                source=RouteSource.browser,
-                                                priority=60,
-                                                evidence="browser_server_endpoint_from_dead_hash",
-                                            )
-                                        )
-                                        continue
-                                    logger.debug(
-                                        "not-found fallback render for %s (client_route=%s)",
-                                        target_url, is_client_route,
-                                    )
-                                    wstate.add_route(
-                                        RouteCandidate(
-                                            url=landed_url,
-                                            source=RouteSource.browser,
-                                            priority=10,
-                                            evidence="browser_not_found_fallback",
-                                            is_spa_fallback=True,
-                                            is_dead=not is_client_route,
-                                        )
-                                    )
-                                    continue
-                            wstate.add_route(
-                                RouteCandidate(
-                                    url=landed_url,
-                                    source=RouteSource.browser,
-                                    priority=75,
-                                    evidence="browser_navigation",
-                                )
+                            await asyncio.wait_for(_process_route(target_url), timeout=route_cap)
+                        except (asyncio.TimeoutError, TimeoutError):
+                            logger.warning(
+                                "worker %d abandoned route %s: exceeded per-route cap of %.0fs "
+                                "(page never settled or an operation hung)",
+                                worker_id, target_url, route_cap,
                             )
-                            # Form capture + active submission is the highest-yield
-                            # body-producing work, so it runs BEFORE blind
-                            # interaction — otherwise ``_exercise_page`` consumes the
-                            # per-route budget first and the submit path (which fires
-                            # the app's real POST/PUT/PATCH XHR that on_request
-                            # captures as a replayable body) is starved on truncation.
-                            #
-                            # Workflow chaining (body-coverage #2): the whole
-                            # body-producing pass (expand → capture → submit → click)
-                            # repeats while a prior in-page action revealed NEW
-                            # interactive controls (e.g. add-to-basket surfaces a
-                            # checkout form; opening the basket surfaces a coupon
-                            # field). Three independent stops prevent runaway: the
-                            # ``crawl_browser_workflow_depth`` cap, the control-
-                            # signature ceasing to change, and the crawl deadline.
-                            # Cross-pass dedup (``submitted_form_keys`` /
-                            # ``clicked_action_keys``) guarantees each pass only fires
-                            # genuinely-new forms/buttons.
-                            workflow_depth = max(
-                                1, int(getattr(self.settings, "crawl_browser_workflow_depth", 2) or 2)
-                            )
-                            prev_control_sig: str | None = None
-                            for _wf_pass in range(workflow_depth):
-                                if effective_deadline is not None and loop.time() >= effective_deadline:
-                                    break
-                                # Expand hidden/collapsed interactive containers (tabs,
-                                # accordions, "show more" controls) so their forms and
-                                # links become visible and capturable before capture.
-                                await self._expand_hidden_content(page)
-                                # Count forms/file inputs from structural clusters
-                                # (RC-1): runs on every route, not gated on literal
-                                # <form>s.
-                                captured_forms = await self._capture_forms(page, target_url)
-                                # Hydration-aware recapture: if any cluster's fields
-                                # resolved no real framework name (pre-hydration SPA
-                                # capture), let the framework settle and capture once
-                                # more so late-bound names (formcontrolname etc.) land.
-                                # ALSO recapture when zero forms were captured: an SPA
-                                # shell always renders at least a search/navigation
-                                # form, so zero forms means the component has not
-                                # hydrated yet. Without this, late-rendering route
-                                # forms (register, forgot-password, etc.) are never
-                                # captured because the recapture trigger only fired on
-                                # forms with unnamed fields, not on empty results.
-                                if not captured_forms or self._forms_need_hydration_recapture(captured_forms):
-                                    await self._settle_inflight(page, inflight, cap_ms=1500.0)
-                                    recaptured = await self._capture_forms(page, target_url)
-                                    if recaptured:
-                                        captured_forms = recaptured
-                                # Discovery counters are delta-based (count each form
-                                # once via the deduping ``add_browser_form``) so a
-                                # chained re-capture of the same DOM never inflates
-                                # the metric; a form revealed by a later pass is still
-                                # counted when it first appears.
-                                before_forms = len(wstate.browser_forms)
-                                for form in captured_forms:
-                                    wstate.add_browser_form(form)
-                                newly_seen = wstate.browser_forms[before_forms:]
-                                wstate.browser_forms_discovered += len(newly_seen)
-                                wstate.file_inputs_discovered += sum(
-                                    int(form.get("file_inputs", 0)) for form in newly_seen
-                                )
-                                # Atomically claim un-submitted form keys under the
-                                # lock so two workers never submit the same form; then
-                                # submit outside the lock (slow) against a throwaway
-                                # dedup set.
-                                async with lock:
-                                    new_forms = []
-                                    for form in captured_forms:
-                                        key = CrawlState._form_key(form)
-                                        # A site-wide widget (e.g. the header search
-                                        # box) is captured on EVERY route with a
-                                        # per-route action, so its ``_form_key`` differs
-                                        # each time and it would be re-submitted on
-                                        # every page — each attempt firing a useless GET
-                                        # and burning ~1-2s of the budget owed to
-                                        # unreached form routes. Dedup a second time on
-                                        # a route-independent structural signature
-                                        # (method + field names) so such a widget is
-                                        # exercised once globally. Two genuinely-distinct
-                                        # forms sharing a signature yield the same body
-                                        # schema anyway, which is what downstream
-                                        # detectors consume.
-                                        sig = self._form_structural_signature(form)
-                                        if key in submitted_form_keys or sig in submitted_form_keys:
-                                            continue
-                                        submitted_form_keys.add(key)
-                                        submitted_form_keys.add(sig)
-                                        new_forms.append(form)
-                                # Active form submission (Task B): fire the app's real
-                                # POST/PUT/PATCH XHR so on_request captures a replayable
-                                # observation. Skips destructive forms.
-                                wstate.browser_forms_submitted += await self._submit_discovered_forms(
-                                    page, new_forms, root_url, target_url, set(),
-                                    inflight=inflight,
-                                    deadline=effective_deadline, loop=loop,
-                                )
-                                await self._drain_observer_tasks(pending_observers)
-                                # Button-driven mutation capture (body-coverage #1):
-                                # fire safe action buttons (add/save/create/rate/…)
-                                # that POST/PUT via a plain click with no <form>, so
-                                # on_request captures their bodies too. Runs here as a
-                                # first-class high-yield step — right after form submit,
-                                # before the blind interaction loop can spend the
-                                # budget — and is deadline/dedup-bounded so it never
-                                # starves route coverage. Only clicks that fire a
-                                # mutating XHR are counted as valuable.
-                                if allow_interaction:
-                                    await self._exercise_action_buttons(
-                                        page, wstate, clicked_action_keys,
-                                        inflight=inflight,
-                                        deadline=effective_deadline, loop=loop,
-                                    )
-                                    await self._drain_observer_tasks(pending_observers)
-                                # Chaining stop: end the route's body-producing work as
-                                # soon as no new interactive surface appeared since the
-                                # last pass (or the signature could not be read).
-                                if workflow_depth <= 1:
-                                    break
-                                control_sig = await self._interactive_control_signature(page)
-                                if not control_sig or control_sig == prev_control_sig:
-                                    break
-                                prev_control_sig = control_sig
-                            # Blind interaction runs last, on whatever budget the
-                            # high-yield submit path left, so it can never starve
-                            # form submission or route coverage.
-                            if allow_interaction:
-                                # RC2: bound blind clicking to this route's budget
-                                # share so no single page starves route coverage.
-                                interaction_budget = float(
-                                    getattr(self.settings, "crawl_browser_per_route_seconds", 6.0)
-                                )
-                                if effective_deadline is not None:
-                                    interaction_budget = min(
-                                        interaction_budget,
-                                        max(0.0, effective_deadline - loop.time()),
-                                    )
-                                if interaction_budget > 0.0:
-                                    workflow_stats = await self._exercise_page(
-                                        page,
-                                        max_seconds=interaction_budget,
-                                        inflight=inflight,
-                                        pending_observers=pending_observers,
-                                        wstate=wstate,
-                                        submitted_form_keys=submitted_form_keys,
-                                        clicked_action_keys=clicked_action_keys,
-                                        root_url=root_url,
-                                        page_url=target_url,
-                                    )
-                                    wstate.workflow_states_visited += workflow_stats.get("states", 0)
-                                await self._drain_observer_tasks(pending_observers)
-                            # Enqueue newly-discovered same-origin routes (scored),
-                            # then wake any idle workers to pick them up.
-                            # Open hamburger/sidebar/dropdown menus so their route
-                            # links become visible in the DOM. Collect links
-                            # IMMEDIATELY after opening menus — a scroll or any
-                            # interaction can close a dropdown (mat-menu,
-                            # cdk-overlay) and its dynamically-rendered route links
-                            # vanish from the DOM. Then scroll for lazy-loaded
-                            # content and collect again.
-                            await self._open_navigation_menus(page)
-                            discovered = await self._discover_routes(page, root_url)
-                            await self._scroll_for_lazy_content(page, inflight)
-                            # Collect again after scroll: lazy-loaded content may
-                            # have rendered new links (pagination, infinite scroll).
-                            discovered.extend(await self._discover_routes(page, root_url))
-                            async with lock:
-                                for new_route in discovered:
-                                    browser_observed_keys.add(
-                                        self._client_route_key(new_route)
-                                    )
-                                    _enqueue(new_route, evidence="browser_discovered")
-                                cond.notify_all()
                         except Exception as exc:
                             logger.warning("browser discovery failed for %s: %s", target_url, exc)
                 finally:
@@ -1809,14 +1852,46 @@ class BrowserDiscoveryEngine:
                     except Exception:
                         pass
                     try:
-                        await context.close()
+                        # Bounded: a hung ``context.close()`` (seen on Windows /
+                        # Proactor when the browser pipe is unresponsive) inside a
+                        # worker's ``finally`` would stall pool cancellation and
+                        # defeat the watchdog.
+                        await self._bounded(context.close(), 5000)
                     except Exception:
                         pass
 
+            worker_gather = asyncio.gather(
+                *[_worker(i) for i in range(num_workers)], return_exceptions=True
+            )
             try:
-                await asyncio.gather(
-                    *[_worker(i) for i in range(num_workers)], return_exceptions=True
-                )
+                if effective_deadline is not None:
+                    # Pool watchdog. A worker stuck on an unbounded await (a
+                    # never-closing response body / socket.io stream that escapes
+                    # the per-op bounds) never returns to the dequeue loop, so it
+                    # never becomes idle — the "all idle => finished" terminator
+                    # can never fire, every other worker parks in ``cond.wait()``,
+                    # and the crawl hangs forever (only a SIGINT breaks it). Cap
+                    # the join at the budget plus a grace: on timeout ``wait_for``
+                    # cancels the gather, which cancels the wedged worker (the
+                    # Python await unwinds even if the browser-side op lingers),
+                    # its ``finally`` closes its context, and the run proceeds to
+                    # merge whatever streamed in. Clean per-route deadline
+                    # truncation fires first on a healthy crawl, so this only
+                    # bites a genuinely stuck worker.
+                    grace = max(0.0, float(getattr(self, "_pool_stuck_grace_s", 20.0)))
+                    join_timeout = max(0.05, (effective_deadline - loop.time()) + grace)
+                    try:
+                        await asyncio.wait_for(worker_gather, timeout=join_timeout)
+                    except (asyncio.TimeoutError, TimeoutError):
+                        _record_truncation()
+                        logger.warning(
+                            "browser worker pool exceeded its hard cap (budget + "
+                            "%.1fs grace) for %s; a worker was stuck on an unbounded "
+                            "await and was cancelled to unblock the crawl",
+                            grace, root_url,
+                        )
+                else:
+                    await worker_gather
             finally:
                 # Merge each worker's local state into the shared state. This runs
                 # in ``finally`` — even under a hard-timeout cancellation — so the
@@ -1857,7 +1932,9 @@ class BrowserDiscoveryEngine:
                     state.browser_error,
                 )
                 try:
-                    await browser.close()
+                    # Bounded for the same reason as the per-worker context
+                    # close: teardown must never be the thing that hangs.
+                    await self._bounded(browser.close(), 5000)
                 except Exception:
                     pass
         return state
@@ -3957,8 +4034,14 @@ class BrowserDiscoveryEngine:
             route = page.url
         except Exception:
             route = ""
-        try:
-            dom_signature = await page.evaluate(
+        # Bound the evaluate like every other page.evaluate in this file:
+        # Playwright's evaluate ignores context.set_default_timeout (it takes no
+        # timeout option), so on a route whose JS keeps the main thread busy this
+        # would never resolve — hanging the worker inside _exercise_page and, via
+        # the pool join, the whole crawl past its deadline. _bounded caps it and
+        # returns _BOUNDED_FAILED (non-str) on timeout, handled below.
+        dom_signature = await self._bounded(
+            page.evaluate(
                 """() => {
                     const visible = (el) => {
                         const style = window.getComputedStyle(el);
@@ -3978,8 +4061,10 @@ class BrowserDiscoveryEngine:
                         ].join(':'));
                     return controls.join('|');
                 }"""
-            )
-        except Exception:
+            ),
+            1000,
+        )
+        if not isinstance(dom_signature, str):
             dom_signature = ""
         return f"{route}|{dom_signature}"[:2000]
 

@@ -447,6 +447,74 @@ async def test_security_headers_detector_reports_once_for_site() -> None:
     assert len(header_findings) >= 4
 
 
+def test_evaluate_cors_classifies_permissive_policies() -> None:
+    detector = SecurityHeadersDetector()
+    probe = detector._CORS_PROBE_ORIGIN
+    probe_lower = probe.lower()
+
+    # Reflected arbitrary origin + credentials -> high (fully exploitable).
+    assert detector._evaluate_cors(
+        {"access-control-allow-origin": probe_lower, "access-control-allow-credentials": "true"}, probe
+    )[0] == "high"
+    # Reflected arbitrary origin, no credentials -> medium.
+    assert detector._evaluate_cors(
+        {"access-control-allow-origin": probe_lower}, probe
+    )[0] == "medium"
+    # Wildcard + credentials -> medium.
+    assert detector._evaluate_cors(
+        {"access-control-allow-origin": "*", "access-control-allow-credentials": "true"}, probe
+    )[0] == "medium"
+    # Wildcard alone -> low (the Juice Shop shape).
+    assert detector._evaluate_cors({"access-control-allow-origin": "*"}, probe)[0] == "low"
+    # null origin -> medium.
+    assert detector._evaluate_cors({"access-control-allow-origin": "null"}, probe)[0] == "medium"
+
+    # Correctly-scoped policies are NOT flagged (zero-FP).
+    assert detector._evaluate_cors({}, probe) is None  # no ACAO header
+    assert detector._evaluate_cors(
+        {"access-control-allow-origin": "https://app.example.com"}, probe
+    ) is None  # echoes a specific allowed origin, not the arbitrary probe
+
+
+@pytest.mark.asyncio
+async def test_security_headers_detector_reports_cors_wildcard() -> None:
+    detector = SecurityHeadersDetector()
+
+    class DummyResponse:
+        def __init__(self, headers: dict) -> None:
+            self.headers = headers
+
+    class DummyClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self) -> "DummyClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, headers: dict | None = None) -> DummyResponse:
+            # The CORS probe carries an Origin header; the target answers with a
+            # static wildcard ACAO regardless of the request origin.
+            return DummyResponse({"access-control-allow-origin": "*"})
+
+    import app.core.detectors.security_headers as security_headers_module
+
+    original_factory = security_headers_module.create_scan_client
+    security_headers_module.create_scan_client = lambda **kwargs: DummyClient()  # type: ignore[assignment]
+    try:
+        findings = await detector.detect(urls=["http://example.com/"], forms=[], root_url="http://example.com/")
+    finally:
+        security_headers_module.create_scan_client = original_factory  # type: ignore[assignment]
+
+    cors = [f for f in findings if f.vuln_type == "CORS Misconfiguration"]
+    assert len(cors) == 1
+    assert cors[0].severity == SeverityLevel.low
+    assert cors[0].verified is True
+    assert cors[0].category == OwaspCategory.a02
+
+
 @pytest.mark.asyncio
 async def test_sql_detector_flags_query_params() -> None:
     detector = SQLInjectionDetector()

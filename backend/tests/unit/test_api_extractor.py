@@ -172,6 +172,29 @@ def test_ambiguous_base_variable_is_not_resolved():
     assert not any(u.endswith(("/x", "/y")) for u in {e.url for e in endpoints})
 
 
+def test_scope_local_base_variable_resolves_reused_service_field_per_class():
+    """A genuine base-URL field name (``host``) reused across minified service
+    classes with DIFFERENT resource paths must still resolve — scope-locally to
+    each call's own nearest-preceding class field — even though the global
+    resolver drops it as ambiguous. This is the exact SPA pattern (one ``host``
+    per Angular service) that otherwise loses every ``this.host + "/x"`` endpoint.
+    Each call resolves to ITS OWN class path, never a sibling's."""
+    script = """
+        class Products { host = "/rest/products"; patch(e){ return this.http.patch(this.host + "/reviews", e); } }
+        class Feedback { host = "/api/Feedbacks"; save(b){ return this.http.post(this.host + "/bulk", b); } }
+    """
+    # Globally ambiguous → dropped (unchanged, conservative).
+    assert ApiExtractor._resolve_base_vars(script) == {}
+    _, endpoints = ApiExtractor.extract_from_javascript("https://example.test/", script)
+    by = {(e.method, e.url) for e in endpoints}
+    # Each concat call resolves to its OWN class's base path — no cross-contamination.
+    assert ("PATCH", "https://example.test/rest/products/reviews") in by
+    assert ("POST", "https://example.test/api/Feedbacks/bulk") in by
+    assert ("PATCH", "https://example.test/api/Feedbacks/reviews") not in by
+    assert ("POST", "https://example.test/rest/products/bulk") not in by
+    assert any(e.evidence == "base-concat" for e in endpoints)
+
+
 
 def test_mines_location_navigation_page_paths():
     from app.core.crawler.api_extractor import ApiExtractor

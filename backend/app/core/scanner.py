@@ -433,6 +433,9 @@ class ScanOrchestrator:
             # Reuse the winning login path from the main account so second/admin
             # logins don't restart the strategy cascade from scratch.
             main_replay = getattr(crawl_result, "auth_replay_state", None)
+            # Expose the winning login recipe to detectors (the auth detector uses it
+            # as a reliable login-flow record for default/weak-credential probing).
+            crawl_context["auth_replay_state"] = main_replay
             main_credentials = (
                 (main_account.username, main_account.password) if main_account else None
             )

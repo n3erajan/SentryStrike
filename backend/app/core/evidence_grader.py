@@ -174,6 +174,7 @@ _PATTERN_MATCH_KEYWORDS: tuple[str, ...] = (
 _STRUCTURAL_VULN_KEYWORDS: tuple[str, ...] = (
     "missing security header",
     "weak content security policy",
+    "cors misconfiguration",
     "missing cache-control",
     "information disclosure in header",
     "server banner",

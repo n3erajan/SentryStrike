@@ -176,7 +176,10 @@ async def test_api_login_rate_limit_probe_uses_replayable_json_request():
     seen_bodies: list[dict] = []
 
     async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
-        seen_bodies.append(kwargs.get("json_body"))
+        # Scope to the rate-limit probe (the default-credentials probe also runs
+        # on login flows under its own test_phase and is asserted elsewhere).
+        if kwargs.get("test_phase") == "api_login_rate_limit":
+            seen_bodies.append(kwargs.get("json_body"))
         return ResponseData(
             200,
             {"content-type": "application/json"},
@@ -206,6 +209,10 @@ async def test_api_login_rate_limit_probe_suppressed_when_rate_limit_signal_seen
 
     async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
         nonlocal calls
+        # Count only rate-limit-probe requests (the default-credentials probe runs
+        # on login flows under its own test_phase; its behaviour is asserted elsewhere).
+        if kwargs.get("test_phase") != "api_login_rate_limit":
+            return ResponseData(200, {"content-type": "text/plain"}, "Invalid credentials", 5.0)
         calls += 1
         status = 429 if calls == 3 else 200
         body = "Too many requests" if status == 429 else "Invalid credentials"
@@ -585,3 +592,181 @@ def test_credential_disclosure_still_flags_config_key_leak() -> None:
     assert any(
         f.vuln_type == "Credential / Config Disclosure in Response Body" for f in findings
     )
+
+
+# ---------------------------------------------------------------------------
+# Default / weak credential probing (JSON API login)
+# ---------------------------------------------------------------------------
+
+def test_harvest_login_identities_prefers_app_domain_over_scanner_domain():
+    detector = AuthenticationFailuresDetector()
+    # The scanner's own account is on an unrelated domain; the app's real user
+    # domain is only observable in a response body (product reviews here).
+    reviews = RequestObservation(
+        url="https://shop.test/rest/products/1/reviews",
+        method="GET",
+        response_snippet='{"data":[{"author":"admin@shop.test"},{"author":"basil@shop.test"}]}',
+    )
+    kwargs = {
+        "root_url": "https://shop.test",
+        "requests": [reviews],
+        # simulate scanner's own identity via a JWT email claim on a foreign domain
+        "auth_headers": {},
+    }
+    with patch.object(get_settings(), "authentication_username", "pentester@gmail.com", create=False):
+        emails, usernames, domains = detector._harvest_login_identities(kwargs, {})
+    assert "shop.test" in domains
+    # app domain (2 observed emails) ranks before the scanner's personal domain
+    assert domains[0] == "shop.test"
+    assert any(e.lower() == "admin@shop.test" for e in emails)
+
+
+def test_build_credential_candidates_probes_admin_at_app_domain_early():
+    detector = AuthenticationFailuresDetector()
+    pairs = detector._build_credential_candidates(
+        emails=["admin@shop.test"], usernames=[], domains=["shop.test"], email_login=True
+    )
+    idx = pairs.index(("admin@shop.test", "admin123"))
+    assert idx < detector._MAX_CRED_ATTEMPTS  # reached within the live attempt cap
+
+
+def test_looks_like_auth_success_discriminates_token_from_denial():
+    detector = AuthenticationFailuresDetector()
+    # 200 + token, baseline was 401 -> accepted
+    assert detector._looks_like_auth_success(200, '{"authentication":{"token":"eyAAAAAAAAAA.BBBBBBBBBB.cc"}}', 401)
+    # 401 rejection -> not accepted
+    assert not detector._looks_like_auth_success(401, '{"error":"Invalid email or password"}', 401)
+    # 200 with no token where baseline was also 200 (accept-anything) -> not accepted
+    assert not detector._looks_like_auth_success(200, '{"status":"ok"}', 200)
+
+
+@pytest.mark.asyncio
+async def test_api_default_credentials_detected_via_harvested_domain():
+    detector = AuthenticationFailuresDetector()
+    # App domain harvested from an observed response; only admin@shop.test/admin123 works.
+    reviews = RequestObservation(
+        url="https://shop.test/rest/products/1/reviews",
+        method="GET",
+        response_snippet='{"data":[{"author":"admin@shop.test"}]}',
+    )
+    endpoint = ApiEndpoint(
+        url="https://shop.test/rest/user/login",
+        method="POST",
+        request_body={"email": "seed@x.io", "password": "seed"},
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        body = kwargs.get("json_body") or {}
+        if body.get("email") == "admin@shop.test" and body.get("password") == "admin123":
+            return ResponseData(200, {"content-type": "application/json"},
+                                 '{"authentication":{"token":"eyAAAAAAAAAA.BBBBBBBBBB.cc"}}', 8.0,
+                                 request_snippet=f"{method} {url}", response_snippet="200")
+        return ResponseData(401, {"content-type": "application/json"},
+                            '{"error":"Invalid email or password"}', 8.0,
+                            request_snippet=f"{method} {url}", response_snippet="401")
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        with patch.object(get_settings(), "authentication_username", "pentester@gmail.com", create=False):
+            findings = await detector.detect(
+                urls=[], forms=[], api_endpoints=[endpoint], requests=[reviews], root_url="https://shop.test",
+            )
+    dc = [f for f in findings if f.vuln_type == "Default Credentials Accepted"]
+    assert len(dc) == 1
+    assert dc[0].payload == "admin@shop.test:admin123"
+    assert dc[0].severity == SeverityLevel.critical
+    assert dc[0].verified is True
+
+
+@pytest.mark.asyncio
+async def test_api_default_credentials_no_false_positive_when_all_rejected():
+    detector = AuthenticationFailuresDetector()
+    reviews = RequestObservation(
+        url="https://shop.test/rest/products/1/reviews",
+        method="GET",
+        response_snippet='{"data":[{"author":"admin@shop.test"}]}',
+    )
+    endpoint = ApiEndpoint(
+        url="https://shop.test/rest/user/login",
+        method="POST",
+        request_body={"email": "seed@x.io", "password": "seed"},
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        # Every credential is rejected (no weak/default creds on this target).
+        return ResponseData(401, {"content-type": "application/json"},
+                            '{"error":"Invalid email or password"}', 8.0,
+                            request_snippet=f"{method} {url}", response_snippet="401")
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[], forms=[], api_endpoints=[endpoint], requests=[reviews], root_url="https://shop.test",
+        )
+    assert not any(f.vuln_type == "Default Credentials Accepted" for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Framework-agnostic login coverage (SPA shell skip + non-SPA form default creds)
+# ---------------------------------------------------------------------------
+
+def _login_form(action: str):
+    return SimpleNamespace(
+        action=action,
+        method="POST",
+        page_url=action,
+        inputs=[
+            SimpleNamespace(name="email", input_type="text", value=""),
+            SimpleNamespace(name="password", input_type="password", value=""),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_auth_skipped_for_spa_shell_hash_route_form():
+    # A form whose action is a client-side hash route posts to the SPA shell; the
+    # detector must NOT run its volume probe there (it would report a misleading
+    # "no brute-force protection" against the app index for every attempt).
+    detector = AuthenticationFailuresDetector()
+    hits = 0
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        nonlocal hits
+        hits += 1
+        return ResponseData(200, {"content-type": "text/html"}, "<html>app shell</html>", 5.0,
+                            request_snippet="", response_snippet="")
+
+    form = _login_form("https://spa.test/#/login")
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(urls=[], forms=[form], is_spa=True)
+
+    assert hits == 0  # no live probing against the shell
+    assert not any(f.vuln_type == "Lack of Brute-Force Protection on Login Form" for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_non_spa_form_default_credentials_via_harvested_domain():
+    # A traditional (non-SPA) HTML form login authenticating by e-mail: the weak
+    # admin credential is detected using the app domain harvested from an observed
+    # response, exactly as for the JSON API path.
+    detector = AuthenticationFailuresDetector()
+    reviews = RequestObservation(
+        url="https://shop.test/rest/products/1/reviews", method="GET",
+        response_snippet='{"data":[{"author":"admin@shop.test"}]}',
+    )
+    form = _login_form("https://shop.test/login")  # real server action, not a hash route
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        body = data or {}
+        if body.get("email") == "admin@shop.test" and body.get("password") == "admin123":
+            return ResponseData(302, {"location": "/dashboard"}, "", 5.0,
+                                request_snippet="", response_snippet="302")
+        return ResponseData(401, {"content-type": "text/html"},
+                            "<html>Invalid email or password</html>", 5.0,
+                            request_snippet="", response_snippet="401")
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        with patch.object(get_settings(), "authentication_username", "pentester@gmail.com", create=False):
+            findings = await detector.detect(urls=[], forms=[form], requests=[reviews], root_url="https://shop.test")
+
+    dc = [f for f in findings if f.vuln_type == "Default Credentials Accepted"]
+    assert len(dc) == 1
+    assert "admin@shop.test" in dc[0].payload and "admin123" in dc[0].payload

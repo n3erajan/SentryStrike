@@ -206,27 +206,43 @@ class ApiExtractor:
         # Resolve the base var to its literal path prefix (only when unambiguous)
         # and reconstruct the full path so the endpoint is recovered. Bodies are
         # NOT invented here — a bare-variable body stays None (see plan #3).
+        # A base var (``host``/``baseUrl``/…) is frequently REUSED across many
+        # minified service classes, each binding it to a different resource path
+        # (``host=this.hostServer+"/rest/products"`` in one, ``+"/api/Feedbacks"``
+        # in another). The global resolver treats such a name as ambiguous and
+        # drops it, losing every ``this.host + "/x"`` endpoint. So resolve each
+        # concat call scope-locally too: the nearest preceding assignment of the
+        # same name (the call's own class field in minified output) wins when the
+        # name is globally ambiguous.
         base_vars = cls._resolve_base_vars(script_text)
-        if base_vars:
-            for match in cls.BASE_CONCAT_VERB_RE.finditer(script_text):
-                var = match.group("tvar") or match.group("cvar") or ""
-                tail = match.group("ttail")
-                if tail is None:
-                    tail = match.group("ctail") or ""
-                prefix = base_vars.get(var) or base_vars.get(var.rsplit(".", 1)[-1])
-                if prefix is None:
-                    continue
-                joined = prefix + (tail if tail.startswith("/") else f"/{tail}" if tail else "")
-                if not cls._looks_api_path(joined):
-                    continue
-                body, content_type = cls._infer_request_schema_near(script_text, match.start())
-                add_endpoint(
-                    joined,
-                    match.group("method").upper(),
-                    evidence="base-concat",
-                    request_body=body,
-                    content_type=content_type,
-                )
+        local_assignments = list(cls._iter_base_var_assignments(script_text))
+        for match in cls.BASE_CONCAT_VERB_RE.finditer(script_text):
+            var = match.group("tvar") or match.group("cvar") or ""
+            tail = match.group("ttail")
+            if tail is None:
+                tail = match.group("ctail") or ""
+            short = var.rsplit(".", 1)[-1]
+            prefix = (
+                base_vars.get(var)
+                or base_vars.get(short)
+                or cls._nearest_base_prefix(local_assignments, short, match.start())
+            )
+            if prefix is None:
+                continue
+            joined = prefix + (tail if tail.startswith("/") else f"/{tail}" if tail else "")
+            # A template tail may still carry ``${id}`` interpolations — normalise
+            # them to ``{name}`` path placeholders (a bare concat tail is unchanged).
+            joined = cls.normalize_template_url(joined)
+            if not cls._looks_api_path(joined):
+                continue
+            body, content_type = cls._infer_request_schema_near(script_text, match.start())
+            add_endpoint(
+                joined,
+                match.group("method").upper(),
+                evidence="base-concat",
+                request_body=body,
+                content_type=content_type,
+            )
 
         for match in re.finditer(r"""\$\.ajax\s*\(\s*\{(?P<args>.*?)\}\s*\)""", script_text, re.I | re.S):
             args = match.group("args")
@@ -614,6 +630,31 @@ class ApiExtractor:
         segment) are kept; absolute ``http(s)://`` origins collapse to their path.
         """
         candidates: dict[str, set[str]] = {}
+        for _pos, name, prefix in cls._iter_base_var_assignments(script_text):
+            candidates.setdefault(name, set()).add(prefix)
+        # Keep only unambiguous names (single agreed literal across the script).
+        return {name: next(iter(vals)) for name, vals in candidates.items() if len(vals) == 1}
+
+    # Bounded backward window for scope-local base-var resolution. A minified
+    # service class defines its own ``host=``/``baseUrl=`` field immediately
+    # before its methods, so the nearest preceding assignment within this many
+    # chars is that class's own field — the correct binding even when the same
+    # name is reused by other classes (which the global resolver drops as
+    # ambiguous). Generous because a class's own field is always the closest
+    # preceding one; the bound only guards against grabbing an unrelated prior
+    # class's field in the pathological case of a scope that never binds the var.
+    _BASE_VAR_SCOPE_WINDOW = 8000
+
+    @classmethod
+    def _iter_base_var_assignments(cls, script_text: str):
+        """Yield ``(pos, name, path_prefix)`` for every base-URL-ish var assignment.
+
+        Shared by the global unambiguous resolver (:meth:`_resolve_base_vars`)
+        and the scope-local nearest-preceding resolver
+        (:meth:`_nearest_base_prefix`). ``name`` is the bare identifier;
+        ``path_prefix`` is the literal collapsed to a path prefix (leading ``/``,
+        no trailing ``/``). Absolute origins collapse to their path portion.
+        """
         for match in cls.BASE_VAR_ASSIGN_RE.finditer(script_text):
             name = match.group("name")
             if not name or not cls._looks_like_base_expression(name):
@@ -621,20 +662,38 @@ class ApiExtractor:
             literal = match.group("lit")
             if literal is None:
                 continue
-            # Absolute origin → keep only its path portion (may be empty).
-            if literal.startswith(("http://", "https://", "//")):
-                literal = urlparse(literal if "//" not in literal[:2] else "https:" + literal if literal.startswith("//") else literal).path
+            if literal.startswith("//"):
+                literal = urlparse("https:" + literal).path
+            elif literal.startswith(("http://", "https://")):
+                literal = urlparse(literal).path
             if not literal:
                 continue
-            # Path-shaped only: a leading slash, or a bare api/rest-style segment.
             if not literal.startswith("/") and not cls.ROOT_RELATIVE_API_RE.match(literal):
                 continue
-            prefix = literal if literal.startswith("/") else f"/{literal}"
-            prefix = prefix.rstrip("/")
+            prefix = (literal if literal.startswith("/") else f"/{literal}").rstrip("/")
             if prefix:
-                candidates.setdefault(name, set()).add(prefix)
-        # Keep only unambiguous names (single agreed literal across the script).
-        return {name: next(iter(vals)) for name, vals in candidates.items() if len(vals) == 1}
+                yield match.start(), name, prefix
+
+    @classmethod
+    def _nearest_base_prefix(
+        cls, assignments: list[tuple[int, str, str]], name: str, pos: int
+    ) -> str | None:
+        """Resolve a base var to its nearest preceding same-name assignment.
+
+        ``assignments`` is the position-sorted ``(pos, name, prefix)`` list from
+        :meth:`_iter_base_var_assignments`. Returns the prefix of the closest
+        assignment of ``name`` occurring before ``pos`` within
+        ``_BASE_VAR_SCOPE_WINDOW`` chars (the call's own class scope in minified
+        output), or ``None`` when none is in range.
+        """
+        best: str | None = None
+        for a_pos, a_name, a_prefix in assignments:
+            if a_pos >= pos:
+                break
+            if a_name != name or pos - a_pos > cls._BASE_VAR_SCOPE_WINDOW:
+                continue
+            best = a_prefix
+        return best
 
     @classmethod
     def _infer_request_schema_near(cls, script_text: str, start: int) -> tuple[Any, str | None]:

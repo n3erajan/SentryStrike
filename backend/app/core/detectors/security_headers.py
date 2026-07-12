@@ -16,6 +16,48 @@ class SecurityHeadersDetector(BaseDetector):
     def __init__(self) -> None:
         self.settings = get_settings()
 
+    # A never-allowlisted attacker origin used to probe the target's CORS policy.
+    _CORS_PROBE_ORIGIN = "https://sentrystrike-cors-probe.example"
+
+    def _evaluate_cors(self, headers: dict[str, str], probe_origin: str) -> tuple[str, str] | None:
+        """Judge a CORS response elicited by an arbitrary attacker ``Origin``.
+
+        ``headers`` must have lowercased keys AND lowercased values (as produced
+        in :meth:`detect`). Returns ``(severity_key, detail)`` when the policy is
+        permissive toward the arbitrary origin, else ``None``. Only genuinely
+        exploitable/permissive shapes are flagged so this stays low-FP:
+
+        * ACAO reflects the arbitrary origin + credentials -> ``high``
+        * ACAO reflects the arbitrary origin (no credentials) -> ``medium``
+        * ACAO == ``*`` + credentials -> ``medium`` (non-browser clients honour it)
+        * ACAO == ``*`` (no credentials) -> ``low`` (any origin reads responses)
+        * ACAO == ``null`` -> ``medium`` (sandboxed/opaque origins granted access)
+
+        A response that echoes back its OWN origin only, or omits ACAO, is a
+        correctly-scoped policy and is not flagged.
+        """
+        acao = headers.get("access-control-allow-origin", "").strip()
+        if not acao:
+            return None
+        credentials = headers.get("access-control-allow-credentials", "").strip() == "true"
+        probe = probe_origin.strip().lower()
+
+        if acao == probe:
+            if credentials:
+                return ("high", f"reflects an arbitrary request Origin ({probe_origin}) together with "
+                                "Access-Control-Allow-Credentials: true — any website can read this "
+                                "origin's authenticated responses")
+            return ("medium", f"reflects an arbitrary request Origin ({probe_origin}) — any website can "
+                              "read cross-origin responses from this origin")
+        if acao == "*":
+            if credentials:
+                return ("medium", "wildcard Access-Control-Allow-Origin '*' combined with "
+                                  "Access-Control-Allow-Credentials: true (honoured by non-browser clients)")
+            return ("low", "wildcard Access-Control-Allow-Origin '*' allows any origin to read responses")
+        if acao == "null":
+            return ("medium", "Access-Control-Allow-Origin: null grants access to sandboxed/opaque origins")
+        return None
+
     def _cache_controls_sensitive(self, cc: str, pragma: str, expires: str) -> bool:
         cc_lower = cc.lower()
         if "no-store" in cc_lower:
@@ -91,6 +133,41 @@ class SecurityHeadersDetector(BaseDetector):
                             url=root_url,
                             evidence=f"CSP header policy is weak: {'; '.join(weaknesses)} (CSP: {response.headers.get('content-security-policy')})",
                             verified=True
+                        )
+                    )
+
+            # CORS misconfiguration: send an arbitrary attacker Origin and see
+            # whether the server grants it cross-origin read access.
+            try:
+                cors_response = await client.get(root_url, headers={"Origin": self._CORS_PROBE_ORIGIN})
+            except Exception:
+                cors_response = None
+            if cors_response is not None:
+                cors_headers = {k.lower(): v.lower() for k, v in cors_response.headers.items()}
+                verdict = self._evaluate_cors(cors_headers, self._CORS_PROBE_ORIGIN)
+                if verdict is not None:
+                    severity_key, detail = verdict
+                    severity_map = {
+                        "high": SeverityLevel.high,
+                        "medium": SeverityLevel.medium,
+                        "low": SeverityLevel.low,
+                    }
+                    raw_acao = cors_response.headers.get("access-control-allow-origin")
+                    raw_acac = cors_response.headers.get("access-control-allow-credentials") or "absent"
+                    findings.append(
+                        Finding(
+                            category=OwaspCategory.a02,
+                            vuln_type="CORS Misconfiguration",
+                            severity=severity_map[severity_key],
+                            url=root_url,
+                            evidence=(
+                                f"Cross-Origin Resource Sharing policy is permissive: {detail}. "
+                                f"Probe Origin: {self._CORS_PROBE_ORIGIN}; "
+                                f"Access-Control-Allow-Origin: {raw_acao}; "
+                                f"Access-Control-Allow-Credentials: {raw_acac}."
+                            ),
+                            verified=True,
+                            detection_method="cors_acao_probe",
                         )
                     )
 

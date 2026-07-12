@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     # bounded by ``crawl_browser_budget_seconds`` as a hard ceiling. Per-route
     # deadline checks still guarantee a clean truncation.
     crawl_browser_per_route_seconds: float = Field(default=6.0, alias="CRAWL_BROWSER_PER_ROUTE_SECONDS")
+    # Hard wall-clock cap on the WHOLE processing of a single route (navigate +
+    # settle + form submit + interaction + discovery). A route whose page never
+    # loads, or an interaction that wedges on an await the per-op bounds miss,
+    # is abandoned when this elapses and the worker moves on to the next route —
+    # so one bad route can never stall a worker (previously it hung until the
+    # pool-level watchdog fired, wasting ~budget seconds). Generous enough that a
+    # legitimately slow route (full nav + several form submits + interaction)
+    # completes well within it.
+    crawl_browser_route_cap_seconds: float = Field(default=60.0, alias="CRAWL_BROWSER_ROUTE_CAP_SECONDS")
     crawl_browser_base_seconds: float = Field(default=30.0, alias="CRAWL_BROWSER_BASE_SECONDS")
     # Hard cap on how many routes the browser crawl will visit in one run
     # (the priority queue drops the low-score tail when this is hit).

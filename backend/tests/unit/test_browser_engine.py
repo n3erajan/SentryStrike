@@ -262,6 +262,92 @@ async def test_crawl_into_streams_partial_results_and_survives_deadline(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_crawl_into_terminates_when_a_worker_hangs_on_unbounded_await(monkeypatch):
+    """A single worker stuck on an unbounded inline await must not freeze the
+    whole pool. In production a never-closing response body / socket.io stream
+    wedged a worker; the other workers parked in ``cond.wait()`` and the crawl
+    hung forever (only Ctrl+C broke it). The pool-level watchdog must cancel a
+    stuck worker at ``deadline + grace`` so the crawl always terminates and
+    still merges whatever streamed in."""
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=20)
+    # Small grace so the backstop fires fast in the test (default is ~20s).
+    engine._pool_stuck_grace_s = 0.3
+
+    # Every worker wedges on its first route the instant it reaches this inline
+    # step — a stand-in for a body read / stream that never resolves. It is a
+    # cancellable await, matching a real Playwright await (the Python task
+    # unwinds on cancel even though the browser-side op may linger).
+    async def _hang(_page):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(engine, "_clear_blocking_overlays", _hang)
+
+    state = CrawlState()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.5
+
+    # Guard: if the watchdog is absent the pool never joins and this awaits
+    # forever, so bound the whole call. A green run returns well under the guard.
+    await asyncio.wait_for(
+        engine.crawl_into(
+            state,
+            "http://spa.test/",
+            routes=[f"/route-{i}" for i in range(6)],
+            deadline=deadline,
+        ),
+        timeout=5.0,
+    )
+
+    # Browser launched, so availability is truthful, and truncation is recorded.
+    assert state.browser_available is True
+    assert state.browser_error is not None
+    assert "truncat" in state.browser_error.lower()
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_abandons_a_route_that_hangs_and_continues(monkeypatch, caplog):
+    """A single route whose processing wedges on an unbounded await must be
+    abandoned at the per-route cap so the worker moves on — one bad route may
+    never stall a worker until the (much later) pool watchdog. The deadline is
+    set far in the future so ONLY the per-route cap can rescue the run: if it is
+    absent the workers hang and the guard below times out."""
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=20)
+    engine.settings.crawl_browser_route_cap_seconds = 0.3  # abandon fast in-test
+
+    async def _hang(_page):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(engine, "_clear_blocking_overlays", _hang)
+
+    state = CrawlState()
+    loop = asyncio.get_running_loop()
+    # Far-off budget: the global pool watchdog (budget + 20s grace) cannot be
+    # what saves this within the guard window — only per-route abandonment can.
+    deadline = loop.time() + 120.0
+
+    with caplog.at_level("WARNING", logger="app.core.crawler.browser_engine"):
+        await asyncio.wait_for(
+            engine.crawl_into(
+                state,
+                "http://spa.test/",
+                routes=[f"/route-{i}" for i in range(6)],
+                deadline=deadline,
+            ),
+            timeout=8.0,
+        )
+
+    assert state.browser_available is True
+    # Every stuck route was abandoned by name, and the crawl still finished.
+    assert any("per-route cap" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_crawl_into_reports_unavailable_when_launch_fails(monkeypatch):
     class _FailingChromium:
         async def launch(self, headless=True):
@@ -1965,3 +2051,27 @@ async def test_fill_form_fields_falls_back_when_field_tag_is_stripped():
     # though their data-sentry-field selectors were gone.
     assert "[data-sentry-cluster='1'] input[type=email] >> nth=0" in page.filled
     assert "[data-sentry-cluster='1'] input[type=password] >> nth=0" in page.filled
+
+
+@pytest.mark.asyncio
+async def test_ui_state_signature_bounded_when_evaluate_hangs():
+    """A route whose JS keeps the main thread busy makes ``page.evaluate()``
+    never resolve. Playwright's ``evaluate`` ignores ``set_default_timeout``, so
+    without an explicit bound the call hangs forever — blocking the worker inside
+    ``_exercise_page``, which never returns to the deadline check, so the pool
+    ``gather`` join never completes and the whole crawl hangs past its budget
+    until killed. ``_ui_state_signature`` must therefore return promptly even
+    when ``evaluate`` never resolves."""
+
+    class _HangingPage:
+        url = "http://spa.test/#/chatbot/conversation/1"
+
+        async def evaluate(self, script, *args):
+            await asyncio.sleep(30)  # a page whose evaluate never returns
+            return "unreachable"
+
+    engine = BrowserDiscoveryEngine()
+    sig = await asyncio.wait_for(engine._ui_state_signature(_HangingPage()), timeout=3.0)
+    # The route prefix is preserved; the DOM portion is empty because the hung
+    # evaluate was bounded out (not awaited to completion).
+    assert sig == "http://spa.test/#/chatbot/conversation/1|"

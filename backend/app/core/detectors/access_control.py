@@ -188,7 +188,22 @@ _NON_ID_VALUES: frozenset[str] = frozenset({
 
 
 def _looks_like_login_page(body: str) -> bool:
-    """Return True when the response body appears to be a login/auth wall."""
+    """Return True when the response body appears to be a login/auth wall.
+
+    A login wall is an HTML document. A structured JSON/data payload is an API
+    response and is NEVER a login page — even when it contains field names such
+    as ``email``, ``username`` or ``lastLoginIp`` (whose substring "login"
+    otherwise trips the word heuristic). Guarding on JSON first prevents a data
+    collection (e.g. a user listing) from being misread as a login wall, which
+    would suppress genuine authorization findings against it.
+    """
+    stripped = body.lstrip()
+    if stripped[:1] in ("{", "["):
+        try:
+            json.loads(stripped)
+            return False
+        except ValueError:
+            pass
     b = body.lower()
     has_login_word = any(s in b for s in _LOGIN_SIGNALS)
     has_credential_field = any(s in b for s in _LOGIN_CREDENTIAL_SIGNALS)

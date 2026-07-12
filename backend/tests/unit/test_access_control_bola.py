@@ -8,6 +8,7 @@ import pytest
 from app.core.crawler.auth_manager import SmartAuthenticator
 from app.core.detectors.access_control import (
     AccessControlDetector,
+    _looks_like_login_page,
     _looks_like_path_id_segment,
 )
 from app.core.verification.response_analyzer import ResponseData
@@ -17,6 +18,26 @@ from app.core.verification.verification_framework import HttpVerifier
 # ---------------------------------------------------------------------------
 # Path-id extraction
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        # A JSON data collection whose field names contain the substrings
+        # "login" (lastLoginIp), "email" and "username" is an API payload, NOT a
+        # login wall. It must not be misclassified (that would suppress genuine
+        # authorization findings against the collection).
+        ('{"data":[{"email":"a@b.io","username":"x","role":"admin","lastLoginIp":"0.0.0.0"}]}', False),
+        ('[{"email":"a@b.io","lastLoginIp":""}]', False),
+        # A real HTML login wall still classifies as a login page.
+        ('<html><form><label>Login</label><input type="password" name="email"></form></html>', True),
+        # HTML that mentions neither a login word nor a credential field is not a login page.
+        ("<html><body>Welcome</body></html>", False),
+        # Malformed JSON-looking text falls through to the word heuristic.
+        ('{ this is not json - please sign in with your password', True),
+    ],
+)
+def test_looks_like_login_page_ignores_json_payloads(body, expected):
+    assert _looks_like_login_page(body) is expected
+
 
 
 @pytest.mark.parametrize(
