@@ -725,3 +725,84 @@ async def test_upload_type_validation_not_flagged_when_endpoint_accepts_everythi
     monkeypatch.setattr("app.core.detectors.file_upload.create_scan_client", lambda **kw: client())
     findings = await detector.detect(urls=[], forms=[_upload_form()])
     assert not any(f.detection_method == "upload_type_allowlist_bypass_differential" for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_file_upload_skips_get_candidate_no_type_validation_fp(monkeypatch):
+    """A GET endpoint is never a file-upload sink. A GET data endpoint ignores the
+    multipart body (identical 2xx for any file type) and its framework rejects an
+    oversized body with a generic 413 — which would otherwise trip the accept/reject
+    differential (Test 8) and manufacture a 'Missing File Type Validation' FP.
+    The detector must drop the GET candidate before testing it."""
+    detector = FileUploadDetector()
+    get_form = SimpleNamespace(
+        page_url="http://localhost:3000/rest/memories/",
+        action="http://localhost:3000/rest/memories/",
+        method="GET",
+        inputs=[SimpleNamespace(name="image", input_type="file")],
+    )
+    requests_sent: list[dict] = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, **kwargs):
+            requests_sent.append(kwargs)
+            # Body-ignoring data endpoint: small files -> 200 identical; oversized
+            # body -> generic 413. This is exactly what tripped the old FP.
+            content = kwargs["files"]["image"][1]
+            status = 413 if len(content) > 100_000 else 200
+            return httpx.Response(
+                status,
+                text="{}" if status == 200 else "Payload Too Large",
+                request=httpx.Request(kwargs["method"], kwargs["url"]),
+            )
+
+    monkeypatch.setattr("app.core.detectors.file_upload.create_scan_client", lambda **kwargs: FakeClient())
+
+    findings = await detector.detect(urls=[], forms=[get_form])
+
+    assert requests_sent == []  # candidate dropped: no request ever sent
+    assert not any(f.vuln_type == "Missing File Type Validation" for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_file_upload_flags_type_validation_on_post_sink(monkeypatch):
+    """Guard against over-correction: a real POST upload sink that accepts any type
+    (identical status) but rejects oversized bodies must STILL be flagged."""
+    detector = FileUploadDetector()
+    post_form = SimpleNamespace(
+        page_url="http://localhost:3000/file-upload",
+        action="http://localhost:3000/file-upload",
+        method="POST",
+        inputs=[SimpleNamespace(name="file", input_type="file")],
+    )
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url):
+            return httpx.Response(404, text="missing", request=httpx.Request("GET", url))
+
+        async def request(self, **kwargs):
+            content = kwargs["files"]["file"][1]
+            status = 413 if len(content) > 100_000 else 204
+            return httpx.Response(
+                status,
+                text="" if status == 204 else "Payload Too Large",
+                request=httpx.Request(kwargs["method"], kwargs["url"]),
+            )
+
+    monkeypatch.setattr("app.core.detectors.file_upload.create_scan_client", lambda **kwargs: FakeClient())
+
+    findings = await detector.detect(urls=[], forms=[post_form])
+
+    assert any(f.vuln_type == "Missing File Type Validation" for f in findings)

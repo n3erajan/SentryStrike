@@ -960,6 +960,46 @@ async def test_active_auth_skipped_for_spa_shell_hash_route_form():
 
 
 @pytest.mark.asyncio
+async def test_csrf_token_check_skipped_for_spa_shell_hash_route_form():
+    # A login form whose action is a client-side hash route (#/login) posts to the
+    # SPA shell: there is no server-side form handler, so "no hidden CSRF field" is
+    # meaningless. The detector must NOT emit the auth-form CSRF finding there.
+    detector = AuthenticationFailuresDetector()
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        return ResponseData(200, {"content-type": "text/html"}, "<html>app shell</html>", 5.0,
+                            request_snippet="", response_snippet="")
+
+    form = _login_form("https://spa.test/#/login")  # hash route → SPA shell
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(urls=[], forms=[form], is_spa=True)
+
+    assert not any(
+        f.vuln_type == "Authentication Form May Lack CSRF Protection" for f in findings
+    )
+
+
+@pytest.mark.asyncio
+async def test_csrf_token_check_still_fires_for_normal_mpa_login_form():
+    # Guard against over-correction: a traditional (non-SPA) login form with a REAL
+    # server action path and no hidden CSRF field must STILL be flagged.
+    detector = AuthenticationFailuresDetector()
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        return ResponseData(401, {"content-type": "text/html"},
+                            "<html>Invalid</html>", 5.0,
+                            request_snippet="", response_snippet="401")
+
+    form = _login_form("https://shop.test/login")  # real server path, not a hash route
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(urls=[], forms=[form], is_spa=False)
+
+    assert any(
+        f.vuln_type == "Authentication Form May Lack CSRF Protection" for f in findings
+    )
+
+
+@pytest.mark.asyncio
 async def test_non_spa_form_default_credentials_via_harvested_domain():
     # A traditional (non-SPA) HTML form login authenticating by e-mail: the weak
     # admin credential is detected using the app domain harvested from an observed

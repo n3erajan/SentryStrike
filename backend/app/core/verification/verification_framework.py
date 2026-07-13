@@ -16,7 +16,7 @@ import httpx
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
-from urllib.parse import urlparse, parse_qsl
+from urllib.parse import urlparse, parse_qsl, unquote
 
 from app.core.detectors.attack_surface import AttackTarget, build_json_body
 from app.core.detectors.base_detector import Finding
@@ -478,8 +478,106 @@ class FindingDeduplicator:
         return f"{parsed_url.scheme}://{parsed_url.netloc}{path}".rstrip("/")
 
     @staticmethod
+    def _route_dedupe_url(canonical_url: str, parameter: str | None) -> str:
+        """Collapse a REST path-variable sink to its route for dedup grouping.
+
+        When the injectable parameter IS the last path segment of the URL (a
+        REST path variable such as ``/ftp/:file`` or ``/download/:name``), each
+        exploited value produces a different full URL even though every request
+        hits the same sink. Reading six different files through one ``/ftp/``
+        poison-null-byte bypass is a single vulnerability demonstrated six times,
+        not six vulnerabilities. Strip the trailing segment when it equals the
+        parameter so those instances land in the same dedup group; the distinct
+        values are preserved as ``affected_parameters`` on the merged finding.
+
+        Only fires when the decoded last segment exactly equals the decoded
+        parameter, so ordinary query/body-param sinks (``/view.php?page=..``,
+        ``/api/Cards/121`` param ``fullName``) and distinct routes are untouched.
+        """
+        if not parameter:
+            return canonical_url
+        parsed = urlparse(canonical_url)
+        path = parsed.path
+        if not path or path == "/":
+            return canonical_url
+        segments = path.split("/")
+        last = segments[-1]
+        if not last:
+            return canonical_url
+        if unquote(last).strip().lower() == unquote(parameter).strip().lower():
+            parent = "/".join(segments[:-1])
+            base = f"{parsed.scheme}://{parsed.netloc}{parent}".rstrip("/")
+            return base or f"{parsed.scheme}://{parsed.netloc}"
+        return canonical_url
+
+    # A path segment that is purely an object identifier: a decimal id, a UUID, or
+    # a long hex/opaque token. Such a segment names a specific *instance* of a REST
+    # resource, not a distinct endpoint.
+    _ID_PATH_SEGMENT_RE = re.compile(
+        r"^(?:\d+"
+        r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        r"|[0-9a-fA-F]{16,})$",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _normalize_object_id_path(canonical_url: str) -> str:
+        """Collapse object-id path segments to ``{id}`` for dedup grouping.
+
+        A BOLA/IDOR on ``/rest/basket/:id`` is one vulnerability even when
+        demonstrated against several object ids (``/rest/basket/1``,
+        ``/rest/basket/6``, ``/rest/basket/7``): each id yields a different full
+        URL but hits the same resource handler. Here the id lives in the URL path
+        and is NOT captured as the finding's parameter (parameter is None), so the
+        parameter-based collapse (`_route_dedupe_url`) cannot fire. Replacing each
+        pure-identifier segment (decimal / UUID / long-hex) with ``{id}`` makes
+        those instances share a dedup key; the concrete ids survive in evidence.
+
+        Only whole-segment identifiers are rewritten, so path words that merely
+        contain digits (``v2``, ``api``, ``products``) and distinct routes
+        (``/api/Users/1`` vs ``/rest/basket/1``) are unaffected.
+        """
+        parsed = urlparse(canonical_url)
+        segments = parsed.path.split("/")
+        normalized = [
+            "{id}" if seg and FindingDeduplicator._ID_PATH_SEGMENT_RE.match(seg) else seg
+            for seg in segments
+        ]
+        path = "/".join(normalized)
+        return f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
+
+    # Vuln types that describe a single application-wide misconfiguration rather
+    # than a per-endpoint bug. Verbose error / stack-trace disclosure comes from
+    # one global framework error handler (e.g. NODE_ENV!=production, Django
+    # DEBUG=True): every endpoint that errors leaks internals the same way, and
+    # the remediation is identical for all of them. Reporting it once per endpoint
+    # over-reports the same defect, so these collapse to a single finding per
+    # origin (affected endpoints preserved in merged evidence).
+    _APP_WIDE_DISCLOSURE_TYPES = frozenset({"verbose error handling"})
+
+    @staticmethod
+    def _is_app_wide_disclosure(vuln_type: str) -> bool:
+        return (vuln_type or "").strip().lower() in FindingDeduplicator._APP_WIDE_DISCLOSURE_TYPES
+
+    @staticmethod
     def _dedupe_family(vuln_type: str) -> str:
         vt = (vuln_type or "").lower()
+        # Horizontal object-level access control: IDOR, Broken Object-Level
+        # Authorization (BOLA) and Horizontal Authorization Bypass are the SAME
+        # vulnerability class under different module names. Different detector
+        # modules flag the same endpoint (e.g. an IDOR verifier and the
+        # authorization-matrix probe both hitting POST /api/Complaints), producing
+        # cross-module duplicates. Fold them into one family so same-endpoint
+        # findings dedupe to a single finding. Vertical privilege escalation is a
+        # DISTINCT class (reaching higher-privilege functionality, not a peer
+        # object) and is deliberately excluded so it is never merged away.
+        if "vertical" not in vt and "privilege escalation" not in vt and (
+            "insecure direct object reference" in vt
+            or "idor" in vt
+            or "object-level authorization" in vt
+            or ("horizontal" in vt and "authorization" in vt)
+        ):
+            return "object_level_authz"
         if "verbose error" in vt or "exception handling" in vt or "debug / metrics" in vt:
             return "exception_disclosure"
         if "remote file inclusion" in vt:
@@ -538,6 +636,18 @@ class FindingDeduplicator:
         groups: dict[tuple, list[Finding]] = {}
         for finding in findings:
             canonical_url = FindingDeduplicator._canonical_url(finding.url)
+            canonical_url = FindingDeduplicator._route_dedupe_url(
+                canonical_url, finding.parameter
+            )
+            canonical_url = FindingDeduplicator._normalize_object_id_path(canonical_url)
+            # App-wide disclosure (verbose errors / stack traces): collapse every
+            # affected endpoint to the origin so the single global-error-handler
+            # misconfiguration is reported once, not once per route that trips it.
+            # Other exception_disclosure-family types (e.g. Debug/Metrics Endpoint
+            # Exposed) keep their real path and are unaffected.
+            if FindingDeduplicator._is_app_wide_disclosure(finding.vuln_type):
+                _p = urlparse(canonical_url)
+                canonical_url = f"{_p.scheme}://{_p.netloc}"
             family = FindingDeduplicator._dedupe_family(finding.vuln_type)
             key = (canonical_url, family)
             if key not in groups:

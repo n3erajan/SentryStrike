@@ -30,6 +30,18 @@ class UploadCandidate:
 class FileUploadDetector(BaseDetector):
     name = "file_upload"
 
+    # A file upload is a state-changing operation: it is carried only by a
+    # request method with a meaningful body (POST/PUT/PATCH). GET/HEAD/DELETE/
+    # OPTIONS candidates are never upload sinks — they arise when the crawler
+    # observed a plain data request to a URL that superficially matched an upload
+    # field/path heuristic. Testing them produces false positives: a GET data
+    # endpoint ignores the multipart body, so every file type yields an identical
+    # 2xx (and an oversized body is rejected 413 by the framework's *generic*
+    # request-size limit, not any upload validator), which trips the accept/reject
+    # differential (Test 8). Restricting candidates to body-bearing methods is
+    # framework- and target-agnostic.
+    _UPLOAD_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
     _upload_paths = [
         "uploads/",
         "files/",
@@ -92,6 +104,18 @@ class FileUploadDetector(BaseDetector):
                 )
 
         candidates.extend(self._api_upload_candidates(kwargs))
+
+        # Drop candidates whose method cannot carry a file upload (see
+        # _UPLOAD_METHODS). A GET/HEAD/DELETE endpoint is not an upload sink;
+        # testing it manufactures accept-differential false positives.
+        non_upload = [c for c in candidates if (c.method or "").upper() not in self._UPLOAD_METHODS]
+        if non_upload:
+            logger.info(
+                "file_upload: dropping %d non-upload-method candidate(s): %s",
+                len(non_upload),
+                ", ".join(sorted({f"{c.method} {c.url}" for c in non_upload})),
+            )
+        candidates = [c for c in candidates if (c.method or "").upper() in self._UPLOAD_METHODS]
 
         if not candidates:
             logger.info(

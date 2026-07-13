@@ -172,7 +172,15 @@ class ResponseAnalyzer:
         r"^total \d+": "ls -la output",
         r"/bin/\w+|/usr/bin|/sbin": "Unix path",
         r"Linux.*\d+\.\d+": "uname output",
-        r"eth\d+|lo|wlan\d+": "ifconfig interface",
+        # ifconfig / `ip addr` output. A bare interface token like "lo" is far
+        # too weak: with IGNORECASE it matches the substring "lo" inside ordinary
+        # words ("lastLogin", "uploads", "close", "block"...), so a reflected
+        # payload that merely gets stored/echoed produced confirmed-exploit FPs.
+        # Require the interface name to be a whole word AND co-occur (same line)
+        # with a real network-config marker (Link encap / flags= / HWaddr /
+        # ether MAC / mtu N / LOOPBACK / BROADCAST), which genuine command output
+        # always carries and benign page text does not.
+        r"\b(?:eth\d+|wlan\d+|lo)\b[:\s][^\n]{0,80}?(?:Link encap|flags=|HWaddr|ether\s+[0-9a-f]{2}[:.]|mtu\s+\d+|\bLOOPBACK\b|\bBROADCAST\b)": "ifconfig interface",
     }
 
     # Windows command output patterns

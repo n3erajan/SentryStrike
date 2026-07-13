@@ -295,15 +295,32 @@ class _V:
 @pytest.mark.asyncio
 async def test_missing_auth_on_mutating_endpoint_is_flagged():
     d = AccessControlDetector()
-    synth = PreparedAttackRequest(url="https://t.test/api/Cards/988000762197", method="DELETE")
-    owner = _V(default=(404, ""))   # authed owner reached business logic (not 401/403)
-    unauth = _V(default=(404, ""))  # unauth treated identically -> no auth gate
+    synth = PreparedAttackRequest(url="https://t.test/api/Cards/988000762197", method="PATCH")
+    # A PROCESSED mutation: the endpoint accepted the write (2xx) for the authed
+    # owner and treated the unauthenticated principal identically -> no auth gate.
+    owner = _V(default=(200, '{"status":"success"}'))
+    unauth = _V(default=(200, '{"status":"success"}'))
     findings = await d._verify_mutating_authz(synth, None, unauth, owner, None)
     assert findings, "expected a missing-authorization finding"
     f = findings[0]
     assert f.vuln_type == "Missing Authorization on State-Changing Request"
     assert f.severity.name == "high"
     assert f.detection_method == "mutating_authz_differential"
+
+
+@pytest.mark.asyncio
+async def test_shared_not_found_status_is_not_flagged():
+    """A matching non-success status (404 for a synthetic id, owner==unauth) proves
+    the mutation never ran, not that authorization is missing: a 404 short-circuits
+    at routing/object-lookup and can occur whether or not auth is enforced. Without
+    a destructive confirmation this must NOT be flagged (regression: two live
+    /api/Products and /api/Hints 404==404 false positives)."""
+    d = AccessControlDetector()
+    synth = PreparedAttackRequest(url="https://t.test/api/Products/988000762197", method="PUT")
+    owner = _V(default=(404, '{"message":"Not Found"}'))
+    unauth = _V(default=(404, '{"message":"Not Found"}'))
+    findings = await d._verify_mutating_authz(synth, None, unauth, owner, None)
+    assert findings == []
 
 
 @pytest.mark.asyncio

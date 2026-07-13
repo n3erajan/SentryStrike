@@ -2629,6 +2629,19 @@ class AuthenticationFailuresDetector(BaseDetector):
             input_types = {getattr(i, "input_type", "text").lower() for i in raw_inputs}
             form_url    = getattr(form, "action", getattr(form, "page_url", ""))
             form_method = getattr(form, "method", "POST").upper()
+
+            # A form whose action is a client-side (hash) route posts to the SPA
+            # shell, not a server endpoint: the "#/login" fragment never leaves the
+            # browser, so there is no server-side form handler and no place for a
+            # CSRF hidden token to live (SPAs authenticate with bearer tokens the
+            # browser does not attach cross-site). Detect this precisely so a normal
+            # multi-page-app login form is NOT affected: only skip when the action's
+            # real (pre-fragment) path is the app shell ("" or "/") AND it carries a
+            # fragment route. "/login" or "/login#anchor" keep a real path → not a
+            # shell form → still checked.
+            _parsed_action = urlparse(form_url or "")
+            posts_to_spa_shell = bool(_parsed_action.fragment) and (_parsed_action.path or "") in ("", "/")
+
             has_password = bool(input_names.intersection({"password", "passwd", "pass", "pwd", "passphrase", "secret"})
                                 or "password" in input_types)
             has_username = bool(input_names.intersection({"username", "user", "email", "mail", "login",
@@ -2671,8 +2684,11 @@ class AuthenticationFailuresDetector(BaseDetector):
                     ),
                 ))
 
-            # 7. Hidden inputs on auth forms → CSRF token presence / absence check
-            if (has_username or has_password) and not has_hidden:
+            # 7. Hidden inputs on auth forms → CSRF token presence / absence check.
+            # Skip SPA-shell forms (see posts_to_spa_shell): a hash-route action has
+            # no server-side form handler, so "no hidden CSRF field" is meaningless
+            # (and misleading) there. A normal MPA login form is unaffected.
+            if (has_username or has_password) and not has_hidden and not posts_to_spa_shell:
                 findings.append(self._finding(
                     vuln_type="Authentication Form May Lack CSRF Protection",
                     url=form_url,

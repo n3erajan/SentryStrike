@@ -1084,6 +1084,18 @@ class AccessControlDetector(BaseDetector):
                     f"real object id returned HTTP {real_unauth.status_code} (state change performed)."
                 )
 
+        # The shared owner/unauth status only demonstrates missing authorization
+        # when the mutating operation was actually PROCESSED. A matching non-success
+        # status (404 not-found, 400 bad-request, 409 conflict, 5xx, ...) proves the
+        # opposite: the mutation never ran, so no record changed and no auth signal
+        # exists — a 404 for a synthetic id short-circuits at routing/object-lookup
+        # and can occur whether or not the endpoint enforces auth. Identical 404s
+        # therefore say nothing about authorization. Require either a processed
+        # (2xx/3xx) shared status, or a destructive confirmation on a real id (which
+        # directly observed an unauthenticated state change).
+        if owner.status_code >= 400 and not confirmed:
+            return []
+
         evidence = (
             f"Missing authentication on state-changing endpoint: an unauthenticated "
             f"{synth_req.method} to {synth_req.url} returned HTTP {unauth.status_code}, identical to "
