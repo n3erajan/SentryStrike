@@ -52,6 +52,22 @@ class ApiExtractor:
         r"""|(?P<cvar>[A-Za-z_$][\w$.]*)\s*\+\s*["'](?P<ctail>[^"']*)["'])""",
         re.I,
     )
+    # A base-URL var concatenated with a quoted absolute-path literal in an
+    # ASSIGNMENT / config-property position (``url:host+"/file-upload"``,
+    # ``host=this.hostServer+"/api/Cards"``) rather than a verb call. The leading
+    # ``[:=]`` (with a negative lookbehind so multi-char operators like ``==`` /
+    # ``+=`` are not treated as the anchor) distinguishes it from
+    # ``BASE_CONCAT_VERB_RE`` (which is anchored on ``.verb(``), so the two never
+    # double-mine the same call. Recovers endpoints an SPA configures on an
+    # uploader / socket / service object whose path segment carries no
+    # ``/api``-style token (e.g. ``/file-upload``) and so is dropped by every
+    # other pass. The var must resolve to a base prefix OR be a base/host-ish
+    # name (then the origin is the base) — this anchoring keeps arbitrary string
+    # concatenations out.
+    BASE_CONCAT_ASSIGN_RE = re.compile(
+        r"""(?<![=!<>+\-*/%&|^~])[:=]\s*"""
+        r"""(?P<var>[A-Za-z_$][\w$.]*)\s*\+\s*["'](?P<tail>/[^"'`\s<>]*)["']""",
+    )
     # Assignment of a base-URL-ish variable to a string literal, optionally
     # prefixed by another base expression (``host = this.hostServer + "/api"``).
     # Only names that themselves look like a base/host/api var are considered.
@@ -242,6 +258,39 @@ class ApiExtractor:
                 evidence="base-concat",
                 request_body=body,
                 content_type=content_type,
+            )
+
+        # Base-var concat in an assignment / config-property position (not a verb
+        # call): ``url:host+"/file-upload"`` on an uploader/socket config, or a
+        # per-service ``host=this.hostServer+"/api/Cards"`` base field. These carry
+        # a real same-origin endpoint whose tail segment may have no /api|/rest
+        # token (``/file-upload``), so the string-literal and verb passes drop it.
+        # Reuse the same base-var resolution as the verb-concat loop; when the var
+        # is a base/host-ish name that resolved to no path prefix, the origin is
+        # the base (prefix ""). Not gated on ``_looks_api_path`` — the base anchor
+        # is what makes the tail a real endpoint — but static assets are skipped.
+        for match in cls.BASE_CONCAT_ASSIGN_RE.finditer(script_text):
+            var = match.group("var") or ""
+            tail = match.group("tail") or ""
+            short = var.rsplit(".", 1)[-1]
+            prefix = (
+                base_vars.get(var)
+                or base_vars.get(short)
+                or cls._nearest_base_prefix(local_assignments, short, match.start())
+            )
+            if prefix is None:
+                if not cls._looks_like_base_expression(short):
+                    continue
+                prefix = ""
+            joined = cls.normalize_template_url(prefix + tail)
+            if not joined.startswith("/") or joined.startswith("//"):
+                continue
+            if joined.lower().endswith(tuple(cls._STATIC_PATH_EXTENSIONS)):
+                continue
+            add_endpoint(
+                joined,
+                "POST" if cls._looks_state_changing(joined) else "GET",
+                evidence="base-concat-assign",
             )
 
         for match in re.finditer(r"""\$\.ajax\s*\(\s*\{(?P<args>.*?)\}\s*\)""", script_text, re.I | re.S):
@@ -1063,7 +1112,7 @@ class ApiExtractor:
     @staticmethod
     def _looks_state_changing(path: str) -> bool:
         lowered = path.lower()
-        return any(token in lowered for token in ("create", "update", "delete", "login", "logout", "submit", "mutation"))
+        return any(token in lowered for token in ("create", "update", "delete", "login", "logout", "submit", "mutation", "upload", "import"))
 
     @staticmethod
     def _infer_method_near(script_text: str, start: int) -> str:

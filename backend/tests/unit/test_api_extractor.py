@@ -228,3 +228,61 @@ def test_navigation_mining_rejects_offorigin_and_non_nav_strings():
     js2 = 'location.replace("https://evil.example.com/profile")'
     routes2, _ = ApiExtractor.extract_from_javascript("http://t.example/x.js", js2)
     assert not any("evil.example.com" in r for r in routes2)
+
+
+def test_base_concat_assignment_recovers_config_endpoint_without_api_token():
+    """A base-var concat in a config/assignment position (``url:host+"/x"`` on an
+    uploader config, or a per-service ``host=this.hostServer+"/x"`` field) whose
+    tail segment carries no /api|/rest token (``/file-upload``) must still be
+    mined. It is anchored to a real base/host var, so it is a genuine same-origin
+    endpoint; upload-token paths are mined as POST (state-changing)."""
+    js = (
+        'class C{hostServer=J.hostServer;'
+        'uploader=new Ts({url:this.hostServer+"/file-upload",authToken:t});'
+        'cards=this.hostServer+"/api/Cards";}'
+    )
+    routes, endpoints = ApiExtractor.extract_from_javascript("http://t.example/main.js", js)
+    by = {(e.method, e.url) for e in endpoints}
+    assert ("POST", "http://t.example/file-upload") in by  # upload token → POST
+    assert ("GET", "http://t.example/api/Cards") in by
+    assert any(e.evidence == "base-concat-assign" for e in endpoints)
+
+
+def test_base_concat_assignment_ignores_non_base_var_and_operators():
+    """The assignment concat miner is anchored on a base/host-ish var; an
+    arbitrary local var concat, and multi-char operators (``==``/``+=``), must NOT
+    fabricate endpoints (no over-mining)."""
+    js = (
+        'const label=prefix+"/thing";'          # prefix is not base-ish → ignored
+        'if(a==host+"/x"){};'                    # == is a comparison, not an anchor
+        'total+="/y";'                            # += is not an anchor
+    )
+    _routes, endpoints = ApiExtractor.extract_from_javascript("http://t.example/x.js", js)
+    urls = {e.url for e in endpoints}
+    assert "http://t.example/thing" not in urls
+    assert "http://t.example/y" not in urls
+
+
+def test_base_concat_assignment_respects_ambiguity_guard_scope_local():
+    """COLLISION GUARD (session 5 + session 7): the assignment concat miner must
+    NOT undermine the reused base-var ambiguity handling. A base-ish var (``host``)
+    bound to DIFFERENT paths per minified class, used in an ASSIGNMENT concat, must
+    resolve SCOPE-LOCALLY to each call's own class path (via the shared
+    `_nearest_base_prefix`), NEVER to a sibling's path and NEVER via the
+    empty-prefix origin fallback (which is reserved for base vars with no path
+    binding at all, e.g. ``hostServer=J.hostServer``)."""
+    js = (
+        'class Cards{host="/api/v1";up=this.host+"/upload";}'
+        'class Docs{host="/api/v2";imp=this.host+"/import";}'
+    )
+    _routes, endpoints = ApiExtractor.extract_from_javascript("http://t.example/x.js", js)
+    got = {(e.method, e.url) for e in endpoints if e.evidence == "base-concat-assign"}
+    assert ("POST", "http://t.example/api/v1/upload") in got
+    assert ("POST", "http://t.example/api/v2/import") in got
+    # No cross-contamination, and NO bare-origin fabrication (empty-prefix fallback
+    # must stay dormant while the var is path-bound somewhere).
+    urls = {u for _m, u in got}
+    assert "http://t.example/api/v1/import" not in urls
+    assert "http://t.example/api/v2/upload" not in urls
+    assert "http://t.example/upload" not in urls
+    assert "http://t.example/import" not in urls

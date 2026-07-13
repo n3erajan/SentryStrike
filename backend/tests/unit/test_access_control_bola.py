@@ -552,3 +552,52 @@ def test_credential_bearing_request_is_recognised_as_auth_endpoint():
 
     form = _PAR(url="http://t/x", method="POST", data={"credential": "z"})
     assert det._request_carries_credentials(form) is True
+
+
+# ---------------------------------------------------------------------------
+# Collection LIST-read matrix targeting (BFLA / admin-directory readable by
+# a non-admin). Regression for the miss where GET /api/Users was never a
+# matrix target because the admin UI that lists users is never crawled by a
+# low-privilege session and the endpoint is known only as POST (registration).
+# ---------------------------------------------------------------------------
+from app.core.crawler.models import ApiEndpoint as _ApiEndpoint, RequestObservation as _ReqObs  # noqa: E402
+
+
+def test_collection_base_url_strips_id_and_scopes_to_api_namespaces():
+    det = AccessControlDetector()
+    assert det._collection_base_url("http://t/api/Users/") == "http://t/api/Users"
+    assert det._collection_base_url("http://t/api/Users/42") == "http://t/api/Users"
+    assert det._collection_base_url("http://t/rest/products/1/reviews") == "http://t/rest/products/1/reviews"
+    # Non-API namespaces and static assets are ignored.
+    assert det._collection_base_url("http://t/assets/i18n/en.json") is None
+    assert det._collection_base_url("http://t/#/administration") is None
+
+
+def test_matrix_synthesizes_get_read_for_post_only_collection():
+    """A collection seen only as POST still gets a GET list-read matrix target."""
+    det = AccessControlDetector()
+    reqs = [_ReqObs(url="http://t/api/Users/", method="POST")]
+    eps = [_ApiEndpoint(url="http://t/api/Users/", method="POST")]
+    targets = det._build_matrix_targets([], [], requests=reqs, api_endpoints=eps)
+    get_users = [
+        t for t in targets
+        if t.request.method == "GET" and t.request.url.rstrip("/").endswith("/api/Users")
+    ]
+    assert get_users, [(t.request.method, t.request.url) for t in targets]
+    assert get_users[0].source == "collection_read_probe"
+
+
+def test_matrix_prioritises_identity_targets_over_noise_under_cap():
+    """High-value targets outrank static/telemetry noise so the cap keeps them."""
+    det = AccessControlDetector()
+    reqs = [
+        _ReqObs(url="http://t/assets/i18n/en.json", method="GET"),
+        _ReqObs(url="http://t/rest/web3/nftMintListen", method="GET"),
+        _ReqObs(url="http://t/api/Users/", method="POST"),
+        _ReqObs(url="http://t/api/Cards/1", method="GET"),
+    ]
+    targets = det._build_matrix_targets([], [], requests=reqs, api_endpoints=[])
+    urls = [t.request.url for t in targets]
+    users_idx = next(i for i, u in enumerate(urls) if u.rstrip("/").endswith("/api/Users"))
+    noise_idx = next(i for i, u in enumerate(urls) if "i18n" in u)
+    assert users_idx < noise_idx

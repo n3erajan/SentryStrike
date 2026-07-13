@@ -4,9 +4,10 @@ import copy
 import json
 import logging
 import re
+import secrets
 import statistics
 import time
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
@@ -268,12 +269,24 @@ class AuthenticationFailuresDetector(BaseDetector):
             return False
 
         # --- 1. Status-code check -------------------------------------------
-        # Any response outside the 2xx range is a hard signal that the server
-        # reacted (lockout, challenge, redirect to error page).
-        for r in responses:
-            code = getattr(r, "status_code", 0)
-            if not (200 <= code < 300):
-                return False
+        # A protection control announces itself either as an explicit throttle
+        # status (423 Locked / 429 Too Many Requests) or as a *transition* away
+        # from the rejection baseline mid-burst (e.g. a 401 that flips to a
+        # 302-lockout / 200-challenge, or a 200 login page replaced by an error
+        # page). Soft signals (rate-limit/challenge terms) are already screened by
+        # _rate_limit_signals_present before this method runs.
+        #
+        # A UNIFORM non-2xx code is NOT a control — it is the normal rejection
+        # baseline. Most correct JSON APIs answer an invalid login with a steady
+        # 401/403; the previous "must be 2xx" gate misread that as the server
+        # reacting, so those APIs could never be flagged for missing brute-force
+        # protection. We therefore key on throttle status + status *stability*,
+        # not on the absolute 2xx range.
+        statuses = [getattr(r, "status_code", 0) for r in responses]
+        if any(code in {423, 429} for code in statuses):
+            return False
+        if len(set(statuses)) > 1:
+            return False
 
         # --- 2. Body-length stability ----------------------------------------
         # A consistent change in response body size across bursts indicates the
@@ -1431,37 +1444,13 @@ class AuthenticationFailuresDetector(BaseDetector):
             )
             detection_method = "api_reset_token_enforcement_probe"
         elif flow_type == "password_change":
-            if not fields.get("new_password"):
-                return []
-            parameter = fields.get("new_password")
-            probe_password = f"SentryStrikeChangeCheck{int(time.time())}!"
-            self._set_body_path(body, parameter, probe_password)
-            if fields.get("confirm_password"):
-                self._set_body_path(body, fields["confirm_password"], probe_password)
-            if fields.get("current_password"):
-                # The endpoint DOES define a current-password field — actively test
-                # whether the server enforces it by OMITTING it from the request. A
-                # server that still applies the change without the current credential
-                # is exploitable for authenticated account takeover (a stolen/CSRF'd
-                # session can change the password blind). Removing a genuinely-required
-                # field yields a validation error on a correct server, so acceptance
-                # is the discriminator.
-                if not self._remove_body_path(body, fields["current_password"]):
-                    return []
-                vuln_type = "Password Change API Does Not Enforce Current Password"
-                evidence = (
-                    "Authenticated password-change API accepted a change request with the current-password "
-                    "field omitted. The server does not enforce the current credential, enabling silent "
-                    "account takeover from an active session."
-                )
-                detection_method = "api_password_change_enforcement_probe"
-            else:
-                vuln_type = "Password Change API Missing Current Password Requirement"
-                evidence = (
-                    "Authenticated password-change API body contains a new-password field but no current-password "
-                    "field. A safe verification request was accepted without a current-password error."
-                )
-                detection_method = "api_password_change_current_password_probe"
+            # SAFETY: change-password enforcement is now tested exclusively by
+            # _test_change_password_current_bypass, which runs against a freshly
+            # provisioned DISPOSABLE account. The previous probe here fired the
+            # change on the user's REAL scan session, which would actually rotate
+            # (and thereby lock out / invalidate) the account under test. Delegated
+            # away so we never mutate the real account's password.
+            return []
         elif flow_type == "mfa":
             if fields.get("mfa_code") or fields.get("token"):
                 return []
@@ -1848,6 +1837,20 @@ class AuthenticationFailuresDetector(BaseDetector):
     def _b64url(raw: bytes) -> str:
         return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
+    # Standard JWT identity claim names (RFC 7519 + common vendor claims). Used to
+    # substitute a canary so a reflected forged identity is undeniable proof. Generic
+    # — no target-specific claim names.
+    _IDENTITY_CLAIM_KEYS = frozenset({
+        "email", "mail", "e-mail", "sub", "username", "user", "user_name",
+        "preferred_username", "name", "login", "uid", "upn", "unique_name",
+        "nameid", "id", "userid", "user_id", "account", "role", "roles",
+    })
+
+    def _unsigned_token(self, header: dict, payload: dict, alg: str = "none") -> str:
+        payload_segment = self._b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        header_segment = self._b64url(json.dumps({**header, "alg": alg}, separators=(",", ":")).encode("utf-8"))
+        return f"{header_segment}.{payload_segment}."
+
     def _forge_alg_none(self, header: dict, payload: dict) -> list[tuple[str, str]]:
         """Forge unsigned tokens for the payload across alg=none casing variants.
 
@@ -1855,13 +1858,36 @@ class AuthenticationFailuresDetector(BaseDetector):
         signature. Casing variants defeat naive blocklists that only reject the
         exact lowercase string. Returns ``(label, token)`` pairs.
         """
-        payload_segment = self._b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-        tokens: list[tuple[str, str]] = []
-        for variant in ("none", "None", "NONE", "nOnE"):
-            header_variant = {**header, "alg": variant}
-            header_segment = self._b64url(json.dumps(header_variant, separators=(",", ":")).encode("utf-8"))
-            tokens.append((f"alg={variant}", f"{header_segment}.{payload_segment}."))
-        return tokens
+        return [
+            (f"alg={variant}", self._unsigned_token(header, payload, variant))
+            for variant in ("none", "None", "NONE", "nOnE")
+        ]
+
+    def _inject_canary(self, payload: dict, canary: str) -> dict | None:
+        """Deep-copy *payload* with a canary substituted into identity claims.
+
+        Returns the mutated payload when at least one identity claim was replaced,
+        else ``None``. Reflecting this canary back proves the server both accepted an
+        unsigned token AND trusted its (attacker-chosen) identity claims.
+        """
+        clone = copy.deepcopy(payload)
+        count = 0
+
+        def walk(node: object) -> None:
+            nonlocal count
+            if isinstance(node, dict):
+                for key, value in list(node.items()):
+                    if isinstance(value, str) and str(key).lower() in self._IDENTITY_CLAIM_KEYS:
+                        node[key] = canary
+                        count += 1
+                    else:
+                        walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(clone)
+        return clone if count else None
 
     def _forge_key_confusion(self, header: dict, payload: dict, public_key_pem: str) -> str | None:
         """Forge an HS256 token signed with the server's RSA public key as the HMAC secret.
@@ -1949,45 +1975,206 @@ class AuthenticationFailuresDetector(BaseDetector):
                 unique.append(pem)
         return unique
 
-    def _forgery_oracle_candidates(self, kwargs: dict[str, object]) -> list[str]:
-        """Observed bearer-authenticated GET endpoints usable as a forgery oracle."""
-        urls: list[str] = []
+    # Generic REST/English conventions for identity-reflecting endpoints. Used only
+    # to RANK candidates so the limited oracle budget is spent on the endpoints most
+    # likely to be a forgery oracle — NOT to gate detection (any endpoint that shows
+    # an auth differential still qualifies). Contains no target-specific paths.
+    _IDENTITY_PATH_TOKENS = (
+        "whoami", "userinfo", "me", "self", "current", "profile", "account",
+        "session", "identity", "user", "users", "member", "principal", "dashboard",
+    )
+    # Generic static-asset markers: an asset can never be an auth oracle.
+    _STATIC_ASSET_EXTS = frozenset({
+        "js", "mjs", "css", "scss", "map", "png", "jpg", "jpeg", "gif", "svg",
+        "ico", "webp", "woff", "woff2", "ttf", "eot", "otf",
+    })
+    _STATIC_ASSET_DIRS = ("/assets/", "/static/", "/i18n/", "/fonts/", "/images/", "/img/")
+
+    @classmethod
+    def _is_static_asset(cls, url: str) -> bool:
+        path = urlparse(url).path.lower()
+        if any(seg in path for seg in cls._STATIC_ASSET_DIRS):
+            return True
+        last = path.rsplit("/", 1)[-1]
+        if "." in last:
+            return last.rsplit(".", 1)[-1] in cls._STATIC_ASSET_EXTS
+        return False
+
+    def _token_carriers_from_request(self, request: object) -> list[dict]:
+        """How a JWT was presented on an observed request (header and/or cookie).
+
+        Returns carrier descriptors ``{loc, name, scheme, token}`` so a forged token
+        can later be replayed in the SAME location the application actually reads it
+        from. Framework-agnostic: covers ``Authorization: Bearer`` headers and any
+        cookie whose value is JWT-shaped (the common SPA pattern).
+        """
+        carriers: list[dict] = []
+        headers = dict(getattr(request, "request_headers", {}) or {})
+        bearer = self._extract_bearer(headers)
+        if bearer and self._looks_like_jwt(bearer):
+            carriers.append({"loc": "header", "name": "Authorization", "scheme": "Bearer ", "token": bearer})
+
+        cookies = dict(getattr(request, "request_cookies", {}) or {})
+        if not cookies:
+            cookie_header = next((v for k, v in headers.items() if k.lower() == "cookie"), "")
+            for part in str(cookie_header).split(";"):
+                if "=" in part:
+                    name, value = part.split("=", 1)
+                    cookies[name.strip()] = value.strip()
+        for name, value in cookies.items():
+            if self._looks_like_jwt(str(value)):
+                carriers.append({"loc": "cookie", "name": str(name), "scheme": "", "token": str(value)})
+        return carriers
+
+    def _forgery_oracle_candidates(self, kwargs: dict[str, object]) -> list[dict]:
+        """Observed GET endpoints that carried a JWT (header OR cookie), ranked.
+
+        Static assets are dropped (never an auth oracle) and identity-reflecting
+        endpoints are ranked first so the budgeted oracle probes land on the URLs
+        most likely to expose a signature-verification bypass. The auth differential
+        measured later — not this ranking — is what actually qualifies an oracle.
+        """
+        ranked: list[tuple[int, str, list[dict]]] = []
         seen: set[str] = set()
         for request in kwargs.get("requests") or []:
             if str(getattr(request, "method", "GET") or "GET").upper() != "GET":
                 continue
-            if not self._extract_bearer(dict(getattr(request, "request_headers", {}) or {})):
-                continue
             url = str(getattr(request, "url", "") or "")
-            if url and url not in seen:
-                seen.add(url)
-                urls.append(url)
-        return urls
+            if not url or url in seen:
+                continue
+            if self._is_static_asset(url):
+                continue
+            carriers = self._token_carriers_from_request(request)
+            if not carriers:
+                continue
+            seen.add(url)
+            path = urlparse(url).path.lower()
+            rank = 0 if any(tok in path for tok in self._IDENTITY_PATH_TOKENS) else 1
+            ranked.append((rank, url, carriers))
+        ranked.sort(key=lambda item: item[0])
+        return [{"url": url, "carriers": carriers} for _rank, url, carriers in ranked[:6]]
 
     @staticmethod
-    async def _send_with_bearer(verifier: object, url: str, token: str | None, *, phase: str) -> object:
-        headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+    async def _send_via_carrier(verifier: object, url: str, token: str | None, carrier: dict, *, phase: str) -> object:
+        """Send GET *url* presenting *token* (or nothing) in the carrier's location."""
+        headers: dict | None = None
+        cookies: dict | None = None
+        if token is not None:
+            if carrier.get("loc") == "cookie":
+                cookies = {carrier["name"]: token}
+            else:
+                headers = {carrier.get("name", "Authorization"): f"{carrier.get('scheme', '')}{token}"}
         return await verifier.send_request(
             url, "GET", None, None,
-            headers=headers, test_phase=phase, module="auth", parameter="jwt",
+            headers=headers, cookies=cookies,
+            test_phase=phase, module="auth", parameter="jwt",
         )
 
-    async def _establish_forgery_oracle(self, verifier: object, url: str, real_token: str) -> dict | None:
-        """Confirm ``url`` is bearer-protected and the real token works.
+    @staticmethod
+    def _identity_signal_values(payload: object, authed_body: str, noauth_body: str) -> list[str]:
+        """Token-derived identity markers reflected ONLY in the authenticated body.
 
-        Returns the real-token success status, or ``None`` when the endpoint is not
-        a usable oracle (public, or the real token is not accepted). No session
-        cookies are sent, so authentication is attributable solely to the bearer.
+        Walks the JWT payload for scalar leaf values (emails, usernames, numeric ids,
+        etc.) and keeps those that appear in the authenticated response but NOT in the
+        no-auth response. Such a value is a zero-FP "the server trusted this token's
+        claims" signal: its later reappearance under a forged token proves acceptance,
+        and its absence from the no-auth baseline rules out coincidental/public echo.
         """
-        no_auth = await self._send_with_bearer(verifier, url, None, phase="jwt_forgery_noauth")
-        real = await self._send_with_bearer(verifier, url, real_token, phase="jwt_forgery_baseline")
-        if getattr(no_auth, "not_tested", False) or getattr(real, "not_tested", False):
+        candidates: list[str] = []
+
+        def walk(node: object) -> None:
+            if isinstance(node, dict):
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+            elif isinstance(node, bool):
+                return
+            elif isinstance(node, str):
+                if len(node) >= 4:
+                    candidates.append(node)
+            elif isinstance(node, int):
+                if node > 999:
+                    candidates.append(str(node))
+
+        walk(payload)
+        signal: list[str] = []
+        for value in candidates:
+            if value in authed_body and value not in noauth_body and value not in signal:
+                signal.append(value)
+        return signal
+
+    async def _establish_forgery_oracle(self, verifier: object, url: str, carriers: list[dict]) -> dict | None:
+        """Confirm *url* distinguishes authed from unauthenticated, via ANY carrier.
+
+        For each observed carrier (header / cookie), replays no-token vs the real
+        token and looks for an auth differential by EITHER status code (401/403 → 2xx)
+        OR body content (token identity claims reflected only when authenticated). The
+        first carrier that shows a differential wins; returns the winning carrier plus
+        the markers used to judge forgery acceptance. ``None`` when the endpoint is
+        public / not a usable oracle. No session cookies are sent, so authentication
+        is attributable solely to the presented token.
+        """
+        for carrier in carriers:
+            base_token = carrier.get("token")
+            if not base_token or not self._decode_jwt(base_token):
+                continue
+            no_auth = await self._send_via_carrier(verifier, url, None, carrier, phase="jwt_forgery_noauth")
+            real = await self._send_via_carrier(verifier, url, base_token, carrier, phase="jwt_forgery_baseline")
+            if getattr(no_auth, "not_tested", False) or getattr(real, "not_tested", False):
+                continue
+
+            noauth_status = getattr(no_auth, "status_code", 0)
+            real_status = getattr(real, "status_code", 0)
+            status_based = noauth_status in (401, 403) and 200 <= real_status < 300
+
+            _header, payload = self._decode_jwt(base_token)
+            signal_values = self._identity_signal_values(
+                payload, getattr(real, "body", "") or "", getattr(no_auth, "body", "") or ""
+            )
+
+            if status_based or signal_values:
+                return {
+                    "carrier": carrier,
+                    "base_token": base_token,
+                    "real_status": real_status,
+                    "noauth_status": noauth_status,
+                    "status_based": status_based,
+                    "signal_values": signal_values,
+                }
+        return None
+
+    @staticmethod
+    def _mask_marker(value: str) -> str:
+        """Partially mask a reflected identity marker for evidence text."""
+        value = str(value)
+        if len(value) <= 6:
+            return "…"
+        return f"{value[:2]}…{value[-2:]}"
+
+    def _judge_forgery(self, resp: object, oracle: dict, canary: str | None) -> dict | None:
+        """Decide whether a forged token was accepted. Zero-FP by construction.
+
+        A canary token counts only if the canary reflects (undeniable identity
+        injection). An unchanged-payload token counts if it reproduces the authed
+        response class: token-derived identity markers that were absent from the
+        no-auth baseline reappear, or (for a status-gated oracle) it returns 2xx.
+        """
+        if getattr(resp, "not_tested", False):
             return None
-        if getattr(no_auth, "status_code", 0) not in (401, 403):
+        status = getattr(resp, "status_code", 0)
+        body = getattr(resp, "body", "") or ""
+        if canary is not None:
+            if canary in body:
+                return {"mode": "identity-injection", "markers": [canary], "status": status}
             return None
-        if not (200 <= getattr(real, "status_code", 0) < 300):
-            return None
-        return {"real_status": getattr(real, "status_code", 0)}
+        hits = [v for v in oracle["signal_values"] if v in body]
+        if hits:
+            return {"mode": "identity-reflection", "markers": hits, "status": status}
+        if oracle["status_based"] and 200 <= status < 300:
+            return {"mode": "status-differential", "markers": [], "status": status}
+        return None
 
     async def _active_jwt_forgery_findings(
         self,
@@ -1997,72 +2184,102 @@ class AuthenticationFailuresDetector(BaseDetector):
         """Actively forge the scanner's own JWT and flag only if the forgery is accepted.
 
         Upgrades passive ``alg=none``/signature notes to a VERIFIED finding: a forged
-        token that a bearer-protected endpoint accepts (where no-auth is denied and
-        the real token works) proves signature verification is broken. Idempotent
-        GET only; runs solely when an observed bearer-protected GET oracle exists, so
-        it adds near-zero cost otherwise. Session cookies are intentionally excluded
-        so acceptance is attributable to the forged token alone.
+        token accepted by an endpoint that distinguishes authenticated from anonymous
+        access proves signature verification is broken. The oracle differential is
+        measured by status code OR response body (identity claim reflection), and the
+        forged token is replayed in the SAME carrier (Authorization header or cookie)
+        the application actually reads — so the check works for header- and cookie-
+        based JWT auth alike. Idempotent GET only; runs solely when an observed
+        JWT-carrying GET oracle exists, so it adds near-zero cost otherwise. Session
+        cookies are excluded so acceptance is attributable to the forged token alone.
         """
         candidates = self._forgery_oracle_candidates(kwargs)
         if not candidates:
             return []
-        tokens = [item for item in self._tokens_from_context(kwargs, session_cookies) if self._decode_jwt(item["token"])]
-        if not tokens:
-            return []
 
         from app.core.verification.verification_framework import HttpVerifier
 
-        primary = tokens[0]
-        header, payload = self._decode_jwt(primary["token"])
-        verifier = HttpVerifier()  # no cookies: bearer is the only auth factor under test
+        verifier = HttpVerifier()  # no session cookies: the presented token is the only auth factor
         try:
-            for url in candidates[:2]:
-                oracle = await self._establish_forgery_oracle(verifier, url, primary["token"])
+            for candidate in candidates:
+                url = candidate["url"]
+                oracle = await self._establish_forgery_oracle(verifier, url, candidate["carriers"])
                 if oracle is None:
                     continue
 
-                forged: list[tuple[str, str]] = list(self._forge_alg_none(header, payload))
+                carrier = oracle["carrier"]
+                header, payload = self._decode_jwt(oracle["base_token"])
+
+                # (label, token, canary) — canary None means unchanged payload.
+                forged: list[tuple[str, str, str | None]] = [
+                    (label, token, None) for label, token in self._forge_alg_none(header, payload)
+                ]
+                canary = "sentryjwt" + secrets.token_hex(6)
+                canary_payload = self._inject_canary(payload, canary)
+                if canary_payload is not None:
+                    forged.append(("alg=none (identity-forged)", self._unsigned_token(header, canary_payload), canary))
                 if str(header.get("alg", "")).upper().startswith(("RS", "ES", "PS")):
                     for pem in await self._fetch_jwks_pems(kwargs, verifier):
                         confused = self._forge_key_confusion(header, payload, pem)
                         if confused:
-                            forged.append(("algorithm confusion (RS→HS256)", confused))
+                            forged.append(("algorithm confusion (RS→HS256)", confused, None))
 
-                for label, token in forged:
-                    resp = await self._send_with_bearer(verifier, url, token, phase="jwt_forgery_attempt")
-                    if getattr(resp, "not_tested", False):
+                for label, token, tok_canary in forged:
+                    resp = await self._send_via_carrier(verifier, url, token, carrier, phase="jwt_forgery_attempt")
+                    proof = self._judge_forgery(resp, oracle, tok_canary)
+                    if proof is None:
                         continue
-                    status = getattr(resp, "status_code", 0)
-                    if 200 <= status < 300:
-                        is_none = label.startswith("alg=")
-                        return [
-                            self._finding(
-                                vuln_type=(
-                                    "JWT alg=none Forgery Accepted" if is_none
-                                    else "JWT Algorithm-Confusion Forgery Accepted"
-                                ),
-                                url=url,
-                                severity=SeverityLevel.critical,
-                                evidence=(
-                                    f"A forged JWT ({label}) built from the scanner's own token was accepted by a "
-                                    f"bearer-protected endpoint (no-auth was denied 401/403, the real token returned "
-                                    f"{oracle['real_status']}, and the forged token returned {status}). "
-                                    "Signature verification is not enforced — any user or role can be impersonated."
-                                ),
-                                verified=True,
-                                detection_method="jwt_active_forgery",
-                                confidence_score=95.0,
-                                verification_request_snippet=getattr(resp, "request_snippet", None),
-                                verification_response_snippet=getattr(resp, "response_snippet", None),
-                                detection_evidence={
-                                    "forgery": label,
-                                    "token_source": primary.get("source"),
-                                    "oracle_url": url,
-                                    "real_status": oracle["real_status"],
-                                    "forged_status": status,
-                                },
-                            )
-                        ]
+
+                    is_none = label.startswith("alg=")
+                    carrier_desc = (
+                        f"cookie '{carrier['name']}'" if carrier["loc"] == "cookie"
+                        else f"'{carrier['name']}' header"
+                    )
+                    if proof["mode"] == "identity-injection":
+                        proof_text = (
+                            "the forged token's attacker-chosen identity claim was reflected in the "
+                            f"response (marker '{self._mask_marker(proof['markers'][0])}'), proving arbitrary "
+                            "identity/role forgery"
+                        )
+                    elif proof["mode"] == "identity-reflection":
+                        proof_text = (
+                            "the forged token reproduced the authenticated identity in the response "
+                            f"(marker {self._mask_marker(proof['markers'][0])}) that the anonymous baseline did not"
+                        )
+                    else:
+                        proof_text = (
+                            f"the no-auth baseline was denied {oracle['noauth_status']} and the forged token "
+                            f"returned {proof['status']}"
+                        )
+                    return [
+                        self._finding(
+                            vuln_type=(
+                                "JWT alg=none Forgery Accepted" if is_none
+                                else "JWT Algorithm-Confusion Forgery Accepted"
+                            ),
+                            url=url,
+                            severity=SeverityLevel.critical,
+                            evidence=(
+                                f"A forged JWT ({label}) built from the scanner's own token, presented via the "
+                                f"{carrier_desc}, was accepted by an authentication-gated endpoint: {proof_text}. "
+                                "Signature verification is not enforced — any user or role can be impersonated."
+                            ),
+                            verified=True,
+                            detection_method="jwt_active_forgery",
+                            confidence_score=95.0,
+                            verification_request_snippet=getattr(resp, "request_snippet", None),
+                            verification_response_snippet=getattr(resp, "response_snippet", None),
+                            detection_evidence={
+                                "forgery": label,
+                                "proof_mode": proof["mode"],
+                                "carrier": f"{carrier['loc']}:{carrier['name']}",
+                                "oracle_url": url,
+                                "real_status": oracle["real_status"],
+                                "noauth_status": oracle["noauth_status"],
+                                "forged_status": proof["status"],
+                            },
+                        )
+                    ]
             return []
         finally:
             await verifier.close()
@@ -2196,6 +2413,191 @@ class AuthenticationFailuresDetector(BaseDetector):
             )
         ]
 
+    # ---------------------------------------------------------------------------
+    # Change-password: current-password enforcement (safe, disposable-account test)
+    # ---------------------------------------------------------------------------
+
+    # Path fragments (separator-stripped) that mark a change-password endpoint, and
+    # separator-stripped parameter names for each password field. Generic — no
+    # target-specific paths or fields.
+    _CHANGE_PW_PATH_TOKENS = (
+        "changepassword", "updatepassword", "setpassword",
+        "passwordchange", "passwordupdate", "accountpassword",
+    )
+    _NEW_PW_PARAMS = frozenset({"newpassword", "newpass", "passwordnew", "new"})
+    _REPEAT_PW_PARAMS = frozenset({
+        "passwordrepeat", "repeatpassword", "confirmpassword", "passwordconfirmation",
+        "passwordconfirm", "confirm", "repeat",
+    })
+    _CURRENT_PW_PARAMS = frozenset({
+        "currentpassword", "oldpassword", "existingpassword", "currentpwd", "oldpwd",
+        "current", "old", "existing",
+    })
+
+    @staticmethod
+    def _norm_param(name: object) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+    def _classify_pw_params(self, names: list[str]) -> dict:
+        found = {"new": None, "repeat": None, "current": None}
+        for name in names:
+            n = self._norm_param(name)
+            if found["new"] is None and n in self._NEW_PW_PARAMS:
+                found["new"] = name
+            elif found["repeat"] is None and n in self._REPEAT_PW_PARAMS:
+                found["repeat"] = name
+            elif found["current"] is None and n in self._CURRENT_PW_PARAMS:
+                found["current"] = name
+        return found
+
+    def _find_change_password_endpoint(self, kwargs: dict[str, object]) -> dict | None:
+        """Locate a change-password endpoint (query- or body-parameterised).
+
+        Keyed on a generic path fragment plus a discoverable new-password field, so
+        it matches ``GET /rest/user/change-password?current=&new=&repeat=`` and
+        ``POST /api/account/change-password {oldPassword,newPassword}`` alike.
+        """
+        for request in kwargs.get("requests") or []:
+            url = str(getattr(request, "url", "") or "")
+            if not url:
+                continue
+            path_norm = re.sub(r"[^a-z0-9]", "", urlparse(url).path.lower())
+            if not any(tok in path_norm for tok in self._CHANGE_PW_PATH_TOKENS):
+                continue
+            method = str(getattr(request, "method", "GET") or "GET").upper()
+
+            query_names = [k for k, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)]
+            q_class = self._classify_pw_params(query_names)
+            if q_class["new"]:
+                return {"url": url.split("?")[0], "method": method, "location": "query", **q_class}
+
+            # Body-parameterised change-password: preserve the observed ENCODING so
+            # the probe is replayed the same way the app expects it (JSON vs
+            # form-urlencoded), otherwise a correct endpoint would 400 on the wrong
+            # content type and the vuln would be missed.
+            body = getattr(request, "post_data", None)
+            content_type = str(getattr(request, "request_content_type", "") or "").lower()
+            body_names: list[str] = []
+            encoding = "json"
+            if isinstance(body, dict):
+                body_names = list(body.keys())
+                encoding = "form" if "form-urlencoded" in content_type else "json"
+            elif isinstance(body, str) and body.strip():
+                parsed = None
+                try:
+                    parsed = json.loads(body)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict) and "form-urlencoded" not in content_type:
+                    body_names = list(parsed.keys())
+                    encoding = "json"
+                else:
+                    body_names = [k for k, _ in parse_qsl(body, keep_blank_values=True)]
+                    encoding = "form"
+            if "json" in content_type:
+                encoding = "json"
+            elif "form-urlencoded" in content_type:
+                encoding = "form"
+            b_class = self._classify_pw_params(body_names)
+            if b_class["new"]:
+                return {"url": url.split("?")[0], "method": method or "POST", "location": encoding, **b_class}
+        return None
+
+    def _build_change_pw_request(self, endpoint: dict, new_pw: str, current_value: str | None):
+        """Return (url, method, params, data, json_body) for a change-password attempt.
+
+        Honours the endpoint's observed transport — query string, JSON body, or
+        form-urlencoded body — so the probe matches how the server accepts input.
+        """
+        fields: dict[str, str] = {endpoint["new"]: new_pw}
+        if endpoint.get("repeat"):
+            fields[endpoint["repeat"]] = new_pw
+        if current_value is not None and endpoint.get("current"):
+            fields[endpoint["current"]] = current_value
+        location = endpoint["location"]
+        method = endpoint["method"] or ("GET" if location == "query" else "POST")
+        if location == "query":
+            return f"{endpoint['url']}?{urlencode(fields)}", method, None, None, None
+        if location == "form":
+            return endpoint["url"], method, None, fields, None
+        return endpoint["url"], method, None, None, fields
+
+    async def _test_change_password_current_bypass(self, kwargs: dict[str, object]) -> list[Finding]:
+        """Safely test whether change-password enforces the current password.
+
+        Runs entirely against a freshly provisioned, DISPOSABLE throwaway account —
+        never the user's scan session — so a successful password change cannot lock
+        anyone out or invalidate the scan. Each variant forward-changes the throwaway
+        password (no revert needed, so password-reuse policies are irrelevant), and a
+        finding is raised only when a login with the NEW password succeeds, proving
+        the change actually took effect without a valid current credential.
+        """
+        endpoint = self._find_change_password_endpoint(kwargs)
+        if endpoint is None:
+            return []
+        root_url = str(kwargs.get("root_url") or "")
+        if not root_url:
+            return []
+
+        from app.core.crawler.account_session import account_login_succeeds, provision_disposable_account
+        from app.core.verification.verification_framework import HttpVerifier
+
+        account = await provision_disposable_account(root_url)
+        if account is None:
+            # Provisioning disabled or not possible → cannot test safely → skip.
+            return []
+
+        verifier = HttpVerifier(cookies=account.session.cookies, headers=account.session.headers)
+        verifier.set_request_context(module="auth", parameter="change-password")
+        try:
+            # Two safe bypass variants on the throwaway: omit the current-password
+            # field, then supply a deliberately wrong one. A correctly-enforcing
+            # endpoint rejects both (login with the new password then fails).
+            variants: list[tuple[str, str | None]] = [
+                ("current-omitted", None),
+                ("current-wrong", "sentry_wrong_" + secrets.token_hex(4)),
+            ]
+            for label, current_value in variants:
+                new_pw = "Sn!" + secrets.token_urlsafe(12)
+                url, method, params, data, json_body = self._build_change_pw_request(endpoint, new_pw, current_value)
+                resp = await verifier.send_request(
+                    url, method, params, data, json_body=json_body,
+                    test_phase="change_password_current_bypass", parameter="change-password",
+                )
+                if getattr(resp, "not_tested", False):
+                    continue
+                if await account_login_succeeds(root_url, account.email, new_pw):
+                    how = "omitted" if current_value is None else "set to a wrong value"
+                    return [
+                        self._finding(
+                            vuln_type="Password Change Does Not Require Current Password",
+                            url=endpoint["url"],
+                            method=method,
+                            severity=SeverityLevel.critical,
+                            evidence=(
+                                "On a throwaway account, the change-password endpoint accepted a new password "
+                                f"with the current-password {how}, and the account password was actually changed "
+                                "— confirmed by logging in with the new password. The endpoint does not verify the "
+                                "current credential, enabling account takeover from any active or CSRF'd session "
+                                "(CWE-620). Tested on a disposable identity; no real account was affected."
+                            ),
+                            verified=True,
+                            detection_method="change_password_current_bypass_login_confirmed",
+                            confidence_score=95.0,
+                            category=OwaspCategory.a07,
+                            verification_request_snippet=getattr(resp, "request_snippet", None),
+                            verification_response_snippet=getattr(resp, "response_snippet", None),
+                            detection_evidence={
+                                "bypass_variant": label,
+                                "endpoint_location": endpoint["location"],
+                                "confirmation": "login_with_new_password_succeeded",
+                            },
+                        )
+                    ]
+            return []
+        finally:
+            await verifier.close()
+
     async def _inspect_tokens_and_sessions(
         self,
         kwargs: dict[str, object],
@@ -2206,6 +2608,7 @@ class AuthenticationFailuresDetector(BaseDetector):
         findings.extend(await self._active_jwt_forgery_findings(kwargs, session_cookies))
         findings.extend(self._cookie_attribute_findings(kwargs))
         findings.extend(await self._logout_token_reuse_findings(kwargs, session_cookies))
+        findings.extend(await self._test_change_password_current_bypass(kwargs))
         return findings
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:

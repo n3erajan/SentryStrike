@@ -1481,6 +1481,17 @@ class AccessControlDetector(BaseDetector):
                 )
             )
 
+        # Collection LIST-read probes. A GET on a REST collection (e.g. GET
+        # /api/Users) is a prime broken-authorization target, but it is frequently
+        # never observed: the listing is often only reachable from an admin/privileged
+        # UI that a low-privilege crawl never renders, and the same endpoint may be
+        # known only under a state-changing verb (e.g. POST /api/Users to register).
+        # Synthesize the read variant for every collection we know about so the
+        # authorization matrix can test it. GET is idempotent/read-only, so this is
+        # safe; genuinely public collections are suppressed by the matrix's own
+        # public-endpoint gate, and non-existent reads simply 404.
+        targets.extend(self._synthesize_collection_read_targets(requests, api_endpoints))
+
         deduped: list[_MatrixTarget] = []
         seen: set[tuple[str, str, str, str]] = set()
         for target in targets:
@@ -1506,6 +1517,12 @@ class AccessControlDetector(BaseDetector):
                 continue
             seen.add(key)
             deduped.append(target)
+        # The matrix is request-budget-capped, so ORDER matters: rank targets that
+        # actually expose an authorization boundary (collection reads, object
+        # references, identity/PII resources) above public noise (static assets,
+        # catalogues, version/telemetry endpoints) so high-value targets are not
+        # crowded out of the cap. Stable sort keeps discovery order within a tier.
+        deduped.sort(key=self._matrix_target_priority, reverse=True)
         return deduped[:80]
 
     async def _verify_idor_baseline(
@@ -2262,6 +2279,90 @@ class AccessControlDetector(BaseDetector):
     def _is_admin_like_url(self, url: str) -> bool:
         lowered = urlparse(url).path.lower()
         return any(token in lowered for token in self.sensitive_path_tokens)
+
+    # Generic REST resource nouns that commonly hold user-scoped / privileged data.
+    # Used only to PRIORITISE authorization-matrix targets (never to gate detection),
+    # so high-value endpoints survive the request-budget cap. Target-agnostic.
+    _IDENTITY_RESOURCE_TOKENS = (
+        "user", "account", "member", "customer", "profile", "card", "address",
+        "order", "payment", "wallet", "invoice", "credential", "token", "admin",
+        "ssn", "email", "phone", "message", "notification", "secret", "key",
+    )
+    # Public/telemetry/static noise that carries no authorization boundary.
+    _MATRIX_NOISE_TOKENS = (
+        "/assets/", "/i18n/", "/fonts/", "/static/", ".js", ".css", ".png", ".svg",
+        ".ico", ".map", "languages", "application-version", "web3", "nft",
+        "captcha", "metrics",
+    )
+
+    @staticmethod
+    def _collection_base_url(url: str) -> str | None:
+        """Return the REST collection URL for *url*, or ``None`` if not applicable.
+
+        ``/api/Users/1`` and ``/api/Users`` both map to ``…/api/Users``. Scoped to
+        API namespaces (``/api/`` or ``/rest/``) so HTML/static pages are ignored.
+        A trailing object-id segment is dropped so an object URL still yields its
+        parent collection listing.
+        """
+        parsed = urlparse(url)
+        low_path = parsed.path.lower()
+        if "/api/" not in low_path and "/rest/" not in low_path:
+            return None
+        segments = [s for s in parsed.path.split("/") if s]
+        if segments and _looks_like_path_id_segment(segments[-1]):
+            segments = segments[:-1]
+        if not segments:
+            return None
+        last = segments[-1]
+        # The collection segment must be a plain resource name, not an id/token.
+        if _looks_like_path_id_segment(last) or not re.match(r"^[A-Za-z][A-Za-z0-9_-]*$", last):
+            return None
+        return f"{parsed.scheme}://{parsed.netloc}/" + "/".join(segments)
+
+    def _synthesize_collection_read_targets(
+        self, requests: list[object], api_endpoints: list[object]
+    ) -> list[_MatrixTarget]:
+        """Build read-only GET matrix targets for every known REST collection."""
+        bases: dict[str, str] = {}
+        for source in (requests or []):
+            url = str(getattr(source, "url", "") or "")
+            base = self._collection_base_url(url) if url else None
+            if base:
+                bases.setdefault(self._canonical_request_url(base), base)
+        for endpoint in (api_endpoints or []):
+            url = str(getattr(endpoint, "url", "") or "")
+            base = self._collection_base_url(url) if url else None
+            if base:
+                bases.setdefault(self._canonical_request_url(base), base)
+
+        targets: list[_MatrixTarget] = []
+        for base in bases.values():
+            request = PreparedAttackRequest(url=base, method="GET")
+            targets.append(
+                _MatrixTarget(
+                    request=request,
+                    source="collection_read_probe",
+                    has_object_reference=False,
+                    admin_like=self._is_admin_like_url(base),
+                )
+            )
+        return targets
+
+    def _matrix_target_priority(self, target: _MatrixTarget) -> int:
+        """Rank an authorization-matrix target; higher survives the budget cap."""
+        path = urlparse(target.request.url).path.lower()
+        score = 0
+        if target.admin_like:
+            score += 5
+        if target.has_object_reference:
+            score += 3
+        if target.source == "collection_read_probe":
+            score += 4
+        if any(token in path for token in self._IDENTITY_RESOURCE_TOKENS):
+            score += 3
+        if any(token in path for token in self._MATRIX_NOISE_TOKENS):
+            score -= 6
+        return score
 
     @staticmethod
     def _canonical_request_url(url: str) -> str:

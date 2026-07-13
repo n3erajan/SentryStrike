@@ -561,3 +561,167 @@ async def test_file_upload_xml_probe_skipped_for_plain_image_form(monkeypatch):
     # No XML control/entity documents were uploaded to the image endpoint.
     assert "sentry_entity.xml" not in uploaded_names
     assert "sentry_control.xml" not in uploaded_names
+
+
+def _xxe_doc_reads_passwd(files: dict) -> bool:
+    """True when the multipart upload carries our external-entity /etc/passwd XML."""
+    for _field, spec in (files or {}).items():
+        _name, content, _ctype = spec
+        body = content.decode("utf-8", "ignore") if isinstance(content, (bytes, bytearray)) else str(content)
+        if 'SYSTEM "file:///etc/passwd"' in body:
+            return True
+    return False
+
+
+@pytest.mark.asyncio
+async def test_file_upload_detector_reports_reflected_xxe_external_entity(monkeypatch):
+    """A parser that resolves an external file:// entity and reflects the file's
+    content is reported as verified XXE (arbitrary file disclosure)."""
+    detector = FileUploadDetector()
+    form = SimpleNamespace(
+        page_url="https://example.test/complain",
+        action="/file-upload",
+        method="POST",
+        inputs=[SimpleNamespace(name="file", input_type="file")],
+    )
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, **kwargs):
+            if _xxe_doc_reads_passwd(kwargs.get("files")):
+                # Server resolved the external entity and reflected /etc/passwd.
+                return httpx.Response(
+                    410,
+                    text="Error: deprecated: <product>root:x:0:0:root:/root:/bin/bash</product>",
+                    request=httpx.Request(kwargs["method"], kwargs["url"]),
+                )
+            return httpx.Response(204, request=httpx.Request(kwargs["method"], kwargs["url"]))
+
+        async def get(self, url):
+            return httpx.Response(404, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr("app.core.detectors.file_upload.create_scan_client", lambda **kwargs: FakeClient())
+
+    findings = await detector.detect(urls=[], forms=[form])
+
+    xxe = [f for f in findings if f.vuln_type == "XML External Entity (XXE) Injection"]
+    assert len(xxe) == 1
+    assert xxe[0].verified is True
+    assert xxe[0].detection_method == "xxe_external_entity_file_read"
+    assert xxe[0].detection_evidence["file_disclosed"] is True
+
+
+@pytest.mark.asyncio
+async def test_file_upload_xxe_probe_zero_fp_when_entity_not_resolved(monkeypatch):
+    """A server that echoes the raw XML but does NOT resolve entities (the entity
+    reference is reflected literally, no file content) yields no XXE finding."""
+    detector = FileUploadDetector()
+    form = SimpleNamespace(
+        page_url="https://example.test/complain",
+        action="/file-upload",
+        method="POST",
+        inputs=[SimpleNamespace(name="file", input_type="file")],
+    )
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, **kwargs):
+            files = kwargs.get("files") or {}
+            # Echo the uploaded document back verbatim (entity NOT expanded).
+            body = ""
+            for _field, spec in files.items():
+                content = spec[1]
+                body = content.decode("utf-8", "ignore") if isinstance(content, (bytes, bytearray)) else str(content)
+            return httpx.Response(200, text=body, request=httpx.Request(kwargs["method"], kwargs["url"]))
+
+        async def get(self, url):
+            return httpx.Response(404, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr("app.core.detectors.file_upload.create_scan_client", lambda **kwargs: FakeClient())
+
+    findings = await detector.detect(urls=[], forms=[form])
+
+    assert not [f for f in findings if f.vuln_type == "XML External Entity (XXE) Injection"]
+
+
+# ---------------------------------------------------------------------------
+# Test 8: file-type allowlist bypass via accept/reject differential (no
+# retrieval needed). Regression for the miss where a discard-on-upload endpoint
+# (accepts any type, never serves it back) exposed no allowlist yet was never
+# flagged because every other upload test requires retrieval/execution.
+# ---------------------------------------------------------------------------
+def _upload_form():
+    return SimpleNamespace(
+        page_url="https://example.test/complaint",
+        action="/file-upload",
+        method="POST",
+        inputs=[SimpleNamespace(name="file", input_type="file")],
+    )
+
+
+def _typecheck_client(*, html_status, oversize_status, benign_status=204):
+    """FakeClient whose response depends on the uploaded file's type/size."""
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def request(self, **kwargs):
+            _field, (filename, content, ctype) = next(iter(kwargs["files"].items()))
+            url = kwargs["url"]
+            if len(content) > 256 * 1024:
+                return httpx.Response(oversize_status, text="File too large", request=httpx.Request("POST", url))
+            if ctype == "text/html" or filename.endswith(".html"):
+                return httpx.Response(html_status, text="", request=httpx.Request("POST", url))
+            return httpx.Response(benign_status, text="", request=httpx.Request("POST", url))
+
+        async def get(self, url):
+            return httpx.Response(404, text="missing", request=httpx.Request("GET", url))
+
+    return FakeClient
+
+
+@pytest.mark.asyncio
+async def test_upload_type_allowlist_bypass_flagged_when_size_checked_but_type_not(monkeypatch):
+    detector = FileUploadDetector()
+    # Accepts html (204) same as benign, but rejects oversize (500) → validates
+    # size, not type → missing type validation.
+    client = _typecheck_client(html_status=204, oversize_status=500)
+    monkeypatch.setattr("app.core.detectors.file_upload.create_scan_client", lambda **kw: client())
+    findings = await detector.detect(urls=[], forms=[_upload_form()])
+    hits = [f for f in findings if f.detection_method == "upload_type_allowlist_bypass_differential"]
+    assert hits, [f.vuln_type for f in findings]
+    assert hits[0].severity.value.lower() in ("medium", "medium".upper())
+
+
+@pytest.mark.asyncio
+async def test_upload_type_validation_not_flagged_when_dangerous_type_rejected(monkeypatch):
+    detector = FileUploadDetector()
+    # Rejects html (415) → has a type allowlist → NOT vulnerable.
+    client = _typecheck_client(html_status=415, oversize_status=500)
+    monkeypatch.setattr("app.core.detectors.file_upload.create_scan_client", lambda **kw: client())
+    findings = await detector.detect(urls=[], forms=[_upload_form()])
+    assert not any(f.detection_method == "upload_type_allowlist_bypass_differential" for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_upload_type_validation_not_flagged_when_endpoint_accepts_everything(monkeypatch):
+    detector = FileUploadDetector()
+    # Accepts EVERYTHING incl. oversize (200) → indistinguishable from a stub that
+    # never validates; zero-FP gate requires a real reject signal → NO finding.
+    client = _typecheck_client(html_status=200, oversize_status=200, benign_status=200)
+    monkeypatch.setattr("app.core.detectors.file_upload.create_scan_client", lambda **kw: client())
+    findings = await detector.detect(urls=[], forms=[_upload_form()])
+    assert not any(f.detection_method == "upload_type_allowlist_bypass_differential" for f in findings)

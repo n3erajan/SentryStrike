@@ -110,6 +110,11 @@ class AuthResult:
     state: AuthVerificationState = AuthVerificationState.unauthenticated
     verification_evidence: str = ""
     storage_state: dict | None = None
+    # Populated only for self-provisioned throwaway accounts, so callers that need
+    # to re-authenticate the account later (e.g. to confirm a password change) know
+    # the credentials that were used. Never set for the user's real scan session.
+    account_email: str | None = None
+    account_password: str | None = None
 
 
 @dataclass
@@ -1294,12 +1299,16 @@ class SmartAuthenticator:
         verified = await self._verify_auth(client)
         if verified.authenticated:
             logger.info("[auth] Secondary identity active from registration response")
+            verified.account_email = username
+            verified.account_password = password
             return verified
 
         # Otherwise log the new user in via the normal cascade.
         result = await self.authenticate(client, root_url, username, password)
         if result and result.authenticated:
             logger.info("[auth] Secondary identity logged in via cascade")
+            result.account_email = username
+            result.account_password = password
             return result
         logger.info("[auth] Secondary identity registered but login failed")
         return None

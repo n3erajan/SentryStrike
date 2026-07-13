@@ -51,6 +51,63 @@ def test_burst_stability_accepts_identical_fast_responses():
     assert detector._rate_limit_signals_present(responses) is False
 
 
+def test_burst_stability_accepts_uniform_401_api_rejection():
+    """A correct JSON API answering invalid logins with a steady 401 is UNprotected.
+
+    Regression: the old gate required every burst response to be 2xx, so any API
+    that returns 401 on bad credentials (the standard, correct behaviour — and what
+    the live target does) was misread as "server reacted" and never flagged for
+    missing brute-force protection.
+    """
+    detector = AuthenticationFailuresDetector()
+    responses = [
+        SimpleNamespace(status_code=401, body='{"error":"Invalid email or password."}', response_time_ms=8.0)
+        for _ in range(6)
+    ]
+    burst_results = [{"size": 6, "responses": responses, "mean_ms": 8.0, "stdev_ms": 0.0}]
+
+    assert detector._rate_limit_signals_present(responses) is False
+    assert detector._burst_responses_stable(burst_results) is True
+
+
+def test_burst_stability_rejects_status_transition_to_lockout():
+    """A rejection baseline that flips status mid-burst (401→302 lockout) is a control."""
+    detector = AuthenticationFailuresDetector()
+    responses = [
+        SimpleNamespace(status_code=401, body="Invalid email or password.", response_time_ms=8.0),
+        SimpleNamespace(status_code=401, body="Invalid email or password.", response_time_ms=8.0),
+        SimpleNamespace(status_code=302, body="", response_time_ms=8.0),  # redirect to lockout page
+    ]
+    burst_results = [{"size": 3, "responses": responses, "mean_ms": 8.0, "stdev_ms": 0.0}]
+
+    assert detector._burst_responses_stable(burst_results) is False
+
+
+@pytest.mark.asyncio
+async def test_api_login_rate_limit_probe_fires_on_401_rejection_baseline():
+    """End-to-end: API login that 401s every invalid attempt → safe-probe finding."""
+    detector = AuthenticationFailuresDetector()
+    request = RequestObservation(
+        url="https://example.test/api/auth/login",
+        method="POST",
+        request_headers={"content-type": "application/json"},
+        post_data='{"email":"alice@example.test","password":"correct"}',
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        if kwargs.get("test_phase") == "api_login_rate_limit":
+            return ResponseData(401, {"content-type": "application/json"},
+                                '{"error":"Invalid email or password."}', 8.0,
+                                request_snippet=f"{method} {url}", response_snippet="HTTP/1.1 401")
+        return ResponseData(401, {"content-type": "application/json"},
+                            '{"error":"Invalid email or password."}', 8.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(urls=[], forms=[], requests=[request])
+
+    assert any(f.vuln_type == "API Login Lacks Safe-Probe Rate-Limit Signal" for f in findings)
+
+
 def test_rate_limit_signal_suppresses_burst_finding():
     detector = AuthenticationFailuresDetector()
     responses = [
@@ -227,33 +284,43 @@ async def test_api_login_rate_limit_probe_suppressed_when_rate_limit_signal_seen
 
 @pytest.mark.asyncio
 async def test_password_change_api_requires_current_password_check_when_replay_accepts_body():
+    """GET change-password (query params) with the current field omitted, confirmed
+    by logging in with the new password → flagged. Runs against a disposable
+    account only (never the scan session)."""
     detector = AuthenticationFailuresDetector()
     request = RequestObservation(
-        url="https://example.test/api/account/change-password",
-        method="POST",
-        request_headers={"content-type": "application/json"},
-        post_data='{"newPassword":"new-pass","confirmPassword":"new-pass"}',
+        url="https://example.test/rest/user/change-password?current=x&new=y&repeat=y",
+        method="GET",
     )
+    disposable = SimpleNamespace(
+        email="throwaway@sentrystrike.invalid",
+        password="OldPass!123",
+        session=SimpleNamespace(cookies={"token": "t"}, headers={"Authorization": "Bearer t"}),
+    )
+    sent_urls: list[str] = []
 
     async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
-        return ResponseData(
-            200,
-            {"content-type": "application/json"},
-            '{"success":true,"message":"password changed"}',
-            5.0,
-            request_snippet=f"{method} {url}",
-            response_snippet="HTTP/1.1 200 OK",
-        )
+        sent_urls.append(url)
+        return ResponseData(200, {}, "", 5.0, request_snippet=f"{method} {url}", response_snippet="200")
 
-    with patch.object(HttpVerifier, "send_request", send_request):
+    async def fake_provision(root_url, allow_override=None):
+        return disposable
+
+    async def fake_login(root_url, email, password):
+        return True  # new password works → change took effect without current
+
+    with patch.object(HttpVerifier, "send_request", send_request), \
+         patch("app.core.crawler.account_session.provision_disposable_account", fake_provision), \
+         patch("app.core.crawler.account_session.account_login_succeeds", fake_login):
         findings = await detector.detect(
-            urls=[],
-            forms=[],
-            requests=[request],
-            auth_headers={"Authorization": "Bearer low-user-token"},
+            urls=[], forms=[], requests=[request],
+            root_url="https://example.test/",
         )
 
-    assert any(f.vuln_type == "Password Change API Missing Current Password Requirement" for f in findings)
+    assert any(f.vuln_type == "Password Change Does Not Require Current Password" for f in findings)
+    # First (current-omitted) probe must NOT carry the current-password parameter.
+    assert sent_urls and "current=" not in sent_urls[0]
+    assert "new=" in sent_urls[0]
 
 
 @pytest.mark.asyncio
@@ -359,8 +426,9 @@ async def test_bearer_token_reuse_after_logout_is_reported_when_replay_still_suc
 
 @pytest.mark.asyncio
 async def test_password_change_enforcement_probe_flags_when_current_password_ignored():
-    """When a change-password body HAS a current-password field, the probe omits it
-    and flags if the server still applies the change (no enforcement)."""
+    """POST JSON change-password with a current-password field: probe omits/falsifies
+    it on a disposable account and flags when the login-with-new-password confirms
+    the change took effect."""
     detector = AuthenticationFailuresDetector()
     request = RequestObservation(
         url="https://example.test/api/account/change-password",
@@ -368,51 +436,96 @@ async def test_password_change_enforcement_probe_flags_when_current_password_ign
         request_headers={"content-type": "application/json"},
         post_data='{"currentPassword":"old-pass","newPassword":"new-pass","confirmPassword":"new-pass"}',
     )
+    disposable = SimpleNamespace(
+        email="throwaway@sentrystrike.invalid",
+        password="OldPass!123",
+        session=SimpleNamespace(cookies={}, headers={"Authorization": "Bearer t"}),
+    )
     sent_bodies: list[dict] = []
 
     async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
         sent_bodies.append(kwargs.get("json_body"))
-        return ResponseData(
-            200, {"content-type": "application/json"},
-            '{"success":true,"message":"password changed"}', 5.0,
-            request_snippet=f"{method} {url}", response_snippet="HTTP/1.1 200 OK",
-        )
+        return ResponseData(200, {}, '{"success":true}', 5.0,
+                            request_snippet=f"{method} {url}", response_snippet="200")
 
-    with patch.object(HttpVerifier, "send_request", send_request):
+    async def fake_provision(root_url, allow_override=None):
+        return disposable
+
+    async def fake_login(root_url, email, password):
+        return True
+
+    with patch.object(HttpVerifier, "send_request", send_request), \
+         patch("app.core.crawler.account_session.provision_disposable_account", fake_provision), \
+         patch("app.core.crawler.account_session.account_login_succeeds", fake_login):
         findings = await detector.detect(
-            urls=[], forms=[], requests=[request],
-            auth_headers={"Authorization": "Bearer low-user-token"},
+            urls=[], forms=[], requests=[request], root_url="https://example.test/",
         )
 
-    assert any(f.vuln_type == "Password Change API Does Not Enforce Current Password" for f in findings)
-    # The current-password field was actually stripped from the replayed body.
+    assert any(f.vuln_type == "Password Change Does Not Require Current Password" for f in findings)
+    # The first (current-omitted) probe body must not carry the current-password field.
     assert sent_bodies and "currentPassword" not in sent_bodies[0]
     assert "newPassword" in sent_bodies[0]
 
 
 @pytest.mark.asyncio
 async def test_password_change_enforcement_probe_no_finding_when_rejected():
+    """When the new password never works (endpoint enforces current) → no finding."""
     detector = AuthenticationFailuresDetector()
     request = RequestObservation(
-        url="https://example.test/api/account/change-password",
-        method="POST",
-        request_headers={"content-type": "application/json"},
-        post_data='{"currentPassword":"old-pass","newPassword":"new-pass"}',
+        url="https://example.test/rest/user/change-password?current=x&new=y&repeat=y",
+        method="GET",
+    )
+    disposable = SimpleNamespace(
+        email="throwaway@sentrystrike.invalid",
+        password="OldPass!123",
+        session=SimpleNamespace(cookies={}, headers={}),
     )
 
     async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
-        return ResponseData(
-            400, {"content-type": "application/json"},
-            '{"error":"current password required"}', 5.0,
-        )
+        return ResponseData(401, {}, "Current password is not correct.", 5.0)
 
-    with patch.object(HttpVerifier, "send_request", send_request):
+    async def fake_provision(root_url, allow_override=None):
+        return disposable
+
+    async def fake_login(root_url, email, password):
+        return False  # new password never works → change did not take effect
+
+    with patch.object(HttpVerifier, "send_request", send_request), \
+         patch("app.core.crawler.account_session.provision_disposable_account", fake_provision), \
+         patch("app.core.crawler.account_session.account_login_succeeds", fake_login):
         findings = await detector.detect(
-            urls=[], forms=[], requests=[request],
-            auth_headers={"Authorization": "Bearer low-user-token"},
+            urls=[], forms=[], requests=[request], root_url="https://example.test/",
         )
 
-    assert not any(f.vuln_type == "Password Change API Does Not Enforce Current Password" for f in findings)
+    assert not any(f.vuln_type == "Password Change Does Not Require Current Password" for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_password_change_never_touches_real_account_when_no_disposable():
+    """When a disposable account cannot be provisioned, the probe is skipped entirely
+    — it must NEVER fire a password change against the real scan session."""
+    detector = AuthenticationFailuresDetector()
+    request = RequestObservation(
+        url="https://example.test/rest/user/change-password?current=x&new=y&repeat=y",
+        method="GET",
+    )
+    calls: list[str] = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        calls.append(kwargs.get("test_phase", ""))
+        return ResponseData(200, {}, "", 5.0)
+
+    async def fake_provision(root_url, allow_override=None):
+        return None  # provisioning disabled / not possible
+
+    with patch.object(HttpVerifier, "send_request", send_request), \
+         patch("app.core.crawler.account_session.provision_disposable_account", fake_provision):
+        findings = await detector.detect(
+            urls=[], forms=[], requests=[request], root_url="https://example.test/",
+        )
+
+    assert not any(f.vuln_type == "Password Change Does Not Require Current Password" for f in findings)
+    assert not any(p == "change_password_current_bypass" for p in calls)
 
 
 @pytest.mark.asyncio
@@ -544,6 +657,110 @@ async def test_active_jwt_forgery_requires_protected_oracle():
         )
 
     assert not any(p.startswith("jwt_forgery") for p in sent_phases)
+
+
+@pytest.mark.asyncio
+async def test_active_jwt_forgery_cookie_carrier_body_differential_flagged():
+    """Cookie-carried JWT + 200-body auth differential (no 401) → forgery flagged.
+
+    Models SPA-style auth where the app reads the JWT from a cookie and returns
+    200 with an empty body when anonymous and 200 with the identity when authed.
+    The old status-only, bearer-header-only oracle missed this entirely.
+    """
+    real = _jwt({"alg": "RS256", "typ": "JWT"},
+                {"data": {"email": "alice@corp.example"}, "iat": int(time.time())})
+    detector = AuthenticationFailuresDetector()
+    oracle_request = RequestObservation(
+        url="https://example.test/api/whoami",
+        method="GET",
+        request_cookies={"token": real},
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase", "")
+        cookies = kwargs.get("cookies") or {}
+        headers = kwargs.get("headers") or {}
+        presented = cookies.get("token") or headers.get("Authorization", "")
+        # Anonymous → 200 empty. Any token the server "accepts" → reflect its email.
+        if not presented:
+            return ResponseData(200, {}, '{"user":{}}', 5.0)
+        seg = presented.split(".")
+        try:
+            pad = seg[1] + "=" * (-len(seg[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(pad))
+            email = payload.get("data", {}).get("email", "")
+        except Exception:
+            email = ""
+        # Server ignores signature entirely (the vuln): reflects whatever email is in the token.
+        return ResponseData(200, {}, json.dumps({"user": {"email": email}}), 5.0,
+                            request_snippet=f"{method} {url}", response_snippet="HTTP/1.1 200 OK")
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[], forms=[], requests=[oracle_request],
+            root_url="https://example.test/",
+        )
+
+    forgery = [f for f in findings if f.vuln_type == "JWT alg=none Forgery Accepted"]
+    assert forgery, [f.vuln_type for f in findings]
+    assert forgery[0].verified is True
+    assert forgery[0].detection_evidence["carrier"] == "cookie:token"
+    assert forgery[0].detection_evidence["proof_mode"] in ("identity-reflection", "identity-injection")
+
+
+@pytest.mark.asyncio
+async def test_active_jwt_forgery_not_flagged_when_server_verifies_signature():
+    """Cookie-JWT app that rejects unsigned/tampered tokens → NO finding (zero-FP)."""
+    real = _jwt({"alg": "RS256", "typ": "JWT"},
+                {"data": {"email": "bob@corp.example"}, "iat": int(time.time())})
+    detector = AuthenticationFailuresDetector()
+    oracle_request = RequestObservation(
+        url="https://example.test/api/whoami",
+        method="GET",
+        request_cookies={"token": real},
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        cookies = kwargs.get("cookies") or {}
+        presented = cookies.get("token", "")
+        # Only the EXACT real token (valid signature) authenticates; forged tokens
+        # (empty/altered signature) are treated as anonymous.
+        if presented == real:
+            return ResponseData(200, {}, '{"user":{"email":"bob@corp.example"}}', 5.0)
+        return ResponseData(200, {}, '{"user":{}}', 5.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[], forms=[], requests=[oracle_request],
+            root_url="https://example.test/",
+        )
+
+    assert not any("Forgery Accepted" in f.vuln_type for f in findings)
+
+
+def test_forgery_oracle_candidates_rank_identity_and_drop_static_assets():
+    """Identity endpoints rank above generic ones; static assets are never oracles."""
+    real = _jwt({"alg": "RS256", "typ": "JWT"}, {"sub": "x", "iat": 1})
+    detector = AuthenticationFailuresDetector()
+    requests = [
+        RequestObservation(url="https://example.test/assets/i18n/en.json", method="GET",
+                           request_headers={"authorization": f"Bearer {real}"}),
+        RequestObservation(url="https://example.test/rest/admin/application-version", method="GET",
+                           request_headers={"authorization": f"Bearer {real}"}),
+        RequestObservation(url="https://example.test/api/whoami", method="GET",
+                           request_cookies={"token": real}),
+        RequestObservation(url="https://example.test/main.js", method="GET",
+                           request_headers={"authorization": f"Bearer {real}"}),
+    ]
+    candidates = detector._forgery_oracle_candidates({"requests": requests})
+    urls = [c["url"] for c in candidates]
+    # Static assets (i18n json, main.js) filtered out entirely.
+    assert "https://example.test/assets/i18n/en.json" not in urls
+    assert "https://example.test/main.js" not in urls
+    # Identity endpoint ranked first, ahead of the generic version endpoint.
+    assert urls[0] == "https://example.test/api/whoami"
+    # whoami's carrier is the cookie it was observed on.
+    assert candidates[0]["carriers"][0]["loc"] == "cookie"
 
 
 def test_credential_disclosure_ignores_reflected_sql_query_echo() -> None:
@@ -770,3 +987,69 @@ async def test_non_spa_form_default_credentials_via_harvested_domain():
     dc = [f for f in findings if f.vuln_type == "Default Credentials Accepted"]
     assert len(dc) == 1
     assert "admin@shop.test" in dc[0].payload and "admin123" in dc[0].payload
+
+
+def test_change_password_endpoint_detects_all_transports():
+    """Discovery + builder honour query, JSON, and form-urlencoded transports."""
+    detector = AuthenticationFailuresDetector()
+
+    # 1) GET query params
+    ep = detector._find_change_password_endpoint({"requests": [RequestObservation(
+        url="http://t/rest/user/change-password?current=x&new=y&repeat=y", method="GET")]})
+    assert ep["location"] == "query"
+    url, method, params, data, jb = detector._build_change_pw_request(ep, "NP", None)
+    assert method == "GET" and "new=" in url and "current=" not in url and data is None and jb is None
+
+    # 2) POST JSON body
+    ep = detector._find_change_password_endpoint({"requests": [RequestObservation(
+        url="http://t/api/account/change-password", method="POST",
+        request_content_type="application/json",
+        post_data='{"currentPassword":"a","newPassword":"b","confirmPassword":"b"}')]})
+    assert ep["location"] == "json"
+    url, method, params, data, jb = detector._build_change_pw_request(ep, "NP", None)
+    assert jb == {"newPassword": "NP", "confirmPassword": "NP"} and data is None and "currentPassword" not in jb
+
+    # 3) POST form-urlencoded body
+    ep = detector._find_change_password_endpoint({"requests": [RequestObservation(
+        url="http://t/account/change-password", method="POST",
+        request_content_type="application/x-www-form-urlencoded",
+        post_data="oldPassword=a&newPassword=b&confirm=b")]})
+    assert ep["location"] == "form"
+    url, method, params, data, jb = detector._build_change_pw_request(ep, "NP", None)
+    assert data == {"newPassword": "NP", "confirm": "NP"} and jb is None and "oldPassword" not in data
+
+
+@pytest.mark.asyncio
+async def test_change_password_bypass_flagged_for_form_urlencoded_post():
+    """End-to-end (mocked) form-urlencoded change-password bypass → flagged, and the
+    probe is sent as form data (not JSON)."""
+    detector = AuthenticationFailuresDetector()
+    request = RequestObservation(
+        url="https://example.test/account/change-password", method="POST",
+        request_content_type="application/x-www-form-urlencoded",
+        post_data="oldPassword=a&newPassword=b&confirm=b",
+    )
+    disposable = SimpleNamespace(
+        email="throwaway@sentrystrike.invalid", password="OldPass!123",
+        session=SimpleNamespace(cookies={}, headers={}))
+    sent = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        sent.append({"data": data, "json_body": kwargs.get("json_body")})
+        return ResponseData(200, {}, "", 5.0, request_snippet=f"{method} {url}", response_snippet="200")
+
+    async def fake_provision(root_url, allow_override=None):
+        return disposable
+
+    async def fake_login(root_url, email, password):
+        return True
+
+    with patch.object(HttpVerifier, "send_request", send_request), \
+         patch("app.core.crawler.account_session.provision_disposable_account", fake_provision), \
+         patch("app.core.crawler.account_session.account_login_succeeds", fake_login):
+        findings = await detector.detect(urls=[], forms=[], requests=[request], root_url="https://example.test/")
+
+    assert any(f.vuln_type == "Password Change Does Not Require Current Password" for f in findings)
+    # Sent as form data, current field omitted, and NOT as a JSON body.
+    assert sent and sent[0]["data"] is not None and sent[0]["json_body"] is None
+    assert "oldPassword" not in sent[0]["data"] and "newPassword" in sent[0]["data"]
