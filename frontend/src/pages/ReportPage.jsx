@@ -350,7 +350,7 @@ function ReportPage({ scanId, target, onBack }) {
             <button
               key={val}
               className={`filter-tab ${filter === val ? "active" : ""}`}
-              style={filter === val ? { background: col, color: "#fff" } : {}}
+              style={filter === val ? { background: col, color: "#06120c" } : {}}
               onClick={() => setFilter(val)}
             >
               {lbl}

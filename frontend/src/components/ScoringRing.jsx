@@ -46,7 +46,7 @@ function ScoreRing({ score = 0, caption = "/ 100", higherIsWorse = false }) {
             cy='50'
             r={r}
             fill='none'
-            stroke='rgba(0,0,0,0.08)'
+            stroke='rgba(255,255,255,0.08)'
             strokeWidth='7'
           />
           <circle
