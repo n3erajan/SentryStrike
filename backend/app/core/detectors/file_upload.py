@@ -11,7 +11,7 @@ from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
-from app.utils.scan_http import build_scan_headers, create_scan_client
+from app.utils.scan_http import build_httpx_evidence_snippets, build_scan_headers, create_scan_client
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +327,9 @@ class FileUploadDetector(BaseDetector):
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
             response_evidence = self._has_upload_response_evidence(response, txt_name)
             if accessible_url or response_evidence:
+                txt_request_snippet, txt_response_snippet = build_httpx_evidence_snippets(
+                    response, payload=txt_name,
+                )
                 findings.append(Finding(
                     category=OwaspCategory.a01,
                     vuln_type="Missing File Type Validation",
@@ -348,6 +351,8 @@ class FileUploadDetector(BaseDetector):
                     ),
                     reproducible=bool(accessible_url),
                     verified=bool(accessible_url),
+                    verification_request_snippet=txt_request_snippet,
+                    verification_response_snippet=txt_response_snippet,
                 ))
 
         # --- Test 5: SVG image-validation bypass (stored-XSS-capable image) ---
@@ -402,6 +407,9 @@ class FileUploadDetector(BaseDetector):
                 and benign_resp.status_code == danger_resp.status_code
                 and not oversize_ok
             ):
+                danger_request_snippet, danger_response_snippet = build_httpx_evidence_snippets(
+                    danger_resp, payload=danger_name,
+                )
                 findings.append(Finding(
                     category=OwaspCategory.a01,
                     vuln_type="Missing File Type Validation",
@@ -430,6 +438,8 @@ class FileUploadDetector(BaseDetector):
                     },
                     reproducible=True,
                     verified=True,
+                    verification_request_snippet=danger_request_snippet,
+                    verification_response_snippet=danger_response_snippet,
                 ))
 
     # A bounded, entirely internal XML entity. There is NO external reference
@@ -644,6 +654,9 @@ class FileUploadDetector(BaseDetector):
             if not match:
                 continue
             disclosed = body[match.start(): match.start() + 80]
+            xxe_request_snippet, xxe_response_snippet = build_httpx_evidence_snippets(
+                response, payload="sentry_xxe.xml", extra_markers=[disclosed],
+            )
             findings.append(Finding(
                 category=OwaspCategory.a05,
                 vuln_type="XML External Entity (XXE) Injection",
@@ -667,6 +680,8 @@ class FileUploadDetector(BaseDetector):
                 },
                 reproducible=True,
                 verified=True,
+                verification_request_snippet=xxe_request_snippet,
+                verification_response_snippet=xxe_response_snippet,
             ))
             return
 

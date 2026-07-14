@@ -24,3 +24,43 @@ def test_path_traversal_cvss_reflects_high_severity():
     assert "/C:H/" in result.vector
     severity = CvssCalculator.get_severity(result.score)
     assert severity == "High", f"expected High, got {severity} (score={result.score})"
+
+
+@pytest.mark.parametrize(
+    "vuln_type",
+    [
+        "Horizontal Authorization Bypass",
+        "Vertical Privilege Bypass",
+        "Broken Object-Level Authorization",
+        "Broken Function-Level Authorization",
+        "Unauthenticated API Data Exposure",
+    ],
+)
+def test_access_control_family_not_underscored(vuln_type):
+    """Broken-authorization findings read others' PII/secrets — Confidentiality
+    High. Regression: these titles matched NO CVSS profile (substring match),
+    so they fell to the generic default (C:L) and were reported Low. They must
+    now match an access-control profile with C:H."""
+    result = CvssCalculator.from_vulnerability_context(vuln_type, requires_auth=True)
+    assert "/C:H/" in result.vector, f"{vuln_type}: expected C:H, got {result.vector}"
+    assert result.score >= 6.0, f"{vuln_type}: expected >=6.0, got {result.score}"
+
+
+def test_mass_assignment_scores_integrity_high():
+    """Mass assignment mutates a privilege field — Integrity High, not the
+    generic read default."""
+    result = CvssCalculator.from_vulnerability_context(
+        "Mass Assignment / Privilege Field Injection", requires_auth=True
+    )
+    assert "/I:H/" in result.vector
+    assert result.score >= 6.0
+
+
+def test_missing_authorization_on_mutation_scores_integrity_high():
+    """A state-changing endpoint that skips authentication is an integrity
+    attack, not a confidentiality one."""
+    result = CvssCalculator.from_vulnerability_context(
+        "Missing Authorization on State-Changing Request", requires_auth=False
+    )
+    assert "/I:H/" in result.vector
+    assert "/PR:N/" in result.vector

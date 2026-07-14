@@ -17,6 +17,18 @@ from app.core.crawler.models import (
 from app.core.crawler.param_discovery import ParamDiscovery
 
 
+# Locations that carry a request *body* — a submission whose real server endpoint
+# is the XHR the form fires, not the URL the field was scraped from. Used to reject
+# synthetic SPA form submissions when their action is a client-side route.
+_BODY_SUBMISSION_LOCATIONS = frozenset(
+    {
+        ParameterLocation.form,
+        ParameterLocation.json_body,
+        ParameterLocation.graphql_variable,
+    }
+)
+
+
 @dataclass
 class PreparedAttackRequest:
     url: str
@@ -172,9 +184,25 @@ class AttackSurface:
             if cls._url_has_route_fragment(candidate.url):
                 # A hash-route URL (``/#/address/create``) never reaches the
                 # server as anything but ``/`` (the SPA shell); injecting into it
-                # tests static index.html. Also try the structurally-derived
-                # server path (``/#/x`` -> ``/x``) as a low-assumption candidate:
-                # this applies to any hash-routed SPA and never hardcodes an app.
+                # tests static index.html.
+                if candidate.location in _BODY_SUBMISSION_LOCATIONS:
+                    # A body candidate on a hash route is a *synthetic SPA form
+                    # submission*: the client view has no real server action, so
+                    # a form-field name (often a framework-generated id like
+                    # ``mat-input-18``) was scraped against the route URL. The
+                    # translated server path (``/#/address/create`` -> ``/address/
+                    # create``) only reaches the shell — a POST there tests
+                    # nothing while multiplying budget across every field × every
+                    # detector. The real endpoint is captured separately as the
+                    # form's observed XHR (an ``/api/…`` request). This mirrors
+                    # ``_synthesize_form_cluster_targets`` (which skips the same
+                    # clusters): "Phase 3 translates discovered route URLs, not
+                    # synthetic form submissions."
+                    continue
+                # Read-style candidates (query/path in the URL) may map to a real
+                # served resource (``/#/ftp/legal.md?file=`` -> ``/ftp/legal.md``),
+                # so translate them as a low-assumption candidate. Framework-
+                # agnostic; never hardcodes an app.
                 translated = cls._translate_hash_route_to_server_url(candidate.url)
                 if not translated:
                     continue

@@ -32,6 +32,26 @@ class CvssCalculator:
         "Insecure Transport": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
         "Stored XSS": {"ac": "L", "ui": "R", "s": "C", "c": "L", "i": "H", "a": "N"},
         "SSRF": {"ac": "L", "ui": "N", "s": "C", "c": "H", "i": "N", "a": "N"},
+        # Broken authorization: a low-privilege or unauthenticated identity reaches
+        # data/actions it must not. Confidentiality is high (reads others' PII /
+        # secrets); integrity is high when it MUTATES state (missing authz on a
+        # state-changing request). PR is dictated by the finding (unauth=N, low
+        # priv=L) via the default path; these are the access-control analogues of
+        # IDOR, deliberately listed alongside it. Matched by substring on the
+        # vuln_type name, so they cover every variant below without hardcoding
+        # an exact title.
+        "Authorization Bypass": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Privilege Bypass": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Privilege Field": {"ac": "L", "ui": "N", "s": "U", "c": "L", "i": "H", "a": "N"},
+        "Mass Assignment": {"ac": "L", "ui": "N", "s": "U", "c": "L", "i": "H", "a": "N"},
+        "Data Exposure": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        "Missing Authorization": {"ac": "L", "ui": "N", "s": "U", "c": "N", "i": "H", "a": "N"},
+        # Generic broken-object/function-level authorization (BOLA/BFLA): a
+        # low-privilege identity reaches an object/function it must not. Listed
+        # AFTER the more-specific keys so "Authorization Bypass" / "Missing
+        # Authorization" win when they apply; this catches BOLA/BFLA titles that
+        # contain only the bare word "Authorization".
+        "Authorization": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
 
         # --- Medium (4.0-6.9) ---
         "XSS": {"ac": "L", "ui": "R", "s": "C", "c": "L", "i": "L", "a": "N"},

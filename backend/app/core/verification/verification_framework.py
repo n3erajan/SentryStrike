@@ -289,13 +289,18 @@ class HttpVerifier:
                 payload=effective_payload,
             )
             logger.error(f"Request failed for {url}: {e}")
+            # Some httpx/OS-level exceptions (e.g. ConnectError wrapping an errno
+            # with no message) stringify to "", which left evidence reading as a
+            # dangling "HTTP/1.1 0 Error:" with nothing after it. Always include
+            # the exception type so the snippet stays informative either way.
+            error_detail = str(e) or e.__class__.__name__
             return ResponseData(
                 status_code=0,
                 headers={},
                 body="",
                 response_time_ms=0,
                 request_snippet=request_snippet,
-                response_snippet=f"HTTP/1.1 0 Error: {str(e)}\n\n",
+                response_snippet=f"HTTP/1.1 0 Error: {error_detail}\n\n",
             )
 
     async def send_requests_batch(

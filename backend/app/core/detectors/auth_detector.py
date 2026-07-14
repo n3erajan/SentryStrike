@@ -2688,7 +2688,15 @@ class AuthenticationFailuresDetector(BaseDetector):
             # Skip SPA-shell forms (see posts_to_spa_shell): a hash-route action has
             # no server-side form handler, so "no hidden CSRF field" is meaningless
             # (and misleading) there. A normal MPA login form is unaffected.
-            if (has_username or has_password) and not has_hidden and not posts_to_spa_shell:
+            #
+            # Require an actual credential field (has_password). An identity field
+            # alone (email/user) does NOT make a form an authentication form — a
+            # contact, feedback, newsletter, data-erasure, or password-reset form
+            # all carry `email` without being login forms, and mislabelling them
+            # as "Authentication Form ... Lacks CSRF" is a false positive. Real
+            # (non-login) CSRF on those endpoints is still covered by the CSRF
+            # detector's active token-bypass verification.
+            if has_password and not has_hidden and not posts_to_spa_shell:
                 findings.append(self._finding(
                     vuln_type="Authentication Form May Lack CSRF Protection",
                     url=form_url,

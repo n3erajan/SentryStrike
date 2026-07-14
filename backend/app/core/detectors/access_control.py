@@ -321,6 +321,71 @@ def _json_structural_analysis(a: str, b: str) -> tuple[float, float] | None:
     val_matches = sum(1 for k in keys_union if fa.get(k) == fb.get(k))
     return key_matches / len(keys_union), val_matches / len(keys_union)
 
+# Response fields that reference the OWNER of a record (not the record's own
+# primary key). If the "own" object and the "mutated" object carry the same
+# owner reference, the reading identity already owns the mutated object, so a
+# 200 is a same-user read — never a cross-user IDOR. Bare ``id`` is excluded on
+# purpose: it is the object's own primary key, not an ownership reference.
+_OWNER_REFERENCE_KEYS: frozenset[str] = frozenset(
+    {
+        "userid", "user_id", "uid",
+        "owner", "ownerid", "owner_id",
+        "accountid", "account_id",
+        "customerid", "customer_id",
+        "createdby", "created_by",
+        "authorid", "author_id",
+    }
+)
+
+
+def _owner_references(body: str) -> dict[str, object]:
+    """Extract owner-reference field values from a JSON body.
+
+    Keys are matched case-insensitively on the LAST path segment of a flattened
+    JSON body, so ``data.UserId`` and ``UserId`` both count. Returns a mapping of
+    ``normalized_owner_key -> value`` for non-empty values only. Framework- and
+    target-agnostic: no specific field name or path is assumed.
+    """
+    import json
+
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return {}
+
+    owners: dict[str, object] = {}
+
+    def walk(obj: object) -> None:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                norm = str(key).replace("-", "_").lower()
+                if norm in _OWNER_REFERENCE_KEYS and isinstance(value, (str, int)) and str(value).strip():
+                    owners.setdefault(norm, value)
+                walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(parsed)
+    return owners
+
+
+def _is_same_owner(own_body: str, mutated_body: str) -> bool:
+    """True when both bodies reference the same record owner.
+
+    Requires at least one owner-reference key present in BOTH bodies with an
+    equal value. When they match, the "victim" object is actually owned by the
+    reading identity (e.g. a scanner-provisioned second identity reading its own
+    resource), so a successful read is not a cross-user authorization bypass.
+    """
+    own_owners = _owner_references(own_body)
+    mutated_owners = _owner_references(mutated_body)
+    shared = set(own_owners) & set(mutated_owners)
+    if not shared:
+        return False
+    return all(own_owners[key] == mutated_owners[key] for key in shared)
+
+
 def _differential_idor_verdict(
     *,
     own_body: str,
@@ -333,6 +398,14 @@ def _differential_idor_verdict(
     """
     if _looks_like_error_page(mutated_authed_body):
         return False, 0.0, "mutated response resembles an error/not-found page"
+
+    # Same-owner guard: if the own and mutated objects reference the same owner
+    # (UserId/owner/account/…), the reading identity already owns the mutated
+    # record, so a 200 is a self-read, not a cross-user IDOR. This kills the
+    # false positive where two resources provisioned under the SAME identity are
+    # mutated between one another.
+    if _is_same_owner(own_body, mutated_authed_body):
+        return False, 0.0, "mutated object shares the same owner reference as the own object (same-user read)"
 
     # Semantic JSON Differential
     json_sims = _json_structural_analysis(own_body, mutated_authed_body)

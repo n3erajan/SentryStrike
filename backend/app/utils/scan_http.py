@@ -14,6 +14,81 @@ from app.utils.scan_throttle import get_scan_http_semaphore
 DEFAULT_SCAN_HEADERS = {"User-Agent": "SentryStrikeScanner/1.0"}
 
 
+def build_httpx_evidence_snippets(
+    response: httpx.Response,
+    *,
+    payload: str = "",
+    extra_markers: list[str] | None = None,
+    include_response_body: bool = True,
+    max_request_body_chars: int = 2000,
+) -> tuple[str | None, str | None]:
+    """Reconstruct ``(request_snippet, response_snippet)`` evidence from a
+    completed ``httpx.Response``.
+
+    Detectors that call ``create_scan_client``/``httpx.AsyncClient`` directly
+    (rather than going through ``HttpVerifier.send_request``) get a real
+    response back but historically discarded it when building a ``Finding`` -
+    the request/response evidence was left ``None`` even though a real HTTP
+    exchange happened. This reads the request httpx actually sent from
+    ``response.request`` (so headers/body reflect what was really
+    transmitted) and reuses ``ResponseAnalyzer.build_evidence_response_snippet``
+    for the response side, matching the same evidence shape ``HttpVerifier``
+    produces.
+
+    Defensive against fake/mock response objects (as used in unit tests)
+    that don't carry a real ``.request``: falls back to a response-only
+    snippet (or ``(None, None)``) rather than raising.
+    """
+    # Local import: response_analyzer lives in app.core.verification and this
+    # module is imported very early (app.config / app.utils.scan_throttle);
+    # importing it at module scope risks a circular import during app startup.
+    from app.core.verification.response_analyzer import ResponseAnalyzer
+
+    status_code = getattr(response, "status_code", 0)
+    headers = dict(getattr(response, "headers", {}) or {})
+    response_body = ""
+    if include_response_body:
+        try:
+            response_body = response.text
+        except Exception:
+            response_body = ""
+
+    response_snippet = ResponseAnalyzer.build_evidence_response_snippet(
+        status_code=status_code,
+        reason_phrase=getattr(response, "reason_phrase", ""),
+        headers=headers,
+        body=response_body,
+        payload=payload,
+        extra_markers=extra_markers or [],
+        include_headers=True,
+    )
+
+    request = getattr(response, "request", None)
+    if request is None:
+        return None, response_snippet
+
+    try:
+        parsed = urlparse(str(request.url))
+        req_path = parsed.path or "/"
+        if parsed.query:
+            req_path += f"?{parsed.query}"
+
+        headers_str = "\n".join(f"{k}: {v}" for k, v in request.headers.items())
+
+        body = ""
+        content = request.content
+        if content:
+            body = content.decode("utf-8", "replace")
+        if len(body) > max_request_body_chars:
+            body = body[:max_request_body_chars] + "\n[...snip...]"
+
+        request_snippet = f"{request.method} {req_path} HTTP/1.1\nHost: {parsed.netloc}\n{headers_str}\n\n{body}"
+    except Exception:
+        request_snippet = None
+
+    return request_snippet, response_snippet
+
+
 def build_scan_headers(auth_headers: Mapping[str, object] | None = None) -> dict[str, str]:
     """Return scanner default headers with safe auth headers layered on top."""
     headers = dict(DEFAULT_SCAN_HEADERS)

@@ -122,10 +122,21 @@ class XSSDetector(BaseDetector):
 
     # Headers that are commonly reflected into response bodies.
     # These are injected as extra headers in header-injection candidates.
-    _injectable_headers = (
+    #
+    # ``_batch_injectable_headers`` are injected together in a single request
+    # (each carrying a distinct canary, so reflection is still attributed to the
+    # exact header). They carry no request-routing semantics, so co-injecting
+    # them cannot change which handler responds.
+    #
+    # ``_isolated_injectable_headers`` alter routing/handler selection on some
+    # stacks (e.g. ``X-Original-URL`` overrides the request path), so they are
+    # tested one-per-request to avoid masking another header's reflection.
+    _batch_injectable_headers = (
         "Referer",
         "User-Agent",
         "X-Forwarded-For",
+    )
+    _isolated_injectable_headers = (
         "X-Original-URL",
     )
 
@@ -772,9 +783,16 @@ class XSSDetector(BaseDetector):
         """
         Build 4-tuple candidates for header-based XSS testing.
 
-        The ``method`` slot is set to ``"HEADER:<header-name>"`` so that
-        XSSVerifier can route them to the header-injection code path without
-        any change to the 4-tuple contract used everywhere else.
+        The ``method`` slot encodes how the verifier tests the candidate:
+
+        - ``"HEADER_BATCH:<h1>,<h2>,..."`` — inject every listed header in one
+          request (each with its own canary) and attribute reflection per
+          header. Used for headers with no routing semantics.
+        - ``"HEADER:<header-name>"`` — inject a single header per request. Used
+          for routing-sensitive headers (e.g. ``X-Original-URL``).
+
+        Both route through XSSVerifier without changing the 4-tuple contract
+        used everywhere else.
         """
         seen: set[str] = set()
         candidates: list[tuple] = []
@@ -804,6 +822,13 @@ class XSSDetector(BaseDetector):
                 except Exception:
                     pass
 
-            for header in self._injectable_headers:
+            if self._batch_injectable_headers:
+                batch_marker = "HEADER_BATCH:" + ",".join(self._batch_injectable_headers)
+                # ``parameter`` slot names all batched headers for logging; the
+                # verifier re-derives the individual header names from the marker.
+                candidates.append(
+                    (base, ",".join(self._batch_injectable_headers), batch_marker, "")
+                )
+            for header in self._isolated_injectable_headers:
                 candidates.append((base, header, f"HEADER:{header}", ""))
         return candidates

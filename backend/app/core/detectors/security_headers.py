@@ -5,7 +5,7 @@ from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
-from app.utils.scan_http import create_scan_client
+from app.utils.scan_http import build_httpx_evidence_snippets, create_scan_client
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,8 @@ class SecurityHeadersDetector(BaseDetector):
                 return findings
 
             headers = {k.lower(): v.lower() for k, v in response.headers.items()}
-            
+            root_request_snippet, root_response_snippet = build_httpx_evidence_snippets(response)
+
             # Check for missing headers
             for req_header in required_headers:
                 if req_header not in headers:
@@ -109,7 +110,9 @@ class SecurityHeadersDetector(BaseDetector):
                             severity=SeverityLevel.medium if req_header in ["content-security-policy", "x-frame-options"] else SeverityLevel.low,
                             url=root_url,
                             evidence=f"Header not found: {req_header}",
-                            verified=True
+                            verified=True,
+                            verification_request_snippet=root_request_snippet,
+                            verification_response_snippet=root_response_snippet,
                         )
                     )
 
@@ -132,7 +135,9 @@ class SecurityHeadersDetector(BaseDetector):
                             severity=SeverityLevel.medium,
                             url=root_url,
                             evidence=f"CSP header policy is weak: {'; '.join(weaknesses)} (CSP: {response.headers.get('content-security-policy')})",
-                            verified=True
+                            verified=True,
+                            verification_request_snippet=root_request_snippet,
+                            verification_response_snippet=root_response_snippet,
                         )
                     )
 
@@ -154,6 +159,7 @@ class SecurityHeadersDetector(BaseDetector):
                     }
                     raw_acao = cors_response.headers.get("access-control-allow-origin")
                     raw_acac = cors_response.headers.get("access-control-allow-credentials") or "absent"
+                    cors_request_snippet, cors_response_snippet = build_httpx_evidence_snippets(cors_response)
                     findings.append(
                         Finding(
                             category=OwaspCategory.a02,
@@ -168,6 +174,8 @@ class SecurityHeadersDetector(BaseDetector):
                             ),
                             verified=True,
                             detection_method="cors_acao_probe",
+                            verification_request_snippet=cors_request_snippet,
+                            verification_response_snippet=cors_response_snippet,
                         )
                     )
 
@@ -195,7 +203,9 @@ class SecurityHeadersDetector(BaseDetector):
                         severity=SeverityLevel.low,
                         url=root_url,
                         evidence=f"Server header leaks version: {server_hdr}",
-                        verified=True
+                        verified=True,
+                        verification_request_snippet=root_request_snippet,
+                        verification_response_snippet=root_response_snippet,
                     )
                 )
 

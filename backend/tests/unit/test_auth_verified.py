@@ -1000,7 +1000,34 @@ async def test_csrf_token_check_still_fires_for_normal_mpa_login_form():
 
 
 @pytest.mark.asyncio
-async def test_non_spa_form_default_credentials_via_harvested_domain():
+async def test_csrf_token_check_not_fired_for_non_login_email_form():
+    # Regression: a non-authentication form that merely carries an `email` field
+    # (data-erasure, contact, newsletter, password-reset) must NOT be labelled an
+    # "Authentication Form ... Lacks CSRF" — that requires an actual credential
+    # (password) field. Real CSRF on such endpoints is still covered by the CSRF
+    # detector's active token-bypass verification, not this heuristic.
+    detector = AuthenticationFailuresDetector()
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        return ResponseData(200, {"content-type": "text/html"},
+                            "<html>erasure</html>", 5.0,
+                            request_snippet="", response_snippet="200")
+
+    erasure_form = SimpleNamespace(
+        action="https://shop.test/dataerasure",  # real server path, no password field
+        method="POST",
+        page_url="https://shop.test/dataerasure",
+        inputs=[
+            SimpleNamespace(name="email", input_type="text", value=""),
+            SimpleNamespace(name="securityAnswer", input_type="text", value=""),
+        ],
+    )
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(urls=[], forms=[erasure_form], is_spa=False)
+
+    assert not any(
+        f.vuln_type == "Authentication Form May Lack CSRF Protection" for f in findings
+    )
     # A traditional (non-SPA) HTML form login authenticating by e-mail: the weak
     # admin credential is detected using the app domain harvested from an observed
     # response, exactly as for the JSON API path.

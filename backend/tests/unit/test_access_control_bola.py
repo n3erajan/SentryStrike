@@ -8,6 +8,8 @@ import pytest
 from app.core.crawler.auth_manager import SmartAuthenticator
 from app.core.detectors.access_control import (
     AccessControlDetector,
+    _differential_idor_verdict,
+    _is_same_owner,
     _looks_like_login_page,
     _looks_like_path_id_segment,
 )
@@ -618,3 +620,44 @@ def test_matrix_prioritises_identity_targets_over_noise_under_cap():
     users_idx = next(i for i, u in enumerate(urls) if u.rstrip("/").endswith("/api/Users"))
     noise_idx = next(i for i, u in enumerate(urls) if "i18n" in u)
     assert users_idx < noise_idx
+
+
+def test_idor_verdict_suppressed_when_same_owner_reference():
+    """Two records provisioned under the SAME identity (same UserId) must not be
+    flagged as cross-user IDOR when one is read while owning the other.
+
+    Regression: a scanner-provisioned second identity that owns both address 7
+    and address 8 reads 8 while 'owning' 7 -> a same-user read, not IDOR.
+    """
+    own = '{"status":"success","data":{"UserId":25,"id":7,"fullName":"A","city":"X"}}'
+    mutated = '{"status":"success","data":{"UserId":25,"id":8,"fullName":"A","city":"Y"}}'
+    assert _is_same_owner(own, mutated) is True
+    is_idor, _, reason = _differential_idor_verdict(
+        own_body=own, mutated_authed_body=mutated, mutated_unauthed_body=None
+    )
+    assert is_idor is False
+    assert "same" in reason.lower()
+
+
+def test_idor_verdict_still_flags_distinct_owners():
+    """A genuine cross-user read (different owner reference) is still IDOR."""
+    own = '{"data":{"UserId":24,"id":7,"city":"X"}}'
+    victim = '{"data":{"UserId":99,"id":8,"city":"Y"}}'
+    assert _is_same_owner(own, victim) is False
+    is_idor, _, _ = _differential_idor_verdict(
+        own_body=own, mutated_authed_body=victim, mutated_unauthed_body=None
+    )
+    assert is_idor is True
+
+
+def test_idor_verdict_owner_guard_inactive_without_owner_reference():
+    """Resources keyed only by their own primary key (bare `id`, e.g. /api/Users)
+    have no owner-reference field, so the same-owner guard never suppresses them —
+    a low-priv user reading another user record is still flagged."""
+    own = '{"data":{"id":24,"email":"me@x.co","role":"customer"}}'
+    other = '{"data":{"id":1,"email":"admin@x.co","role":"admin"}}'
+    assert _is_same_owner(own, other) is False
+    is_idor, _, _ = _differential_idor_verdict(
+        own_body=own, mutated_authed_body=other, mutated_unauthed_body=None
+    )
+    assert is_idor is True

@@ -357,6 +357,17 @@ class XSSVerifier(BaseVerifier):
             self._begin_verification(parameter)
             findings: list[Finding] = []
 
+            # Batched header injection: all listed headers are sent in a single
+            # request per payload (each with a distinct canary). Delegated to a
+            # dedicated path that reuses the shared response for per-header
+            # attribution instead of one request per (header, payload).
+            if method.upper().startswith("HEADER_BATCH:"):
+                return await self._verify_header_batch(
+                    url, method, stored_display_urls=stored_display_urls,
+                    stored_baselines=stored_baselines,
+                    stored_display_overrides=stored_display_overrides,
+                )
+
             is_header_injection = method.upper().startswith("HEADER:")
             is_jsonp = parameter.lower() in self._JSONP_PARAM_NAMES
 
@@ -591,11 +602,126 @@ class XSSVerifier(BaseVerifier):
             )
         return None
 
+    async def _verify_header_batch(
+        self,
+        url: str,
+        method: str,
+        stored_display_urls: Optional[list[str]] = None,
+        stored_baselines: Optional[dict[str, ResponseData]] = None,
+        stored_display_overrides: Optional[dict[str, set[str]]] = None,
+    ) -> VerificationResult:
+        """Test several request headers for reflected XSS in one request per payload.
+
+        ``method`` is ``"HEADER_BATCH:<h1>,<h2>,..."``. For each header payload a
+        single request injects every header with its own distinct canary; the
+        shared response is then attributed per header via that canary. This
+        collapses the direct-reflection probes from ``headers × payloads`` to
+        just ``payloads`` while keeping per-header stored-replay behaviour
+        identical (each header defers to ``_test_payload``, which applies the
+        existing SPA-skip and stored fan-out gating unchanged).
+        """
+        header_names = [h.strip() for h in method.split(":", 1)[1].split(",") if h.strip()]
+        if not header_names:
+            return VerificationResult(
+                is_vulnerable=False, confidence_score=0.0, detection_method="none", findings=[], evidence={},
+            )
+
+        self._begin_verification(",".join(header_names))
+        self._stored_baselines = dict(stored_baselines or {})
+
+        # One clean baseline (no injection) shared by every header/payload.
+        try:
+            pre_test_baseline = await self.fetch_pre_test_baseline(
+                url, header_names[0], f"HEADER:{header_names[0]}"
+            )
+        except Exception as e:
+            logger.debug("Failed to fetch header-batch baseline for %s: %s", url, e)
+            pre_test_baseline = await self._send(url, "GET", test_phase="pre_test_baseline")
+
+        findings: list[Finding] = []
+        pending_jobs: list[PendingBrowserVerification] = []
+
+        # DOM-source/sink static scan of the page (header-independent). Runs once
+        # for the batch rather than once per header.
+        try:
+            dom_finding = self._check_dom_xss(url, pre_test_baseline.body)
+            if dom_finding:
+                findings.append(dom_finding)
+        except Exception as e:
+            logger.debug("Header-batch DOM check failed for %s: %s", url, e)
+
+        for payload_type, payload in self.HEADER_PAYLOADS.items():
+            # Inject every header in a single request, each with its own canary so
+            # a reflected payload is attributed to the exact header that carried it.
+            canaries: dict[str, str] = {}
+            injected_payloads: dict[str, str] = {}
+            request_headers: dict[str, str] = {}
+            for header in header_names:
+                canary = ResponseAnalyzer.generate_probe_canary()
+                injected_payload = _embed_canary(payload, canary)
+                canaries[header] = canary
+                injected_payloads[header] = injected_payload
+                request_headers[header] = injected_payload
+
+            try:
+                batched = await self._send(
+                    url, "GET", None, None, headers=request_headers,
+                    test_phase=f"payload_{payload_type}", payload=payload,
+                )
+            except Exception as e:
+                logger.debug("Header-batch send failed for %s (%s): %s", url, payload_type, e)
+                continue
+
+            for header in header_names:
+                result = await self._test_payload(
+                    url, header, f"HEADER:{header}", "", payload, payload_type,
+                    None, stored_display_urls, pre_test_baseline, target=None,
+                    stored_display_overrides=stored_display_overrides,
+                    prefetched_response=batched,
+                    prefetched_canary=canaries[header],
+                    prefetched_injected_payload=injected_payloads[header],
+                )
+                if result.is_vulnerable:
+                    findings.extend(result.findings)
+                elif result.evidence and result.evidence.get("browser_verification_pending"):
+                    job = result.evidence.get("pending_job")
+                    if job:
+                        pending_jobs.append(job)
+
+        # Confirm any deferred executable contexts in the browser (mirrors verify()).
+        if pending_jobs and PLAYWRIGHT_AVAILABLE:
+            for job in pending_jobs:
+                browser_findings = await self.run_browser_verification(job)
+                if browser_findings:
+                    findings.extend(browser_findings)
+
+        if findings:
+            has_stored = any(f.vuln_type == "Stored XSS" for f in findings)
+            if has_stored:
+                for finding in findings:
+                    if finding.vuln_type == "Reflected XSS":
+                        finding.vuln_type = "Stored XSS"
+                        finding.evidence = f"[Consolidated Reflection] Immediate echo of a confirmed Stored XSS parameter. {finding.evidence}"
+            findings.sort(key=lambda f: f.confidence_score, reverse=True)
+            best = findings[0]
+            return VerificationResult(
+                is_vulnerable=True, confidence_score=best.confidence_score,
+                detection_method=best.detection_method, findings=findings,
+                evidence={"payload_type": best.detection_method}, reproducible=True,
+            )
+
+        return VerificationResult(
+            is_vulnerable=False, confidence_score=0.0, detection_method="none", findings=[], evidence={},
+        )
+
     async def _test_payload(
         self, url: str, parameter: str, method: str, value: str, payload: str, payload_type: str,
         form_inputs: Optional[list], stored_display_urls: Optional[list[str]], pre_test_baseline: ResponseData,
         target: Optional[object] = None,
         stored_display_overrides: Optional[dict[str, set[str]]] = None,
+        prefetched_response: Optional[ResponseData] = None,
+        prefetched_canary: Optional[str] = None,
+        prefetched_injected_payload: Optional[str] = None,
     ) -> VerificationResult:
         """Test a single XSS payload using rapid static check followed by safe dynamic execution fallback.
 
@@ -603,26 +729,40 @@ class XSSVerifier(BaseVerifier):
         batch discovery confirmed this parameter is stored, probe only the
         confirmed display URLs; when batch discovery confirmed it is *not*
         stored (absent from the map), skip the stored probe entirely.
+
+        ``prefetched_*`` let a batched header probe reuse a single already-sent
+        response for per-header attribution instead of re-issuing the injection
+        request: the caller passes the shared response plus the canary and
+        canaried payload it embedded for *this* header, and the injection
+        ``_send`` is skipped entirely.
         """
         try:
             is_header = method.upper().startswith("HEADER:")
-            canary = ResponseAnalyzer.generate_probe_canary()
-            injected_payload = _embed_canary(payload, canary)
 
-            (
-                injected_url,
-                injected_method,
-                injected_params,
-                injected_data,
-                injected_json,
-                injected_headers,
-                injected_cookies,
-            ) = self._build_attack_request(url, parameter, method, injected_payload, form_inputs, target)
-            injected = await self._send(
-                injected_url, injected_method, injected_params, injected_data,
-                headers=injected_headers, cookies=injected_cookies, json_body=injected_json,
-                test_phase=f"payload_{payload_type}", payload=injected_payload,
-            )
+            if prefetched_response is not None:
+                # Batched header path: reuse the shared injection response and
+                # this header's canary/payload; no new injection request.
+                canary = prefetched_canary or ResponseAnalyzer.generate_probe_canary()
+                injected_payload = prefetched_injected_payload or _embed_canary(payload, canary)
+                injected = prefetched_response
+            else:
+                canary = ResponseAnalyzer.generate_probe_canary()
+                injected_payload = _embed_canary(payload, canary)
+
+                (
+                    injected_url,
+                    injected_method,
+                    injected_params,
+                    injected_data,
+                    injected_json,
+                    injected_headers,
+                    injected_cookies,
+                ) = self._build_attack_request(url, parameter, method, injected_payload, form_inputs, target)
+                injected = await self._send(
+                    injected_url, injected_method, injected_params, injected_data,
+                    headers=injected_headers, cookies=injected_cookies, json_body=injected_json,
+                    test_phase=f"payload_{payload_type}", payload=injected_payload,
+                )
 
             # Budget-denied probe: untested, never a negative reflection verdict.
             if getattr(injected, "status_code", 200) == -1:

@@ -1,4 +1,5 @@
 from app.core.crawler.models import ApiEndpoint, ParameterLocation, RequestObservation
+from app.core.crawler.spider import FormInput, HtmlForm
 from app.core.detectors.attack_surface import AttackSurface, build_json_body
 
 
@@ -63,6 +64,37 @@ def test_hash_route_translates_to_server_path_candidate():
 
     assert any(target.url == "http://example.com/ftp/legal.md?file=legal.md" for target in targets)
     assert not any("#/ftp" in target.url for target in targets)
+
+
+def test_hash_route_form_submission_is_not_resurrected_as_shell_target():
+    """A browser-cluster form whose action is a client-side hash route must not
+    become a translated server-path POST target: that path only reaches the SPA
+    shell, and the real endpoint is captured separately as the form's XHR.
+
+    Regression: SPA form clusters on ``/#/address/create`` (fields such as the
+    framework-generated ``mat-input-18``) were being translated to bare
+    ``/address/create`` and hammered by every injection detector — hundreds of
+    shell-only POSTs per scan.
+    """
+    form = HtmlForm(
+        page_url="http://example.com/#/address/create",
+        action="http://example.com/#/address/create",
+        method="POST",
+        inputs=[FormInput(name="mat-input-18", input_type="text")],
+        source="browser_cluster",
+    )
+
+    targets = AttackSurface.build([], [form])
+
+    # No target points at the translated client-route path…
+    assert not any(t.url == "http://example.com/address/create" for t in targets)
+    # …and none carries the hash route verbatim either.
+    assert not any("#/address/create" in t.url for t in targets)
+    # The junk field never becomes a form-location injection target.
+    assert not any(
+        t.location == ParameterLocation.form and t.parameter == "mat-input-18"
+        for t in targets
+    )
 
 
 def test_attack_surface_filter_can_read_whole_candidate():
