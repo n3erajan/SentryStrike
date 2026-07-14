@@ -208,9 +208,9 @@ nav.navbar {
   transition: all 0.15s;
 }
 .nav-logout:hover {
-  color: var(--danger);
-  border-color: var(--danger-line);
-  background: var(--danger-weak);
+  color: #ef4444;
+  border-color: var(--danger);
+  background: rgba(248, 113, 113, 0.2);
 }
 
 /* ============================================================

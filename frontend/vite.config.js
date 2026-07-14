@@ -9,7 +9,7 @@ export default defineConfig({
     // (no CORS in dev). The backend mounts everything under /api/v1 on :8000.
     proxy: {
       "/api": {
-        target: "https://sentry.nirajan-paudel.com.np",
+        target: "http://localhost:8000/",
         changeOrigin: true,
       },
     },

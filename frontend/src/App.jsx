@@ -10,11 +10,8 @@ import RegisterPage from "./pages/RegisterPage.jsx";
 import { getCurrentUser, logout } from "./services/auth.js";
 
 function App() {
-  // DEV: skip login while developing scan/report pages.
-  // Revert to `useState(getCurrentUser)` before shipping.
-
-  const [user, setUser] = useState({ email: "dev@sentrystrike.local" });
-  // const [user, setUser] = useState(getCurrentUser);
+  // const [user, setUser] = useState({ email: "dev@sentrystrike.local" });
+  const [user, setUser] = useState(getCurrentUser);
 
   const [authView, setAuthView] = useState("login");
   const [page, setPage] = useState("scan");
