@@ -30,6 +30,7 @@ class AIClient:
         self._api_key = self.settings.ai_api_key
         self._timeout = self.settings.ai_timeout_seconds
         self._json_mode = self.settings.ai_json_mode
+        self._reasoning_effort = self.settings.ai_reasoning_effort
 
     async def _complete(self, prompt: str) -> str:
         """Return raw model text for *prompt* via Chat Completions."""
@@ -41,12 +42,17 @@ class AIClient:
         }
         if self._json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if self._reasoning_effort:
+            # String value ("none"/"low"/"medium"/"high"). On Ollama's /v1
+            # endpoint "none" disables the model's <think> block.
+            payload["reasoning_effort"] = self._reasoning_effort
         headers: dict[str, str] = {}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         logger.debug(
-            "%s request to %s (model=%s, json_mode=%s, prompt_len=%d)",
-            self.provider_name, self._base_url, self._model, self._json_mode, len(prompt),
+            "%s request to %s (model=%s, json_mode=%s, reasoning_effort=%s, prompt_len=%d)",
+            self.provider_name, self._base_url, self._model, self._json_mode,
+            self._reasoning_effort, len(prompt),
         )
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(
@@ -163,10 +169,45 @@ class AIClient:
     def _extract_json(self, text: str) -> dict:
         text = text.strip()
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
         except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start >= 0 and end > start:
-                return json.loads(text[start : end + 1])
-            raise
+            # Locate the outermost JSON value — array or object, whichever the
+            # model emitted first — and parse that.
+            start_brace = text.find("{")
+            start_bracket = text.find("[")
+            if start_bracket >= 0 and (start_brace < 0 or start_bracket < start_brace):
+                end = text.rfind("]")
+                if end <= start_bracket:
+                    raise
+                parsed = json.loads(text[start_bracket : end + 1])
+            elif start_brace >= 0:
+                end = text.rfind("}")
+                if end <= start_brace:
+                    raise
+                parsed = json.loads(text[start_brace : end + 1])
+            else:
+                raise
+        return self._coerce_to_dict(parsed)
+
+    @staticmethod
+    def _coerce_to_dict(parsed: object) -> dict:
+        """Reduce a parsed JSON value to the single dict callers expect.
+
+        Providers are inconsistent for single-object prompts: some return the
+        object directly, others wrap it in an array ``[{...}]``. Unwrap a
+        single-element list so callers never receive a ``list`` (which would
+        break ``result.get(...)``).
+        """
+        if isinstance(parsed, list):
+            dicts = [item for item in parsed if isinstance(item, dict)]
+            if not dicts:
+                raise ValueError("AI response was a list with no JSON object")
+            if len(dicts) > 1:
+                logger.warning(
+                    "AI returned %d objects for a single-object prompt; using the first",
+                    len(dicts),
+                )
+            return dicts[0]
+        if not isinstance(parsed, dict):
+            raise ValueError(f"AI response was not a JSON object (got {type(parsed).__name__})")
+        return parsed

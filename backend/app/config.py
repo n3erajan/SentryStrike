@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # providers support this; disable if yours rejects it — the client still
     # extracts JSON from plain text.
     ai_json_mode: bool = Field(default=True, alias="AI_JSON_MODE")
+    # Reasoning/thinking control for reasoning-capable models. Ollama's
+    # OpenAI-compatible /v1 endpoint maps this to its Think field: "none"
+    # disables the <think> block (big latency win, JSON returns in content),
+    # while "low"/"medium"/"high" enable it. Leave empty to send nothing and
+    # keep the provider's default. NOTE: pass a string — the native boolean
+    # `think` flag does NOT work on /v1 and a JSON bool errors server-side.
+    ai_reasoning_effort: str | None = Field(default=None, alias="AI_REASONING_EFFORT")
 
     crawl_depth: int = Field(default=3, alias="CRAWL_DEPTH")
     crawl_max_urls: int = Field(default=200, alias="CRAWL_MAX_URLS")

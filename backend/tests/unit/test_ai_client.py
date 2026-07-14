@@ -135,6 +135,69 @@ async def test_extracts_json_from_plain_text(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_generate_json_unwraps_single_element_array(monkeypatch):
+    """Some providers wrap a single object in an array [{...}] — must be unwrapped
+    so callers get a dict, not a list (which would break result.get(...))."""
+    monkeypatch.setenv("AI_API_KEY", "sk-test")
+    get_settings.cache_clear()
+    try:
+        capture: dict = {}
+        _patch_post(monkeypatch, capture, _chat_response('[{"confidence": 0.7}]'))
+        result = await AIClient().generate_json("x")
+        assert result == {"confidence": 0.7}
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_generate_json_unwraps_array_embedded_in_prose(monkeypatch):
+    """Array-in-prose with JSON mode off must still reduce to a dict."""
+    monkeypatch.setenv("AI_API_KEY", "sk-test")
+    monkeypatch.setenv("AI_JSON_MODE", "false")
+    get_settings.cache_clear()
+    try:
+        capture: dict = {}
+        _patch_post(
+            monkeypatch, capture,
+            _chat_response('Result:\n[{"exploitability": "Easy"}]\nDone.'),
+        )
+        result = await AIClient().generate_json("x")
+        assert result == {"exploitability": "Easy"}
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_sent_when_configured(monkeypatch):
+    """AI_REASONING_EFFORT is forwarded as a string to disable model thinking."""
+    monkeypatch.setenv("AI_API_KEY", "sk-test")
+    monkeypatch.setenv("AI_REASONING_EFFORT", "none")
+    get_settings.cache_clear()
+    try:
+        capture: dict = {}
+        _patch_post(monkeypatch, capture, _chat_response('{"a": 1}'))
+        await AIClient().generate_json("x")
+        assert capture["json"]["reasoning_effort"] == "none"
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_absent_by_default(monkeypatch):
+    """When unset, no reasoning_effort key is sent — provider default preserved."""
+    monkeypatch.setenv("AI_API_KEY", "sk-test")
+    monkeypatch.delenv("AI_REASONING_EFFORT", raising=False)
+    get_settings.cache_clear()
+    try:
+        capture: dict = {}
+        _patch_post(monkeypatch, capture, _chat_response('{"a": 1}'))
+        await AIClient().generate_json("x")
+        assert "reasoning_effort" not in capture["json"]
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
 async def test_generate_json_list(monkeypatch):
     monkeypatch.setenv("AI_API_KEY", "sk-test")
     get_settings.cache_clear()
