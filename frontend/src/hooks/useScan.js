@@ -1,21 +1,13 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useCallback } from "react";
 import { isValidUrl } from "../utils/helpers.js";
-import { SCAN_STAGES } from "../data/constants.js";
-import { createScan, getScanStatus, cancelScan } from "../services/scan.js";
+import { createScan } from "../services/scan.js";
 
-const POLL_INTERVAL_MS = 5000;
-
-// The backend reports numeric progress + a status string; it does not stream
-// per-stage labels. We derive a stage from progress so the UI stays in step
-// with real work instead of a fake timer.
-function stageForProgress(progress, status) {
-  if (status === "completed") return SCAN_STAGES.length - 1;
-  if (status === "queued" || !status) return 0;
-  const idx = Math.floor((progress / 100) * (SCAN_STAGES.length - 1));
-  return Math.max(0, Math.min(SCAN_STAGES.length - 2, idx));
-}
-
-function useScan(onComplete) {
+// Form state + submission for a new scan. Polling and progress no longer live
+// here — once a scan is created the caller navigates to its own active-scan
+// page (see ActiveScanPage / useScanStatus). `startScan` resolves to the new
+// scan_id (or null on failure), leaving the form intact so the user can queue
+// another scan immediately while the first one runs.
+function useScanForm() {
   // Inputs required by the backend CreateScanRequest.
   const [url, setUrl] = useState("");
   const [crawlMode, setCrawlMode] = useState("full"); // full | single
@@ -56,44 +48,20 @@ function useScan(onComplete) {
     });
   }, []);
 
-  // Live scan state.
-  const [scanning, setScanning] = useState(false);
-  const [scanId, setScanId] = useState(null);
-  const [status, setStatus] = useState(null);
-  const [progress, setProgress] = useState(0);
-  const [eta, setEta] = useState(null);
-  const [logs, setLogs] = useState([]);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
-  const logRef = useRef(null);
-  const startRef = useRef(0);
-  const doneRef = useRef(false);
-  const lastStageRef = useRef(-1);
-
   const valid = isValidUrl(url);
-  const canStart = valid && consent && !scanning;
-  const stageIdx = stageForProgress(progress, status);
+  const canStart = valid && consent && !submitting;
 
-  const pushLog = useCallback((kind, text) => {
-    setLogs((prev) => [...prev, { kind, text }]);
-  }, []);
-
+  // Creates the scan and returns its id. Returns null (and sets `error`) on
+  // failure. Does NOT poll — the caller routes to the active-scan view.
   const startScan = useCallback(async () => {
     setTouched(true);
-    if (!valid || !consent || scanning) return;
+    if (!valid || !consent || submitting) return null;
 
     setError("");
-    setLogs([]);
-    setProgress(0);
-    setEta(null);
-    setStatus("queued");
-    setScanId(null);
-    doneRef.current = false;
-    lastStageRef.current = -1;
-    startRef.current = Date.now();
-    setScanning(true);
-    pushLog("ok", `[✓] Requesting authorized scan of ${url}`);
-
+    setSubmitting(true);
     try {
       const res = await createScan({
         targetUrl: url,
@@ -103,110 +71,14 @@ function useScan(onComplete) {
         config,
         credentials,
       });
-      setScanId(res.scan_id);
-      setStatus(res.status || "queued");
-      setProgress(typeof res.progress === "number" ? res.progress : 0);
-      pushLog("ok", `[✓] Scan queued · id ${res.scan_id}`);
+      return { scanId: res.scan_id, target: url };
     } catch (err) {
       setError(err.message || "Could not start the scan.");
-      pushLog("warn", `[!] ${err.message || "Could not start the scan."}`);
-      setScanning(false);
-      setStatus("failed");
+      return null;
+    } finally {
+      setSubmitting(false);
     }
-  }, [
-    valid,
-    consent,
-    scanning,
-    url,
-    crawlMode,
-    authText,
-    config,
-    credentials,
-    pushLog,
-  ]);
-
-  const cancel = useCallback(async () => {
-    if (!scanId) {
-      setScanning(false);
-      setStatus(null);
-      return;
-    }
-    pushLog("warn", "[!] Cancelling scan…");
-    try {
-      await cancelScan(scanId);
-    } catch {
-      // Best-effort — we stop polling locally regardless.
-    }
-    setStatus("cancelled");
-    setScanning(false);
-  }, [scanId, pushLog]);
-
-  // Poll the backend for real status/progress once a scan is queued.
-  useEffect(() => {
-    if (!scanning || !scanId) return undefined;
-
-    let stopped = false;
-    const controller = new AbortController();
-
-    async function poll() {
-      try {
-        const s = await getScanStatus(scanId, controller.signal);
-        if (stopped) return;
-
-        const p = typeof s.progress === "number" ? s.progress : 0;
-        setProgress(p);
-        setStatus(s.status);
-
-        const stage = stageForProgress(p, s.status);
-        if (stage !== lastStageRef.current && s.status === "running") {
-          lastStageRef.current = stage;
-          pushLog("ok", `[✓] ${SCAN_STAGES[stage]}`);
-        }
-
-        const elapsed = (Date.now() - startRef.current) / 1000;
-        if (p > 3 && p < 100 && elapsed > 0) {
-          setEta(Math.max(1, Math.ceil((elapsed / p) * (100 - p))));
-        }
-
-        if (s.status === "completed" && !doneRef.current) {
-          doneRef.current = true;
-          setProgress(100);
-          setEta(0);
-          pushLog("ok", "[✓] Scan complete — compiling report");
-          setScanning(false);
-          setTimeout(() => onComplete({ scanId, target: url }), 800);
-        } else if (s.status === "failed") {
-          setError(s.error || "The scan failed. Please try again.");
-          pushLog("warn", `[!] ${s.error || "Scan failed"}`);
-          setScanning(false);
-        } else if (s.status === "cancelled") {
-          pushLog("warn", "[!] Scan cancelled");
-          setScanning(false);
-        }
-      } catch (err) {
-        if (stopped || err.name === "AbortError") return;
-        setError(err.message || "Lost connection to the scan.");
-        pushLog("warn", `[!] ${err.message || "Lost connection to the scan."}`);
-        setScanning(false);
-      }
-    }
-
-    poll();
-    const id = setInterval(poll, POLL_INTERVAL_MS);
-    return () => {
-      stopped = true;
-      controller.abort();
-      clearInterval(id);
-    };
-  }, [scanning, scanId, url, onComplete, pushLog]);
-
-  // Keep the live log scrolled to the newest line.
-  useEffect(() => {
-    logRef.current?.scrollTo({
-      top: logRef.current.scrollHeight,
-      behavior: "smooth",
-    });
-  }, [logs]);
+  }, [valid, consent, submitting, url, crawlMode, authText, config, credentials]);
 
   return {
     // inputs
@@ -225,22 +97,14 @@ function useScan(onComplete) {
     setConfigField,
     credentials,
     setCredentialField,
-    // live state
-    scanning,
-    status,
-    progress,
-    stageIdx,
-    eta,
-    logs,
-    logRef,
+    // submission
+    submitting,
     error,
-    scanId,
-    // derived + actions
     valid,
     canStart,
     startScan,
-    cancel,
   };
 }
 
-export { useScan };
+export { useScanForm };
+export default useScanForm;

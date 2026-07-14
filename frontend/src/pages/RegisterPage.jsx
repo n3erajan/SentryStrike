@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import {
   EnvelopeSimple,
   Lock,
@@ -6,12 +7,15 @@ import {
   WarningCircle,
   CircleNotch,
 } from "@phosphor-icons/react";
-import { register } from "../services/auth.js";
+import { useAuth } from "../context/AuthContext.jsx";
 import AuthBrand from "../components/AuthBrand.jsx";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function RegisterPage({ onAuthed, onGoLogin }) {
+function RegisterPage() {
+  const { register } = useAuth();
+  const navigate = useNavigate();
+
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -31,8 +35,8 @@ function RegisterPage({ onAuthed, onGoLogin }) {
     setError("");
     setSubmitting(true);
     try {
-      const user = await register({ email, password });
-      onAuthed(user);
+      await register({ email, password });
+      navigate("/app/scan", { replace: true });
     } catch (err) {
       setError(err.message || "Unable to create account. Please try again.");
     } finally {
@@ -154,9 +158,9 @@ function RegisterPage({ onAuthed, onGoLogin }) {
 
           <p className='auth-switch'>
             Already have an account?{" "}
-            <button type='button' className='auth-link' onClick={onGoLogin}>
+            <Link className='auth-link' to='/login'>
               Sign in
-            </button>
+            </Link>
           </p>
         </div>
       </div>

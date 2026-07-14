@@ -5,7 +5,6 @@ import {
   CircleNotch,
   TreeStructure,
   File as FileIcon,
-  Check,
   ShieldCheck,
   SealCheck,
   FileArrowDown,
@@ -15,22 +14,14 @@ import {
   Lock,
 } from "@phosphor-icons/react";
 import { useState } from "react";
-import { useScan } from "../hooks/useScan.js";
+import { useNavigate } from "react-router-dom";
+import { useScanForm } from "../hooks/useScan.js";
 import {
-  SCAN_STAGES,
   SCAN_MODES,
   CONFIG_GROUPS,
   CRED_ROLES,
   CRED_FIELDS,
 } from "../data/constants.js";
-
-const STATUS_LABEL = {
-  queued: "Queued",
-  running: "Scanning",
-  completed: "Complete",
-  failed: "Failed",
-  cancelled: "Cancelled",
-};
 
 const NOTES = [
   {
@@ -190,7 +181,8 @@ function CredentialAccount({ role, account, onField, disabled, lead }) {
   );
 }
 
-function ScanPage({ onComplete }) {
+function ScanPage() {
+  const navigate = useNavigate();
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const {
     url,
@@ -207,18 +199,25 @@ function ScanPage({ onComplete }) {
     setConfigField,
     credentials,
     setCredentialField,
-    scanning,
-    status,
-    progress,
-    stageIdx,
+    submitting,
     error,
     valid,
     canStart,
     startScan,
-    cancel,
-  } = useScan(onComplete);
+  } = useScanForm();
 
   const scanMode = config.scan_mode || "";
+
+  // On start, create the scan then route to its live active-scan page. The form
+  // stays mounted so the user can come back and queue another concurrent scan.
+  async function handleStart() {
+    const result = await startScan();
+    if (result) {
+      navigate(`/app/active/${result.scanId}`, {
+        state: { target: result.target },
+      });
+    }
+  }
 
   return (
     <div className='page'>
@@ -259,7 +258,7 @@ function ScanPage({ onComplete }) {
             value={url}
             onChange={(event) => setUrl(event.target.value)}
             onBlur={() => setTouched(true)}
-            disabled={scanning}
+            disabled={submitting}
           />
           {valid && <CheckCircle className='input-ok' size={17} weight='fill' />}
         </div>
@@ -277,7 +276,7 @@ function ScanPage({ onComplete }) {
             type='button'
             className={`segmented-btn ${crawlMode === "full" ? "active" : ""}`}
             onClick={() => setCrawlMode("full")}
-            disabled={scanning}
+            disabled={submitting}
           >
             <span className='segmented-title'>
               <TreeStructure size={16} weight='bold' /> Full site
@@ -290,7 +289,7 @@ function ScanPage({ onComplete }) {
             type='button'
             className={`segmented-btn ${crawlMode === "single" ? "active" : ""}`}
             onClick={() => setCrawlMode("single")}
-            disabled={scanning}
+            disabled={submitting}
           >
             <span className='segmented-title'>
               <FileIcon size={16} weight='bold' /> Single page
@@ -315,7 +314,7 @@ function ScanPage({ onComplete }) {
             placeholder='Ticket, contract, or scope note'
             value={authText}
             onChange={(event) => setAuthText(event.target.value)}
-            disabled={scanning}
+            disabled={submitting}
           />
         </div>
 
@@ -372,7 +371,7 @@ function ScanPage({ onComplete }) {
                       onClick={() =>
                         setConfigField("scan_mode", scanMode === val ? "" : val)
                       }
-                      disabled={scanning}
+                      disabled={submitting}
                     >
                       <span className='segmented-title'>{title}</span>
                       <span className='segmented-desc'>{desc}</span>
@@ -404,7 +403,7 @@ function ScanPage({ onComplete }) {
                           field={field}
                           value={config[field.key]}
                           onChange={setConfigField}
-                          disabled={scanning}
+                          disabled={submitting}
                         />
                       ))}
                     </div>
@@ -434,7 +433,7 @@ function ScanPage({ onComplete }) {
                   role={role}
                   account={credentials[role.key] || {}}
                   onField={setCredentialField}
-                  disabled={scanning}
+                  disabled={submitting}
                   lead={role.key === "main"}
                 />
               ))}
@@ -449,7 +448,7 @@ function ScanPage({ onComplete }) {
                       e.target.checked ? true : "",
                     )
                   }
-                  disabled={scanning}
+                  disabled={submitting}
                 />
                 <span>
                   Auto-provision a throwaway second identity when no second
@@ -465,7 +464,7 @@ function ScanPage({ onComplete }) {
             type='checkbox'
             checked={consent}
             onChange={(event) => setConsent(event.target.checked)}
-            disabled={scanning}
+            disabled={submitting}
           />
           <span className='consent-text'>
             I confirm I am authorized to scan this target. Unauthorized scanning
@@ -473,10 +472,10 @@ function ScanPage({ onComplete }) {
           </span>
         </label>
 
-        <button className='btn-primary' disabled={!canStart} onClick={startScan}>
-          {scanning ? (
+        <button className='btn-primary' disabled={!canStart} onClick={handleStart}>
+          {submitting ? (
             <>
-              <CircleNotch className='spin' size={17} weight='bold' /> Scanning
+              <CircleNotch className='spin' size={17} weight='bold' /> Starting
             </>
           ) : (
             <>
@@ -486,51 +485,15 @@ function ScanPage({ onComplete }) {
         </button>
       </div>
 
-      {scanning && (
-        <div className='card scan-progress'>
-          <div className='progress-header'>
-            <div className='progress-stage'>
-              <CircleNotch className='spin' size={16} weight='bold' />
-              {SCAN_STAGES[stageIdx]}
-            </div>
-            <div className='progress-meta'>
-              <span className={`status-pill status-${status || "queued"}`}>
-                {STATUS_LABEL[status] || "Queued"}
-              </span>
-              <span className='progress-pct'>{Math.round(progress)}%</span>
-            </div>
+      <div className='scan-notes'>
+        {NOTES.map(({ icon: Icon, title, desc }) => (
+          <div key={title} className='scan-note'>
+            <Icon className='scan-note-icon' size={24} weight='bold' />
+            <div className='scan-note-title'>{title}</div>
+            <div className='scan-note-desc'>{desc}</div>
           </div>
-          <div className='progress-bar'>
-            <div className='progress-fill' style={{ width: `${progress}%` }} />
-          </div>
-          <div className='stage-chips'>
-            {SCAN_STAGES.slice(0, -1).map((stage, index) => (
-              <div
-                key={stage}
-                className={`stage-chip ${index <= stageIdx ? "done" : "pending"}`}
-              >
-                {index <= stageIdx && <Check size={12} weight='bold' />}
-                {stage.replace("...", "")}
-              </div>
-            ))}
-          </div>
-          <button type='button' className='btn-ghost' onClick={cancel}>
-            Cancel scan
-          </button>
-        </div>
-      )}
-
-      {!scanning && (
-        <div className='scan-notes'>
-          {NOTES.map(({ icon: Icon, title, desc }) => (
-            <div key={title} className='scan-note'>
-              <Icon className='scan-note-icon' size={24} weight='bold' />
-              <div className='scan-note-title'>{title}</div>
-              <div className='scan-note-desc'>{desc}</div>
-            </div>
-          ))}
-        </div>
-      )}
+        ))}
+      </div>
     </div>
   );
 }

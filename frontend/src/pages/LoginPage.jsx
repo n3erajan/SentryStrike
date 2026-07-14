@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link, useNavigate, useLocation } from "react-router-dom";
 import {
   EnvelopeSimple,
   Lock,
@@ -6,12 +7,18 @@ import {
   WarningCircle,
   CircleNotch,
 } from "@phosphor-icons/react";
-import { login } from "../services/auth.js";
+import { useAuth } from "../context/AuthContext.jsx";
 import AuthBrand from "../components/AuthBrand.jsx";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function LoginPage({ onAuthed, onGoRegister }) {
+function LoginPage() {
+  const { login } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+  // Return the user to wherever ProtectedRoute bounced them from, else the app.
+  const dest = location.state?.from?.pathname || "/app/scan";
+
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [touched, setTouched] = useState({});
@@ -29,8 +36,8 @@ function LoginPage({ onAuthed, onGoRegister }) {
     setError("");
     setSubmitting(true);
     try {
-      const user = await login({ email, password });
-      onAuthed(user);
+      await login({ email, password });
+      navigate(dest, { replace: true });
     } catch (err) {
       setError(err.message || "Unable to sign in. Please try again.");
     } finally {
@@ -123,9 +130,9 @@ function LoginPage({ onAuthed, onGoRegister }) {
 
           <p className='auth-switch'>
             Don&apos;t have an account?{" "}
-            <button type='button' className='auth-link' onClick={onGoRegister}>
+            <Link className='auth-link' to='/register'>
               Create one
-            </button>
+            </Link>
           </p>
         </div>
       </div>

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   CircleNotch,
   WarningCircle,
@@ -25,7 +26,8 @@ function formatDate(iso) {
 
 // Lists the signed-in user's past scans (GET /scans). Completed scans open
 // straight into their report; the rest show their last known status.
-function HistoryPage({ onOpenReport, onNewScan }) {
+function HistoryPage() {
+  const navigate = useNavigate();
   const [scans, setScans] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -63,7 +65,10 @@ function HistoryPage({ onOpenReport, onNewScan }) {
             report.
           </p>
         </div>
-        <button className='btn-dl btn-dl-primary' onClick={onNewScan}>
+        <button
+          className='btn-dl btn-dl-primary'
+          onClick={() => navigate("/app/scan")}
+        >
           New scan
         </button>
       </div>
@@ -93,7 +98,7 @@ function HistoryPage({ onOpenReport, onNewScan }) {
           <button
             className='btn-dl btn-dl-primary'
             style={{ marginTop: 6 }}
-            onClick={onNewScan}
+            onClick={() => navigate("/app/scan")}
           >
             Start your first scan
           </button>
@@ -102,32 +107,32 @@ function HistoryPage({ onOpenReport, onNewScan }) {
         <div className='history-list'>
           {scans.map((scan) => {
             const completed = scan.status === "completed";
+            const active = scan.status === "queued" || scan.status === "running";
+            const openable = completed || active;
             const CrawlIcon =
               scan.crawl_mode === "single" ? FileIcon : TreeStructure;
+            // Completed scans open their report; in-flight scans open their
+            // live active-scan view. Terminal-but-empty states aren't clickable.
+            const open = () => {
+              if (completed) {
+                navigate(`/app/report/${scan.id}`, {
+                  state: { target: scan.target_url },
+                });
+              } else if (active) {
+                navigate(`/app/active/${scan.id}`, {
+                  state: { target: scan.target_url },
+                });
+              }
+            };
             return (
               <div
                 key={scan.id}
                 className={`history-row ${completed ? "is-open" : ""}`}
-                role={completed ? "button" : undefined}
-                tabIndex={completed ? 0 : undefined}
-                onClick={
-                  completed
-                    ? () =>
-                        onOpenReport({
-                          scanId: scan.id,
-                          target: scan.target_url,
-                        })
-                    : undefined
-                }
+                role={openable ? "button" : undefined}
+                tabIndex={openable ? 0 : undefined}
+                onClick={openable ? open : undefined}
                 onKeyDown={
-                  completed
-                    ? (e) =>
-                        e.key === "Enter" &&
-                        onOpenReport({
-                          scanId: scan.id,
-                          target: scan.target_url,
-                        })
-                    : undefined
+                  openable ? (e) => e.key === "Enter" && open() : undefined
                 }
               >
                 <span className={`status-pill status-${scan.status}`}>

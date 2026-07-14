@@ -1,96 +1,43 @@
-import { useState } from "react";
+import { Routes, Route, Navigate } from "react-router-dom";
 import "./App.css";
-import Navbar from "./components/Navbar.jsx";
-import ScanPage from "./pages/ScanPage.jsx";
-import ReportPage from "./pages/ReportPage.jsx";
-import HistoryPage from "./pages/HistoryPage.jsx";
+import AppLayout from "./components/AppLayout.jsx";
+import ProtectedRoute from "./components/ProtectedRoute.jsx";
+import { PublicOnlyRoute } from "./components/ProtectedRoute.jsx";
+import LandingPage from "./pages/LandingPage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import RegisterPage from "./pages/RegisterPage.jsx";
-// eslint-disable-next-line no-unused-vars -- getCurrentUser is used once the dev auth bypass below is reverted
-import { getCurrentUser, logout } from "./services/auth.js";
+import ScanPage from "./pages/ScanPage.jsx";
+import ActiveScansPage from "./pages/ActiveScansPage.jsx";
+import ActiveScanPage from "./pages/ActiveScanPage.jsx";
+import HistoryPage from "./pages/HistoryPage.jsx";
+import ReportPage from "./pages/ReportPage.jsx";
 
+// Route map (see plan). Public marketing + auth screens live at the root; the
+// authenticated app is nested under /app behind the vertical-sidebar layout.
 function App() {
-  // const [user, setUser] = useState({ email: "dev@sentrystrike.local" });
-  const [user, setUser] = useState(getCurrentUser);
-
-  const [authView, setAuthView] = useState("login");
-  const [page, setPage] = useState("scan");
-  const [target, setTarget] = useState("");
-  const [scanId, setScanId] = useState(null);
-  // Where the report was opened from, so its back button returns there.
-  const [reportOrigin, setReportOrigin] = useState("scan");
-
-  function handleScanComplete({ scanId: id, target: url }) {
-    setScanId(id);
-    setTarget(url);
-    setReportOrigin("scan");
-    setPage("report");
-  }
-
-  function handleOpenReport({ scanId: id, target: url }) {
-    setScanId(id);
-    setTarget(url);
-    setReportOrigin("history");
-    setPage("report");
-  }
-
-  function handleAuthed(authedUser) {
-    setUser(authedUser);
-    setPage("scan");
-  }
-
-  function handleLogout() {
-    logout();
-    setUser(null);
-    setAuthView("login");
-    setTarget("");
-    setScanId(null);
-    setPage("scan");
-  }
-
-  if (!user) {
-    return authView === "login" ? (
-      <LoginPage
-        onAuthed={handleAuthed}
-        onGoRegister={() => setAuthView("register")}
-      />
-    ) : (
-      <RegisterPage
-        onAuthed={handleAuthed}
-        onGoLogin={() => setAuthView("login")}
-      />
-    );
-  }
-
   return (
-    <>
-      <div />
-      <Navbar
-        page={page}
-        onGoScan={() => setPage("scan")}
-        onGoHistory={() => setPage("history")}
-        onGoReport={() => {
-          if (scanId) setPage("report");
-        }}
-        hasReport={!!scanId}
-        user={user}
-        onLogout={handleLogout}
-      />
-      {page === "scan" && <ScanPage onComplete={handleScanComplete} />}
-      {page === "history" && (
-        <HistoryPage
-          onOpenReport={handleOpenReport}
-          onNewScan={() => setPage("scan")}
-        />
-      )}
-      {page === "report" && (
-        <ReportPage
-          scanId={scanId}
-          target={target}
-          onBack={() => setPage(reportOrigin)}
-        />
-      )}
-    </>
+    <Routes>
+      {/* Public — redirect to the app when already signed in. */}
+      <Route element={<PublicOnlyRoute />}>
+        <Route path='/' element={<LandingPage />} />
+        <Route path='/login' element={<LoginPage />} />
+        <Route path='/register' element={<RegisterPage />} />
+      </Route>
+
+      {/* Protected app shell with the left sidebar. */}
+      <Route element={<ProtectedRoute />}>
+        <Route path='/app' element={<AppLayout />}>
+          <Route index element={<Navigate to='scan' replace />} />
+          <Route path='scan' element={<ScanPage />} />
+          <Route path='active' element={<ActiveScansPage />} />
+          <Route path='active/:scanId' element={<ActiveScanPage />} />
+          <Route path='history' element={<HistoryPage />} />
+          <Route path='report/:scanId' element={<ReportPage />} />
+        </Route>
+      </Route>
+
+      <Route path='*' element={<Navigate to='/' replace />} />
+    </Routes>
   );
 }
 

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import {
   ArrowLeft,
   Globe,
@@ -11,12 +12,17 @@ import {
   Warning,
   DownloadSimple,
   FileText,
+  Sparkle,
 } from "@phosphor-icons/react";
 import SeverityBadge from "../components/SeverityBadge.jsx";
 import ScoreRing from "../components/ScoringRing.jsx";
 import VulnerabilityCard from "../components/VulnerabilityCard.jsx";
 import { SEVERITIES, SEVERITY_META } from "../data/constants.js";
-import { getReport, downloadReportPdf } from "../services/reports.js";
+import {
+  getReport,
+  downloadReportPdf,
+  generateAiReport,
+} from "../services/reports.js";
 import { downloadFile, saveBlob } from "../utils/helpers.js";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
@@ -60,13 +66,22 @@ function KV({ k, v }) {
   );
 }
 
-function ReportPage({ scanId, target, onBack }) {
+function ReportPage() {
+  const { scanId } = useParams();
+  const navigate = useNavigate();
+  const location = useLocation();
+  // Target URL passed via router state when navigating from history/active;
+  // falls back to the report payload's own scan_id in the header.
+  const target = location.state?.target || "";
+
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [filter, setFilter] = useState("all");
-  const [busy, setBusy] = useState(""); // "" | "pdf"
+  const [busy, setBusy] = useState(""); // "" | "pdf" | "ai"
   const [notice, setNotice] = useState("");
+
+  const onBack = useCallback(() => navigate("/app/history"), [navigate]);
 
   const load = useCallback(
     async (signal) => {
@@ -113,6 +128,22 @@ function ReportPage({ scanId, target, onBack }) {
       setBusy("");
     }
   }, [scanId]);
+
+  // Re-run the AI executive-summary pass (POST /reports/{id}/generate) and
+  // reload the report so the fresh summary shows.
+  const handleRegenerate = useCallback(async () => {
+    setBusy("ai");
+    setNotice("");
+    try {
+      await generateAiReport(scanId);
+      await load();
+      setNotice("AI summary regenerated.");
+    } catch (err) {
+      setNotice(err.message || "Could not regenerate the AI summary.");
+    } finally {
+      setBusy("");
+    }
+  }, [scanId, load]);
 
   if (loading) {
     return (
@@ -265,6 +296,22 @@ function ReportPage({ scanId, target, onBack }) {
             onClick={handleDownloadJson}
           >
             <FileText size={16} weight='bold' /> Download JSON
+          </button>
+          <button
+            className='btn-dl btn-dl-secondary'
+            onClick={handleRegenerate}
+            disabled={busy === "ai"}
+            title='Re-run the AI stage to rewrite the executive summary'
+          >
+            {busy === "ai" ? (
+              <>
+                <CircleNotch className='spin' size={16} weight='bold' /> Regenerating
+              </>
+            ) : (
+              <>
+                <Sparkle size={16} weight='bold' /> Regenerate AI summary
+              </>
+            )}
           </button>
         </div>
       </div>

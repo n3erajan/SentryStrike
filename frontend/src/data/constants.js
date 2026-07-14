@@ -8,6 +8,9 @@ import {
   Gauge,
   Bug,
   Browsers,
+  ShieldCheck,
+  Pulse,
+  ClockCounterClockwise,
 } from "@phosphor-icons/react";
 
 const SEVERITIES = ["critical", "high", "medium", "low", "info"];
@@ -352,6 +355,15 @@ const CRED_FIELDS = [
   },
 ];
 
+// Vertical-sidebar navigation. Each entry is an /app child route. The Active
+// item carries a live badge (count of queued/running scans) supplied by the
+// Sidebar, so no count lives here.
+const NAV_ITEMS = [
+  { to: "/app/scan", label: "New Scan", Icon: ShieldCheck, end: false },
+  { to: "/app/active", label: "Active", Icon: Pulse, badge: "active" },
+  { to: "/app/history", label: "History", Icon: ClockCounterClockwise },
+];
+
 export {
   SEVERITIES,
   SEVERITY_META,
@@ -360,4 +372,5 @@ export {
   CONFIG_GROUPS,
   CRED_ROLES,
   CRED_FIELDS,
+  NAV_ITEMS,
 };
