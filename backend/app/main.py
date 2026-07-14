@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.dependencies import get_current_user
-from app.api.routes import analysis, auth, health, reports, scan
+from app.api.routes import analysis, auth, health, oast, reports, scan
 from app.config import get_settings
 from app.core.exceptions import AppError
 from app.core.scanner import ScanOrchestrator
@@ -53,6 +53,10 @@ def create_app() -> FastAPI:
     app.include_router(scan.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(analysis.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(reports.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
+
+    # OAST callback collaborator — unauthenticated by design (the tested target
+    # is unauthenticated when its server-side fetch calls back). No /api/v1 prefix.
+    app.include_router(oast.router)
 
     @app.exception_handler(AppError)
     async def app_error_handler(_: Request, exc: AppError) -> JSONResponse:

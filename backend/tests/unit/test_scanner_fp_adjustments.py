@@ -59,6 +59,57 @@ def test_to_vulnerability_preserves_detector_verification_metadata() -> None:
     assert vulnerability.evidence.detection_evidence == {"timing_delta_ms": 5100}
 
 
+def test_to_vulnerability_redacts_credentials_in_evidence() -> None:
+    """Evidence snippets must never persist real auth tokens, cookies, or the
+    scan account password — they would leak durable credentials into the stored
+    report and PDF, outliving the scan session."""
+    secret_password = "#Yatra@9821"
+    jwt = (
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9."
+        "eyJzdGF0dXMiOiJzdWNjZXNzIn0.sigpart"
+    )
+    finding = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="SQL Injection (Error-Based)",
+        severity=SeverityLevel.critical,
+        url="http://localhost:3000/rest/products/search",
+        parameter="q",
+        payload="' OR 1=1--",
+        evidence=f"Verbose error echoed credential: {secret_password}",
+        verification_request_snippet=(
+            "POST /rest/user/login HTTP/1.1\r\n"
+            "Host: localhost:3000\r\n"
+            f"Authorization: Bearer {jwt}\r\n"
+            "Cookie: language=en; token=opaque-session-xyz\r\n"
+            f'{{"email":"admin@test","password":"{secret_password}"}}'
+        ),
+        verified=True,
+    )
+
+    vuln = _orchestrator()._to_vulnerability(finding, extra_secrets=[secret_password])
+
+    req = vuln.evidence.request_snippet or ""
+    resp = vuln.evidence.response_snippet or ""
+    # Real secrets are scrubbed from both snippets ...
+    assert secret_password not in req
+    assert secret_password not in resp
+    assert jwt not in req
+    assert "opaque-session-xyz" not in req
+    # ... while structure and benign context survive for reviewers.
+    assert "Authorization:" in req
+    assert "Cookie:" in req
+    assert "language=en" in req
+    assert "admin@test" in req
+    assert "[REDACTED]" in req
+
+
+def test_vulnerability_no_longer_carries_detected_at() -> None:
+    """detected_at was identical across every finding (stamped at assembly time,
+    not real detection time) and carried no signal beyond the report's
+    generated_at — removed to avoid a misleading field."""
+    assert "detected_at" not in Vulnerability.model_fields
+
+
 def test_static_spa_coverage_warning_is_deterministic() -> None:
     class CrawlResult:
         is_spa = True
@@ -494,7 +545,10 @@ def test_verified_time_based_sqli_is_not_auto_suppressed_by_high_ai_fp_probabili
     assert vulnerability.review_status == ReviewStatus.confirmed
     assert vulnerability.cvss_score == 9.1
     assert vulnerability.severity == SeverityLevel.critical
-    assert vulnerability.ai_analysis.false_positive_probability == 0.05
+    # timing_strong proof type: ceiling is 0.15 (not 0.05) — the proof is
+    # strong but indirect (time delta, not output), so the AI has slightly
+    # more room than for error_echo/active_output.
+    assert vulnerability.ai_analysis.false_positive_probability == 0.15
 
 
 def test_unverified_high_fp_finding_is_still_suppressed() -> None:
@@ -547,3 +601,104 @@ def test_file_upload_fallback_covers_double_extension_bypass() -> None:
     fallback = _orchestrator()._get_fallback_for("Double Extension Bypass")
 
     assert "compound extensions" in fallback["remediation"]
+
+
+def test_auth_coverage_uses_real_spa_surface_not_collapsed_url_list() -> None:
+    """A browser-crawled SPA collapses ``urls`` to the shell (~1). Auth-coverage
+    must report the true scanned surface (routes + API endpoints), and a real
+    protected-target count from authorized 2xx data responses — not a hardcoded 1."""
+
+    class Route:
+        def __init__(self, url):
+            self.url = url
+
+    from app.core.crawler.models import ApiEndpoint
+
+    class CrawlResult:
+        is_spa = True
+        assets = ["http://t.test/main.js"]
+        urls = ["http://t.test/"]  # SPA shell only
+        routes = [Route("http://t.test/#/login"), Route("http://t.test/#/profile")]
+        api_endpoints = [ApiEndpoint(url="http://t.test/api/Cards"), ApiEndpoint(url="http://t.test/rest/basket/7")]
+        parameters = []
+        dead_routes = []
+        forms = []
+        session_cookies = {"token": "abc"}
+        auth_headers = {}
+        auth_state = "authenticated_verified"
+        browser_available = True
+        browser_error = None
+        requests = [
+            # Two distinct protected data endpoints reached with 2xx under the session.
+            RequestObservation(url="http://t.test/api/Cards", method="GET",
+                               response_status=200, response_content_type="application/json"),
+            RequestObservation(url="http://t.test/rest/basket/7", method="GET",
+                               response_status=200, response_content_type="application/json"),
+            # Same endpoint different id -> collapses to one protected target.
+            RequestObservation(url="http://t.test/api/Cards?id=9", method="GET",
+                               response_status=200, response_content_type="application/json"),
+            # A static asset 200 must NOT count.
+            RequestObservation(url="http://t.test/main.js", method="GET",
+                               response_status=200, response_content_type="application/javascript"),
+            # A 401 must NOT count (not authorized).
+            RequestObservation(url="http://t.test/api/Secret", method="GET",
+                               response_status=401, response_content_type="application/json"),
+        ]
+
+    scan = SimpleNamespace(
+        target_url="http://t.test/",
+        statistics=ScanStatistics(),
+        report_metadata=ReportMetadata(
+            spa_api_coverage=SpaApiCoverage(),
+            auth_coverage=AuthCoverage(),
+            evidence_strength_breakdown=EvidenceStrengthBreakdown(),
+        ),
+    )
+    _orchestrator()._update_crawl_metadata(scan, CrawlResult())
+
+    ac = scan.report_metadata.auth_coverage
+    # Real surface = union of shell + 2 routes + 2 api endpoints = 5, not 1.
+    assert ac.authenticated_url_count == 5
+    assert ac.unauthenticated_url_count == 0
+    # Two distinct protected endpoints verified (Cards collapsed across ids); the
+    # asset and the 401 are excluded. No longer the hardcoded 1.
+    assert ac.protected_targets_verified == 2
+    assert ac.session_cookies_present is True
+
+
+def test_protected_targets_zero_when_unverified_session() -> None:
+    class CrawlResult:
+        is_spa = False
+        assets = []
+        urls = ["http://t.test/", "http://t.test/a"]
+        routes = []
+        api_endpoints = []
+        parameters = []
+        dead_routes = []
+        forms = []
+        session_cookies = {}
+        auth_headers = {}
+        auth_state = "unauthenticated"
+        browser_available = True
+        browser_error = None
+        requests = [
+            RequestObservation(url="http://t.test/api/x", method="POST",
+                               response_status=200, response_content_type="application/json"),
+        ]
+
+    scan = SimpleNamespace(
+        target_url="http://t.test/",
+        statistics=ScanStatistics(),
+        report_metadata=ReportMetadata(
+            spa_api_coverage=SpaApiCoverage(),
+            auth_coverage=AuthCoverage(),
+            evidence_strength_breakdown=EvidenceStrengthBreakdown(),
+        ),
+    )
+    _orchestrator()._update_crawl_metadata(scan, CrawlResult())
+
+    ac = scan.report_metadata.auth_coverage
+    # Unverified: surface counts as unauthenticated, protected count is 0.
+    assert ac.authenticated_url_count == 0
+    assert ac.unauthenticated_url_count == 2
+    assert ac.protected_targets_verified == 0

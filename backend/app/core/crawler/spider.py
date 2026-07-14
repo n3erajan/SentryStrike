@@ -24,27 +24,15 @@ from app.core.crawler.browser_engine import BrowserDiscoveryEngine
 from app.core.crawler.models import ApiEndpoint, CrawlState, ParameterCandidate, RouteCandidate, RouteSource
 from app.core.crawler.param_discovery import ParamDiscovery
 from app.core.crawler.spa import SpaFallbackDetector
-from app.core.crawler.url_parser import normalize_url, same_domain, normalize_for_dedupe
+from app.core.crawler.url_parser import STATIC_EXTENSIONS, normalize_url, same_domain, normalize_for_dedupe
 from app.utils.http_logging import make_httpx_response_logger
 from app.utils.scan_http import create_scan_client
 
 logger = logging.getLogger(__name__)
 
-STATIC_EXTENSIONS = {
-    # Stylesheets & scripts
-    ".css", ".js", ".map",
-    # Images
-    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-    ".webp", ".bmp", ".tiff",
-    # Fonts
-    ".woff", ".woff2", ".ttf", ".eot", ".otf",
-    # Media
-    ".mp4", ".mp3", ".ogg", ".webm", ".avi",
-    # Documents & data (not web endpoints)
-    ".pdf", ".xml", ".json", ".csv", ".xls", ".xlsx",
-    # Archives
-    ".zip", ".tar", ".gz",
-}
+# STATIC_EXTENSIONS is the shared static-asset set (now includes ``.txt``) and
+# lives in url_parser so the crawler and the detectors classify assets the same
+# way. Imported above and re-exported here for existing references.
 
 
 @dataclass
@@ -98,6 +86,8 @@ class CrawlResult:
     workflow_states_visited: int = 0
     browser_forms_discovered: int = 0
     browser_forms_submitted: int = 0
+    buttons_clicked: int = 0
+    button_mutations_fired: int = 0
     file_inputs_discovered: int = 0
     browser_forms: list[dict[str, object]] = field(default_factory=list)
 
@@ -319,28 +309,52 @@ class WebSpider:
                             queue.task_done()
                             break
 
+                        # Detect the SPA shell fallback for EVERY discovery source
+                        # and even file-like paths (``allow_file_like_path=True``).
+                        # In a SPA the server returns the same ``index.html`` shell
+                        # for any path with no distinct resource — client routes
+                        # (``/login``, ``/accounting``, ``/order-completion/:id``),
+                        # dead brute-force guesses (``/.env``, ``/.git``), and
+                        # mistyped file paths all render byte-identical HTML. Such a
+                        # URL is NOT a distinct HTTP resource: it must never enter
+                        # ``discovered_urls`` or every detector re-tests the same
+                        # shell under dozens of different URLs (the ``/.env``,
+                        # ``/accounting`` … stored-XSS noise). The default
+                        # ``allow_file_like_path=False`` skipped extensioned paths,
+                        # so shell-returning guesses like ``/.env`` slipped through.
                         fallback_signal = spa_detector.detect(
                             url,
                             response.status_code,
                             response.headers.get("content-type", ""),
                             response.text if "text/html" in response.headers.get("content-type", "") else "",
+                            allow_file_like_path=True,
                         )
                         if url == root_url and "text/html" in response.headers.get("content-type", ""):
                             spa_detector.configure_root(root_url, response.text)
                             spa_root_html = response.text
                             self._is_spa = self._is_spa or spa_detector.root_looks_like_spa()
 
-                        if fallback_signal.is_fallback and url != root_url and source == RouteSource.brute_force:
-                            route = RouteCandidate(
-                                url=url,
-                                source=source,
-                                priority=0,
-                                depth=depth,
-                                evidence=fallback_signal.reason,
-                                is_spa_fallback=True,
-                                is_dead=True,
-                            )
-                            dead_routes.append(route)
+                        if fallback_signal.is_fallback and url != root_url:
+                            # A shell fallback is kept OUT of the HTTP-testable URL
+                            # set regardless of source. Brute-force guesses were
+                            # probes for a resource that does not exist, so they are
+                            # additionally recorded as dead (reported/suppressed).
+                            # Real client routes (js/html/sitemap) are NOT dead —
+                            # they remain in ``crawl_state.routes`` so the browser
+                            # engine still visits them via SPA navigation; they are
+                            # only excluded from the raw-HTTP detector surface.
+                            if source == RouteSource.brute_force:
+                                dead_routes.append(
+                                    RouteCandidate(
+                                        url=url,
+                                        source=source,
+                                        priority=0,
+                                        depth=depth,
+                                        evidence=fallback_signal.reason,
+                                        is_spa_fallback=True,
+                                        is_dead=True,
+                                    )
+                                )
                             queue.task_done()
                             continue
 
@@ -353,13 +367,11 @@ class WebSpider:
                     if "text/html" not in response.headers.get("content-type", ""):
                         queue.task_done()
                         continue
-                    
-                    if fallback_signal.is_fallback and url != root_url:
-                        # Skip parsing the HTML of fallback/shell pages again to avoid duplicate links/forms,
-                        # but we still kept the URL in discovered_urls/routes for the browser crawl.
-                        queue.task_done()
-                        continue
-                    
+
+                    # Note: SPA shell fallbacks (any source) already `continue`d
+                    # above, so they never reach HTML parsing here — no duplicate
+                    # link/form extraction from identical shells.
+
                     async with lock:
                         # Update cookies in case session updated
                         self.session_cookies.update(self._snapshot_cookies(client.cookies))
@@ -409,14 +421,29 @@ class WebSpider:
                 await asyncio.gather(*workers, return_exceptions=True)
 
             if self._should_run_browser(self._is_spa or spa_detector.root_looks_like_spa()):
-                browser_routes = [route.url for route in crawl_state.routes if route.source == RouteSource.javascript]
+                # Brute-force wordlist guesses that HTTP-resolved to the SPA shell
+                # are dead (``/wp-admin``, ``/.env`` → index.html). They are recorded
+                # in ``dead_routes`` but the ORIGINAL enqueued RouteCandidate in
+                # ``crawl_state.routes`` keeps ``is_dead=False``, so without this set
+                # they would still be canonicalised to ``#/wp-admin`` and navigated
+                # as live SPA routes — wasting budget on the app's not-found
+                # component. A correctly-guessed real route (``/administration`` →
+                # ``#/administration``) never HTTP-resolves to the shell, so it is
+                # NOT in ``dead_urls`` and is still browser-seeded.
+                dead_urls = {route.url for route in dead_routes}
+                browser_routes = [
+                    route.url for route in crawl_state.routes
+                    if route.source in (RouteSource.javascript, RouteSource.html, RouteSource.sitemap, RouteSource.brute_force)
+                    and not getattr(route, "is_dead", False)
+                    and route.url not in dead_urls
+                ]
                 await self._run_browser_discovery(crawl_state, root_url, browser_routes)
 
-        # P4: browser-navigated routes with query strings hold real parameter
-        # values (e.g. /redirect?to=https://...) that the HTTP worker never saw
-        # because they redirect externally or were visited browser-only. Extend
-        # discovered_urls so ParamDiscovery parses their query parameters and all
-        # detectors (open_redirect, file_inclusion, ssrf, …) receive them.
+        # P4: browser routes reconstructed from a dead hash route hold a real
+        # server URL the HTTP worker never saw — a query-bearing endpoint
+        # (/redirect?to=https://...) or a served file (/ftp/legal.md). Extend
+        # discovered_urls so ParamDiscovery + all detectors (open_redirect,
+        # file_inclusion, ssrf, …) receive them.
         if crawl_state.browser_available:
             _seen_for_p4 = {normalize_for_dedupe(u) for u in discovered_urls}
             for _route in crawl_state.routes:
@@ -424,7 +451,12 @@ class WebSpider:
                     continue
                 if _route.source not in (RouteSource.browser,):
                     continue
-                if "?" not in _route.url:
+                # Only real server paths are HTTP-testable. A ``/#/route``
+                # fragment is never sent over the wire, so skip hash routes;
+                # reconstructed server URLs (query-bearing or a plain file path)
+                # have no route fragment and pass.
+                _frag = urlparse(_route.url).fragment
+                if _frag.startswith("/") or _frag.startswith("!/"):
                     continue
                 # Scope guard: a browser route may have followed a redirect to a
                 # third-party host (e.g. /redirect?to=https://github.com/...).
@@ -470,6 +502,8 @@ class WebSpider:
             workflow_states_visited=crawl_state.workflow_states_visited,
             browser_forms_discovered=crawl_state.browser_forms_discovered,
             browser_forms_submitted=crawl_state.browser_forms_submitted,
+            buttons_clicked=crawl_state.buttons_clicked,
+            button_mutations_fired=crawl_state.button_mutations_fired,
             file_inputs_discovered=crawl_state.file_inputs_discovered,
             browser_forms=list(crawl_state.browser_forms),
         )
@@ -501,6 +535,14 @@ class WebSpider:
             inputs: list[FormInput] = []
             for raw_input in form.get("inputs") or []:
                 if not isinstance(raw_input, dict):
+                    continue
+                # Synthetic positional fallback names (field_<cid>_<idx>) are
+                # internal handles for fill/submit addressing, never real backend
+                # parameter names. Dropping them here prevents useless injection
+                # targets against names the server doesn't recognize. The live
+                # submit path uses field_id (data-sentry-field attr), not the name,
+                # so this does not affect form submission.
+                if raw_input.get("named") is False:
                     continue
                 input_type = str(raw_input.get("type") or "text").lower()
                 name = str(raw_input.get("name") or "").strip()
@@ -679,6 +721,15 @@ class WebSpider:
             max_interactions=self._scan_config.get_val("crawl_browser_max_interactions", self.settings.crawl_browser_max_interactions) if self._scan_config else self.settings.crawl_browser_max_interactions,
             workers=self._scan_config.get_val("crawl_browser_workers", self.settings.crawl_browser_workers) if self._scan_config else self.settings.crawl_browser_workers,
         )
+        # The app's OWN client routes (mined from JS bundles / HTML / sitemap).
+        # Passed so the engine can distinguish a router-defined route that merely
+        # lacks a query parameter (kept alive) from a brute-force guess that
+        # renders the not-found component (recorded dead).
+        client_routes = [
+            r.url for r in crawl_state.routes
+            if getattr(r, "source", None)
+            in (RouteSource.javascript, RouteSource.html, RouteSource.sitemap)
+        ]
         task = asyncio.create_task(
             engine.crawl_into(
                 browser_state,
@@ -688,6 +739,7 @@ class WebSpider:
                 routes=routes,
                 deadline=deadline,
                 storage_state=self._auth_storage_state,
+                client_routes=client_routes,
             )
         )
         safety_timeout = budget + max(30.0, budget * 0.5)
@@ -723,6 +775,8 @@ class WebSpider:
         target.workflow_states_visited += source.workflow_states_visited
         target.browser_forms_discovered += source.browser_forms_discovered
         target.browser_forms_submitted += source.browser_forms_submitted
+        target.buttons_clicked += source.buttons_clicked
+        target.button_mutations_fired += source.button_mutations_fired
         target.file_inputs_discovered += source.file_inputs_discovered
         for form in source.browser_forms:
             target.add_browser_form(form)
@@ -767,7 +821,8 @@ class WebSpider:
         logger.info(
             "crawler finished for %s: urls=%d routes=%d api_endpoints=%d parameters=%d "
             "forms=%d dead_routes=%d assets=%d | browser_available=%s "
-            "browser_forms_captured=%d browser_forms_submitted=%d file_inputs=%d "
+            "browser_forms_captured=%d browser_forms_submitted=%d "
+            "buttons_clicked=%d button_mutations=%d file_inputs=%d "
             "requests=%d post_bodies=%d json_bodies=%d browser_error=%s",
             root_url,
             len(result.urls),
@@ -780,6 +835,8 @@ class WebSpider:
             getattr(result, "browser_available", None),
             getattr(result, "browser_forms_discovered", 0),
             getattr(result, "browser_forms_submitted", 0),
+            getattr(result, "buttons_clicked", 0),
+            getattr(result, "button_mutations_fired", 0),
             getattr(result, "file_inputs_discovered", 0),
             len(requests),
             len(post_bodies),

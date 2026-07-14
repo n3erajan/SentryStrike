@@ -93,6 +93,9 @@ class SpaApiCoverage(BaseModel):
     observed_json_body_targets: int = 0
     observed_form_body_targets: int = 0
     static_synth_body_targets: int = 0
+    # Replayable PUT/PATCH targets derived from an observed create (POST) via REST
+    # convention (create → update) using the real server-assigned id.
+    derived_update_body_targets: int = 0
     skipped_unresolved_body_targets: int = 0
     post_bodies: int = 0
     workflow_states_visited: int = 0
@@ -182,6 +185,9 @@ class Scan(Document):
 
     statistics: ScanStatistics = Field(default_factory=ScanStatistics)
     overall_risk_score: float = Field(default=0.0, ge=0, le=100)
+    # Qualitative band for the aggregate score (Critical/High/Medium/Low/Info),
+    # derived from CVSS severity thresholds. Reported alongside the number.
+    overall_risk_level: str = Field(default="Info")
     technology_stack: list[TechnologyComponent] = Field(default_factory=list)
     vulnerabilities: list[Vulnerability] = Field(default_factory=list)
     report_metadata: ReportMetadata = Field(default_factory=ReportMetadata)

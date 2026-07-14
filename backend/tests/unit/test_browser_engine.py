@@ -12,6 +12,60 @@ from app.core.crawler.browser_engine import (
 from app.core.crawler.models import CrawlState, RequestObservation
 
 
+def test_client_route_key_matches_bare_and_hash_forms():
+    """A route mined as a bare path and its rendered hash-router form must key
+    identically, so a router-defined route is recognised at the not-found
+    suppression site and kept alive (not dropped as dead)."""
+    key = BrowserDiscoveryEngine._client_route_key
+    assert key("http://x/#/search") == key("http://x/search") == "/search"
+    assert key("http://x/#/track-result?id=1") == "/track-result"
+    assert key("http://x/#!/login") == key("http://x/login/") == "/login"
+    # Distinct routes stay distinct.
+    assert key("http://x/#/search") != key("http://x/#/administration")
+
+
+def test_server_endpoint_from_dead_route_reconstructs_query_endpoint():
+    """A hash-routed SPA canonicalises a real server anchor (``./redirect?to=X``)
+    into a dead hash route (``#/redirect?to=X``). When that route renders the
+    not-found shell, reconstruct the same-origin HTTP endpoint from the fragment
+    so the HTTP detectors receive its query params (the open-redirect miss)."""
+    recon = BrowserDiscoveryEngine._server_endpoint_from_dead_route
+    got = recon("http://x/#/redirect?to=https://github.com/juice-shop/juice-shop")
+    assert got.startswith("http://x/redirect?")
+    assert "to=" in got
+    # The allowlisted target value round-trips through parse/re-encode.
+    from urllib.parse import parse_qs, urlparse
+    assert parse_qs(urlparse(got).query)["to"] == [
+        "https://github.com/juice-shop/juice-shop"
+    ]
+
+
+def test_server_endpoint_from_dead_route_ignores_paramless_and_api_routes():
+    """A dead route with no query (an ordinary brute-force/client dead route such
+    as ``#/wp-admin``) or a root API path stays dead — never resurrected as an
+    HTTP endpoint."""
+    recon = BrowserDiscoveryEngine._server_endpoint_from_dead_route
+    assert recon("http://x/#/wp-admin") == ""          # no query, no extension
+    assert recon("http://x/#/administration") == ""    # no query, no extension
+    assert recon("http://x/#/api/users?id=1") == ""    # root API path, already covered
+    assert recon("http://x/#/?to=evil") == ""          # empty path
+
+
+def test_server_endpoint_from_dead_route_reconstructs_served_file():
+    """A hash-routed SPA canonicalises a real served-file anchor
+    (``./ftp/legal.md``) into a dead hash route (``#/ftp/legal.md``). A query-less
+    path whose last segment has a file extension is a real static resource the
+    router swallowed — reconstruct its plain server URL (the ``/ftp/:file`` path
+    traversal / arbitrary-file-read discovery miss). A bare route word stays dead."""
+    recon = BrowserDiscoveryEngine._server_endpoint_from_dead_route
+    assert recon("http://x/#/ftp/legal.md") == "http://x/ftp/legal.md"
+    assert recon("http://x/#/ftp/package.json.bak") == "http://x/ftp/package.json.bak"
+    assert recon("http://x/#!/reports/q3.pdf") == "http://x/reports/q3.pdf"
+    # Extension-less client route words are NOT served files → stay dead.
+    assert recon("http://x/#/search") == ""
+    assert recon("http://x/#/order-history") == ""
+
+
 # --- Fake Playwright scaffolding for streaming/truncation tests -------------
 
 
@@ -208,6 +262,92 @@ async def test_crawl_into_streams_partial_results_and_survives_deadline(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_crawl_into_terminates_when_a_worker_hangs_on_unbounded_await(monkeypatch):
+    """A single worker stuck on an unbounded inline await must not freeze the
+    whole pool. In production a never-closing response body / socket.io stream
+    wedged a worker; the other workers parked in ``cond.wait()`` and the crawl
+    hung forever (only Ctrl+C broke it). The pool-level watchdog must cancel a
+    stuck worker at ``deadline + grace`` so the crawl always terminates and
+    still merges whatever streamed in."""
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=20)
+    # Small grace so the backstop fires fast in the test (default is ~20s).
+    engine._pool_stuck_grace_s = 0.3
+
+    # Every worker wedges on its first route the instant it reaches this inline
+    # step — a stand-in for a body read / stream that never resolves. It is a
+    # cancellable await, matching a real Playwright await (the Python task
+    # unwinds on cancel even though the browser-side op may linger).
+    async def _hang(_page):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(engine, "_clear_blocking_overlays", _hang)
+
+    state = CrawlState()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.5
+
+    # Guard: if the watchdog is absent the pool never joins and this awaits
+    # forever, so bound the whole call. A green run returns well under the guard.
+    await asyncio.wait_for(
+        engine.crawl_into(
+            state,
+            "http://spa.test/",
+            routes=[f"/route-{i}" for i in range(6)],
+            deadline=deadline,
+        ),
+        timeout=5.0,
+    )
+
+    # Browser launched, so availability is truthful, and truncation is recorded.
+    assert state.browser_available is True
+    assert state.browser_error is not None
+    assert "truncat" in state.browser_error.lower()
+
+
+@pytest.mark.asyncio
+async def test_crawl_into_abandons_a_route_that_hangs_and_continues(monkeypatch, caplog):
+    """A single route whose processing wedges on an unbounded await must be
+    abandoned at the per-route cap so the worker moves on — one bad route may
+    never stall a worker until the (much later) pool watchdog. The deadline is
+    set far in the future so ONLY the per-route cap can rescue the run: if it is
+    absent the workers hang and the guard below times out."""
+    page = _FakePage(goto_sleep=0.0)
+    _install_fake_playwright(monkeypatch, page)
+
+    engine = BrowserDiscoveryEngine(max_interactions=20)
+    engine.settings.crawl_browser_route_cap_seconds = 0.3  # abandon fast in-test
+
+    async def _hang(_page):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(engine, "_clear_blocking_overlays", _hang)
+
+    state = CrawlState()
+    loop = asyncio.get_running_loop()
+    # Far-off budget: the global pool watchdog (budget + 20s grace) cannot be
+    # what saves this within the guard window — only per-route abandonment can.
+    deadline = loop.time() + 120.0
+
+    with caplog.at_level("WARNING", logger="app.core.crawler.browser_engine"):
+        await asyncio.wait_for(
+            engine.crawl_into(
+                state,
+                "http://spa.test/",
+                routes=[f"/route-{i}" for i in range(6)],
+                deadline=deadline,
+            ),
+            timeout=8.0,
+        )
+
+    assert state.browser_available is True
+    # Every stuck route was abandoned by name, and the crawl still finished.
+    assert any("per-route cap" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_crawl_into_reports_unavailable_when_launch_fails(monkeypatch):
     class _FailingChromium:
         async def launch(self, headless=True):
@@ -323,6 +463,28 @@ def test_browser_targets_visit_same_origin_routes_only():
     ]
     # The cross-origin route is never a target.
     assert "http://evil.example/api" not in targets
+
+
+def test_browser_navigable_gate_excludes_api_and_asset_leaves():
+    """The browser navigation gate keeps the finite budget on HTML/app routes:
+    raw API/data/asset leaves (which render as a dead <pre>/bytes and bear no
+    forms or client-side routes) are excluded, while app pages and hash-router
+    routes are always navigable."""
+    nav = BrowserDiscoveryEngine._is_browser_navigable
+    # Raw API/data/asset leaves — excluded (already covered by the HTTP crawler).
+    assert nav("http://x.test/api/Feedbacks") is False
+    assert nav("http://x.test/rest/products/search") is False
+    assert nav("http://x.test/graphql") is False
+    assert nav("http://x.test/assets/i18n/en.json") is False
+    assert nav("http://x.test/main.js") is False
+    assert nav("http://x.test/logo.png") is False
+    # App pages and hash-router routes — always navigable.
+    assert nav("http://x.test/") is True
+    assert nav("http://x.test/login") is True
+    assert nav("http://x.test/#/register") is True
+    assert nav("http://x.test/#/search?q=test") is True
+    assert nav("http://x.test/api-docs") is True  # Swagger HTML page, not an /api leaf
+    assert nav("http://x.test/products/42") is True
 
 
 def test_browser_request_dedupe_uses_url_template_and_body_schema():
@@ -908,10 +1070,25 @@ async def test_capture_forms_returns_structured_forms():
         {
             "action": "http://spa.test/submit",
             "method": "POST",
-            "inputs": [{"name": "email", "type": "email", "field_id": "0:0", "named": True}],
+            "inputs": [
+                {
+                    "name": "email",
+                    "type": "email",
+                    "field_id": "0:0",
+                    "named": True,
+                    "hint": "",
+                    "required": False,
+                    "maxlength": None,
+                    "minlength": None,
+                    "pattern": None,
+                    "min": None,
+                    "max": None,
+                }
+            ],
             "cluster_id": 0,
             "has_form": True,
             "file_inputs": 0,
+            "no_submit": False,
             "page_url": "http://spa.test/page",
             "all_named": True,
         },
@@ -919,12 +1096,37 @@ async def test_capture_forms_returns_structured_forms():
             "action": "http://spa.test/upload",
             "method": "POST",
             "inputs": [
-                {"name": "avatar", "type": "file", "field_id": "1:0", "named": True},
-                {"name": "bio", "type": "text", "field_id": "1:1", "named": True},
+                {
+                    "name": "avatar",
+                    "type": "file",
+                    "field_id": "1:0",
+                    "named": True,
+                    "hint": "",
+                    "required": False,
+                    "maxlength": None,
+                    "minlength": None,
+                    "pattern": None,
+                    "min": None,
+                    "max": None,
+                },
+                {
+                    "name": "bio",
+                    "type": "text",
+                    "field_id": "1:1",
+                    "named": True,
+                    "hint": "",
+                    "required": False,
+                    "maxlength": None,
+                    "minlength": None,
+                    "pattern": None,
+                    "min": None,
+                    "max": None,
+                },
             ],
             "cluster_id": 1,
             "has_form": False,
             "file_inputs": 1,
+            "no_submit": False,
             "page_url": "http://spa.test/page",
             "all_named": True,
         },
@@ -976,6 +1178,8 @@ class _RichFakePage:
     async def evaluate(self, script, *args):
         if "elementFromPoint" in script:
             return False
+        if "script[src]" in script:  # unique to SPA_SHELL_PROBE_SCRIPT
+            return True  # this fake page models a live SPA shell
         if "__sentry_routes" in script:
             return []
         if "routerLink" in script:  # unique to DOM_LINK_SCRIPT
@@ -1296,6 +1500,9 @@ class _SubmitFakePage:
     async def evaluate(self, script, *args):
         return None
 
+    async def wait_for_timeout(self, ms):
+        return None
+
     async def goto(self, url, wait_until=None, timeout=None):
         self.url = url
 
@@ -1567,7 +1774,7 @@ async def test_crawl_into_visits_high_value_routes_first(monkeypatch):
     routes = [
         "/about",
         "/blog",
-        "/rest/user/login",
+        "/login",
         "/search?q=test",
         "/contact",
     ]
@@ -1632,6 +1839,87 @@ def test_hash_routed_targets_canonicalize_path_routes_and_dedupe():
     assert engine._normalize_for_seen("http://spa.test/current#/login") == engine._normalize_for_seen(
         "http://spa.test/#/login"
     )
+
+
+def test_runtime_hash_hint_converts_flat_seed_routes_to_hash():
+    """Flat routes mined from a JS bundle (``/login``) must be seeded as hash
+    routes (``/#/login``) once a runtime probe reports the app is hash-routed —
+    otherwise the bare path only ever loads the SPA shell and the real page's
+    forms/XHR never fire. The static heuristic cannot see this because every
+    seed string is a bare path with no fragment."""
+    engine = BrowserDiscoveryEngine()
+    flat_routes = ["/login", "/register", "/search", "/administration"]
+
+    # Without the runtime hint the static heuristic sees no ``#/`` and leaves
+    # the routes as bare paths (the pre-fix behaviour).
+    static = engine._browser_targets("http://spa.test/", flat_routes)
+    assert "http://spa.test/login" in static
+    assert "http://spa.test/#/login" not in static
+
+    # With the runtime hint every flat route is canonicalized into hash form.
+    hashed = engine._browser_targets("http://spa.test/", flat_routes, hash_routed=True)
+    for route in ("login", "register", "search", "administration"):
+        assert f"http://spa.test/#/{route}" in hashed
+        assert f"http://spa.test/{route}" not in hashed
+
+
+@pytest.mark.asyncio
+async def test_detect_hash_routing_from_root_redirect(monkeypatch):
+    """The probe returns True when loading the root leaves the URL on a
+    route-bearing fragment (the app rewrote ``/`` into ``#/``)."""
+
+    class _RootRedirectPage(_FakePage):
+        async def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            # App boots and the router rewrites the root into a hash route.
+            self.url = url.rstrip("/") + "/#/"
+
+        async def evaluate(self, script, *args):
+            return []
+
+    page = _RootRedirectPage()
+    engine = BrowserDiscoveryEngine()
+    assert await engine._detect_hash_routing(page, "http://spa.test/") is True
+
+
+@pytest.mark.asyncio
+async def test_detect_hash_routing_from_nav_links(monkeypatch):
+    """The probe returns True when the app's own same-origin links are route
+    fragments (``#/login``), even if the root URL itself did not change."""
+
+    class _HashLinkPage(_FakePage):
+        async def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            self.url = url  # no root rewrite
+
+        async def evaluate(self, script, *args):
+            if "routerLink" in script:  # DOM_LINK_SCRIPT
+                return ["http://spa.test/#/login", "http://spa.test/#/register"]
+            return []
+
+    page = _HashLinkPage()
+    engine = BrowserDiscoveryEngine()
+    assert await engine._detect_hash_routing(page, "http://spa.test/") is True
+
+
+@pytest.mark.asyncio
+async def test_detect_hash_routing_false_for_path_router(monkeypatch):
+    """A path-routed app neither rewrites the root into a ``#/`` fragment nor
+    links via route fragments, so the probe reports False (bare-path seeding)."""
+
+    class _PathRouterPage(_FakePage):
+        async def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            self.url = url
+
+        async def evaluate(self, script, *args):
+            if "routerLink" in script:  # DOM_LINK_SCRIPT
+                return ["http://spa.test/login", "http://spa.test/about#section"]
+            return []
+
+    page = _PathRouterPage()
+    engine = BrowserDiscoveryEngine()
+    assert await engine._detect_hash_routing(page, "http://spa.test/") is False
 
 
 def test_runtime_request_classifier_records_concrete_drop_reasons():
@@ -1739,6 +2027,12 @@ class _FallbackFillPage:
             raise RuntimeError("element not found (re-rendered)")
         self.filled[selector] = "checked"
 
+    async def evaluate(self, script, *args):
+        return None
+
+    async def wait_for_timeout(self, ms):
+        return None
+
 
 @pytest.mark.asyncio
 async def test_fill_form_fields_falls_back_when_field_tag_is_stripped():
@@ -1757,3 +2051,27 @@ async def test_fill_form_fields_falls_back_when_field_tag_is_stripped():
     # though their data-sentry-field selectors were gone.
     assert "[data-sentry-cluster='1'] input[type=email] >> nth=0" in page.filled
     assert "[data-sentry-cluster='1'] input[type=password] >> nth=0" in page.filled
+
+
+@pytest.mark.asyncio
+async def test_ui_state_signature_bounded_when_evaluate_hangs():
+    """A route whose JS keeps the main thread busy makes ``page.evaluate()``
+    never resolve. Playwright's ``evaluate`` ignores ``set_default_timeout``, so
+    without an explicit bound the call hangs forever — blocking the worker inside
+    ``_exercise_page``, which never returns to the deadline check, so the pool
+    ``gather`` join never completes and the whole crawl hangs past its budget
+    until killed. ``_ui_state_signature`` must therefore return promptly even
+    when ``evaluate`` never resolves."""
+
+    class _HangingPage:
+        url = "http://spa.test/#/chatbot/conversation/1"
+
+        async def evaluate(self, script, *args):
+            await asyncio.sleep(30)  # a page whose evaluate never returns
+            return "unreachable"
+
+    engine = BrowserDiscoveryEngine()
+    sig = await asyncio.wait_for(engine._ui_state_signature(_HangingPage()), timeout=3.0)
+    # The route prefix is preserved; the DOM portion is empty because the hung
+    # evaluate was bounded out (not awaited to completion).
+    assert sig == "http://spa.test/#/chatbot/conversation/1|"

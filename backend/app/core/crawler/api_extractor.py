@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
-from urllib.parse import parse_qs, parse_qsl, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlparse, urlunparse
 
 from app.core.crawler.models import ApiEndpoint, ParameterCandidate, ParameterLocation, RouteSource
 from app.core.crawler.url_parser import normalize_url
@@ -20,6 +20,18 @@ class ApiExtractor:
         r"""(?P<quote>["'`])(?P<path>(?:api|graphql|gql|rest|v[0-9]+|rpc|trpc|auth|oauth|session)/(?:[^"'`\s<>]+))(?P=quote)""",
         re.I,
     )
+    URL_STRING_RE = re.compile(r"""(?P<quote>["'`])(?P<path>/[^"'`\s<>]+)(?P=quote)""")
+    # Client-side navigation sinks: location.assign("/x") / location.replace("/x")
+    # / (window.)location.href = "/x" / window.location = "/x". Captures the quoted
+    # absolute-path literal, tolerating a leading base concat (hostServer+"/x").
+    # These are real server pages the app navigates to — safe to fetch (and parse
+    # their forms) even when single-segment, unlike arbitrary quoted strings.
+    NAV_SINK_RE = re.compile(
+        r"""(?:location\s*\.\s*(?:assign|replace)\s*\(|"""
+        r"""location(?:\s*\.\s*href)?\s*=)"""
+        r"""[^"'`]{0,40}?["'`](?P<path>/[^"'`\s<>]*)["'`]""",
+        re.I,
+    )
     FETCH_RE = re.compile(
         r"""(?:(?P<axios>axios)\.(?P<axios_method>get|post|put|patch|delete)|fetch|\.(?P<chain_method>get|post|put|patch|delete))\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""",
         re.I,
@@ -27,6 +39,42 @@ class ApiExtractor:
     JQUERY_AJAX_RE = re.compile(r"""\$\.(?:ajax|get|post)\s*\(\s*(?P<args>\{.*?\}|["'`][^"'`]+["'`])""", re.I | re.S)
     ANGULAR_HTTP_RE = re.compile(
         r"""(?:http|HttpClient)\s*\.\s*(?P<method>get|post|put|patch|delete)\s*\(\s*["'`](?P<path>[^"'`]+)["'`]""",
+        re.I,
+    )
+    # A verb call whose URL is a base-variable concat/template rather than a bare
+    # string literal: ``.post(this.host + "/x", body)`` or ``.put(`${base}/x/${id}`)``.
+    # The literal path tail is captured; the base var is resolved separately (see
+    # ``_resolve_base_vars``) so ``/api``-style prefixes are recovered. Matching
+    # both the fetch/axios and Angular ``HttpClient`` chains generically.
+    BASE_CONCAT_VERB_RE = re.compile(
+        r"""\.\s*(?P<method>get|post|put|patch|delete)\s*\(\s*"""
+        r"""(?:`\$\{\s*(?P<tvar>[A-Za-z_$][\w$.]*)\s*\}(?P<ttail>[^`]*)`"""
+        r"""|(?P<cvar>[A-Za-z_$][\w$.]*)\s*\+\s*["'](?P<ctail>[^"']*)["'])""",
+        re.I,
+    )
+    # A base-URL var concatenated with a quoted absolute-path literal in an
+    # ASSIGNMENT / config-property position (``url:host+"/file-upload"``,
+    # ``host=this.hostServer+"/api/Cards"``) rather than a verb call. The leading
+    # ``[:=]`` (with a negative lookbehind so multi-char operators like ``==`` /
+    # ``+=`` are not treated as the anchor) distinguishes it from
+    # ``BASE_CONCAT_VERB_RE`` (which is anchored on ``.verb(``), so the two never
+    # double-mine the same call. Recovers endpoints an SPA configures on an
+    # uploader / socket / service object whose path segment carries no
+    # ``/api``-style token (e.g. ``/file-upload``) and so is dropped by every
+    # other pass. The var must resolve to a base prefix OR be a base/host-ish
+    # name (then the origin is the base) — this anchoring keeps arbitrary string
+    # concatenations out.
+    BASE_CONCAT_ASSIGN_RE = re.compile(
+        r"""(?<![=!<>+\-*/%&|^~])[:=]\s*"""
+        r"""(?P<var>[A-Za-z_$][\w$.]*)\s*\+\s*["'](?P<tail>/[^"'`\s<>]*)["']""",
+    )
+    # Assignment of a base-URL-ish variable to a string literal, optionally
+    # prefixed by another base expression (``host = this.hostServer + "/api"``).
+    # Only names that themselves look like a base/host/api var are considered.
+    BASE_VAR_ASSIGN_RE = re.compile(
+        r"""(?:(?:const|let|var)\s+|this\.)?(?P<name>[A-Za-z_$][\w$]*)\s*[:=]\s*"""
+        r"""(?:(?P<base>[A-Za-z_$][\w$.]*)\s*\+\s*)?"""
+        r"""["'`](?P<lit>[^"'`]*)["'`]""",
         re.I,
     )
     JS_TEMPLATE_RE = re.compile(r"\$\{\s*(?P<expr>[^}]+?)\s*\}")
@@ -125,6 +173,24 @@ class ApiExtractor:
             path = match.group("path")
             add_endpoint(f"/{path}", "POST" if cls._looks_state_changing(path) else "GET")
 
+        for match in cls.URL_STRING_RE.finditer(script_text):
+            path = match.group("path")
+            if not cls._looks_rest_string_path(path):
+                continue
+            add_endpoint(path, "POST" if cls._looks_state_changing(path) else "GET", evidence="js-url-string")
+            parent = cls._rest_parent_path(path)
+            if parent:
+                add_endpoint(parent, "GET", evidence="rest-parent")
+
+        for match in cls.NAV_SINK_RE.finditer(script_text):
+            path = match.group("path")
+            # Same-origin absolute page paths the app navigates to. add_route
+            # resolves against base_url; the spider enforces same_domain, so an
+            # off-origin absolute URL matched here is dropped downstream. Guard
+            # protocol-relative (//host) explicitly since that is cross-origin.
+            if path and path.startswith("/") and not path.startswith("//"):
+                add_route(path)
+
         for match in cls.FETCH_RE.finditer(script_text):
             path = match.group("path")
             if cls._looks_api_path(path):
@@ -148,6 +214,84 @@ class ApiExtractor:
                     request_body=body,
                     content_type=content_type,
                 )
+
+        # Base-variable concat/template calls (body-coverage #3). A minified/dev
+        # build often writes ``http.post(this.api + "/Feedbacks", body)`` or
+        # ``http.put(`${base}/user/${id}`)`` where the literal tail alone carries
+        # no /api|/rest token and so is dropped by the string-literal passes above.
+        # Resolve the base var to its literal path prefix (only when unambiguous)
+        # and reconstruct the full path so the endpoint is recovered. Bodies are
+        # NOT invented here — a bare-variable body stays None (see plan #3).
+        # A base var (``host``/``baseUrl``/…) is frequently REUSED across many
+        # minified service classes, each binding it to a different resource path
+        # (``host=this.hostServer+"/rest/products"`` in one, ``+"/api/Feedbacks"``
+        # in another). The global resolver treats such a name as ambiguous and
+        # drops it, losing every ``this.host + "/x"`` endpoint. So resolve each
+        # concat call scope-locally too: the nearest preceding assignment of the
+        # same name (the call's own class field in minified output) wins when the
+        # name is globally ambiguous.
+        base_vars = cls._resolve_base_vars(script_text)
+        local_assignments = list(cls._iter_base_var_assignments(script_text))
+        for match in cls.BASE_CONCAT_VERB_RE.finditer(script_text):
+            var = match.group("tvar") or match.group("cvar") or ""
+            tail = match.group("ttail")
+            if tail is None:
+                tail = match.group("ctail") or ""
+            short = var.rsplit(".", 1)[-1]
+            prefix = (
+                base_vars.get(var)
+                or base_vars.get(short)
+                or cls._nearest_base_prefix(local_assignments, short, match.start())
+            )
+            if prefix is None:
+                continue
+            joined = prefix + (tail if tail.startswith("/") else f"/{tail}" if tail else "")
+            # A template tail may still carry ``${id}`` interpolations — normalise
+            # them to ``{name}`` path placeholders (a bare concat tail is unchanged).
+            joined = cls.normalize_template_url(joined)
+            if not cls._looks_api_path(joined):
+                continue
+            body, content_type = cls._infer_request_schema_near(script_text, match.start())
+            add_endpoint(
+                joined,
+                match.group("method").upper(),
+                evidence="base-concat",
+                request_body=body,
+                content_type=content_type,
+            )
+
+        # Base-var concat in an assignment / config-property position (not a verb
+        # call): ``url:host+"/file-upload"`` on an uploader/socket config, or a
+        # per-service ``host=this.hostServer+"/api/Cards"`` base field. These carry
+        # a real same-origin endpoint whose tail segment may have no /api|/rest
+        # token (``/file-upload``), so the string-literal and verb passes drop it.
+        # Reuse the same base-var resolution as the verb-concat loop; when the var
+        # is a base/host-ish name that resolved to no path prefix, the origin is
+        # the base (prefix ""). Not gated on ``_looks_api_path`` — the base anchor
+        # is what makes the tail a real endpoint — but static assets are skipped.
+        for match in cls.BASE_CONCAT_ASSIGN_RE.finditer(script_text):
+            var = match.group("var") or ""
+            tail = match.group("tail") or ""
+            short = var.rsplit(".", 1)[-1]
+            prefix = (
+                base_vars.get(var)
+                or base_vars.get(short)
+                or cls._nearest_base_prefix(local_assignments, short, match.start())
+            )
+            if prefix is None:
+                if not cls._looks_like_base_expression(short):
+                    continue
+                prefix = ""
+            joined = cls.normalize_template_url(prefix + tail)
+            if not joined.startswith("/") or joined.startswith("//"):
+                continue
+            if joined.lower().endswith(tuple(cls._STATIC_PATH_EXTENSIONS)):
+                continue
+            add_endpoint(
+                joined,
+                "POST" if cls._looks_state_changing(joined) else "GET",
+                evidence="base-concat-assign",
+            )
 
         for match in re.finditer(r"""\$\.ajax\s*\(\s*\{(?P<args>.*?)\}\s*\)""", script_text, re.I | re.S):
             args = match.group("args")
@@ -436,6 +580,65 @@ class ApiExtractor:
             )
         )
 
+    _STATIC_PATH_EXTENSIONS = {
+        ".css", ".js", ".mjs", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+        ".webp", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".webm",
+        ".pdf", ".txt", ".html", ".htm",
+    }
+    _REST_PARENT_PARAM_RE = re.compile(
+        r"/(?:\{[A-Za-z_][A-Za-z0-9_]*\}|:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[0-9a-fA-F]{16,}|[0-9a-fA-F-]{32,})$"
+    )
+
+    @classmethod
+    def _looks_rest_string_path(cls, path: str) -> bool:
+        """True for server-testable URL string literals found in JS bundles.
+
+        This is deliberately structural: keep same-origin absolute paths that
+        look like REST/API surfaces, and skip assets, templates, and UI routes.
+        It catches endpoints such as ``/profile/image/url`` without hardcoding
+        app-specific paths.
+        """
+        if not path.startswith("/") or path.startswith("//"):
+            return False
+        if any(token in path for token in ("${", "*", " ")):
+            return False
+        parsed = urlparse(path)
+        lowered_path = parsed.path.lower()
+        if not lowered_path or lowered_path == "/":
+            return False
+        if lowered_path.endswith(tuple(cls._STATIC_PATH_EXTENSIONS)):
+            return False
+        segments = [segment for segment in lowered_path.split("/") if segment]
+        if not segments:
+            return False
+        if cls._looks_api_path(path):
+            return True
+        if any(re.fullmatch(r"v[0-9]+", segment) for segment in segments):
+            return True
+        if len(segments) >= 3 and all(cls._is_restish_segment(segment) for segment in segments):
+            return True
+        return False
+
+    @staticmethod
+    def _is_restish_segment(segment: str) -> bool:
+        if not segment:
+            return False
+        if segment.startswith((".", "#")):
+            return False
+        if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", segment):
+            return True
+        if re.fullmatch(r"\{[A-Za-z_][A-Za-z0-9_]*\}|:[A-Za-z_][A-Za-z0-9_]*", segment):
+            return True
+        return False
+
+    @classmethod
+    def _rest_parent_path(cls, path: str) -> str | None:
+        parsed = urlparse(path)
+        parent = cls._REST_PARENT_PARAM_RE.sub("", parsed.path.rstrip("/"))
+        if parent and parent != parsed.path.rstrip("/") and parent != "/":
+            return urlunparse(parsed._replace(path=parent, params="", query="", fragment=""))
+        return None
+
     @staticmethod
     def _placeholder_name(expr: str) -> str:
         expr = expr.strip()
@@ -455,6 +658,91 @@ class ApiExtractor:
         return lowered in {"baseurl", "apiurl", "host", "server", "hostserver"} or any(
             token in lowered for token in ("base", "api", "host", "server", "origin")
         )
+
+    @classmethod
+    def _resolve_base_vars(cls, script_text: str) -> dict[str, str]:
+        """Map base-URL-ish variable names to their resolved literal *path* prefix.
+
+        Recovers the common ``const API = "/api"`` / ``this.baseUrl = "/rest"``
+        pattern so a later ``http.post(API + "/Feedbacks", …)`` call can be emitted
+        as ``/api/Feedbacks`` instead of being dropped. A base var may itself be a
+        concat of another base var and a literal (``host = this.hostServer +
+        "/api"``); those are resolved to just their literal tail's path so the tail
+        segment (``/api``) is preserved.
+
+        Framework-agnostic and deliberately conservative: a name is kept ONLY when
+        every assignment to it across the whole script agrees on the same literal.
+        Minified per-class fields frequently reuse a name (e.g. ``host`` bound to a
+        different resource path in each service) — resolving an ambiguous name
+        would fabricate wrong endpoints, so ambiguous names are dropped entirely.
+        Only path-shaped literals (leading ``/`` or a bare ``api``/``rest``-style
+        segment) are kept; absolute ``http(s)://`` origins collapse to their path.
+        """
+        candidates: dict[str, set[str]] = {}
+        for _pos, name, prefix in cls._iter_base_var_assignments(script_text):
+            candidates.setdefault(name, set()).add(prefix)
+        # Keep only unambiguous names (single agreed literal across the script).
+        return {name: next(iter(vals)) for name, vals in candidates.items() if len(vals) == 1}
+
+    # Bounded backward window for scope-local base-var resolution. A minified
+    # service class defines its own ``host=``/``baseUrl=`` field immediately
+    # before its methods, so the nearest preceding assignment within this many
+    # chars is that class's own field — the correct binding even when the same
+    # name is reused by other classes (which the global resolver drops as
+    # ambiguous). Generous because a class's own field is always the closest
+    # preceding one; the bound only guards against grabbing an unrelated prior
+    # class's field in the pathological case of a scope that never binds the var.
+    _BASE_VAR_SCOPE_WINDOW = 8000
+
+    @classmethod
+    def _iter_base_var_assignments(cls, script_text: str):
+        """Yield ``(pos, name, path_prefix)`` for every base-URL-ish var assignment.
+
+        Shared by the global unambiguous resolver (:meth:`_resolve_base_vars`)
+        and the scope-local nearest-preceding resolver
+        (:meth:`_nearest_base_prefix`). ``name`` is the bare identifier;
+        ``path_prefix`` is the literal collapsed to a path prefix (leading ``/``,
+        no trailing ``/``). Absolute origins collapse to their path portion.
+        """
+        for match in cls.BASE_VAR_ASSIGN_RE.finditer(script_text):
+            name = match.group("name")
+            if not name or not cls._looks_like_base_expression(name):
+                continue
+            literal = match.group("lit")
+            if literal is None:
+                continue
+            if literal.startswith("//"):
+                literal = urlparse("https:" + literal).path
+            elif literal.startswith(("http://", "https://")):
+                literal = urlparse(literal).path
+            if not literal:
+                continue
+            if not literal.startswith("/") and not cls.ROOT_RELATIVE_API_RE.match(literal):
+                continue
+            prefix = (literal if literal.startswith("/") else f"/{literal}").rstrip("/")
+            if prefix:
+                yield match.start(), name, prefix
+
+    @classmethod
+    def _nearest_base_prefix(
+        cls, assignments: list[tuple[int, str, str]], name: str, pos: int
+    ) -> str | None:
+        """Resolve a base var to its nearest preceding same-name assignment.
+
+        ``assignments`` is the position-sorted ``(pos, name, prefix)`` list from
+        :meth:`_iter_base_var_assignments`. Returns the prefix of the closest
+        assignment of ``name`` occurring before ``pos`` within
+        ``_BASE_VAR_SCOPE_WINDOW`` chars (the call's own class scope in minified
+        output), or ``None`` when none is in range.
+        """
+        best: str | None = None
+        for a_pos, a_name, a_prefix in assignments:
+            if a_pos >= pos:
+                break
+            if a_name != name or pos - a_pos > cls._BASE_VAR_SCOPE_WINDOW:
+                continue
+            best = a_prefix
+        return best
 
     @classmethod
     def _infer_request_schema_near(cls, script_text: str, start: int) -> tuple[Any, str | None]:
@@ -824,7 +1112,7 @@ class ApiExtractor:
     @staticmethod
     def _looks_state_changing(path: str) -> bool:
         lowered = path.lower()
-        return any(token in lowered for token in ("create", "update", "delete", "login", "logout", "submit", "mutation"))
+        return any(token in lowered for token in ("create", "update", "delete", "login", "logout", "submit", "mutation", "upload", "import"))
 
     @staticmethod
     def _infer_method_near(script_text: str, start: int) -> str:

@@ -57,7 +57,7 @@ from typing import Optional
 from app.config import get_settings
 from app.core.crawler.models import ParameterLocation
 from app.core.detectors.attack_surface import AttackTarget
-from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
+from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData, is_dead_baseline
 from app.core.verification.verification_framework import (
     BaseVerifier,
     URLParameterBuilder,
@@ -311,6 +311,24 @@ class SQLiVerifier(BaseVerifier):
                 is_vulnerable=False, confidence_score=0.0,
                 detection_method="none", findings=[],
                 evidence={"skipped": "phpinfo_or_debug_page"},
+            )
+
+        # Gate 0.5: Dead-baseline abort. When the UNMODIFIED baseline is
+        # 401/403/404/405 the target is unreachable/unauthorized/wrong-shape as
+        # sent, so no injection differential can exist — firing the full payload
+        # matrix (boolean/error/UNION/time) only produces 4xx noise. Login-style
+        # SQLi is unaffected: its baseline is a healthy 200 (only the deliberate
+        # false payload returns 401). A None/governor-denied baseline is not dead
+        # and falls through to the normal (best-effort) path.
+        if is_dead_baseline(pre_test_baseline):
+            logger.debug(
+                "Skipping all SQLi techniques on dead baseline (HTTP %s) %s:%s",
+                pre_test_baseline.status_code, url, parameter,
+            )
+            return VerificationResult(
+                is_vulnerable=False, confidence_score=0.0,
+                detection_method="none", findings=[],
+                evidence={"skipped": "dead_baseline", "baseline_status": pre_test_baseline.status_code},
             )
 
         # Gate 1: Content Type Check

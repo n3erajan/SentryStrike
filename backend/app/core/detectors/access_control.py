@@ -2,9 +2,10 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qsl, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
 
 from app.config import get_settings
 from app.core.crawler.spa import SpaFallbackDetector
@@ -47,8 +48,19 @@ class _ResponseProfile:
     json_shape: frozenset[str] = field(default_factory=frozenset)
     identifiers: frozenset[str] = field(default_factory=frozenset)
     sensitive_fields: frozenset[str] = field(default_factory=frozenset)
+    # Narrow subset of sensitive_fields that carry genuinely secret material
+    # (credentials, tokens, keys, crypto seeds). Unlike broad PII field names
+    # (email/username/role), a secret field in an anonymous response is an
+    # unambiguous leak regardless of whether the endpoint is otherwise public.
+    secret_fields: frozenset[str] = field(default_factory=frozenset)
     item_count: int = 0
     body_length: int = 0
+
+# State-changing HTTP methods whose authorization is tested non-destructively
+# (synthetic non-existent id + status differential), never via the read-oriented
+# IDOR baseline. POST is excluded: it targets a collection (no owner id to
+# destroy) and is already exercised by the auth matrix / create paths.
+_MUTATING_AUTHZ_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
 
 # ---------------------------------------------------------------------------
 # Regex helpers
@@ -176,7 +188,22 @@ _NON_ID_VALUES: frozenset[str] = frozenset({
 
 
 def _looks_like_login_page(body: str) -> bool:
-    """Return True when the response body appears to be a login/auth wall."""
+    """Return True when the response body appears to be a login/auth wall.
+
+    A login wall is an HTML document. A structured JSON/data payload is an API
+    response and is NEVER a login page — even when it contains field names such
+    as ``email``, ``username`` or ``lastLoginIp`` (whose substring "login"
+    otherwise trips the word heuristic). Guarding on JSON first prevents a data
+    collection (e.g. a user listing) from being misread as a login wall, which
+    would suppress genuine authorization findings against it.
+    """
+    stripped = body.lstrip()
+    if stripped[:1] in ("{", "["):
+        try:
+            json.loads(stripped)
+            return False
+        except ValueError:
+            pass
     b = body.lower()
     has_login_word = any(s in b for s in _LOGIN_SIGNALS)
     has_credential_field = any(s in b for s in _LOGIN_CREDENTIAL_SIGNALS)
@@ -261,6 +288,39 @@ def _strip_query(url: str) -> str:
 # We implement the same multi-signal differential below.
 # ---------------------------------------------------------------------------
 
+def _json_structural_analysis(a: str, b: str) -> tuple[float, float] | None:
+    import json
+    try:
+        ja = json.loads(a)
+        jb = json.loads(b)
+    except Exception:
+        return None
+        
+    def flatten(obj: object, prefix: str = "") -> dict[str, object]:
+        items: dict[str, object] = {}
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                items.update(flatten(v, f"{prefix}.{k}"))
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                items.update(flatten(v, f"{prefix}[{i}]"))
+        else:
+            items[prefix] = obj
+        return items
+        
+    fa = flatten(ja)
+    fb = flatten(jb)
+    if not fa and not fb:
+        return 1.0, 1.0
+        
+    keys_union = set(fa.keys()) | set(fb.keys())
+    if not keys_union:
+        return 1.0, 1.0
+        
+    key_matches = sum(1 for k in keys_union if k in fa and k in fb)
+    val_matches = sum(1 for k in keys_union if fa.get(k) == fb.get(k))
+    return key_matches / len(keys_union), val_matches / len(keys_union)
+
 def _differential_idor_verdict(
     *,
     own_body: str,
@@ -270,51 +330,40 @@ def _differential_idor_verdict(
     """
     Apply Burp-Suite-style differential analysis to decide whether a response
     to a mutated ID represents a genuine IDOR or a false positive.
-
-    Returns (is_idor, similarity_own_vs_mutated, reason).
-
-    Rules (applied in order):
-      R1. If the mutated+authed body looks like an error / not-found page →
-          not IDOR (the app rejected the mutated ID gracefully).
-      R2. If the mutated+unauthed body is provided and is nearly identical to
-          the mutated+authed body → the resource is publicly accessible,
-          so this is not a meaningful access-control bypass.
-      R3. similarity(own, mutated_authed) > 0.98 → both requests returned the
-          same generic template; not a real different object.
-      R4. similarity(own, mutated_authed) < 0.10 → the response is so
-          different that it is probably a generic error page that slipped
-          through the keyword filter.
-      R5. Passed all guards → genuine IDOR signal; report with similarity score.
-
-    The similarity thresholds are intentionally conservative to minimise
-    false positives at the cost of a slightly higher miss rate.
     """
-    # R1: error-page guard
     if _looks_like_error_page(mutated_authed_body):
         return False, 0.0, "mutated response resembles an error/not-found page"
 
-    # R2: public-resource guard
+    # Semantic JSON Differential
+    json_sims = _json_structural_analysis(own_body, mutated_authed_body)
+    if json_sims is not None:
+        key_sim, val_sim = json_sims
+        if key_sim < 0.50:
+            return False, key_sim, "mutated JSON structure differs too much (likely an error object)"
+        if val_sim == 1.0:
+            return False, 1.0, "mutated JSON has identical values (generic template or same object)"
+            
+        if mutated_unauthed_body is not None:
+            unauth_json_sims = _json_structural_analysis(mutated_authed_body, mutated_unauthed_body)
+            if unauth_json_sims is not None:
+                _, unauth_val_sim = unauth_json_sims
+                if unauth_val_sim > 0.99:
+                    return False, 0.0, "mutated JSON is identical to unauthed JSON (publicly accessible)"
+                    
+        return True, val_sim, "JSON differential analysis passed"
+
+    # Fallback to Text-Based Differential
     if mutated_unauthed_body is not None:
         unauth_sim = _body_similarity(mutated_authed_body, mutated_unauthed_body)
         if unauth_sim > 0.85:
-            return (
-                False,
-                0.0,
-                f"mutated resource is publicly accessible (authed vs unauthed similarity: {unauth_sim:.0%})",
-            )
+            return False, 0.0, f"mutated resource is publicly accessible (authed vs unauthed similarity: {unauth_sim:.0%})"
 
-    # R3 / R4: own-vs-mutated similarity band
     own_sim = _body_similarity(own_body, mutated_authed_body)
     if own_sim > 0.95:
         return False, own_sim, "mutated response is virtually identical to own resource (generic template)"
     if own_sim < 0.10:
-        return (
-            False,
-            own_sim,
-            "mutated response is too dissimilar from own resource — likely an error page",
-        )
+        return False, own_sim, "mutated response is too dissimilar from own resource — likely an error page"
 
-    # Passed all guards
     return True, own_sim, "differential analysis passed"
 
 
@@ -437,16 +486,33 @@ class AccessControlDetector(BaseDetector):
                 authed_verifier,
                 **kwargs,
             )
-            fb_findings, idor_findings, matrix_findings, mass_assignment_findings = await asyncio.gather(
+            mutating_authz_task = self._check_mutating_authorization(
+                urls,
+                forms,
+                unauthed_verifier,
+                authed_verifier,
+                second_verifier,
+                privileged_verifier,
+                **kwargs,
+            )
+            (
+                fb_findings,
+                idor_findings,
+                matrix_findings,
+                mass_assignment_findings,
+                mutating_authz_findings,
+            ) = await asyncio.gather(
                 forced_browsing_task,
                 idor_task,
                 matrix_task,
                 mass_assignment_task,
+                mutating_authz_task,
             )
             findings.extend(fb_findings)
             findings.extend(idor_findings)
             findings.extend(matrix_findings)
             findings.extend(mass_assignment_findings)
+            findings.extend(mutating_authz_findings)
         finally:
             await authed_verifier.close()
             await unauthed_verifier.close()
@@ -467,6 +533,7 @@ class AccessControlDetector(BaseDetector):
         ("isAdmin", True),
         ("admin", True),
         ("is_admin", True),
+        ("is_staff", True),
         ("permissions", ["admin"]),
     )
 
@@ -530,36 +597,88 @@ class AccessControlDetector(BaseDetector):
             token in str(key).lower() for key in body for token in ("email", "user", "account", "profile")
         )
 
+    # Entire-value email match (a bare address, not free text that mentions one).
+    _BARE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    # Body keys whose values carry a uniqueness constraint on a create.
+    _IDENTITY_KEY_TOKENS: tuple[str, ...] = ("email", "username", "user_name", "login")
+
+    @classmethod
+    def _freshen_unique_identity_fields(cls, body: dict[str, Any]) -> dict[str, Any]:
+        """Return a shallow copy of a create-request body with uniqueness-
+        constrained identity fields replaced by fresh unique values.
+
+        Replaying a captured CREATE (e.g. user registration) verbatim collides
+        with the record it originally created; the server rejects the duplicate
+        identity (``email must be unique``) with a 4xx, which would abort
+        replay-based checks before the real probe runs. Giving each replayed
+        create a unique identity lets it succeed so the actual probe is
+        evaluated. Framework-agnostic: identity fields are matched by common
+        key tokens or a bare-email-shaped value, and each replacement keeps the
+        observed shape (an email stays an email on its original domain).
+        """
+        if not isinstance(body, dict):
+            return body
+        fresh = dict(body)
+        unique = uuid.uuid4().hex[:12]
+        for key, value in list(fresh.items()):
+            if not isinstance(value, str):
+                continue
+            lowered = str(key).lower()
+            key_is_email = "email" in lowered
+            value_is_email = bool(cls._BARE_EMAIL_RE.match(value))
+            if key_is_email or value_is_email:
+                domain = value.split("@", 1)[1] if value_is_email else "sentrystrike.test"
+                fresh[key] = f"ss_ma_{unique}@{domain}"
+            elif any(token in lowered for token in cls._IDENTITY_KEY_TOKENS):
+                fresh[key] = f"ss_ma_{unique}"
+        return fresh
+
     async def _verify_mass_assignment_candidate(
         self,
         verifier: HttpVerifier,
         request: PreparedAttackRequest,
     ) -> list[Finding]:
+        body = request.json_body if request.json_body is not None else request.data
+        if not isinstance(body, dict):
+            return []
+
+        # A replayed CREATE (registration/signup) collides with the record it
+        # originally created — the server rejects the duplicate identity (e.g.
+        # "email must be unique") with a 4xx. That aborts the check before the
+        # privilege-field probe ever runs, producing a false negative. For POST
+        # (create) requests, give each replayed body a fresh unique identity so
+        # the create succeeds and the probe can be evaluated. UPDATE (PUT/PATCH)
+        # replays keep the observed identity (updating a record to its own value
+        # never collides).
+        is_create = request.method.upper() == "POST"
+
+        def _prepare_body(source: dict[str, Any]) -> dict[str, Any]:
+            return self._freshen_unique_identity_fields(source) if is_create else dict(source)
+
+        def _build(new_body: dict[str, Any]) -> PreparedAttackRequest:
+            return PreparedAttackRequest(
+                url=request.url,
+                method=request.method,
+                params=request.params,
+                data=new_body if request.data is not None and request.json_body is None else None,
+                json_body=new_body if request.json_body is not None else None,
+                headers=request.headers,
+                cookies=request.cookies,
+            )
+
         baseline = await self._send_prepared_request(
-            verifier, request, test_phase="mass_assignment_baseline"
+            verifier, _build(_prepare_body(body)), test_phase="mass_assignment_baseline"
         )
         baseline_profile = self._response_profile(baseline)
         if not baseline_profile.success or _looks_like_error_page(baseline.body):
             return []
 
-        body = request.json_body if request.json_body is not None else request.data
-        if not isinstance(body, dict):
-            return []
-
         for field, value in self._MASS_ASSIGNMENT_PROBES:
             if field in body:
                 continue
-            mutated_body = dict(body)
+            mutated_body = _prepare_body(body)
             mutated_body[field] = value
-            mutated = PreparedAttackRequest(
-                url=request.url,
-                method=request.method,
-                params=request.params,
-                data=mutated_body if request.data is not None and request.json_body is None else None,
-                json_body=mutated_body if request.json_body is not None else None,
-                headers=request.headers,
-                cookies=request.cookies,
-            )
+            mutated = _build(mutated_body)
             response = await self._send_prepared_request(
                 verifier,
                 mutated,
@@ -781,6 +900,234 @@ class AccessControlDetector(BaseDetector):
         return findings
 
     # ---------------------------------------------------------------------------
+    # Mutating-method authorization (universal, non-destructive)
+    #
+    # For ANY id-bearing state-changing request (DELETE/PUT/PATCH /x/:id) on any
+    # app, verify the authorization boundary by replaying it under each auth
+    # context with a SYNTHETIC NON-EXISTENT object id. A protected endpoint
+    # returns 401/403 to an unauthenticated principal BEFORE looking the object
+    # up; a broken one processes the request (any non-401/403 status). Because the
+    # id does not exist, no real record is ever modified — safe against any
+    # target. The optional destructive confirmation (opt-in) re-tests a real
+    # self-observed id to prove an actual state change.
+    # ---------------------------------------------------------------------------
+
+    async def _check_mutating_authorization(
+        self,
+        urls: list[str],
+        forms: list[object],
+        unauthed_verifier: HttpVerifier,
+        authed_verifier: HttpVerifier,
+        second_verifier: HttpVerifier | None,
+        privileged_verifier: HttpVerifier | None,
+        **kwargs: object,
+    ) -> list[Finding]:
+        settings = get_settings()
+        if not getattr(settings, "access_control_probe_mutating_methods", True):
+            return []
+        targets = self._build_mutating_authz_targets(**kwargs)
+        if not targets:
+            return []
+        allow_destructive = bool(getattr(settings, "allow_destructive_authz_confirmation", False))
+        semaphore = asyncio.Semaphore(self._CONCURRENCY)
+
+        async def _verify(entry: tuple[PreparedAttackRequest, PreparedAttackRequest | None]) -> list[Finding]:
+            synth_req, real_req = entry
+            async with semaphore:
+                try:
+                    return await self._verify_mutating_authz(
+                        synth_req,
+                        real_req if allow_destructive else None,
+                        unauthed_verifier,
+                        authed_verifier,
+                        second_verifier,
+                    )
+                except Exception:
+                    logger.exception("mutating-authz check failed for %s", synth_req.url)
+                    return []
+
+        results = await asyncio.gather(*[_verify(entry) for entry in targets])
+        findings: list[Finding] = []
+        for result in results:
+            findings.extend(result)
+        return findings
+
+    def _build_mutating_authz_targets(
+        self, **kwargs: object
+    ) -> list[tuple[PreparedAttackRequest, PreparedAttackRequest | None]]:
+        """Build (synthetic-id, real-id) request pairs for id-bearing mutating
+        endpoints. ``synthetic`` is always safe to fire (non-existent id); ``real``
+        is the original self-observed request (concrete id) used only for opt-in
+        destructive confirmation, or ``None`` when the source was a template with
+        no observed real id."""
+        requests = kwargs.get("requests") if isinstance(kwargs.get("requests"), list) else []
+        api_endpoints = kwargs.get("api_endpoints") if isinstance(kwargs.get("api_endpoints"), list) else []
+        out: list[tuple[PreparedAttackRequest, PreparedAttackRequest | None]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _add(req: PreparedAttackRequest | None, real: PreparedAttackRequest | None) -> None:
+            if req is None or req.method.upper() not in _MUTATING_AUTHZ_METHODS:
+                return
+            synth = self._request_with_synthetic_id(req)
+            if synth is None:
+                # No id-bearing path segment: not safe to fire (an id-less
+                # destructive action like DELETE /account would hit the real
+                # principal). Skipped in safe mode.
+                return
+            key = (synth.method.upper(), self._canonical_request_url(synth.url))
+            if key in seen:
+                return
+            seen.add(key)
+            out.append((synth, real))
+
+        for observation in requests:
+            req = self._request_from_observation(observation)
+            if req is None or req.method.upper() not in _MUTATING_AUTHZ_METHODS:
+                continue
+            # The observed request already carries a concrete (self-owned) id, so
+            # it doubles as the real-id request for destructive confirmation.
+            real = req if self._request_with_synthetic_id(req) is not None else None
+            _add(req, real)
+
+        for endpoint in api_endpoints:
+            req = self._request_from_endpoint(endpoint)
+            _add(req, None)
+
+        return out[:40]
+
+    def _request_with_synthetic_id(self, request: PreparedAttackRequest) -> PreparedAttackRequest | None:
+        """Return ``request`` with its last object-id path segment replaced by a
+        synthetic value guaranteed not to exist, or ``None`` when the path has no
+        id-bearing segment."""
+        parsed = urlparse(request.url)
+        segments = parsed.path.split("/")
+        target_index: int | None = None
+        for index in range(len(segments) - 1, -1, -1):
+            if segments[index] and _looks_like_path_id_segment(segments[index]):
+                target_index = index
+                break
+        if target_index is None:
+            return None
+        segments[target_index] = self._synthetic_nonexistent_id(segments[target_index])
+        new_url = urlunparse(parsed._replace(path="/".join(segments)))
+        return PreparedAttackRequest(
+            url=new_url,
+            method=request.method.upper(),
+            params=request.params,
+            data=request.data,
+            json_body=request.json_body,
+            headers=request.headers,
+            cookies=request.cookies,
+        )
+
+    @staticmethod
+    def _synthetic_nonexistent_id(original: str) -> str:
+        """A deterministic, same-shape id that will not resolve to any record."""
+        original = str(original)
+        if _NUMERIC_RE.match(original):
+            return "988000762197"  # far beyond any plausible sequential id
+        if _UUID_RE.match(original):
+            return "ffffffff-ffff-4fff-8fff-ffffffffffff"  # valid v4 shape, never assigned
+        if _LONG_HEX_RE.match(original):
+            return "f" * len(original)
+        return "sentrystrike-nonexistent-000000"
+
+    async def _verify_mutating_authz(
+        self,
+        synth_req: PreparedAttackRequest,
+        real_req: PreparedAttackRequest | None,
+        unauthed_verifier: HttpVerifier,
+        authed_verifier: HttpVerifier,
+        second_verifier: HttpVerifier | None,
+    ) -> list[Finding]:
+        _DENY = {401, 403}
+        owner = await self._send_prepared_request(
+            authed_verifier, synth_req, test_phase="mutating_authz_owner"
+        )
+        # Skip when even the authenticated owner is denied (creds insufficient for
+        # this endpoint) or the method is simply unsupported (405/501) — no
+        # reliable signal. A 404 for the OWNER is expected and fine: the object id
+        # is synthetic, so the endpoint (which we observed/extracted as live) ran
+        # the auth check, passed it, then failed the object lookup. That "auth
+        # passed, object not found" 404 is exactly the owner baseline we compare
+        # the unauthenticated principal against.
+        if owner.status_code in _DENY or owner.status_code in (405, 501):
+            return []
+
+        unauth = await self._send_prepared_request(
+            unauthed_verifier, synth_req, test_phase="mutating_authz_unauth"
+        )
+        # Missing authentication: the unauthenticated principal is treated the
+        # same as the authenticated owner (both processed past the auth gate). A
+        # protected endpoint returns 401/403 to unauth BEFORE object lookup.
+        if unauth.status_code in _DENY or _looks_like_login_page(unauth.body):
+            return []
+        if unauth.status_code != owner.status_code:
+            # Different handling for unauth vs owner (e.g. unauth 400 vs owner 204)
+            # is ambiguous; require identical treatment for a high-confidence call.
+            return []
+
+        confirmed = False
+        confirm_note = ""
+        if real_req is not None:
+            # Opt-in destructive confirmation (caller already gated on the flag):
+            # fire the mutating method with a REAL self-observed id under the
+            # unauthenticated context. A success proves an actual unauthorised
+            # state change, not merely reachable business logic.
+            real_unauth = await self._send_prepared_request(
+                unauthed_verifier, real_req, test_phase="mutating_authz_confirm_unauth"
+            )
+            if real_unauth.status_code in (200, 201, 202, 204):
+                confirmed = True
+                confirm_note = (
+                    f" Destructive confirmation: an unauthenticated {real_req.method} on the "
+                    f"real object id returned HTTP {real_unauth.status_code} (state change performed)."
+                )
+
+        # The shared owner/unauth status only demonstrates missing authorization
+        # when the mutating operation was actually PROCESSED. A matching non-success
+        # status (404 not-found, 400 bad-request, 409 conflict, 5xx, ...) proves the
+        # opposite: the mutation never ran, so no record changed and no auth signal
+        # exists — a 404 for a synthetic id short-circuits at routing/object-lookup
+        # and can occur whether or not the endpoint enforces auth. Identical 404s
+        # therefore say nothing about authorization. Require either a processed
+        # (2xx/3xx) shared status, or a destructive confirmation on a real id (which
+        # directly observed an unauthenticated state change).
+        if owner.status_code >= 400 and not confirmed:
+            return []
+
+        evidence = (
+            f"Missing authentication on state-changing endpoint: an unauthenticated "
+            f"{synth_req.method} to {synth_req.url} returned HTTP {unauth.status_code}, identical to "
+            f"the authenticated owner's HTTP {owner.status_code} — the endpoint does not enforce "
+            f"authentication for a mutating operation. Probed with a synthetic non-existent object id, "
+            f"so no real record was modified." + confirm_note
+        )
+        return [
+            Finding(
+                category=OwaspCategory.a01,
+                vuln_type="Missing Authorization on State-Changing Request",
+                severity=SeverityLevel.critical if confirmed else SeverityLevel.high,
+                url=synth_req.url,
+                parameter="",
+                method=synth_req.method,
+                payload=self._synthetic_nonexistent_id(""),
+                evidence=evidence,
+                confidence_score=95.0 if confirmed else 80.0,
+                detection_method="mutating_authz_differential",
+                detection_evidence={
+                    "unauth_status": unauth.status_code,
+                    "owner_status": owner.status_code,
+                    "destructive_confirmed": confirmed,
+                },
+                verified=True,
+                verification_request_snippet=unauth.request_snippet,
+                verification_response_snippet=unauth.response_snippet,
+                reproducible=True,
+            )
+        ]
+
+    # ---------------------------------------------------------------------------
     # API Authorization Matrix
     # ---------------------------------------------------------------------------
 
@@ -859,18 +1206,50 @@ class AccessControlDetector(BaseDetector):
         protected_low = low_profile.success and not _looks_like_login_page(low.body)
         unauth_success = unauth_profile.success and not _looks_like_login_page(unauth.body)
         unauth_sensitive = self._profile_exposes_nonpublic_data(target, unauth_profile)
+        # An endpoint that authenticates via credentials carried in the REQUEST
+        # body (login / token / authenticate) is doing its designed job when it
+        # returns 200 with a session token — stripping ambient session state does
+        # not make the call "unauthenticated", because the body itself carries the
+        # credential. Framework-agnostic: never treat such a response as an
+        # unauthorized data leak.
+        is_auth_endpoint = self._request_carries_credentials(request)
+
+        # PUBLIC-ENDPOINT SUPPRESSION (framework-agnostic).
+        # An endpoint that returns a response structurally identical to what an
+        # authenticated identity receives is *public by design*: identity does
+        # not change the result, so there is no authorization boundary being
+        # bypassed (product catalogues, language lists, public config, captcha,
+        # feedback walls, …). This is the single largest source of noise — a bare
+        # 200 JSON collection is not, on its own, a data leak. Only genuine secret
+        # material in the anonymous body overrides this, because such values must
+        # never be world-readable regardless of the endpoint's intended audience.
+        serves_secret = bool(unauth_profile.secret_fields)
+        authed_states = [
+            (profile, body)
+            for profile, body in (
+                (low_profile, low.body),
+                (second_profile, second.body if second is not None else ""),
+                (privileged_profile, privileged.body if privileged is not None else ""),
+            )
+            if profile is not None and profile.success
+        ]
+        serves_public_data = not serves_secret and any(
+            self._profiles_compatible(unauth_profile, profile, unauth.body, body)
+            for profile, body in authed_states
+        )
 
         if (
             unauth_success
             and unauth_sensitive
+            and not is_auth_endpoint
+            and not serves_public_data
             and not _looks_like_error_page(unauth.body)
-            and (not protected_low or self._profiles_compatible(unauth_profile, low_profile, unauth.body, low.body))
         ):
             findings.append(
                 Finding(
                     category=OwaspCategory.a01,
                     vuln_type="Unauthenticated API Data Exposure",
-                    severity=SeverityLevel.high if target.admin_like or unauth_profile.sensitive_fields else SeverityLevel.medium,
+                    severity=SeverityLevel.high if unauth_profile.secret_fields else SeverityLevel.medium,
                     url=request.url,
                     parameter=target.parameter,
                     method=request.method,
@@ -884,7 +1263,8 @@ class AccessControlDetector(BaseDetector):
                     confidence_score=88.0,
                     detection_method="authorization_matrix",
                     detection_evidence=self._matrix_evidence(
-                        unauth_profile, low_profile, second_profile, privileged_profile, target
+                        unauth_profile, low_profile, second_profile, privileged_profile, target,
+                        serves_public_data=serves_public_data,
                     ),
                     verified=True,
                     verification_request_snippet=unauth.request_snippet,
@@ -952,6 +1332,64 @@ class AccessControlDetector(BaseDetector):
                     ),
                     confidence_score=92.0,
                     detection_method="authorization_matrix_privileged_baseline",
+                    detection_evidence=self._matrix_evidence(
+                        unauth_profile, low_profile, second_profile, privileged_profile, target
+                    ),
+                    verified=True,
+                    verification_request_snippet=low.request_snippet,
+                    verification_response_snippet=low.response_snippet,
+                    reproducible=True,
+                )
+            )
+
+        # BROKEN OBJECT-LEVEL AUTHORIZATION (cross-identity, framework-agnostic).
+        # An object-scoped request (an id names ONE record) that is denied to
+        # anonymous callers (401/403/login/redirect) but returns the SAME record
+        # to two DISTINCT authenticated identities is not scoped to its owner:
+        # any authenticated user can read another user's object. The id-mutation
+        # path deliberately drops this — identical values across identities look
+        # like a "generic template" under its val_sim==1.0 short-circuit — so the
+        # matrix consumes {unauth, low, second} directly, regardless of val_sim.
+        # The "same record to both" signal is value-level (shared stable object
+        # identifiers), so genuine per-owner objects (different ids per identity)
+        # do not fire. Complements the horizontal check above, which handles the
+        # non-object-scoped (list/collection) case.
+        unauth_denied = (
+            unauth_profile.status_code in (401, 403)
+            or 300 <= unauth_profile.status_code < 400
+            or _looks_like_login_page(unauth.body)
+        )
+        if (
+            second is not None
+            and second_profile is not None
+            and second_profile.success
+            and protected_low
+            and target.has_object_reference
+            and unauth_denied
+            and not is_auth_endpoint
+            and not _looks_like_error_page(low.body)
+            and self._profile_has_sensitive_data(low_profile)
+            and bool(self._shared_identifiers(low_profile, second_profile))
+        ):
+            shared = sorted(self._shared_identifiers(low_profile, second_profile))
+            findings.append(
+                Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Broken Object-Level Authorization",
+                    severity=SeverityLevel.high,
+                    url=request.url,
+                    parameter=target.parameter,
+                    method=request.method,
+                    evidence=(
+                        "API authorization matrix: an object-scoped resource denied to "
+                        f"anonymous callers (HTTP {unauth.status_code}) returned the same "
+                        "object identifiers to two distinct authenticated identities "
+                        f"(low HTTP {low.status_code}, second HTTP {second.status_code}). "
+                        f"Shared identifiers: {', '.join(shared) or 'none'}. "
+                        f"Sensitive fields: {', '.join(sorted(low_profile.sensitive_fields)) or 'none'}."
+                    ),
+                    confidence_score=85.0,
+                    detection_method="authorization_matrix_cross_identity",
                     detection_evidence=self._matrix_evidence(
                         unauth_profile, low_profile, second_profile, privileged_profile, target
                     ),
@@ -1055,10 +1493,31 @@ class AccessControlDetector(BaseDetector):
                 )
             )
 
+        # Collection LIST-read probes. A GET on a REST collection (e.g. GET
+        # /api/Users) is a prime broken-authorization target, but it is frequently
+        # never observed: the listing is often only reachable from an admin/privileged
+        # UI that a low-privilege crawl never renders, and the same endpoint may be
+        # known only under a state-changing verb (e.g. POST /api/Users to register).
+        # Synthesize the read variant for every collection we know about so the
+        # authorization matrix can test it. GET is idempotent/read-only, so this is
+        # safe; genuinely public collections are suppressed by the matrix's own
+        # public-endpoint gate, and non-existent reads simply 404.
+        targets.extend(self._synthesize_collection_read_targets(requests, api_endpoints))
+
         deduped: list[_MatrixTarget] = []
         seen: set[tuple[str, str, str, str]] = set()
         for target in targets:
             if not self._is_replayable_matrix_request(target.request):
+                continue
+            # SAFETY: an id-bearing state-changer (DELETE/PUT/PATCH /x/:id) would,
+            # in the matrix, fire against the REAL object id under every auth
+            # context — destroying/altering a real record. Those are covered
+            # non-destructively (synthetic non-existent id) by
+            # ``_check_mutating_authorization``, so exclude them here. POST creates
+            # (no owner id in the path) stay in the matrix.
+            if target.request.method.upper() in _MUTATING_AUTHZ_METHODS and self._request_with_synthetic_id(
+                target.request
+            ) is not None:
                 continue
             key = (
                 target.request.method.upper(),
@@ -1070,6 +1529,12 @@ class AccessControlDetector(BaseDetector):
                 continue
             seen.add(key)
             deduped.append(target)
+        # The matrix is request-budget-capped, so ORDER matters: rank targets that
+        # actually expose an authorization boundary (collection reads, object
+        # references, identity/PII resources) above public noise (static assets,
+        # catalogues, version/telemetry endpoints) so high-value targets are not
+        # crowded out of the cap. Stable sort keeps discovery order within a tier.
+        deduped.sort(key=self._matrix_target_priority, reverse=True)
         return deduped[:80]
 
     async def _verify_idor_baseline(
@@ -1082,6 +1547,16 @@ class AccessControlDetector(BaseDetector):
         second_verifier: HttpVerifier | None,
     ) -> list[Finding]:
         cand_findings: list[Finding] = []
+
+        # SAFETY: the read-oriented IDOR baseline fires ``target.method`` on the
+        # OWNER's real value first (``idor_authed_own``). For a state-changing
+        # method that would mutate/destroy the owner's real resource, and the
+        # body-similarity verdict is meaningless on the empty/204 response anyway.
+        # Mutating-method authorization is handled non-destructively (synthetic
+        # non-existent id + status differential) by ``_check_mutating_authorization``.
+        if target.method.upper() in _MUTATING_AUTHZ_METHODS:
+            return []
+
         mutated_vals = _mutate_id(val)
 
         own_request = self._build_request_for_value(target, val)
@@ -1520,6 +1995,7 @@ class AccessControlDetector(BaseDetector):
         json_shape: set[str] = set()
         identifiers: set[str] = set()
         sensitive_fields: set[str] = set()
+        secret_fields: set[str] = set()
         item_count = 0
 
         def walk(value: Any, path: str = "") -> None:
@@ -1531,6 +2007,8 @@ class AccessControlDetector(BaseDetector):
                     lowered = key.lower()
                     if self._is_sensitive_field(lowered):
                         sensitive_fields.add(child_path)
+                    if self._is_secret_field(lowered):
+                        secret_fields.add(child_path)
                     if self._is_idor_param(key) and isinstance(child, (str, int)):
                         child_value = str(child)
                         if _is_valid_id_value(child_value):
@@ -1552,6 +2030,7 @@ class AccessControlDetector(BaseDetector):
             json_shape=frozenset(json_shape),
             identifiers=frozenset(identifiers),
             sensitive_fields=frozenset(sensitive_fields),
+            secret_fields=frozenset(secret_fields),
             item_count=item_count,
             body_length=len(response.body or ""),
         )
@@ -1563,12 +2042,19 @@ class AccessControlDetector(BaseDetector):
         second: _ResponseProfile | None,
         privileged: _ResponseProfile | None,
         target: _MatrixTarget,
+        *,
+        serves_public_data: bool | None = None,
     ) -> dict[str, Any]:
         return {
             "source": target.source,
             "parameter_location": target.parameter_location,
             "has_object_reference": target.has_object_reference,
             "admin_like": target.admin_like,
+            # The key discriminative signal for the AI: whether anonymous and
+            # authenticated responses are identical (public by design). When
+            # True, the endpoint has no authorization boundary — the AI should
+            # flag it as a false positive.
+            "serves_public_data": serves_public_data,
             "states": {
                 "unauthenticated": self._profile_summary(unauth),
                 "low": self._profile_summary(low),
@@ -1586,6 +2072,7 @@ class AccessControlDetector(BaseDetector):
             "json_shape": sorted(profile.json_shape)[:20],
             "identifiers": sorted(profile.identifiers)[:20],
             "sensitive_fields": sorted(profile.sensitive_fields)[:20],
+            "secret_fields": sorted(profile.secret_fields)[:20],
             "item_count": profile.item_count,
         }
 
@@ -1618,7 +2105,26 @@ class AccessControlDetector(BaseDetector):
 
     @staticmethod
     def _profile_exposes_nonpublic_data(target: _MatrixTarget, profile: _ResponseProfile) -> bool:
-        return target.admin_like or bool(profile.sensitive_fields)
+        # Non-public exposure must be evidenced by the anonymous response BODY
+        # carrying data that is not meant to be world-readable. Two structural,
+        # framework-agnostic signals qualify:
+        #   1. Secret material — passwords, tokens, API keys, crypto seeds, etc.
+        #      A secret in an anonymous response is a leak regardless of design.
+        #   2. Object-scoped data — the request targets a specific object (id in
+        #      path/query/body) and the response returns that record. Whether it
+        #      is truly a leak is then decided by the public-endpoint suppression
+        #      in ``_verify_matrix_target`` (a public detail page is identical
+        #      across auth states and is dropped there).
+        # A bare public collection (a product/feedback/language list with no
+        # secret fields and no object scoping) is NOT, on its own, evidence of a
+        # leak — such listings are public on the overwhelming majority of sites.
+        # An admin-looking URL is likewise not evidence: a public
+        # ``{"version": "x.y.z"}`` under ``/admin/*`` is not a data leak.
+        if profile.secret_fields:
+            return True
+        if target.has_object_reference and (profile.identifiers or profile.item_count > 0):
+            return True
+        return False
 
     @staticmethod
     def _is_sensitive_field(name: str) -> bool:
@@ -1645,10 +2151,70 @@ class AccessControlDetector(BaseDetector):
             )
         )
 
+    # Narrow secret-material tokens. Deliberately excludes broad PII names
+    # (email/username/role/address/phone) that legitimately appear in public
+    # listings: those are not, by themselves, a secret disclosure. A field whose
+    # name carries one of these tokens holds a credential, key, or crypto seed
+    # whose presence in an anonymous response is an unambiguous leak.
+    _SECRET_FIELD_TOKENS: tuple[str, ...] = (
+        "password",
+        "passwd",
+        "passwrd",
+        "pwd",
+        "secret",
+        "token",
+        "apikey",
+        "api_key",
+        "accesskey",
+        "access_key",
+        "privatekey",
+        "private_key",
+        "jwt",
+        "ssn",
+        "cvv",
+        "seed",
+        "mnemonic",
+        "passphrase",
+        "otp",
+        "totp",
+    )
+
+    @classmethod
+    def _is_secret_field(cls, name: str) -> bool:
+        return any(token in name for token in cls._SECRET_FIELD_TOKENS)
+
     def _target_has_access_control_relevance(self, target: AttackTarget) -> bool:
         if "access_control" in target.security_relevance:
             return True
         return self._is_idor_param(target.parameter)
+
+    _CREDENTIAL_BODY_KEYS = frozenset(
+        {"password", "passwd", "pass", "pwd", "otp", "totp", "credential", "credentials"}
+    )
+
+    def _request_carries_credentials(self, request: PreparedAttackRequest) -> bool:
+        """True when the request itself carries login credentials in its body.
+
+        Such an endpoint (login / authenticate / token / sign-in) is *meant* to
+        accept anonymous callers and return a session token, so a 200 under the
+        unauthenticated verifier is expected behaviour — not an authorization
+        bypass. Detection is structural (a password-like body key), so it holds
+        for any framework, not just a specific app's ``/login`` path.
+        """
+        body = request.json_body if request.json_body is not None else request.data
+        return self._body_has_credential_key(body)
+
+    def _body_has_credential_key(self, value: Any) -> bool:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if str(key).strip().lower() in self._CREDENTIAL_BODY_KEYS:
+                    return True
+                if self._body_has_credential_key(child):
+                    return True
+            return False
+        if isinstance(value, list):
+            return any(self._body_has_credential_key(child) for child in value[:5])
+        return False
 
     def _request_has_object_reference(self, request: PreparedAttackRequest) -> bool:
         parsed = urlparse(request.url)
@@ -1679,8 +2245,33 @@ class AccessControlDetector(BaseDetector):
             and not _looks_like_error_page(response.body)
         )
 
+    @staticmethod
+    def _has_placeholder_segment(url: str) -> bool:
+        """True when a URL path still contains an unresolved template/placeholder
+        segment rather than a concrete value.
+
+        Crawlers frequently capture route templates before the SPA binds real
+        data — ``/rest/track-order/:id``, ``/rest/track-order/undefined``,
+        ``/api/orders/{orderId}`` — and these are not real, replayable endpoints.
+        Detection is structural (segment shape), so it holds for any framework or
+        client router, and covers URL-encoded ``:`` (``%3A``) which the simple
+        ``/:`` literal check misses.
+        """
+        path = unquote(urlparse(url).path)
+        for segment in path.split("/"):
+            if not segment:
+                continue
+            lowered = segment.lower()
+            if lowered in {"undefined", "null", "nan", "none"}:
+                return True
+            if segment[0] in ":{[" or segment[-1] in "}]":
+                return True
+        return False
+
     def _is_replayable_matrix_request(self, request: PreparedAttackRequest) -> bool:
         if not request.url or "{" in request.url or re.search(r"/:[A-Za-z_]", request.url):
+            return False
+        if self._has_placeholder_segment(request.url):
             return False
         method = request.method.upper()
         if method in {"OPTIONS", "HEAD"}:
@@ -1700,6 +2291,90 @@ class AccessControlDetector(BaseDetector):
     def _is_admin_like_url(self, url: str) -> bool:
         lowered = urlparse(url).path.lower()
         return any(token in lowered for token in self.sensitive_path_tokens)
+
+    # Generic REST resource nouns that commonly hold user-scoped / privileged data.
+    # Used only to PRIORITISE authorization-matrix targets (never to gate detection),
+    # so high-value endpoints survive the request-budget cap. Target-agnostic.
+    _IDENTITY_RESOURCE_TOKENS = (
+        "user", "account", "member", "customer", "profile", "card", "address",
+        "order", "payment", "wallet", "invoice", "credential", "token", "admin",
+        "ssn", "email", "phone", "message", "notification", "secret", "key",
+    )
+    # Public/telemetry/static noise that carries no authorization boundary.
+    _MATRIX_NOISE_TOKENS = (
+        "/assets/", "/i18n/", "/fonts/", "/static/", ".js", ".css", ".png", ".svg",
+        ".ico", ".map", "languages", "application-version", "web3", "nft",
+        "captcha", "metrics",
+    )
+
+    @staticmethod
+    def _collection_base_url(url: str) -> str | None:
+        """Return the REST collection URL for *url*, or ``None`` if not applicable.
+
+        ``/api/Users/1`` and ``/api/Users`` both map to ``…/api/Users``. Scoped to
+        API namespaces (``/api/`` or ``/rest/``) so HTML/static pages are ignored.
+        A trailing object-id segment is dropped so an object URL still yields its
+        parent collection listing.
+        """
+        parsed = urlparse(url)
+        low_path = parsed.path.lower()
+        if "/api/" not in low_path and "/rest/" not in low_path:
+            return None
+        segments = [s for s in parsed.path.split("/") if s]
+        if segments and _looks_like_path_id_segment(segments[-1]):
+            segments = segments[:-1]
+        if not segments:
+            return None
+        last = segments[-1]
+        # The collection segment must be a plain resource name, not an id/token.
+        if _looks_like_path_id_segment(last) or not re.match(r"^[A-Za-z][A-Za-z0-9_-]*$", last):
+            return None
+        return f"{parsed.scheme}://{parsed.netloc}/" + "/".join(segments)
+
+    def _synthesize_collection_read_targets(
+        self, requests: list[object], api_endpoints: list[object]
+    ) -> list[_MatrixTarget]:
+        """Build read-only GET matrix targets for every known REST collection."""
+        bases: dict[str, str] = {}
+        for source in (requests or []):
+            url = str(getattr(source, "url", "") or "")
+            base = self._collection_base_url(url) if url else None
+            if base:
+                bases.setdefault(self._canonical_request_url(base), base)
+        for endpoint in (api_endpoints or []):
+            url = str(getattr(endpoint, "url", "") or "")
+            base = self._collection_base_url(url) if url else None
+            if base:
+                bases.setdefault(self._canonical_request_url(base), base)
+
+        targets: list[_MatrixTarget] = []
+        for base in bases.values():
+            request = PreparedAttackRequest(url=base, method="GET")
+            targets.append(
+                _MatrixTarget(
+                    request=request,
+                    source="collection_read_probe",
+                    has_object_reference=False,
+                    admin_like=self._is_admin_like_url(base),
+                )
+            )
+        return targets
+
+    def _matrix_target_priority(self, target: _MatrixTarget) -> int:
+        """Rank an authorization-matrix target; higher survives the budget cap."""
+        path = urlparse(target.request.url).path.lower()
+        score = 0
+        if target.admin_like:
+            score += 5
+        if target.has_object_reference:
+            score += 3
+        if target.source == "collection_read_probe":
+            score += 4
+        if any(token in path for token in self._IDENTITY_RESOURCE_TOKENS):
+            score += 3
+        if any(token in path for token in self._MATRIX_NOISE_TOKENS):
+            score -= 6
+        return score
 
     @staticmethod
     def _canonical_request_url(url: str) -> str:

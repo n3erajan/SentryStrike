@@ -209,3 +209,68 @@ def test_sqli_verifier_resolves_value_from_url():
         None,
     )
     assert resolved == "1"
+
+
+@pytest.mark.asyncio
+async def test_sqli_verifier_aborts_on_dead_baseline():
+    """A 401/404 baseline means the endpoint is unreachable as sent — the full
+    payload matrix must NOT fire (that was ~55% of wasted SQLi traffic)."""
+    verifier = SQLiVerifier()
+    phases: list[str] = []
+
+    async def mock_send(url, method="GET", params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase")
+        phases.append(phase)
+        # Every request (baseline included) is a hard 401 auth wall.
+        return ResponseData(
+            status_code=401, headers={}, body="Unauthorized",
+            response_time_ms=5.0, request_snippet="", response_snippet="",
+        )
+
+    verifier._send = mock_send
+
+    result = await verifier.verify(
+        url="http://example.com/api/Feedbacks/",
+        parameter="UserId",
+        method="POST",
+        value="1",
+    )
+
+    assert result.is_vulnerable is False
+    assert result.evidence.get("skipped") == "dead_baseline"
+    assert result.evidence.get("baseline_status") == 401
+    # Only the baseline probe ran; no injection phase was attempted.
+    assert phases == ["pre_test_baseline"]
+    assert not any(
+        p and ("injection" in p or "boolean" in p or "union" in p or "time" in p)
+        for p in phases
+    )
+
+
+@pytest.mark.asyncio
+async def test_sqli_verifier_proceeds_on_healthy_baseline_status():
+    """A healthy 200 baseline (login-style flow) must NOT be gated — injection
+    phases still run so real login SQLi is preserved."""
+    verifier = SQLiVerifier()
+    phases: list[str] = []
+
+    async def mock_send(url, method="GET", params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase")
+        phases.append(phase)
+        return ResponseData(
+            status_code=200, headers={}, body="ok" * 100,
+            response_time_ms=5.0, request_snippet="", response_snippet="",
+        )
+
+    verifier._send = mock_send
+
+    result = await verifier.verify(
+        url="http://example.com/rest/user/login",
+        parameter="email",
+        method="POST",
+        value="a@b.c",
+    )
+
+    # Not gated: the verifier moved past the baseline into real technique phases.
+    assert result.evidence.get("skipped") != "dead_baseline"
+    assert len(phases) > 1

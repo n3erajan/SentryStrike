@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from urllib.parse import urlsplit
 
 from app.config import get_settings
 from app.core.crawler.models import ParameterLocation
@@ -15,6 +16,60 @@ from app.core.verification.xss_verifier import (
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
+
+
+def _fragment_path(url: str) -> str:
+    """Return the fragment's path portion (``/#/search?q=x`` → ``/search``).
+
+    Empty for non-hash-router URLs — those are server paths the target sweep
+    already covers, so they need no SPA projection.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return ""
+    frag = parts.fragment or ""
+    if not frag:
+        return ""
+    # Strip a leading router token (``#``, ``!/``, ``/``) so ``!/search`` and
+    # ``#/search`` both normalise to a path starting with ``search``.
+    frag = frag.lstrip("#!").lstrip("/")
+    # Drop the fragment's own query string so segment splitting isn't confused.
+    frag = frag.split("?", 1)[0]
+    return frag
+
+
+def _path_segments(url_or_path: str) -> list[str]:
+    """Non-empty, deduplicated path segments in first-seen order.
+
+    ``/rest/products/search?q=x`` → ``["rest", "products", "search"]``;
+    ``/search`` → ``["search"]``. Generic over any path shape.
+    """
+    if not url_or_path:
+        return []
+    try:
+        parts = urlsplit(url_or_path)
+        path = parts.path or url_or_path
+    except Exception:
+        path = url_or_path
+    # If a full URL came in, urlsplit already isolated the path; otherwise
+    # strip any leading scheme/host/query by taking only the path portion.
+    if "://" in path:
+        try:
+            path = urlsplit(path).path
+        except Exception:
+            pass
+    path = path.split("?", 1)[0]
+    seen: set[str] = set()
+    segs: list[str] = []
+    for seg in path.split("/"):
+        seg = seg.strip()
+        if seg and seg not in seen:
+            seen.add(seg)
+            segs.append(seg)
+    return segs
 
 
 class XSSDetector(BaseDetector):
@@ -159,6 +214,73 @@ class XSSDetector(BaseDetector):
             stored_probe_urls, session_cookies,
         )
 
+        # ── Phase 0: Batch stored-XSS discovery ─────────────────────────────────
+        # Group body-parameter candidates by (url, method) and inject a unique
+        # canary into every parameter of each group in a single request, then
+        # probe each display URL once. This discovers which (param, display_url)
+        # pairs reflect *before* the per-payload fan-out, collapsing the stored
+        # probe from O(params × payloads × urls) to O(1 injection + urls).
+        # Only body/form/json candidates batch; query/path/header candidates are
+        # tested individually by the per-candidate verify loop below.
+        stored_display_overrides: dict[str, set[str]] = {}
+        batch_groups: dict[tuple[str, str], list[AttackTarget]] = {}
+        for cand in candidates:
+            if not isinstance(cand, AttackTarget):
+                continue
+            if cand.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable, ParameterLocation.form}:
+                key = (cand.url, cand.method.upper())
+                batch_groups.setdefault(key, []).append(cand)
+
+        # Run batch discovery for groups with 2+ body parameters — single-param
+        # groups get no batching benefit and are handled by the normal per-candidate
+        # verify loop. Run all batches concurrently.
+        async def run_batch_discovery(
+            group_key: tuple[str, str], group_cands: list[AttackTarget],
+        ) -> dict[str, set[str]]:
+            batch_verifier = XSSVerifier()
+            batch_verifier.http_verifier.cookies = session_cookies
+            if auth_headers:
+                batch_verifier.http_verifier.headers = {
+                    **batch_verifier.http_verifier.headers, **auth_headers,
+                }
+            try:
+                return await batch_verifier._batch_stored_discovery(
+                    group_cands,
+                    stored_probe_urls,
+                    stored_baselines=shared_baselines,
+                )
+            except Exception as e:
+                logger.debug("Batch stored discovery failed for %s: %s", group_key[0], e)
+                return {}
+            finally:
+                await batch_verifier.close()
+
+        batchable_groups = {
+            key: cands for key, cands in batch_groups.items() if len(cands) >= 2
+        }
+        if batchable_groups:
+            logger.debug(
+                "XSSDetector: running batch stored discovery for %d groups (%d total params)",
+                len(batchable_groups),
+                sum(len(c) for c in batchable_groups.values()),
+            )
+            batch_results = await asyncio.gather(
+                *(run_batch_discovery(k, c) for k, c in batchable_groups.items()),
+                return_exceptions=True,
+            )
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    logger.debug("Batch stored discovery group failed: %s", result)
+                    continue
+                for param, display_urls in result.items():
+                    stored_display_overrides.setdefault(param, set()).update(display_urls)
+
+            if stored_display_overrides:
+                logger.debug(
+                    "XSSDetector: batch discovery confirmed %d stored parameter(s)",
+                    len(stored_display_overrides),
+                )
+
         # ── Phase 1: HTTP-only scanning ───────────────────────────────────────────
         pending_browser_jobs: list[PendingBrowserVerification] = []
 
@@ -185,6 +307,12 @@ class XSSDetector(BaseDetector):
             # disable that fan-out and defer the stored-header hypothesis to the
             # browser-DOM sweep instead.
             verifier.spa_mode = is_spa
+            # Phase 5: seed the browser-aware stored oracle with the same
+            # authenticated storage_state the DOM sweep uses, so it can render
+            # authed-only display routes (e.g. a profile page carrying a stored
+            # canary) during stored-XSS execution confirmation.
+            if storage_state:
+                verifier._auth_storage_state = storage_state
             if auth_headers:
                 verifier.http_verifier.headers = {**verifier.http_verifier.headers, **auth_headers}
             try:
@@ -194,6 +322,7 @@ class XSSDetector(BaseDetector):
                     stored_display_urls=stored_probe_urls,
                     stored_baselines=shared_baselines,
                     target=target,
+                    stored_display_overrides=stored_display_overrides if stored_display_overrides else None,
                 )
                 pending: list[PendingBrowserVerification] = []
                 if result.evidence.get("browser_verification_pending"):
@@ -298,7 +427,7 @@ class XSSDetector(BaseDetector):
         if max_jobs == 0 or budget <= 0:
             return []
 
-        jobs = self._select_dom_reflection_jobs(targets, existing_findings, max_jobs)
+        jobs = self._select_dom_reflection_jobs(targets, existing_findings, max_jobs, routes=routes)
         if not jobs:
             return []
 
@@ -402,12 +531,30 @@ class XSSDetector(BaseDetector):
         targets: list[AttackTarget],
         existing_findings: list[Finding],
         max_jobs: int,
+        routes: list[object] | None = None,
     ) -> list[tuple[str, str, str]]:
         """Pick a bounded, prioritised set of (route_url, param, location) probes.
 
         Priority: params the HTTP phase already echoed (partial reflection), then
-        classic reflective names. Only query/fragment-reachable GET targets are
-        eligible — SPAs read these from location.search/hash.
+        classic reflective names, then everything else. Only query/fragment-
+        reachable GET targets are eligible — SPAs read these from
+        location.search/hash.
+
+        Jobs come from three sources:
+
+        1. Replayable GET attack targets — params observed on server-reachable
+           URLs. On an SPA these are typically API endpoints
+           (``/rest/<seg>/search?q=``) whose raw JSON response never executes an
+           injected canary, so navigating the API URL directly yields a clean
+           negative. To recover the dominant DOM-XSS class, each API-observed
+           param is additionally projected onto any discovered SPA route that
+           shares a path segment with the API (``/rest/<seg>/search`` ↔
+           ``/#/<seg>`` or ``/#/<seg>/…``) so the canary is delivered to the
+           route the SPA actually renders.
+        2. The query parameters carried on discovered SPA routes themselves
+           (``/#/search?q=x``) — these are never in the HTTP attack surface.
+        3. API↔SPA segment projection of route-derived params, so a ``q``
+           observed only on an API route still reaches its SPA counterpart.
         """
         echoed_params = {
             f.parameter for f in existing_findings if getattr(f, "parameter", None)
@@ -415,20 +562,34 @@ class XSSDetector(BaseDetector):
         prioritized: list[tuple[str, str, str]] = []
         fallback: list[tuple[str, str, str]] = []
         seen: set[tuple[str, str]] = set()
-        for target in targets:
-            if not isinstance(target, AttackTarget):
+
+        # Pre-compute SPA route URLs and their path segments once, so each
+        # API-observed param can be projected onto a rendering SPA route in
+        # O(1) per segment. Only hash-router SPA routes are candidates: a
+        # path-router SPA and a path API share the same server path and need
+        # no projection (the target itself navigates the rendered page).
+        spa_routes: list[str] = []
+        spa_segments: dict[str, list[str]] = {}
+        for route in routes or []:
+            route_url = getattr(route, "url", None) or (route if isinstance(route, str) else None)
+            if not route_url:
                 continue
-            if target.method.upper() != "GET":
+            frag = _fragment_path(route_url)
+            if not frag:
                 continue
-            if target.location not in (ParameterLocation.query, ParameterLocation.path):
-                continue
-            param = target.parameter
-            key = (target.url, param)
+            spa_routes.append(route_url)
+            for seg in _path_segments(frag):
+                spa_segments.setdefault(seg, []).append(route_url)
+
+        def consider(url: str, param: str) -> None:
+            if not url or not param:
+                return
+            key = (url, param)
             if key in seen:
-                continue
+                return
             seen.add(key)
             # SPAs read from both search and hash; probe both.
-            entry = (target.url, param, "both")
+            entry = (url, param, "both")
             param_lower = param.lower()
             reflective = (
                 param_lower in self.reflective_param_names
@@ -440,8 +601,73 @@ class XSSDetector(BaseDetector):
                 prioritized.append(entry)
             else:
                 fallback.append(entry)
+
+        def project_to_spa(api_url: str, param: str) -> None:
+            """Project an API-observed param onto any SPA route sharing a path segment.
+
+            Generic structural association: the last non-empty path segment of
+            the API URL is matched against the segments of every discovered SPA
+            hash route. ``/rest/products/search`` ↔ ``/#/search`` shares
+            ``search``; ``/api/v2/users`` ↔ ``/#/users`` shares ``users``. This
+            is string logic over observed structure — never a hardcoded
+            API↔SPA mapping.
+            """
+            for seg in _path_segments(api_url):
+                for spa_url in spa_segments.get(seg, []):
+                    consider(spa_url, param)
+
+        for target in targets:
+            if not isinstance(target, AttackTarget):
+                continue
+            if target.method.upper() != "GET":
+                continue
+            if target.location not in (ParameterLocation.query, ParameterLocation.path):
+                continue
+            consider(target.url, target.parameter)
+            # Project the API-observed param onto SPA routes sharing a segment
+            # so the DOM sweep navigates the rendering route, not the raw API.
+            project_to_spa(target.url, target.parameter)
+
+        # Route-derived jobs: query params on discovered SPA routes (including the
+        # fragment query of hash routes) that the target sweep above did not cover.
+        for route in routes or []:
+            route_url = getattr(route, "url", None) or (route if isinstance(route, str) else None)
+            if not route_url:
+                continue
+            for param in self._route_query_params(route_url):
+                consider(route_url, param)
+            # An API-style route (e.g. /rest/products/search?q=seed) can appear
+            # in the routes list too; project its params onto SPA counterparts.
+            for param in self._route_query_params(route_url):
+                project_to_spa(route_url, param)
+
         ordered = prioritized + fallback
         return ordered[:max_jobs]
+
+    @staticmethod
+    def _route_query_params(url: str) -> list[str]:
+        """Query-parameter names carried on a route URL.
+
+        Reads both the ordinary query string (``?a=1``) and the query embedded in
+        a client-side route fragment (``/#/search?q=x`` → ``q``), so hash-router
+        parameters become DOM-XSS probe candidates.
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        names: list[str] = []
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return names
+        parts = [parsed.query]
+        fragment = parsed.fragment or ""
+        if "?" in fragment:
+            parts.append(fragment.split("?", 1)[1])
+        for part in parts:
+            for name in parse_qs(part, keep_blank_values=True):
+                if name and name not in names:
+                    names.append(name)
+        return names
 
     @staticmethod
     def _static_dom_findings(kwargs: dict[str, object]) -> list[Finding]:

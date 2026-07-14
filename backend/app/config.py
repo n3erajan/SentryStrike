@@ -21,11 +21,26 @@ class Settings(BaseSettings):
     auth_cookie_secure: bool = Field(default=False, alias="AUTH_COOKIE_SECURE")
     auth_cookie_samesite: str = Field(default="lax", alias="AUTH_COOKIE_SAMESITE")
 
-    ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
-    ollama_model: str = Field(default="gemma4-e4b-8k", alias="OLLAMA_MODEL")
-    ollama_timeout_seconds: float = Field(default=120.0, alias="OLLAMA_TIMEOUT_SECONDS")
+    # AI / LLM — single OpenAI-compatible client. Works with any provider that
+    # speaks the Chat Completions API: local Ollama (set AI_BASE_URL to its /v1
+    # endpoint, leave AI_API_KEY empty), OpenAI, Groq, Together, OpenRouter,
+    # DeepSeek, Mistral, vLLM, LM Studio, llama.cpp, … Just change the base URL,
+    # model, and (for hosted providers) the API key.
+    ai_base_url: str = Field(default="http://localhost:11434/v1", alias="AI_BASE_URL")
+    ai_model: str = Field(default="gemma4-e4b-8k", alias="AI_MODEL")
+    # API key. Optional — local Ollama / unauthenticated local servers need none.
+    ai_api_key: str | None = Field(default=None, alias="AI_API_KEY")
+    ai_timeout_seconds: float = Field(default=120.0, alias="AI_TIMEOUT_SECONDS")
     ai_max_retries: int = Field(default=3, alias="AI_MAX_RETRIES")
     ai_batch_size: int = Field(default=1, alias="AI_BATCH_SIZE")
+    # Master switch for AI/LLM analysis. When False, the scanner and report
+    # generator skip all LLM calls and populate findings with deterministic
+    # fallbacks (faster, no model needed). Useful for CI/tests or offline runs.
+    ai_analysis_enabled: bool = Field(default=True, alias="AI_ANALYSIS_ENABLED")
+    # Send response_format={"type":"json_object"} (OpenAI JSON mode). Most
+    # providers support this; disable if yours rejects it — the client still
+    # extracts JSON from plain text.
+    ai_json_mode: bool = Field(default=True, alias="AI_JSON_MODE")
 
     crawl_depth: int = Field(default=3, alias="CRAWL_DEPTH")
     crawl_max_urls: int = Field(default=200, alias="CRAWL_MAX_URLS")
@@ -42,6 +57,15 @@ class Settings(BaseSettings):
     # bounded by ``crawl_browser_budget_seconds`` as a hard ceiling. Per-route
     # deadline checks still guarantee a clean truncation.
     crawl_browser_per_route_seconds: float = Field(default=6.0, alias="CRAWL_BROWSER_PER_ROUTE_SECONDS")
+    # Hard wall-clock cap on the WHOLE processing of a single route (navigate +
+    # settle + form submit + interaction + discovery). A route whose page never
+    # loads, or an interaction that wedges on an await the per-op bounds miss,
+    # is abandoned when this elapses and the worker moves on to the next route —
+    # so one bad route can never stall a worker (previously it hung until the
+    # pool-level watchdog fired, wasting ~budget seconds). Generous enough that a
+    # legitimately slow route (full nav + several form submits + interaction)
+    # completes well within it.
+    crawl_browser_route_cap_seconds: float = Field(default=60.0, alias="CRAWL_BROWSER_ROUTE_CAP_SECONDS")
     crawl_browser_base_seconds: float = Field(default=30.0, alias="CRAWL_BROWSER_BASE_SECONDS")
     # Hard cap on how many routes the browser crawl will visit in one run
     # (the priority queue drops the low-score tail when this is hit).
@@ -51,6 +75,30 @@ class Settings(BaseSettings):
     # N contexts means N× the request rate at the target — browser traffic
     # bypasses the httpx scan semaphore — so keep this conservative.
     crawl_browser_workers: int = Field(default=4, alias="CRAWL_BROWSER_WORKERS")
+    # Playwright per-action default timeout (ms) for the crawl context. Bounds any
+    # locator op that is not given an explicit timeout (get_attribute/evaluate/…)
+    # so it can never inherit Playwright's 30s default and orphan a 30s future
+    # after ``_bounded`` cancels it. Keep well below the per-route budget.
+    crawl_browser_action_timeout_ms: float = Field(default=2000.0, alias="CRAWL_BROWSER_ACTION_TIMEOUT_MS")
+    # Max safe action buttons clicked per in-page pass during button-driven
+    # mutation capture (body-coverage #1). Buttons that POST/PUT via a plain
+    # click with no <form> (add-to-cart, save, create, rate, redeem, …) are
+    # otherwise never exercised. Destructive/navigation labels are always
+    # excluded regardless of this cap. Keep modest so a control-dense grid can
+    # never dominate the per-route budget.
+    crawl_browser_action_click_limit: int = Field(default=15, alias="CRAWL_BROWSER_ACTION_CLICK_LIMIT")
+    # How many action-click passes to run per route. A pass re-runs only when the
+    # previous one clicked genuinely-new controls (SPA re-render / lazy content);
+    # a static page stops after one pass. Cross-route dedup + the crawl deadline
+    # are the other two independent stops, so this cannot loop.
+    crawl_browser_action_click_passes: int = Field(default=2, alias="CRAWL_BROWSER_ACTION_CLICK_PASSES")
+    # Workflow chaining depth (body-coverage #2). Some endpoints only fire after a
+    # prerequisite in-page action (add-to-basket → checkout; create address →
+    # select at checkout). After the first form+button pass on a route, if new
+    # interactive controls appeared, re-run the body-producing pass — up to this
+    # many total passes, or until the control signature stops changing, or the
+    # deadline hits. 1 disables chaining (single pass, same cost as before).
+    crawl_browser_workflow_depth: int = Field(default=2, alias="CRAWL_BROWSER_WORKFLOW_DEPTH")
     # Block non-essential resources (images/media/fonts/stylesheets + known
     # trackers) during browser crawl/auth to speed up settle. Never blocks
     # same-origin script/xhr/fetch/document. Disable if a target renders needed
@@ -61,6 +109,12 @@ class Settings(BaseSettings):
     # never dominate a scan.
     xss_browser_dom_max_jobs: int = Field(default=12, alias="XSS_BROWSER_DOM_MAX_JOBS")
     xss_browser_dom_budget_seconds: float = Field(default=60.0, alias="XSS_BROWSER_DOM_BUDGET_SECONDS")
+    # Bounds for the open-redirect browser-navigation sweep. Client-side SPA
+    # redirects (``#/redirect?to=…`` that set window.location in JS) leave no HTTP
+    # 302 to observe, so they are confirmed by navigating a real browser and
+    # checking the final origin. Same shape/caps as the XSS DOM sweep.
+    open_redirect_browser_max_jobs: int = Field(default=10, alias="OPEN_REDIRECT_BROWSER_MAX_JOBS")
+    open_redirect_browser_budget_seconds: float = Field(default=45.0, alias="OPEN_REDIRECT_BROWSER_BUDGET_SECONDS")
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     scanner_concurrency: int = Field(default=8, alias="SCANNER_CONCURRENCY")
     sensitive_paths_permutation_cap: int = Field(default=200, alias="SENSITIVE_PATHS_PERMUTATION_CAP")
@@ -71,6 +125,24 @@ class Settings(BaseSettings):
     # pathological fan-out (e.g. the header-stored XSS explosion) is capped.
     scanner_per_detector_request_cap: int = Field(default=6000, alias="SCANNER_PER_DETECTOR_REQUEST_CAP")
     scanner_per_parameter_request_cap: int = Field(default=600, alias="SCANNER_PER_PARAMETER_REQUEST_CAP")
+
+    # Authorization testing of STATE-CHANGING requests (universal, framework/
+    # business-agnostic). When on, the access-control detector probes id-bearing
+    # mutating endpoints (DELETE/PUT/PATCH /x/:id) under each auth context using a
+    # SYNTHETIC NON-EXISTENT object id, reading only the authorization verdict
+    # (401/403 = enforced; processed = missing auth). No real record is ever
+    # modified — safe against any target.
+    access_control_probe_mutating_methods: bool = Field(
+        default=True, alias="ACCESS_CONTROL_PROBE_MUTATING_METHODS"
+    )
+    # Opt-in higher-fidelity confirmation: additionally fire the mutating method
+    # against a REAL object id that OUR OWN session created/observed, to confirm
+    # an actual state change (true object-level BOLA). This performs real
+    # mutations (only on self-observed data) so it is OFF by default and must be
+    # enabled explicitly per authorized engagement.
+    allow_destructive_authz_confirmation: bool = Field(
+        default=False, alias="ALLOW_DESTRUCTIVE_AUTHZ_CONFIRMATION"
+    )
 
     # Verification / Scanning Settings
     scan_mode: str = Field(default="verified", alias="SCAN_MODE")  # verified / heuristic / aggressive
@@ -100,6 +172,11 @@ class Settings(BaseSettings):
     )
     oast_callback_base_url: str | None = Field(default=None, alias="OAST_CALLBACK_BASE_URL")
     oast_poll_url: str | None = Field(default=None, alias="OAST_POLL_URL")
+    oast_interaction_ttl_seconds: int = Field(default=3600, alias="OAST_INTERACTION_TTL_SECONDS")
+    # Blind-SSRF OAST confirmation: a fire-and-forget server-side fetch may land
+    # slightly after the injection returns, so poll a bounded number of times.
+    ssrf_oast_poll_attempts: int = Field(default=5, alias="SSRF_OAST_POLL_ATTEMPTS")
+    ssrf_oast_poll_interval_seconds: float = Field(default=0.4, alias="SSRF_OAST_POLL_INTERVAL_SECONDS")
     # In-band SSRF fallback: minimum consistent response-time delta (ms) between an
     # internal target and the external control before a probable (unverified) SSRF
     # is reported when no OAST callback is configured.

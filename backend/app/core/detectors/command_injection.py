@@ -1,10 +1,10 @@
 import asyncio
 import logging
-from urllib.parse import urlparse
 
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
+from app.core.detectors.param_selection import command_candidate, is_opaque_timing_value
 from app.core.verification.command_verifier import CommandInjectionVerifier
 
 logger = logging.getLogger(__name__)
@@ -13,43 +13,30 @@ logger = logging.getLogger(__name__)
 class CommandInjectionDetector(BaseDetector):
     name = "command_injection"
 
-    cmd_param_tokens = {
-        "ip", "host", "cmd", "exec", "ping", "command", "run", "args", "query", "target", "addr", "address",
-        "domain", "server", "destination", "uri", "url"
-    }
-    endpoint_context_tokens = {
-        "ping", "trace", "traceroute", "lookup", "nslookup", "dns", "whois", "network", "diagnostic",
-        "command", "exec", "shell", "run", "proxy", "connect",
-    }
-    contextual_param_tokens = {
-        "target", "value", "input", "query", "host", "ip", "addr", "address", "domain", "server",
-        "destination", "url", "uri",
-    }
-
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
         session_cookies = kwargs.get("session_cookies") or {}
         scan_config = kwargs.get("scan_config")
 
-        def cmd_filter(param_name: str) -> bool:
-            return self._name_may_be_command_input(param_name)
-
+        # Build the surface UNFILTERED, then select value-aware so that params
+        # with a generic name still qualify via a shell/host-shaped value or a
+        # diagnostic endpoint context. Command injection is often blind (no value
+        # shape at all), so any *replayable* param carrying a substantive opaque
+        # value is also allowed through to the timing probe — a positive signal
+        # is preferred, but its absence must not zero out coverage.
         planner = kwargs.get("attack_planner")
-        if planner is not None and hasattr(planner, "targets_for"):
-            candidates = [
-                cand for cand in planner.targets_for(self.name)
-                if cmd_filter(cand.parameter)
-            ]
-        else:
-            candidates = AttackSurface.build(
+        surface = (
+            planner.targets_for(self.name)
+            if planner is not None and hasattr(planner, "targets_for")
+            else AttackSurface.build(
                 urls,
                 forms,
                 parameters=kwargs.get("parameters") or [],
                 api_endpoints=kwargs.get("api_endpoints") or [],
                 requests=kwargs.get("requests") or [],
-                filter_fn=cmd_filter,
             )
-        candidates = [cand for cand in candidates if self._is_command_candidate(cand)]
+        )
+        candidates = [cand for cand in surface if self._is_command_candidate(cand)]
 
         if not candidates:
             return []
@@ -94,25 +81,15 @@ class CommandInjectionDetector(BaseDetector):
         await verifier.close()
         return findings
 
-    def _name_may_be_command_input(self, param_name: str) -> bool:
-        param_lower = param_name.lower()
-        return (
-            param_lower in self.cmd_param_tokens
-            or param_lower in self.contextual_param_tokens
-            or any(token in param_lower for token in ["cmd", "command", "exec", "run", "shell", "ping"])
-        )
-
     def _is_command_candidate(self, target: AttackTarget) -> bool:
-        param_lower = target.parameter.lower()
-        if param_lower in self.cmd_param_tokens or any(
-            token in param_lower for token in ["cmd", "command", "exec", "run", "shell", "ping"]
-        ):
-            return True
+        """Select a target for command-injection probing.
 
-        path_tokens = {
-            token
-            for token in urlparse(target.url).path.lower().replace("-", "/").replace("_", "/").split("/")
-            if token
-        }
-        has_endpoint_context = not path_tokens.isdisjoint(self.endpoint_context_tokens)
-        return has_endpoint_context and param_lower in self.contextual_param_tokens
+        Positive signal — a command-token name, a shell/host-shaped value, or a
+        diagnostic endpoint context (via the shared value-aware selection). Or,
+        for blind command injection (no value shape), any *replayable* target
+        whose baseline value is a substantive opaque string, so replayable
+        params are never silently dropped for lacking a positive signal.
+        """
+        if command_candidate(target.parameter, target.value, target.url):
+            return True
+        return bool(getattr(target, "replayable", False)) and is_opaque_timing_value(target.value)

@@ -103,3 +103,32 @@ def test_browser_forms_are_merged_into_detector_forms_same_origin_only():
         ("file", "file"),
         ("userId", "hidden"),
     ]
+
+
+def test_synthetic_named_inputs_are_dropped_during_merge():
+    # Pre-hydration Angular captures yield positional fallback names
+    # (field_<cid>_<idx>) flagged named=False. These are internal handles for
+    # fill/submit addressing, never real backend parameter names — they must
+    # not become injection targets. Real-named inputs in the same cluster
+    # survive.
+    browser_forms = [
+        {
+            "page_url": "http://localhost:3000/complain",
+            "action": "http://localhost:3000/api/Complaints",
+            "method": "POST",
+            "inputs": [
+                {"name": "message", "type": "textarea", "named": True},
+                {"name": "field_1_0", "type": "text", "named": False},
+                {"name": "field_1_1", "type": "text", "named": False},
+            ],
+        },
+    ]
+
+    merged = WebSpider._merge_browser_forms(
+        "http://localhost:3000/",
+        [],
+        browser_forms,
+    )
+
+    assert len(merged) == 1
+    assert [inp.name for inp in merged[0].inputs] == ["message"]

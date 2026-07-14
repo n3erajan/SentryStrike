@@ -8,13 +8,14 @@ browser validation to preserve performance while eliminating false positives.
 """
 
 import asyncio
+import copy
 import json
 import html
 import logging
 import random
 import re
 import string
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse, quote
 
 # Import Playwright's async framework smoothly
@@ -26,7 +27,8 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
 from app.core.crawler.models import ParameterLocation
-from app.core.detectors.attack_surface import AttackTarget
+from app.core.crawler.url_parser import is_static_asset
+from app.core.detectors.attack_surface import AttackTarget, _set_json_path
 from app.core.detectors.base_detector import Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
 from app.core.verification.verification_framework import (
@@ -153,11 +155,18 @@ class XSSVerifier(BaseVerifier):
 
     @classmethod
     def select_stored_probe_urls(cls, urls: list[str]) -> list[str]:
-        """Return a deduplicated, capped list of URLs worth probing for stored XSS."""
+        """Return a deduplicated, capped list of URLs worth probing for stored XSS.
+
+        Static assets (js/css/txt/images/…) are excluded: a stored XSS payload is
+        reflected into an HTML page's DOM, never into a plain-text/binary asset, so
+        re-fetching ``robots.txt``/``main.js`` as a stored sink only wastes budget.
+        """
         bare_urls: list[str] = []
         seen: set[str] = set()
         for url in urls:
             bare = url.split("?")[0]
+            if is_static_asset(bare):
+                continue
             if bare not in seen:
                 seen.add(bare)
                 bare_urls.append(bare)
@@ -166,6 +175,129 @@ class XSSVerifier(BaseVerifier):
         others = [u for u in bare_urls if u not in sinks]
         capped = sinks + others[: cls._STORED_PROBE_URL_CAP]
         return list(dict.fromkeys(capped))
+
+    async def _batch_stored_discovery(
+        self,
+        candidates: list[AttackTarget],
+        stored_display_urls: list[str],
+        stored_baselines: dict[str, ResponseData] | None = None,
+    ) -> dict[str, set[str]]:
+        """Inject unique canaries into all params of a route in one request,
+        then probe each display URL once to discover which (param, display_url)
+        pairs reflect.
+
+        Returns a mapping of ``parameter → {display_url, ...}`` for parameters
+        whose canary was found in at least one display URL's response. The
+        per-parameter canary mapping is stored in ``self._batch_canaries`` for
+        downstream use by ``_test_payload`` (so it can restrict stored probing
+        to only confirmed display URLs instead of fanning out to all of them).
+
+        This collapses the stored-XSS discovery phase from ``params × payloads ×
+        probe_urls`` to ``1 injection + probe_urls``, an O(n²) → O(n) reduction.
+        """
+        if not candidates or not stored_display_urls:
+            return {}
+
+        self._stored_baselines = dict(stored_baselines or {})
+        self._batch_canaries: dict[str, str] = {}
+
+        # Build one request that injects a unique canary into every parameter
+        # of the batch. For JSON-body targets, each canary goes into its own
+        # path within the same template. For form targets, each canary replaces
+        # its parameter's value. For query targets, each canary is appended.
+        canary_map: dict[str, str] = {}
+        primary_target = candidates[0]
+
+        # All candidates in a batch share the same url+method, so we use the
+        # first as the template carrier and inject every canary through it.
+        # For JSON-body targets, we merge canaries into one body copy.
+        merged_json_body: Any = None
+        merged_form_data: dict[str, str] = {}
+        merged_params: dict[str, str] = {}
+
+        for cand in candidates:
+            canary = ResponseAnalyzer.generate_probe_canary()
+            canary_map[cand.parameter] = canary
+            self._batch_canaries[cand.parameter] = canary
+
+            if cand.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
+                if merged_json_body is None:
+                    merged_json_body = copy.deepcopy(cand.json_template) if cand.json_template else {}
+                _set_json_path(merged_json_body, cand.parent_path or cand.parameter, canary)
+            elif cand.location == ParameterLocation.form and cand.form_inputs is not None:
+                merged_form_data[cand.parameter] = canary
+            elif cand.location == ParameterLocation.query:
+                merged_params[cand.parameter] = canary
+            else:
+                # path/header/cookie locations don't batch — skip them here;
+                # they're handled by the normal per-candidate verify loop.
+                pass
+
+        # Send the single batch injection request
+        try:
+            batch_url = primary_target.url
+            batch_method = primary_target.method
+            batch_headers = dict(primary_target.headers or {})
+            batch_cookies = dict(primary_target.cookies or {})
+
+            if merged_json_body is not None:
+                batch_headers.setdefault("Content-Type", "application/json")
+                batch_resp = await self._send(
+                    batch_url, batch_method, None, None,
+                    headers=batch_headers, cookies=batch_cookies,
+                    json_body=merged_json_body,
+                    test_phase="batch_stored_inject",
+                )
+            elif merged_form_data:
+                batch_resp = await self._send(
+                    batch_url, batch_method, None, merged_form_data,
+                    headers=batch_headers, cookies=batch_cookies,
+                    test_phase="batch_stored_inject",
+                )
+            elif merged_params:
+                batch_resp = await self._send(
+                    batch_url, batch_method, merged_params, None,
+                    headers=batch_headers, cookies=batch_cookies,
+                    test_phase="batch_stored_inject",
+                )
+            else:
+                return {}
+        except Exception as e:
+            logger.debug("Batch stored injection failed for %s: %s", primary_target.url, e)
+            return {}
+
+        # If the injection itself was rejected (e.g. 400 validation error),
+        # we can't determine stored reflection — fall back to per-param testing.
+        if getattr(batch_resp, "status_code", 200) in {400, 422}:
+            logger.debug(
+                "Batch stored injection rejected (status=%s) for %s; "
+                "falling back to per-parameter canary probing",
+                batch_resp.status_code, primary_target.url,
+            )
+            return {}
+
+        # Probe each display URL once and check for ANY canary
+        confirmed: dict[str, set[str]] = {}
+        for probe_url in stored_display_urls:
+            try:
+                if hasattr(self, "_stored_baselines") and probe_url in self._stored_baselines:
+                    baseline_resp = self._stored_baselines[probe_url]
+                else:
+                    baseline_resp = await self._send(
+                        probe_url, "GET", test_phase="stored_pre_test_baseline",
+                    )
+                    self._stored_baselines[probe_url] = baseline_resp
+
+                resp = await self._send(probe_url, "GET", test_phase="batch_stored_check")
+                body = resp.body or ""
+
+                for param, canary in canary_map.items():
+                    if canary in body:
+                        confirmed.setdefault(param, set()).add(probe_url)
+            except Exception as e:
+                logger.debug("Batch stored probe failed for %s: %s", probe_url, e)
+
+        return confirmed
 
     def _build_attack_request(
         self,
@@ -211,8 +343,16 @@ class XSSVerifier(BaseVerifier):
             stored_display_urls: Optional[list[str]] = None,
             stored_baselines: Optional[dict[str, ResponseData]] = None,
             target: Optional[object] = None,
+            stored_display_overrides: Optional[dict[str, set[str]]] = None,
         ) -> VerificationResult:
-            """Verify XSS vulnerability safely utilizing integrated hybrid checks."""
+            """Verify XSS vulnerability safely utilizing integrated hybrid checks.
+
+            ``stored_display_overrides`` carries the result of batch stored-XSS
+            discovery: a mapping of ``parameter → {display_url, ...}`` for
+            parameters whose canary was confirmed stored. When present, the
+            stored-reflection probe narrows to only those display URLs instead
+            of fanning out to every discovered URL.
+            """
             
             self._begin_verification(parameter)
             findings: list[Finding] = []
@@ -282,11 +422,43 @@ class XSSVerifier(BaseVerifier):
                         )
 
                         if not is_canary_reflected or method.upper() == "POST":
-                            reflected_in_stored = await self._check_stored_reflection(
-                                canary_payload, url, stored_display_urls, canary=canary
-                            )
-                            if reflected_in_stored:
-                                is_canary_reflected = True
+                            # Use batch stored-discovery results when available to
+                            # narrow the probe fan-out to only confirmed display URLs.
+                            # This replaces the broken O(params × payloads × urls)
+                            # fan-out with a targeted O(1) probe of the single
+                            # display URL where the canary was confirmed stored.
+                            batch_stored_urls: list[str] | None = None
+                            if stored_display_overrides and parameter in stored_display_overrides:
+                                batch_stored_urls = list(stored_display_overrides[parameter])
+
+                            if batch_stored_urls is not None:
+                                # Narrowed: probe only confirmed display URLs.
+                                for probe_url in batch_stored_urls:
+                                    try:
+                                        if hasattr(self, "_stored_baselines") and probe_url in self._stored_baselines:
+                                            baseline_resp = self._stored_baselines[probe_url]
+                                        else:
+                                            baseline_resp = await self._send(
+                                                probe_url, "GET", test_phase="stored_pre_test_baseline",
+                                            )
+                                            self._stored_baselines[probe_url] = baseline_resp
+                                        resp = await self._send(probe_url, "GET", test_phase="canary_stored_check")
+                                        is_ref, locs, was_enc = self._detect_reflection(canary_payload, resp.body)
+                                        if is_ref:
+                                            is_canary_reflected = True
+                                            break
+                                    except Exception as e:
+                                        logger.debug("Narrowed stored probe failed for %s: %s", probe_url, e)
+                            else:
+                                # No batch override: fall back to the existing
+                                # per-candidate stored probe (now correctly
+                                # calling _probe_stored, not the nonexistent
+                                # _check_stored_reflection).
+                                stored_reflected, _, _, _, _ = await self._probe_stored(
+                                    canary_payload, url, stored_display_urls, canary=canary,
+                                )
+                                if stored_reflected:
+                                    is_canary_reflected = True
 
                         if not is_canary_reflected:
                             return VerificationResult(
@@ -311,6 +483,7 @@ class XSSVerifier(BaseVerifier):
                 result = await self._test_payload(
                     url, parameter, method, value, payload, payload_type,
                     form_inputs, stored_display_urls, pre_test_baseline, target=target,
+                    stored_display_overrides=stored_display_overrides,
                 )
                 
                 if result.is_vulnerable:
@@ -422,8 +595,15 @@ class XSSVerifier(BaseVerifier):
         self, url: str, parameter: str, method: str, value: str, payload: str, payload_type: str,
         form_inputs: Optional[list], stored_display_urls: Optional[list[str]], pre_test_baseline: ResponseData,
         target: Optional[object] = None,
+        stored_display_overrides: Optional[dict[str, set[str]]] = None,
     ) -> VerificationResult:
-        """Test a single XSS payload using rapid static check followed by safe dynamic execution fallback."""
+        """Test a single XSS payload using rapid static check followed by safe dynamic execution fallback.
+
+        ``stored_display_overrides`` narrows the stored-reflection probe: when
+        batch discovery confirmed this parameter is stored, probe only the
+        confirmed display URLs; when batch discovery confirmed it is *not*
+        stored (absent from the map), skip the stored probe entirely.
+        """
         try:
             is_header = method.upper().startswith("HEADER:")
             canary = ResponseAnalyzer.generate_probe_canary()
@@ -470,19 +650,66 @@ class XSSVerifier(BaseVerifier):
             # single reflected-header check above (one request per header per
             # payload at the origin) still runs.
             skip_stored = is_header and getattr(self, "spa_mode", False)
+
+            # Batch stored-discovery override: when available, use the confirmed
+            # display URLs instead of fanning out to every discovered URL. If
+            # batch discovery ran and this parameter is absent from the map,
+            # the canary was not stored — skip the probe entirely (this is the
+            # primary request-savings path for non-stored POST params).
+            batch_overrides_present = stored_display_overrides is not None
+            batch_confirmed_urls: list[str] | None = None
+            if batch_overrides_present:
+                batch_confirmed_urls = list(stored_display_overrides.get(parameter, set()))
+
             if (not is_reflected or method.upper() == "POST") and not skip_stored:
-                await asyncio.sleep(0.1)
-                stored_reflected, stored_locations, stored_was_encoded, stored_resp, stored_evidence = (
-                    await self._probe_stored(
-                        injected_payload,
-                        url,
-                        stored_display_urls,
-                        canary=canary,
-                        is_header_injection=is_header,
+                if batch_overrides_present and not batch_confirmed_urls:
+                    # Batch discovery confirmed this param is not stored — skip
+                    # the per-payload stored probe fan-out entirely.
+                    pass
+                elif batch_confirmed_urls:
+                    # Narrowed: probe only confirmed display URLs.
+                    await asyncio.sleep(0.1)
+                    for probe_url in batch_confirmed_urls:
+                        try:
+                            if hasattr(self, "_stored_baselines") and probe_url in self._stored_baselines:
+                                baseline_resp = self._stored_baselines[probe_url]
+                            else:
+                                baseline_resp = await self._send(
+                                    probe_url, "GET", test_phase="stored_pre_test_baseline",
+                                )
+                                self._stored_baselines[probe_url] = baseline_resp
+                            resp = await self._send(probe_url, "GET", test_phase="stored_check")
+                            is_ref, locs, was_enc = self._detect_reflection(injected_payload, resp.body)
+                            if is_ref:
+                                verified, stored_evidence = ResponseAnalyzer.verify_reflection(
+                                    injected_payload, resp.body,
+                                    baseline_body=baseline_resp.body, canary=canary,
+                                )
+                                if verified:
+                                    is_reflected = True
+                                    locations = locs
+                                    was_encoded = was_enc
+                                    injected = resp
+                                    is_stored = True
+                                    reflection_evidence = stored_evidence
+                                    break
+                        except Exception as e:
+                            logger.debug("Narrowed stored payload probe failed for %s: %s", probe_url, e)
+                else:
+                    # No batch override: fall back to the existing per-payload
+                    # stored probe fan-out (correctly calling _probe_stored).
+                    await asyncio.sleep(0.1)
+                    stored_reflected, stored_locations, stored_was_encoded, stored_resp, stored_evidence = (
+                        await self._probe_stored(
+                            injected_payload,
+                            url,
+                            stored_display_urls,
+                            canary=canary,
+                            is_header_injection=is_header,
+                        )
                     )
-                )
-                if stored_reflected:
-                    is_reflected, locations, was_encoded, injected, is_stored, reflection_evidence = True, stored_locations, stored_was_encoded, stored_resp, True, stored_evidence
+                    if stored_reflected:
+                        is_reflected, locations, was_encoded, injected, is_stored, reflection_evidence = True, stored_locations, stored_was_encoded, stored_resp, True, stored_evidence
 
             if not is_reflected:
                 return VerificationResult(is_vulnerable=False, confidence_score=0.0, detection_method=payload_type, findings=[], evidence={"reflected": False})
@@ -584,6 +811,17 @@ class XSSVerifier(BaseVerifier):
   }};
   window.__sentry_xss_fired = false;
   window.__sentry_xss_events = [];
+  // EXECUTION-only oracle. A "fire" means our uniquely-canaried JavaScript
+  // actually RAN. Mere reflection of the canary as text or markup in the DOM is
+  // NOT execution: a payload that the app HTML-escapes or strips to inert text
+  // still leaves the canary substring in the page, but nothing executes. We
+  // therefore deliberately do NOT observe DOM mutations for canary presence —
+  // doing so conflates reflection with execution and produces false positives on
+  // any route that sanitises input (e.g. a track/search route that renders the
+  // parameter as escaped text). Every sweep vector invokes
+  // ``window.sentry_hook(canary)`` (or alert/confirm/prompt) from its executing
+  // context (onerror/onload/javascript:/inline script), so a genuine execution
+  // always routes through one of these callbacks — and only those set the flag.
   window.sentry_hook = (value) => {{
     if (!sentryCanary || String(value).includes(sentryCanary)) mark('hook', value);
   }};
@@ -592,31 +830,6 @@ class XSSVerifier(BaseVerifier):
       if (!sentryCanary || String(message || '').includes(sentryCanary)) mark(name, message);
       return name === 'prompt' ? '' : true;
     }};
-  }}
-  const hasCanary = (value) => !!value && String(value).includes(sentryCanary);
-  const scanNode = (node) => {{
-    if (!node) return;
-    if (hasCanary(node.textContent) || hasCanary(node.outerHTML)) mark('dom_mutation', sentryCanary);
-    if (node.tagName && String(node.tagName).toLowerCase() === 'script' && hasCanary(node.textContent)) {{
-      mark('script_canary', sentryCanary);
-    }}
-  }};
-  const startObserver = () => {{
-    try {{
-      new MutationObserver((mutations) => {{
-        for (const mutation of mutations) {{
-          scanNode(mutation.target);
-          for (const node of mutation.addedNodes || []) scanNode(node);
-        }}
-      }}).observe(document.documentElement || document, {{
-        childList: true, subtree: true, attributes: true, characterData: true
-      }});
-    }} catch (err) {{}}
-  }};
-  if (document.readyState === 'loading') {{
-    document.addEventListener('DOMContentLoaded', startObserver, {{once: true}});
-  }} else {{
-    startObserver();
   }}
 }})();
 """
@@ -893,23 +1106,31 @@ class XSSVerifier(BaseVerifier):
         surfaces.append(("query", urlunparse(parts)))
 
         # 2. Hash-route query: a query scoped to the hash path (``/#/route?p=``).
+        # Parse the hash's own query and REPLACE the parameter's value in place.
+        # A route discovered WITH a seed value (``/#/search?q=seed``) must not
+        # yield a duplicate ``q`` — the SPA resolves a repeated param to the
+        # first (seed) value, so the payload would never render. Preserve the
+        # route path and any sibling hash params.
         parts = list(parsed)
         frag = parts[5]
-        if frag and "?" in frag:
+        if frag:
             base, _, existing_q = frag.partition("?")
-            joiner = "&" if existing_q else ""
-            parts[5] = f"{base}?{existing_q}{joiner}{parameter}={enc}"
-        elif frag:
-            parts[5] = f"{frag}?{parameter}={enc}"
+            hash_query = dict(parse_qsl(existing_q, keep_blank_values=True))
+            hash_query[parameter] = payload
+            parts[5] = f"{base}?{urlencode(hash_query)}"
         else:
-            parts[5] = f"/?{parameter}={enc}"
+            parts[5] = f"/?{urlencode({parameter: payload})}"
         surfaces.append(("hash_query", urlunparse(parts)))
 
-        # 3. Raw fragment (``#p=``).
+        # 3. Raw fragment (``#p=``): some apps read ``location.hash`` as an opaque
+        # value string. Append rather than overwrite so a ``/route`` path in the
+        # fragment is never destroyed (overwriting it would navigate away from the
+        # rendering route and guarantee a false negative).
         parts = list(parsed)
         frag = parts[5]
-        if frag and "=" in frag and "?" not in frag:
-            parts[5] = f"{frag}&{parameter}={enc}"
+        if frag:
+            joiner = "&" if ("?" in frag or "=" in frag) else "?"
+            parts[5] = f"{frag}{joiner}{parameter}={enc}"
         else:
             parts[5] = f"{parameter}={enc}"
         surfaces.append(("fragment", urlunparse(parts)))
@@ -1095,7 +1316,117 @@ class XSSVerifier(BaseVerifier):
             if result:
                 return result
 
+        # Browser-aware stored oracle: for SPA targets the HTTP-body oracle
+        # above cannot observe client-rendered stored XSS — the canary is stored
+        # in the database and rendered into the DOM by the SPA, but the display
+        # URL's HTTP body is raw JSON or the SPA shell, never executable HTML.
+        # Navigate the display URL in a real browser with canary hooks installed
+        # and confirm EXECUTION. Falls back to the HTTP check above when no
+        # browser is available (already handled — we only reach here on a clean
+        # HTTP negative). Reuses the existing Playwright plumbing from the DOM
+        # sweep: _new_reflection_context, _install_xss_browser_hooks,
+        # _browser_xss_fired.
+        if (
+            getattr(self, "spa_mode", False)
+            and PLAYWRIGHT_AVAILABLE
+            and canary
+        ):
+            browser_result = await self._browser_stored_execution_probe(
+                urls_to_probe + tier2, canary, origin_url=origin_url,
+            )
+            if browser_result is not None:
+                return browser_result
+
         return False, [], False, None, {}
+
+    async def _browser_stored_execution_probe(
+        self,
+        display_urls: list[str],
+        canary: str,
+        *,
+        origin_url: str = "",
+    ) -> Optional[tuple[bool, list[int], bool, Optional[object], dict]]:
+        """Navigate display URLs in a browser and confirm canary execution.
+
+        For SPA targets where the stored canary is rendered client-side, the
+        HTTP-body oracle cannot observe it. This reuses the existing Playwright
+        canary-hook machinery (also used by the DOM reflection sweep) to navigate
+        each display URL, let the SPA render the stored data, and assert on
+        canary EXECUTION rather than HTTP-body reflection.
+
+        Returns the same tuple shape as :meth:`_probe_stored` on confirmation,
+        or ``None`` when no display URL executed the canary. The reflection
+        evidence is marked ``browser_execution_confirmed=True`` so the downstream
+        finding logic emits a verified Stored XSS rather than an API-reflection
+        note. Bounded to a small number of display URLs and a short per-page
+        wait to keep cost near-zero when nothing fires.
+        """
+        if not display_urls or not canary:
+            return None
+
+        # Bound the browser fan-out: the highest-value stored sinks (comment
+        # walls, profile pages, product reviews) cluster in the first few
+        # display URLs; the rest are low-yield static assets already filtered
+        # by select_stored_probe_urls.
+        probe_urls = display_urls[:5]
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = None
+            try:
+                context = await self._new_reflection_context(
+                    browser, origin_url or (probe_urls[0] if probe_urls else ""),
+                    storage_state=getattr(self, "_auth_storage_state", None),
+                )
+                for probe_url in probe_urls:
+                    page = await context.new_page()
+                    try:
+                        await self._install_xss_browser_hooks(page, canary)
+                        # Navigate the display route; the SPA reads stored data
+                        # from its API and renders it into the DOM. If the
+                        # stored canary is in the rendered output and the
+                        # browser executes it, the hooked hooks fire.
+                        await page.goto(probe_url, wait_until="domcontentloaded", timeout=5000)
+                        # Give the SPA a beat to fetch its data and render.
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=3000)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.35)
+                        fired = bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page)
+                        if fired:
+                            evidence = {
+                                "browser_execution_confirmed": True,
+                                "verification_canary": canary,
+                                "display_url": probe_url,
+                            }
+                            # The HTTP response object isn't the confirmation
+                            # medium here; synthesise a minimal carrier so the
+                            # downstream finding logic has a body to analyse.
+                            carrier = ResponseData(
+                                status_code=200,
+                                headers={},
+                                body=f"<stored xss canary={canary} executed in browser>",
+                                response_time_ms=0.0,
+                                request_snippet=f"GET {probe_url}",
+                                response_snippet=f"browser execution confirmed (canary={canary})",
+                            )
+                            return True, [0], False, carrier, evidence
+                    except Exception as exc:
+                        logger.debug("Browser stored-XSS probe failed for %s: %s", probe_url, exc)
+                    finally:
+                        if not page.is_closed():
+                            await page.close()
+            except Exception as exc:
+                logger.debug("Browser stored-XSS execution probe aborted: %s", exc)
+            finally:
+                if context is not None:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                await browser.close()
+        return None
 
     @staticmethod
     def _detect_reflection(payload: str, body: str) -> tuple[bool, list[int], bool]:

@@ -33,6 +33,11 @@ class FakeSpider:
         class Result:
             urls = ["https://example.com/search?q=1"]
             forms = []
+            routes = []
+            api_endpoints = []
+            requests = []
+            parameters = []
+            request_audit = []
 
         return Result()
 
@@ -40,12 +45,17 @@ class FakeSpider:
         class Result:
             urls = ["https://example.com/search?q=1"]
             forms = []
+            routes = []
+            api_endpoints = []
+            requests = []
+            parameters = []
+            request_audit = []
 
         return Result()
 
 
 class FakeTechDetector:
-    async def detect(self, _: str):
+    async def detect(self, _: str, **kwargs):
         return [TechnologyComponent(name="nginx", version="1.18", category="server")]
 
 
@@ -241,7 +251,7 @@ async def test_full_scan_against_mock_server(monkeypatch):
     
     try:
         # Mock AI Client to avoid actual LLM calls
-        from app.analyzers.ai_client import OllamaClient
+        from app.analyzers.ai_client import AIClient
         
         async def mock_generate_json_list(*args, **kwargs):
             # Return empty list or fallbacks
@@ -252,8 +262,8 @@ async def test_full_scan_against_mock_server(monkeypatch):
         async def mock_generate_json(*args, **kwargs):
             return kwargs.get('fallback', {})
             
-        monkeypatch.setattr(OllamaClient, "generate_json_list", mock_generate_json_list)
-        monkeypatch.setattr(OllamaClient, "generate_json", mock_generate_json)
+        monkeypatch.setattr(AIClient, "generate_json_list", mock_generate_json_list)
+        monkeypatch.setattr(AIClient, "generate_json", mock_generate_json)
         
         scan = FakeScan()
         scan.target_url = "http://127.0.0.1:8089"

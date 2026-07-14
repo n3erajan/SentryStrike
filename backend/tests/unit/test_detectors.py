@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qsl, urlparse
 
-from app.core.crawler.models import ApiEndpoint, RequestObservation
+from app.core.crawler.models import ApiEndpoint, ParameterCandidate, ParameterLocation, RequestObservation
 from app.core.detectors.access_control import AccessControlDetector
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
 from app.core.detectors.crypto_failures import CryptoFailuresDetector
@@ -188,6 +188,10 @@ async def test_access_control_tests_path_template_idor_targets() -> None:
 
 @pytest.mark.asyncio
 async def test_access_control_matrix_flags_sensitive_unauthenticated_api_exposure() -> None:
+    # A genuine unauthenticated exposure: the anonymous response carries secret
+    # material (a token). Such data must never be world-readable regardless of
+    # whether authenticated identities receive the same body, so the
+    # public-endpoint suppression does NOT apply — the secret path fires.
     detector = AccessControlDetector()
     request = RequestObservation(
         url="https://example.com/api/profile",
@@ -195,6 +199,10 @@ async def test_access_control_matrix_flags_sensitive_unauthenticated_api_exposur
         request_headers={"authorization": "Bearer browser-token"},
     )
     seen_headers: list[dict | None] = []
+    secret_body = (
+        '{"userId":1,"email":"alice@example.com","role":"user",'
+        '"apiToken":"sk_live_9f8e7d6c5b4a3210"}'
+    )
 
     async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
         seen_headers.append(kwargs.get("headers"))
@@ -203,7 +211,7 @@ async def test_access_control_matrix_flags_sensitive_unauthenticated_api_exposur
             return ResponseData(
                 200,
                 {"content-type": "application/json"},
-                '{"userId":1,"email":"alice@example.com","role":"user"}',
+                secret_body,
                 1.0,
                 request_snippet=f"{method} {url}",
                 response_snippet="HTTP/1.1 200 OK",
@@ -212,7 +220,7 @@ async def test_access_control_matrix_flags_sensitive_unauthenticated_api_exposur
             return ResponseData(
                 200,
                 {"content-type": "application/json"},
-                '{"userId":1,"email":"alice@example.com","role":"user"}',
+                secret_body,
                 1.0,
             )
         return ResponseData(404, {"content-type": "application/json"}, '{"error":"not found"}', 1.0)
@@ -244,6 +252,40 @@ async def test_access_control_matrix_does_not_flag_public_catalog_ids_without_se
 
     with patch.object(HttpVerifier, "send_request", send_request):
         findings = await detector.detect(urls=[], forms=[], requests=[request])
+
+    assert not any(f.vuln_type == "Unauthenticated API Data Exposure" for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_access_control_matrix_does_not_flag_public_endpoint_identical_across_auth_states() -> None:
+    # Regression guard for the dominant real-world false positive: a public
+    # endpoint (e.g. an app-configuration route) that returns a byte-identical
+    # response to anonymous, low-privilege and second-user requests. Identity
+    # does not change the result, so there is no authorization boundary being
+    # bypassed — even though the body contains a field name that trips the broad
+    # "sensitive" heuristic (``privacyContactEmail``). It must NOT be flagged.
+    detector = AccessControlDetector()
+    request = RequestObservation(
+        url="https://example.com/rest/admin/application-configuration",
+        method="GET",
+    )
+    public_config = (
+        '{"config":{"application":{"name":"Shop",'
+        '"privacyContactEmail":"donotreply@shop.example","altcoinName":"Coin"}}}'
+    )
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        # Same public body regardless of which auth state (unauth/low/second) asks.
+        return ResponseData(200, {"content-type": "application/json"}, public_config, 1.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[],
+            forms=[],
+            requests=[request],
+            auth_headers={"Authorization": "Bearer low-user"},
+            second_user_headers={"Authorization": "Bearer second-user"},
+        )
 
     assert not any(f.vuln_type == "Unauthenticated API Data Exposure" for f in findings)
 
@@ -298,6 +340,67 @@ async def test_access_control_reports_mass_assignment_privilege_field() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mass_assignment_survives_unique_create_collision() -> None:
+    """A replayed registration whose captured email is already taken must still
+    be detected: the detector freshens the unique identity field so the create
+    succeeds instead of aborting on the duplicate-email 400."""
+    detector = AccessControlDetector()
+    original_email = "taken@example.com"
+    request = RequestObservation(
+        url="https://example.com/api/Users",
+        method="POST",
+        request_headers={"content-type": "application/json"},
+        post_data='{"email":"' + original_email + '","password":"pw12345","passwordRepeat":"pw12345"}',
+        request_content_type="application/json",
+        replayable=True,
+    )
+    seen_emails: list[object] = []
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        body = kwargs.get("json_body")
+        phase = kwargs.get("test_phase", "")
+        email = body.get("email") if isinstance(body, dict) else None
+        seen_emails.append(email)
+        # The app enforces email uniqueness: any replay of the captured email
+        # (already registered) is rejected, exactly like Juice Shop.
+        if email == original_email:
+            return ResponseData(
+                400,
+                {"content-type": "application/json"},
+                '{"message":"Validation error","errors":[{"field":"email","message":"email must be unique"}]}',
+                1.0,
+            )
+        if phase == "mass_assignment_baseline":
+            return ResponseData(
+                201, {"content-type": "application/json"},
+                '{"id":9,"email":"' + str(email) + '","role":"customer"}', 1.0,
+                request_snippet=f"{method} {url}", response_snippet="HTTP/1.1 201 Created",
+            )
+        if phase == "mass_assignment_probe" and isinstance(body, dict) and body.get("role") == "admin":
+            return ResponseData(
+                201, {"content-type": "application/json"},
+                '{"id":9,"email":"' + str(email) + '","role":"admin"}', 1.0,
+                request_snippet=f"{method} {url}",
+                response_snippet="HTTP/1.1 201 Created\n\n{\"role\":\"admin\"}",
+            )
+        return ResponseData(400, {"content-type": "application/json"}, '{"error":"bad request"}', 1.0)
+
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=[], forms=[], requests=[request],
+            auth_headers={"Authorization": "Bearer low-user"},
+        )
+
+    # Mass-assignment replays used freshened unique identities (not the taken
+    # email), so the create succeeded and the probe ran — proving the finding is
+    # produced only because the duplicate-email collision was avoided. (Other
+    # access-control checks share the patched sender and may replay the observed
+    # body verbatim; the freshened create is what unlocks this finding.)
+    assert any(isinstance(e, str) and e.startswith("ss_ma_") for e in seen_emails)
+    assert any(f.vuln_type == "Mass Assignment / Privilege Field Injection" for f in findings)
+
+
+@pytest.mark.asyncio
 async def test_crypto_detector_flags_http() -> None:
     detector = CryptoFailuresDetector()
     urls = ["http://example.com/login"]
@@ -342,6 +445,74 @@ async def test_security_headers_detector_reports_once_for_site() -> None:
 
     header_findings = [finding for finding in findings if finding.vuln_type == "Missing Security Header"]
     assert len(header_findings) >= 4
+
+
+def test_evaluate_cors_classifies_permissive_policies() -> None:
+    detector = SecurityHeadersDetector()
+    probe = detector._CORS_PROBE_ORIGIN
+    probe_lower = probe.lower()
+
+    # Reflected arbitrary origin + credentials -> high (fully exploitable).
+    assert detector._evaluate_cors(
+        {"access-control-allow-origin": probe_lower, "access-control-allow-credentials": "true"}, probe
+    )[0] == "high"
+    # Reflected arbitrary origin, no credentials -> medium.
+    assert detector._evaluate_cors(
+        {"access-control-allow-origin": probe_lower}, probe
+    )[0] == "medium"
+    # Wildcard + credentials -> medium.
+    assert detector._evaluate_cors(
+        {"access-control-allow-origin": "*", "access-control-allow-credentials": "true"}, probe
+    )[0] == "medium"
+    # Wildcard alone -> low (the Juice Shop shape).
+    assert detector._evaluate_cors({"access-control-allow-origin": "*"}, probe)[0] == "low"
+    # null origin -> medium.
+    assert detector._evaluate_cors({"access-control-allow-origin": "null"}, probe)[0] == "medium"
+
+    # Correctly-scoped policies are NOT flagged (zero-FP).
+    assert detector._evaluate_cors({}, probe) is None  # no ACAO header
+    assert detector._evaluate_cors(
+        {"access-control-allow-origin": "https://app.example.com"}, probe
+    ) is None  # echoes a specific allowed origin, not the arbitrary probe
+
+
+@pytest.mark.asyncio
+async def test_security_headers_detector_reports_cors_wildcard() -> None:
+    detector = SecurityHeadersDetector()
+
+    class DummyResponse:
+        def __init__(self, headers: dict) -> None:
+            self.headers = headers
+
+    class DummyClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self) -> "DummyClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, headers: dict | None = None) -> DummyResponse:
+            # The CORS probe carries an Origin header; the target answers with a
+            # static wildcard ACAO regardless of the request origin.
+            return DummyResponse({"access-control-allow-origin": "*"})
+
+    import app.core.detectors.security_headers as security_headers_module
+
+    original_factory = security_headers_module.create_scan_client
+    security_headers_module.create_scan_client = lambda **kwargs: DummyClient()  # type: ignore[assignment]
+    try:
+        findings = await detector.detect(urls=["http://example.com/"], forms=[], root_url="http://example.com/")
+    finally:
+        security_headers_module.create_scan_client = original_factory  # type: ignore[assignment]
+
+    cors = [f for f in findings if f.vuln_type == "CORS Misconfiguration"]
+    assert len(cors) == 1
+    assert cors[0].severity == SeverityLevel.low
+    assert cors[0].verified is True
+    assert cors[0].category == OwaspCategory.a02
 
 
 @pytest.mark.asyncio
@@ -429,3 +600,141 @@ def test_file_inclusion_payloads_keep_php_wrappers_for_php_stack() -> None:
 
     assert any("/etc/passwd" in payload.lower() for payload in payload_values)
     assert any(payload.lower().startswith("php://") for payload in payload_values)
+
+
+# --- Poison-null-byte extension-filter bypass (directory-served files) --------
+
+def test_looks_like_directory_listing() -> None:
+    assert FileInclusionDetector._looks_like_directory_listing(
+        "<html><head><title>listing directory /ftp</title></head><body>...</body></html>"
+    )
+    assert FileInclusionDetector._looks_like_directory_listing(
+        '<a href="../">..</a><a href="a.md">a</a><a href="b.bak">b</a>'
+        '<a href="c.pyc">c</a><a href="d.yml">d</a><a href="e.gg">e</a>'
+    )
+    # A normal application page is not a directory listing.
+    assert not FileInclusionDetector._looks_like_directory_listing(
+        "<html><body><h1>Welcome</h1><a href='/login'>Login</a></body></html>"
+    )
+
+
+class _FakeResp:
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.body = body
+        self.request_snippet = "GET"
+        self.response_snippet = body[:120]
+
+
+class _FakeVerifier:
+    """Serves canned (status, body) by exact URL; everything else is 404."""
+
+    def __init__(self, routes: dict[str, tuple[int, str]]) -> None:
+        self._routes = routes
+
+    def set_request_context(self, **_kw) -> None:
+        pass
+
+    async def send_request(self, url, method, params, data, test_phase=None, payload=None, **_kw):
+        status, body = self._routes.get(url, (404, "Cannot GET"))
+        return _FakeResp(status, body)
+
+    async def close(self) -> None:
+        pass
+
+
+_FTP_LISTING = (
+    "<html><head><title>listing directory /ftp</title></head><body>"
+    '<a href="../">..</a>'
+    '<a href="legal.md">legal.md</a>'
+    '<a href="package.json.bak">package.json.bak</a>'
+    "</body></html>"
+)
+
+
+@pytest.mark.asyncio
+async def test_null_byte_bypass_detects_forbidden_file_read() -> None:
+    """A file forbidden directly (403) but readable via ``%2500.<allowed-ext>``
+    is reported as a poison-null-byte arbitrary file read."""
+    routes = {
+        "http://h/ftp/": (200, _FTP_LISTING),
+        "http://h/ftp/legal.md": (200, "# Legal document, readable and allowed."),
+        "http://h/ftp/package.json.bak": (403, "Error: Only .md and .pdf files are allowed!"),
+        "http://h/ftp/package.json.bak%2500.md": (200, '{"name":"app","secret":"leaked-backup"}'),
+        # control (non-existent sibling) is not in routes -> defaults to 404.
+    }
+    det = FileInclusionDetector()
+    findings = await det._detect_null_byte_filter_bypass(
+        ["http://h/ftp/legal.md"], _FakeVerifier(routes), asyncio.Semaphore(4), ""
+    )
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.url == "http://h/ftp/package.json.bak"
+    assert f.detection_method == "poison_null_byte_extension_bypass"
+    assert f.payload == "http://h/ftp/package.json.bak%2500.md"
+    assert f.verified is True
+    assert f.category == OwaspCategory.a05
+
+
+@pytest.mark.asyncio
+async def test_null_byte_bypass_ignores_catch_all_soft_200() -> None:
+    """When a non-existent-file control returns the SAME 200 body as the injected
+    request, the 200 is a catch-all/SPA shell, not a real read -> no finding."""
+    shell = "<html><body><app-root></app-root></body></html>"
+    routes = {
+        "http://h/ftp/": (200, _FTP_LISTING),
+        "http://h/ftp/legal.md": (200, "# Legal document."),
+        "http://h/ftp/package.json.bak": (403, "Error: Only .md and .pdf files are allowed!"),
+        # Both the injected AND the control return the identical shell.
+        "http://h/ftp/package.json.bak%2500.md": (200, shell),
+        "http://h/ftp/sentry_nx_probe_md%2500.md": (200, shell),
+    }
+    det = FileInclusionDetector()
+    findings = await det._detect_null_byte_filter_bypass(
+        ["http://h/ftp/legal.md"], _FakeVerifier(routes), asyncio.Semaphore(4), ""
+    )
+    assert findings == []
+
+
+@pytest.mark.asyncio
+async def test_ssrf_detector_verifies_blind_via_oast_client():
+    from app.core.detectors.ssrf_detector import SSRFDetector
+    from app.core.verification.oast import OastClient, OastInteraction
+
+    # A fake OAST client: enabled, returns an interaction only on the 3rd poll
+    # (simulates a fire-and-forget callback landing after a short delay).
+    class FakeOast(OastClient):
+        def __init__(self):
+            super().__init__("https://scanner.test/oast", "https://scanner.test/oast/poll")
+            self._polls = 0
+
+        async def poll(self, interaction_id):
+            self._polls += 1
+            if self._polls >= 3:
+                return [OastInteraction(interaction_id=interaction_id, raw="hit")]
+            return []
+
+    detector = SSRFDetector()
+
+    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
+        # Blind sink: constant 302, no reflection, regardless of payload.
+        return ResponseData(
+            302, {"content-type": "text/html"}, "", 1.0,
+            request_snippet=f"{method} {url}", response_snippet="HTTP/1.1 302 Found",
+        )
+
+    param = ParameterCandidate(
+        name="imageUrl",
+        location=ParameterLocation.json_body,
+        url="https://example.com/profile/image/url",
+        method="POST",
+        baseline_value="http://example.com/a.png",
+    )
+    with patch.object(HttpVerifier, "send_request", send_request):
+        findings = await detector.detect(
+            urls=["https://example.com/profile/image/url"],
+            forms=[],
+            parameters=[param],
+            oast_client=FakeOast(),
+        )
+    assert any("Blind Server-Side Request Forgery" in f.vuln_type and f.verified for f in findings)

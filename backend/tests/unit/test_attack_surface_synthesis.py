@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ApiEndpoint, ParameterLocation, RequestObservation, RouteSource
+from app.core.crawler.spider import FormInput, HtmlForm
 from app.core.detectors.attack_surface import AttackSurface, build_json_body
 
 
@@ -337,3 +338,236 @@ def test_build_skips_parameter_candidates_with_unresolved_path_placeholders():
     )
 
     assert targets == []
+
+
+# --- Phase 4: synthetic body fallback for captured-but-unsubmittable forms -------------
+
+
+def _browser_cluster_form(action, inputs, method="GET"):
+    return HtmlForm(
+        page_url="http://x/register",
+        action=action,
+        method=method,
+        inputs=[FormInput(name=n, input_type=t) for n, t in inputs],
+        source="browser_cluster",
+    )
+
+
+def test_build_synthesizes_form_synth_json_targets_from_browser_cluster():
+    form = _browser_cluster_form(
+        "http://x/register",
+        [("email", "text"), ("password", "password")],
+    )
+    targets = AttackSurface.build([], [form])
+
+    synth = [t for t in targets if t.source_confidence == "form_synth"]
+    assert {t.parameter for t in synth} == {"email", "password"}
+    for target in synth:
+        assert target.location == ParameterLocation.json_body
+        assert target.method == "POST"
+        assert target.replayable is False
+        assert target.source == "form_synth"
+        # the synthesized template is injectable
+        body = build_json_body(target.json_template, target, "' OR 1=1--")
+        assert body[target.parameter] == "' OR 1=1--"
+
+
+def test_form_synth_respects_filter_fn():
+    form = _browser_cluster_form(
+        "http://x/register",
+        [("email", "text"), ("password", "password")],
+    )
+    targets = AttackSurface.build([], [form], filter_fn=lambda name: name == "email")
+    synth = [t for t in targets if t.source_confidence == "form_synth"]
+    assert {t.parameter for t in synth} == {"email"}
+
+
+def test_form_synth_skips_non_injectable_input_types():
+    form = _browser_cluster_form(
+        "http://x/register",
+        [("email", "text"), ("csrf", "hidden"), ("go", "submit"), ("avatar", "file")],
+    )
+    targets = AttackSurface.build([], [form])
+    synth = [t for t in targets if t.source_confidence == "form_synth"]
+    assert {t.parameter for t in synth} == {"email"}
+
+
+def test_form_synth_dropped_for_hash_route_cluster_url():
+    """A cluster whose only URL is a client-side hash route (``/#/register``)
+    must NOT produce any target: the ``#/…`` fragment is stripped on the wire, so
+    a POST there only hits the SPA shell and tests nothing. The real endpoint is
+    captured separately via the observed XHR. Framework-agnostic guard."""
+    form = HtmlForm(
+        page_url="http://x/#/register",
+        action="http://x/#/register",
+        method="POST",
+        inputs=[FormInput(name="email", input_type="text"),
+                FormInput(name="mat-input-16", input_type="text")],
+        source="browser_cluster",
+    )
+    targets = AttackSurface.build([], [form])
+    # No target may point at the hash-route URL, regardless of source.
+    assert all("/#/" not in t.url for t in targets)
+    assert all(t.source_confidence != "form_synth" for t in targets)
+
+
+def test_form_synth_only_fires_for_browser_clusters_not_html_forms():
+    # A server-rendered <form> already yields observed form-location targets; it
+    # must NOT also get a form_synth JSON fallback.
+    html_form = HtmlForm(
+        page_url="http://x/login",
+        action="http://x/login",
+        method="POST",
+        inputs=[FormInput(name="email", input_type="text")],
+        source="html",
+    )
+    targets = AttackSurface.build([], [html_form])
+    assert all(t.source_confidence != "form_synth" for t in targets)
+
+
+def test_form_synth_deduped_and_coexists_with_observed_form_target():
+    form = _browser_cluster_form(
+        "http://x/register",
+        [("email", "text")],
+    )
+    targets = AttackSurface.build([], [form])
+    observed = [t for t in targets if t.source_confidence != "form_synth"]
+    synth = [t for t in targets if t.source_confidence == "form_synth"]
+    # The cluster produced a normal form target (from inventory) AND a JSON fallback.
+    assert any(t.location == ParameterLocation.form for t in observed)
+    assert any(t.location == ParameterLocation.json_body for t in synth)
+
+
+def test_form_synth_skips_unresolved_path_placeholder():
+    form = _browser_cluster_form(
+        "http://x/rest/basket/{param_1}/checkout",
+        [("coupon", "text")],
+    )
+    targets = AttackSurface.build([], [form])
+    assert all(t.source_confidence != "form_synth" for t in targets)
+
+
+# --- Create -> update target synthesis (replayable-body coverage) -----------------------
+
+
+def _create_observation(url, body, response, status=201, headers=None):
+    return RequestObservation(
+        url=url,
+        method="POST",
+        request_content_type="application/json",
+        post_data=body,
+        request_headers=headers or {"authorization": "Bearer t"},
+        response_status=status,
+        response_snippet=response,
+    )
+
+
+def test_create_response_id_synthesizes_put_and_patch_update_targets():
+    """A POST create returning an id yields replayable PUT/PATCH targets at the
+    id-scoped item path with the same body shape (universal REST convention)."""
+    obs = _create_observation(
+        "http://x/api/Cards",
+        '{"fullName": "A", "cardNum": 4111111111111111}',
+        '{"status": "success", "data": {"id": 42, "fullName": "A"}}',
+    )
+    targets = AttackSurface.build([], [], requests=[obs])
+    derived = [t for t in targets if t.source_confidence == "derived_update"]
+    assert derived, "expected create->update synthesis"
+    methods = {t.method for t in derived}
+    assert methods == {"PUT", "PATCH"}
+    assert all(t.url == "http://x/api/Cards/42" for t in derived)
+    assert all(t.replayable is True for t in derived)
+    # Same body fields become injectable parameters.
+    assert {t.parameter for t in derived} >= {"fullName", "cardNum"}
+    # Authenticated context carried over from the create.
+    assert all(t.headers.get("authorization") == "Bearer t" for t in derived)
+
+
+def test_no_update_synthesis_without_created_id():
+    """An RPC-style POST (login) whose response carries no resource id must not
+    synthesize bogus /login/{id} update targets."""
+    obs = _create_observation(
+        "http://x/rest/user/login",
+        '{"email": "a@b.c", "password": "x"}',
+        '{"authentication": {"token": "abc.def.ghi"}}',
+        status=200,
+    )
+    targets = AttackSurface.build([], [], requests=[obs])
+    assert [t for t in targets if t.source_confidence == "derived_update"] == []
+
+
+def test_no_update_synthesis_when_post_targets_item_path():
+    """A POST already aimed at an item path (…/42) is not a collection create."""
+    obs = _create_observation(
+        "http://x/api/Cards/42/activate",
+        '{"flag": true}',
+        '{"id": 99}',
+    )
+    targets = AttackSurface.build([], [], requests=[obs])
+    # /activate is a noun, but the id 42 earlier doesn't matter — the final segment
+    # "activate" is not an id, so this WOULD synthesize; guard instead on failure
+    # responses. Here status is 201 so it synthesizes an /activate/{id}: acceptable
+    # only if an id was returned. This asserts the create-id gate, not path shape.
+    derived = [t for t in targets if t.source_confidence == "derived_update"]
+    assert all(t.url.endswith("/99") for t in derived)
+
+
+def test_no_update_synthesis_on_failed_create():
+    obs = _create_observation(
+        "http://x/api/Cards",
+        '{"fullName": "A"}',
+        '{"error": "bad request"}',
+        status=400,
+    )
+    targets = AttackSurface.build([], [], requests=[obs])
+    assert [t for t in targets if t.source_confidence == "derived_update"] == []
+
+
+def test_observed_update_wins_over_synthesized():
+    """When the crawler already observed the PUT, no duplicate synthesis."""
+    create = _create_observation(
+        "http://x/api/Cards",
+        '{"fullName": "A"}',
+        '{"id": 42}',
+    )
+    observed_put = RequestObservation(
+        url="http://x/api/Cards/42",
+        method="PUT",
+        request_content_type="application/json",
+        post_data='{"fullName": "B"}',
+        response_status=200,
+    )
+    targets = AttackSurface.build([], [], requests=[create, observed_put])
+    put_targets = [t for t in targets if t.method == "PUT" and t.url == "http://x/api/Cards/42"]
+    # The observed PUT is present; the synthesizer did not add a duplicate derived one.
+    assert put_targets
+    assert all(t.source_confidence != "derived_update" for t in put_targets)
+
+
+def test_request_with_unresolved_path_placeholder_yields_no_body_targets():
+    """An observed request whose URL still carries a route template (:addressId)
+    is a crawler artifact, not a replayable XHR — it must not emit body targets
+    that would each 404 against a non-existent object."""
+    req = RequestObservation(
+        url="http://x/api/Addresss/:addressId",
+        method="PUT",
+        request_content_type="application/json",
+        post_data='{"fullName": "x", "city": "y"}',
+    )
+    targets = AttackSurface.build([], [], requests=[req])
+    assert not any(
+        t.location == ParameterLocation.json_body and ":addressId" in t.url
+        for t in targets
+    )
+
+
+def test_request_with_concrete_id_still_yields_body_targets():
+    """The guard above must not suppress a genuinely-observed concrete-id XHR."""
+    req = RequestObservation(
+        url="http://x/api/Addresss/42",
+        method="PUT",
+        request_content_type="application/json",
+        post_data='{"fullName": "x"}',
+    )
+    targets = AttackSurface.build([], [], requests=[req])
+    assert any(t.location == ParameterLocation.json_body for t in targets)

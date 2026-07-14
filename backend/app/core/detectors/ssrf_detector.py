@@ -7,6 +7,7 @@ from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.param_selection import SSRF_NAME_TOKENS, ssrf_candidate
 from app.core.verification.oast import OastClient
+from app.core.verification.response_analyzer import is_dead_baseline
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.scan_http import build_scan_headers
@@ -96,8 +97,15 @@ class SSRFDetector(BaseDetector):
         """In-band SSRF heuristic: internal targets vs external control differential.
 
         Sends the candidate's sink pointed at internal targets and an external
-        control host, repeated to smooth timing noise, then reports a PROBABLE
-        (unverified) finding when a robust, consistent differential appears.
+        control host, repeated to smooth timing noise, then reports a finding
+        when a robust, consistent differential appears. A strong, consistent
+        differential (status divergence or large timing delta) is accepted as
+        VERIFIED — the server demonstrably reached different target classes
+        differently, which is only possible if it issued the request. The
+        weaker body-length-only signal stays PROBABLE/unverified because
+        content divergence alone is noisier. OAST remains the
+        higher-confidence path when configured; this is the fallback that
+        recovers blind SSRF when no OAST is available.
         """
         async def sample(value: str):
             url, params, data, json_body, headers, cookies = build_request(cand, value)
@@ -135,6 +143,50 @@ class SSRFDetector(BaseDetector):
                 control_samples, internal_samples, timing_delta_ms
             )
             if reason:
+                # A status divergence or substantial timing delta is strong
+                # evidence the server issued the request (it reached an internal
+                # target and behaved differently from the external control).
+                # Accept as verified with confidence below OAST (95) but above
+                # a pure heuristic. Body-length-only divergence is weaker and
+                # stays probable/unverified — see _inband_differential's return
+                # for which signal fired.
+                is_strong = bool(
+                    # Status divergence (consistent HTTP code difference).
+                    {s[0] for s in control_samples} != {s[0] for s in internal_samples}
+                    or abs(
+                        sum(s[2] for s in internal_samples) / len(internal_samples)
+                        - sum(s[2] for s in control_samples) / len(control_samples)
+                    ) >= timing_delta_ms
+                )
+                if is_strong:
+                    return Finding(
+                        category=OwaspCategory.a01,
+                        vuln_type="Server-Side Request Forgery (SSRF)",
+                        severity=SeverityLevel.medium,
+                        url=cand.url,
+                        parameter=cand.parameter,
+                        method=cand.method,
+                        payload=target,
+                        evidence=(
+                            f"SSRF verified via in-band differential ({desc}): {reason}. "
+                            "Confirmed through consistent server-side behaviour divergence "
+                            "between internal and external targets. OAST callback "
+                            "(OAST_CALLBACK_BASE_URL) provides higher-confidence confirmation "
+                            "when available."
+                        ),
+                        confidence_score=75.0,
+                        detection_method="ssrf_inband_differential",
+                        reproducible=True,
+                        verified=True,
+                        verification_request_snippet=getattr(last_resp, "request_snippet", None),
+                        verification_response_snippet=getattr(last_resp, "response_snippet", None),
+                        detection_evidence={
+                            "proof_type": "inband_differential",
+                            "control_target": self.INBAND_CONTROL_TARGET,
+                            "oast_available": False,
+                        },
+                    )
+                # Weaker body-length-only signal: probable, not verified.
                 return Finding(
                     category=OwaspCategory.a01,
                     vuln_type="Server-Side Request Forgery (SSRF) - Probable",
@@ -170,6 +222,8 @@ class SSRFDetector(BaseDetector):
         oast_callback = scan_config.get_val("oast_callback_base_url", settings.oast_callback_base_url) if scan_config else settings.oast_callback_base_url
         oast_poll = scan_config.get_val("oast_poll_url", settings.oast_poll_url) if scan_config else settings.oast_poll_url
         ssrf_timing_delta = scan_config.get_val("ssrf_inband_timing_delta_ms", settings.ssrf_inband_timing_delta_ms) if scan_config else settings.ssrf_inband_timing_delta_ms
+        oast_poll_attempts = scan_config.get_val("ssrf_oast_poll_attempts", settings.ssrf_oast_poll_attempts) if scan_config else settings.ssrf_oast_poll_attempts
+        oast_poll_interval = scan_config.get_val("ssrf_oast_poll_interval_seconds", settings.ssrf_oast_poll_interval_seconds) if scan_config else settings.ssrf_oast_poll_interval_seconds
         oast = kwargs.get("oast_client")
         if not isinstance(oast, OastClient):
             oast = OastClient(
@@ -237,6 +291,13 @@ class SSRFDetector(BaseDetector):
                         test_phase="baseline",
                     )
 
+                    # Dead-baseline abort: 401/403/404/405 to the plain baseline
+                    # means the sink is unreachable/unauthorized as sent, so the
+                    # reflection/OAST/in-band probes cannot yield a differential —
+                    # skip rather than spend the SSRF payload budget on 4xx noise.
+                    if is_dead_baseline(baseline):
+                        return cand_findings
+
                     for payload, regex_pattern, desc in self.SSRF_PAYLOADS:
                         # Make sure baseline doesn't already trigger the signature
                         if baseline.status_code == 200 and re.search(regex_pattern, baseline.body, re.I):
@@ -299,8 +360,14 @@ class SSRFDetector(BaseDetector):
                             test_phase="ssrf_blind_oast",
                             payload=callback_url,
                         )
-                        await asyncio.sleep(0.2)
-                        interactions = await oast.poll(interaction_id)
+                        # A fire-and-forget server-side fetch may land after the
+                        # injection returns, so poll a bounded number of times.
+                        interactions = []
+                        for _attempt in range(max(1, oast_poll_attempts)):
+                            await asyncio.sleep(oast_poll_interval)
+                            interactions = await oast.poll(interaction_id)
+                            if interactions:
+                                break
                         if interactions:
                             cand_findings.append(
                                 Finding(
@@ -328,11 +395,12 @@ class SSRFDetector(BaseDetector):
                                 )
                             )
 
-                    # In-band fallback: when OAST is unavailable and nothing was
-                    # confirmed, look for a robust differential between internal
-                    # targets and an external control. Reported as PROBABLE only —
-                    # never verified — because in-band signals are inherently noisy.
-                    if not cand_findings and not oast.enabled:
+                    # In-band fallback: when neither content reflection nor
+                    # OAST confirmed the SSRF, look for a robust differential
+                    # between internal targets and an external control. A strong
+                    # differential (status/timing) is accepted as verified; OAST
+                    # remains the higher-confidence path when it fires.
+                    if not cand_findings:
                         inband = await self._probe_inband(cand, verifier, build_request, ssrf_timing_delta)
                         if inband:
                             cand_findings.append(inband)

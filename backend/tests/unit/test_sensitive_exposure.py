@@ -55,6 +55,31 @@ def test_plain_env_without_secret_pattern_is_not_classified_as_sensitive():
     assert matched is False
 
 
+def test_application_data_field_named_scoreboard_is_not_debug_metrics():
+    # The Apache mod_status marker is the whole word "Scoreboard:"; an
+    # application data field whose name merely contains the substring (e.g.
+    # {"key":"scoreBoardChallenge"}) is not a debug/metrics endpoint. Word
+    # boundaries keep the marker precise without hardcoding any app's schema.
+    detector = SensitivePathsDetector()
+    body = '{"status":"success","data":[{"id":75,"key":"scoreBoardChallenge","name":"Score Board"}]}'
+
+    matched, *_ = detector._classify_content("/api/Challenges/", body, "application/json")
+
+    assert matched is False
+
+
+def test_apache_server_status_scoreboard_is_still_debug_metrics():
+    detector = SensitivePathsDetector()
+    body = "Apache Server Status for localhost\nScoreboard: _W_W..CC____\n"
+
+    matched, vuln_type, _evidence, _severity = detector._classify_content(
+        "/server-status", body, "text/html"
+    )
+
+    assert matched is True
+    assert vuln_type == "Debug / Metrics Endpoint Exposed"
+
+
 def test_spa_fallback_context_is_metadata_not_vulnerability():
     detector = SensitivePathsDetector()
     route = RouteCandidate(
@@ -252,3 +277,36 @@ async def test_sensitive_path_detector_suppresses_spa_shell_200(monkeypatch):
     )
 
     assert findings == []
+
+
+# --------------------------------------------------------------------------- #
+# Dependency-manifest content classification
+# --------------------------------------------------------------------------- #
+
+_PKG_JSON = '{"name":"demo","version":"1.0.0","dependencies":{"express":"^4.18.2"}}'
+_REQ_TXT = "Django==4.2.1\nFlask>=2.3\n"
+
+
+@pytest.mark.parametrize(
+    "path, body, expected",
+    [
+        ("/package.json", _PKG_JSON, True),                 # standard manifest
+        ("/ftp/package.json", _PKG_JSON, True),             # nested manifest
+        ("/requirements.txt", _REQ_TXT, True),
+        # Backup/temp/version suffixes on a manifest still classify (universal
+        # file-management conventions, not app-specific paths).
+        ("/ftp/package.json.bak", _PKG_JSON, True),
+        ("/composer.lock.old", '{"packages":[{"name":"x","version":"1.0"}]}', True),
+        ("/package.json~", _PKG_JSON, True),
+        ("/requirements.txt.1", _REQ_TXT, True),
+        # Manifest-named path but body is NOT manifest content -> not flagged.
+        ("/package.json", "<html>not a manifest</html>", False),
+        # Manifest-looking body at a non-manifest path -> not flagged (no FP on
+        # an ordinary API JSON response that happens to mention dependencies).
+        ("/rest/products/1/reviews", '{"status":"success","data":[]}', False),
+        ("/api/config", '{"dependencies":{"a":"1"}}', False),
+    ],
+)
+def test_dependency_manifest_classification(path, body, expected):
+    det = SensitivePathsDetector()
+    assert det._looks_like_dependency_manifest(path, body) is expected

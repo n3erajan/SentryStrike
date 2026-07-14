@@ -144,6 +144,11 @@ class CryptoFailuresDetector(BaseDetector):
                 for header in set_cookie_headers:
                     cookie_parts = [p.strip().lower() for p in header.split(";")]
                     cookie_name = cookie_parts[0].split("=")[0] if "=" in cookie_parts[0] else ""
+                    # Suppress the standalone Secure-flag finding for session cookies
+                    # already reported under "Insecure Session Cookie Attributes" on
+                    # this response; the standalone finding stays for non-session cookies.
+                    if cookie_name in reported_session_cookies:
+                        continue
                     if "secure" not in cookie_parts:
                         findings.append(
                             Finding(

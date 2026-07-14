@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from urllib.parse import urlencode
 from uuid import uuid4
 
 import httpx
+
+
+# Genuine scanner-minted interaction ids only: new_callback_url() mints
+# f"{purpose}-{uuid4().hex}", where uuid4().hex is exactly 32 lowercase hex
+# chars. This anchored pattern is the "genuine uuid" gate — random strings,
+# traversal probes, wrong length/case all fail it, so they are never stored.
+INTERACTION_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}-[0-9a-f]{32}$")
 
 
 @dataclass
@@ -30,6 +38,10 @@ class OastClient:
     @property
     def enabled(self) -> bool:
         return bool(self.callback_base_url)
+
+    @staticmethod
+    def is_valid_interaction_id(value: str) -> bool:
+        return bool(isinstance(value, str) and INTERACTION_ID_RE.match(value))
 
     def new_callback_url(self, purpose: str = "ssrf") -> tuple[str, str]:
         interaction_id = f"{purpose}-{uuid4().hex}"

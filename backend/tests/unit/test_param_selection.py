@@ -3,11 +3,15 @@
 import pytest
 
 from app.core.detectors.param_selection import (
+    command_candidate,
     file_candidate,
+    is_opaque_timing_value,
+    looks_like_command_value,
     looks_like_file_extension,
     looks_like_path,
     looks_like_url,
     redirect_candidate,
+    select,
     ssrf_candidate,
 )
 
@@ -124,6 +128,12 @@ def test_file_candidate(name, value, expected):
         ("callbackUrl", "1", True),  # substring "url"
         ("image", "http://127.0.0.1/", True),  # generic name, url value
         ("avatar", "//evil.test", True),
+        ("image", "photo.png", True),  # profile-image-by-URL sink, name only
+        ("avatar", "cat", True),  # name token even with non-url value
+        ("webhook", "x", True),  # webhook fetch sink
+        ("endpoint", "x", True),
+        ("callback", "x", True),
+        ("imageWidth", "800", False),  # not an exact token, no url value
         ("id", "42", False),
         ("name", "alice", False),
     ],
@@ -132,8 +142,99 @@ def test_ssrf_candidate(name, value, expected):
     assert ssrf_candidate(name, value) is expected
 
 
+@pytest.mark.parametrize(
+    "name, value, expected",
+    [
+        ("to", "x", True),  # exact generic redirect name
+        ("uri", "x", True),
+        ("redirect", "1", True),
+        ("returnUrl", "1", True),  # substring
+        ("goto", "x", True),
+        ("id", "42", False),
+        ("page", "1", False),
+    ],
+)
+def test_redirect_candidate_name_tokens(name, value, expected):
+    assert redirect_candidate(name, value) is expected
+
+
 def test_no_hardcoded_target_specifics():
     """A generic id param must never be selected purely by value."""
     assert redirect_candidate("id", "42") is False
     assert file_candidate("id", "42") is False
     assert ssrf_candidate("id", "42") is False
+
+
+# --------------------------------------------------------------------------- #
+# Command injection: name OR value OR endpoint-context selection
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(
+    "name, value, url, expected",
+    [
+        ("cmd", "x", "", True),               # name token
+        ("host", "1", "", True),              # name token
+        ("execCommand", "x", "", True),       # substring
+        ("q", "8.8.8.8", "", True),           # generic name, host-shaped value
+        ("q", "1; ls -la", "", True),         # generic name, shell-metachar value
+        # generic name on a diagnostic endpoint path -> context selection
+        ("target", "opaque", "http://t/api/ping", True),
+        ("host", "x", "http://t/network/trace", True),
+        # generic name, benign value, non-diagnostic endpoint -> not selected here
+        ("city", "Berlin", "http://t/api/address", False),
+        ("id", "42", "", False),
+        ("q", "search terms", "", False),
+    ],
+)
+def test_command_candidate(name, value, url, expected):
+    assert command_candidate(name, value, url) is expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("1; ls", True),
+        ("a | b", True),
+        ("$(whoami)", True),
+        ("8.8.8.8", True),          # host-shaped
+        ("http://127.0.0.1", True),
+        ("Berlin", False),
+        ("hello world", False),
+        ("", False),
+    ],
+)
+def test_looks_like_command_value(value, expected):
+    assert looks_like_command_value(value) is expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("Berlin", True),           # substantive opaque string
+        ("some message", True),
+        ("42", False),              # bare numeric id
+        ("7", False),
+        ("", False),
+        ("x", False),               # too short
+        ("true", False),
+        ("null", False),
+    ],
+)
+def test_is_opaque_timing_value(value, expected):
+    assert is_opaque_timing_value(value) is expected
+
+
+def test_select_facade_any_signal():
+    # Name-only signal.
+    assert select("url", "x", name_tokens=frozenset({"url"})) is True
+    # Value-only signal via a predicate.
+    assert select("q", "http://x", value_predicates=(looks_like_url,)) is True
+    # Context-only signal via a predicate.
+    ctx = (lambda n, v, u: "ping" in str(u),)
+    assert select("q", "x", "http://t/ping", context_predicates=ctx) is True
+    # No signal at all.
+    assert select("q", "x") is False
+    # A raising predicate must not blow up selection.
+    boom = (lambda v: (_ for _ in ()).throw(ValueError("boom")),)
+    assert select("q", "x", value_predicates=boom) is False
+

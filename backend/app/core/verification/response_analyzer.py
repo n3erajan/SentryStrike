@@ -39,6 +39,31 @@ class ResponseData:
         return self.status_code == -1
 
 
+# Baseline status codes that mean the target is unreachable/unauthorized as sent,
+# so there is no exploitable differential to measure. When the UNMODIFIED baseline
+# returns one of these, firing the full payload matrix only produces 4xx noise
+# (observed as ~27% of scan traffic against Juice Shop). 401/403 = auth wall,
+# 404 = dead endpoint or non-existent object, 405 = wrong method for this URL.
+# Deliberately excludes 400 (a validation error an injection may still flip) and
+# 500 (error-based injection's signal), and login-style flows are unaffected
+# because their baseline is a healthy 200 — only the deliberate false-payload
+# returns 401.
+_DEAD_BASELINE_STATUSES = frozenset({401, 403, 404, 405})
+
+
+def is_dead_baseline(response: "ResponseData | None") -> bool:
+    """True when an unmodified baseline response is structurally unexploitable.
+
+    Used by injection verifiers to abort a target before spending the payload
+    budget on a URL that returned 401/403/404/405 to the plain baseline. A
+    ``None`` or governor-denied (``not_tested``) baseline is NOT dead — the probe
+    simply never ran, which is handled separately.
+    """
+    if response is None or response.not_tested:
+        return False
+    return response.status_code in _DEAD_BASELINE_STATUSES
+
+
 @dataclass
 class DifferentialAnalysis:
     """Results of comparing baseline vs injected response."""
@@ -147,7 +172,15 @@ class ResponseAnalyzer:
         r"^total \d+": "ls -la output",
         r"/bin/\w+|/usr/bin|/sbin": "Unix path",
         r"Linux.*\d+\.\d+": "uname output",
-        r"eth\d+|lo|wlan\d+": "ifconfig interface",
+        # ifconfig / `ip addr` output. A bare interface token like "lo" is far
+        # too weak: with IGNORECASE it matches the substring "lo" inside ordinary
+        # words ("lastLogin", "uploads", "close", "block"...), so a reflected
+        # payload that merely gets stored/echoed produced confirmed-exploit FPs.
+        # Require the interface name to be a whole word AND co-occur (same line)
+        # with a real network-config marker (Link encap / flags= / HWaddr /
+        # ether MAC / mtu N / LOOPBACK / BROADCAST), which genuine command output
+        # always carries and benign page text does not.
+        r"\b(?:eth\d+|wlan\d+|lo)\b[:\s][^\n]{0,80}?(?:Link encap|flags=|HWaddr|ether\s+[0-9a-f]{2}[:.]|mtu\s+\d+|\bLOOPBACK\b|\bBROADCAST\b)": "ifconfig interface",
     }
 
     # Windows command output patterns

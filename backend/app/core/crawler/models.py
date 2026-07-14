@@ -109,6 +109,12 @@ class CrawlState:
     workflow_states_visited: int = 0
     browser_forms_discovered: int = 0
     browser_forms_submitted: int = 0
+    # Button-driven mutation capture (body-coverage #1). ``buttons_clicked`` counts
+    # safe action buttons clicked (add/save/create/… — no <form> wraps them);
+    # ``button_mutations_fired`` counts how many of those clicks fired a real
+    # mutating (non GET/HEAD/OPTIONS) XHR whose body ``on_request`` captured.
+    buttons_clicked: int = 0
+    button_mutations_fired: int = 0
     file_inputs_discovered: int = 0
     browser_available: bool | None = None
     browser_error: str | None = None

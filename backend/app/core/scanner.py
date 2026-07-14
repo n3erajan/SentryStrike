@@ -3,13 +3,14 @@ import json
 import logging
 import math
 import re
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from uuid import uuid4
 from urllib.parse import urlparse
 
 from app.config import get_settings
 
-from app.analyzers.ai_client import OllamaClient
+from app.analyzers.ai_client import AIClient
 from app.analyzers.report_generator import AiReportGenerator
 from app.core.crawler.account_session import provision_secondary_session, resolve_account_session
 from app.core.crawler.spider import WebSpider
@@ -26,6 +27,7 @@ from app.core.detectors.sql_injection import SQLInjectionDetector
 from app.core.detectors.supply_chain import SupplyChainDetector
 from app.core.detectors.xss_detector import XSSDetector
 from app.core.detectors.command_injection import CommandInjectionDetector
+from app.core.detectors.nosql_injection import NoSqlInjectionDetector
 from app.core.detectors.file_inclusion import FileInclusionDetector
 from app.core.detectors.file_upload import FileUploadDetector
 from app.core.detectors.csrf_detector import CSRFDetector
@@ -33,6 +35,7 @@ from app.core.detectors.ssrf_detector import SSRFDetector
 from app.core.detectors.open_redirect import OpenRedirectDetector
 from app.core.detectors.sensitive_paths import SensitivePathsDetector
 from app.core.verification.verification_framework import FindingDeduplicator, TestPollutionFilter
+from app.core.verification.oast import OastClient
 
 
 def _normalize_llm_string(value: object) -> str | None:
@@ -44,11 +47,12 @@ def _normalize_llm_string(value: object) -> str | None:
     return str(value)
 
 
-from app.core.evidence_grader import EvidenceGrader
+from app.core.evidence_grader import EvidenceGrade, EvidenceGrader
 from app.database.repositories.scan_repository import ScanRepository
 from app.integrations.cve_database import CveDatabaseService
 from app.integrations.sslyze_wrapper import SslAnalyzer
 from app.integrations.wappalyzer import TechnologyDetector
+from app.integrations import error_fingerprints
 from app.models.scan import CrawlMode, Scan, ScanPhase, ScanStatus
 from app.models.scan import AuthCoverage, DetectorCoverageMetric, EvidenceStrengthBreakdown, SpaApiCoverage
 from app.models.vulnerability import (
@@ -60,11 +64,13 @@ from app.models.vulnerability import (
     OwaspCategory,
     ReviewStatus,
     SeverityLevel,
+    TechnologyComponent,
     Vulnerability,
     normalize_exploitability,
     AiAnalysisStatus,
 )
 from app.utils.cvss_calculator import CvssCalculator
+from app.utils.redaction import redact_secrets
 from app.utils.scan_metrics import begin_request_counting, end_request_counting, snapshot_request_counts
 from app.core.request_governor import begin_governor, end_governor, denied_snapshot
 
@@ -74,6 +80,7 @@ ATTACK_SURFACE_BACKED_DETECTORS = frozenset(
     {
         "access_control",
         "injection_sql_command",
+        "nosql_injection",
         "xss",
         "file_inclusion",
         "ssrf",
@@ -103,7 +110,7 @@ class ScanOrchestrator:
         self.cve_service = CveDatabaseService()
         self.ssl_analyzer = SslAnalyzer()
 
-        self.ai_client = OllamaClient()
+        self.ai_client = AIClient()
         self.ai_report = AiReportGenerator()
         self.evidence_grader = EvidenceGrader()
 
@@ -116,6 +123,7 @@ class ScanOrchestrator:
             AuthenticationFailuresDetector(),
             ExceptionHandlingDetector(),
             CommandInjectionDetector(),
+            NoSqlInjectionDetector(),
             FileInclusionDetector(),
             CSRFDetector(),
             SSRFDetector(),
@@ -329,7 +337,7 @@ class ScanOrchestrator:
                     return False
 
             crawl_result.urls = [u for u in crawl_result.urls if is_same_origin(target_url, u)]
-            crawl_result.routes = [r for r in crawl_result.routes if is_same_origin(target_url, getattr(r, "url", ""))]
+            crawl_result.routes = [r for r in crawl_result.routes if is_same_origin(target_url, getattr(r, "url", "")) and not getattr(r, "is_dead", False)]
             crawl_result.api_endpoints = [e for e in crawl_result.api_endpoints if is_same_origin(target_url, getattr(e, "url", ""))]
             crawl_result.requests = [req for req in crawl_result.requests if is_same_origin(target_url, getattr(req, "url", ""))]
             if hasattr(crawl_result, "request_audit"):
@@ -343,13 +351,26 @@ class ScanOrchestrator:
                 if is_same_origin(target_url, getattr(f, "action", "")) or is_same_origin(target_url, getattr(f, "page_url", ""))
             ]
 
-            scan.statistics.total_urls_crawled = len(crawl_result.urls)
-            await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {len(crawl_result.urls)} URL(s) discovered")
+            scan.statistics.total_urls_crawled = self._count_discovered_surface(crawl_result)
+            await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {scan.statistics.total_urls_crawled} URL(s) discovered")
             await self._check_cancelled(scan_id)
 
             await self._set_progress(scan, 25, ScanPhase.technology_detection, "Detecting technology stack and known CVEs")
-            technologies = await self.technology_detector.detect(scan.target_url)
+            technologies = await self.technology_detector.detect(
+                scan.target_url,
+                crawl_result=crawl_result,
+                browser_available=getattr(crawl_result, "browser_available", False),
+                storage_state=getattr(crawl_result, "auth_storage_state", None),
+                session_cookies=getattr(crawl_result, "session_cookies", {}),
+            )
             scan.technology_stack = await self.cve_service.enrich_components(technologies)
+            # Back-fill component versions from ecosystem-standard manifests and
+            # version-bearing headers so the supply-chain gate can emit true A03
+            # findings. Best-effort: never fail the scan over version enrichment.
+            try:
+                await self._enrich_tech_from_manifests(scan, crawl_result)
+            except Exception as exc:
+                logger.debug("manifest/header version enrichment failed: %s", exc)
             await self._set_progress(scan, 35, ScanPhase.technology_detection, f"Technology analysis complete: {len(scan.technology_stack)} component(s) identified")
             await self._check_cancelled(scan_id)
 
@@ -382,6 +403,7 @@ class ScanOrchestrator:
             detector_parallelism = max(2, effective_concurrency // 3)
             detector_semaphore = asyncio.Semaphore(detector_parallelism)
             session_cookies = getattr(crawl_result, "session_cookies", {})
+            oast_settings = get_settings()
             crawl_context = {
                 "root_url": scan.target_url,
                 "session_cookies": session_cookies,
@@ -401,11 +423,19 @@ class ScanOrchestrator:
                 "browser_available": getattr(crawl_result, "browser_available", None),
                 "browser_error": getattr(crawl_result, "browser_error", None),
                 "browser_forms": getattr(crawl_result, "browser_forms", []),
+                "oast_client": OastClient(
+                    (scan_config.oast_callback_base_url if scan_config else None) or oast_settings.oast_callback_base_url,
+                    (scan_config.oast_poll_url if scan_config else None) or oast_settings.oast_poll_url,
+                    timeout_seconds=oast_settings.request_timeout_seconds,
+                ),
                 "scan_config": scan_config,
             }
             # Reuse the winning login path from the main account so second/admin
             # logins don't restart the strategy cascade from scratch.
             main_replay = getattr(crawl_result, "auth_replay_state", None)
+            # Expose the winning login recipe to detectors (the auth detector uses it
+            # as a reliable login-flow record for default/weak-credential probing).
+            crawl_context["auth_replay_state"] = main_replay
             main_credentials = (
                 (main_account.username, main_account.password) if main_account else None
             )
@@ -525,6 +555,13 @@ class ScanOrchestrator:
                         self._add_findings_to_metric(metric, observed_credential_findings)
                         findings.extend(observed_credential_findings)
 
+                # A10/A07 derived-evidence cross-guard: when the same source finding
+                # yields both a verbose-error (A10) and a credential disclosure
+                # (A07) derivation, fold the verbose-error finding into the
+                # credential finding so one response body isn't counted twice.
+                # Only same-source derived findings merge; independent findings stay.
+                self._merge_same_source_derived_findings(findings)
+
                 # Provide the scan root URL so site-wide detectors can avoid duplicate page-level findings.
                 crypto_detector = next((detector for detector in self.detectors if isinstance(detector, CryptoFailuresDetector)), None)
                 if crypto_detector is not None:
@@ -584,6 +621,16 @@ class ScanOrchestrator:
 
             await self._set_progress(scan, 60, ScanPhase.vulnerability_detection, f"Detector phase complete: {len(findings)} raw finding(s)")
             await self._check_cancelled(scan_id)
+
+            # Enrich the technology stack from error responses the detectors just
+            # triggered. Stack traces / DB errors leak the framework, ORM, DB
+            # engine and language (often with versions) that header/HTML/runtime
+            # fingerprinting at scan start could not see. Best-effort: never fail
+            # the scan over fingerprint enrichment.
+            try:
+                await self._enrich_tech_from_errors(scan, findings)
+            except Exception as exc:
+                logger.debug("error-based technology enrichment failed: %s", exc)
 
             # DEDUPLICATION PHASE: Merge duplicate findings from different detectors
             # Findings with same (url, parameter, vuln_type) are consolidated
@@ -715,9 +762,15 @@ class ScanOrchestrator:
 
             scan.report_metadata.detector_coverage = detector_metrics
             self._log_detector_coverage(detector_metrics)
+            scan.report_metadata.coverage_warnings.extend(
+                self._detector_coverage_warnings(detector_metrics)
+            )
 
             # PHASE 1: Detect all vulnerabilities
-            vulnerabilities = [self._to_vulnerability(f) for f in findings]
+            redaction_secrets = self._collect_redaction_secrets(submitted_accounts)
+            vulnerabilities = [
+                self._to_vulnerability(f, extra_secrets=redaction_secrets) for f in findings
+            ]
             logger.info("phase 1 complete: detected %d vulnerabilities", len(vulnerabilities))
 
             # PHASE 2: Analyze all findings with AI
@@ -750,26 +803,9 @@ class ScanOrchestrator:
             scan.statistics.severity_breakdown.low = len([v for v in vulnerabilities if v.severity.value == "Low"])
             scan.statistics.severity_breakdown.info = len([v for v in vulnerabilities if v.severity.value == "Info"])
 
-            active = [v for v in vulnerabilities if not v.is_false_positive]
-
-            if active:
-                total_weighted_score = 0.0
-                total_weight = 0.0
-                for v in active:
-                    w = 1.0 if v.evidence.verified else 0.7
-                    total_weighted_score += v.cvss_score * w
-                    total_weight += w
-
-                avg_cvss = total_weighted_score / total_weight if total_weight > 0 else 0.0
-
-                # Volume amplification with logarithmic diminishing returns.
-                # More findings → higher risk, but each additional finding adds less.
-                n = len(active)
-                volume_mult = 1.0 + (0.15 * math.log(n) if n > 1 else 0.0)
-
-                scan.overall_risk_score = min(100.0, round(avg_cvss * 10 * volume_mult, 2))
-            else:
-                scan.overall_risk_score = 0.0
+            scan.overall_risk_score, scan.overall_risk_level = self._calculate_aggregate_risk(
+                vulnerabilities
+            )
 
             # PHASE 3: Generate final report from analyzed findings
             logger.info("phase 3 starting: generating report")
@@ -808,6 +844,73 @@ class ScanOrchestrator:
     def _tag_detector_findings(self, findings: list[Finding], detector_name: str) -> None:
         for finding in findings or []:
             setattr(finding, "detector_name", detector_name)
+
+    @staticmethod
+    def _merge_same_source_derived_findings(findings: list[Finding]) -> None:
+        """Fold same-source derived A10 (Verbose Error) findings into matching
+        A07 (Credential / Config Disclosure) findings in place.
+
+        Only findings derived from observed evidence (detection_method of
+        ``observed_exception_evidence`` and ``observed_credential_disclosure``)
+        that share the same source-finding key (url, parameter, source vuln
+        type, source detection method) are merged. The A07 finding stays primary
+        and records the verbose-error patterns as supporting evidence; the A10
+        finding is dropped. Independent findings are never merged, so A10 and
+        A07 findings that do not share a source stay as-is.
+        """
+        verbose_method = "observed_exception_evidence"
+        credential_method = "observed_credential_disclosure"
+
+        def _source_key(finding: Finding) -> tuple:
+            evidence = finding.detection_evidence or {}
+            return (
+                finding.url or "",
+                finding.parameter or "",
+                str(evidence.get("source_vuln_type") or ""),
+                str(evidence.get("source_detection_method") or ""),
+            )
+
+        credential_by_key: dict[tuple, Finding] = {}
+        for finding in findings:
+            if getattr(finding, "detection_method", None) == credential_method:
+                key = _source_key(finding)
+                if key not in credential_by_key:
+                    credential_by_key[key] = finding
+
+        if not credential_by_key:
+            return
+
+        merged: list[Finding] = []
+        for finding in findings:
+            if getattr(finding, "detection_method", None) != verbose_method:
+                merged.append(finding)
+                continue
+            primary = credential_by_key.get(_source_key(finding))
+            if primary is None:
+                merged.append(finding)
+                continue
+            verbose_patterns = (finding.detection_evidence or {}).get("matched_patterns", [])
+            primary_evidence = primary.detection_evidence or {}
+            supporting = primary_evidence.get("supporting_verbose_error_patterns", [])
+            for pattern in verbose_patterns:
+                if pattern not in supporting:
+                    supporting.append(pattern)
+            primary_evidence["supporting_verbose_error_patterns"] = supporting
+            if finding.evidence:
+                prior = primary_evidence.get("supporting_verbose_evidence", "")
+                primary_evidence["supporting_verbose_evidence"] = (
+                    f"{prior}\n{finding.evidence}".strip()
+                )
+            primary.detection_evidence = primary_evidence
+            if verbose_patterns:
+                primary.evidence = (primary.evidence or "") + (
+                    f" Verbose error disclosure also observed in the same response: "
+                    f"{', '.join(verbose_patterns[:2])}."
+                )
+            # Drop the verbose-error finding; it has been folded into the
+            # credential disclosure finding above.
+        findings.clear()
+        findings.extend(merged)
 
     def _add_findings_to_metric(self, metric: DetectorCoverageMetric, findings: list[Finding]) -> None:
         metric.candidates_built += len(findings or [])
@@ -1007,6 +1110,7 @@ class ScanOrchestrator:
             "authentication_failures": ("authentication_failures", "auth"),
             "file_inclusion": ("file_inclusion", "lfi", "rfi"),
             "injection_sql_command": ("injection_sql_command", "sqli"),
+            "nosql_injection": ("nosql_injection", "nosqli"),
         }
         return aliases.get(detector_name, (detector_name,))
 
@@ -1085,6 +1189,37 @@ class ScanOrchestrator:
                 metric.skipped_reasons,
             )
 
+    def _detector_coverage_warnings(
+        self, detector_metrics: list[DetectorCoverageMetric]
+    ) -> list[str]:
+        """Surface 0-request detectors as explicit coverage warnings.
+
+        A detector that built candidates but sent 0 requests represents a silent
+        coverage gap — either every candidate was filtered, the budget governor
+        denied everything, or a structural prerequisite was missing. Each of
+        these is already recorded in ``skipped_reasons``; this method lifts the
+        gap to a top-level ``coverage_warning`` so an operator reading the report
+        sees it without drilling into per-detector metrics. Detectors that built
+        0 candidates are not warned here (no gap — there was nothing to test).
+        """
+        warnings: list[str] = []
+        for metric in detector_metrics:
+            if metric.candidates_built > 0 and metric.requests_sent == 0:
+                # Prefer the most informative skip reason when available.
+                reason = (
+                    ", ".join(
+                        f"{k}={v}" for k, v in metric.skipped_reasons.items() if v
+                    )
+                    or "no requests dispatched"
+                )
+                warnings.append(
+                    f"detector '{metric.detector}' built {metric.candidates_built} "
+                    f"candidate(s) but sent 0 requests ({reason}); "
+                    "coverage gap — findings for this class are absent by design, "
+                    "not by confirmation."
+                )
+        return warnings
+
     async def _set_progress(
         self,
         scan: Scan,
@@ -1110,11 +1245,49 @@ class ScanOrchestrator:
             raise asyncio.CancelledError
 
     async def _analyze_all_findings(self, vulnerabilities: list[Vulnerability], scan: 'Scan') -> list[Vulnerability]:
-            """Analyze findings with AI using optimised local model constraints."""
+            """Analyze findings with AI using optimised local model constraints.
+
+            When ``ai_analysis_enabled`` is False, the LLM is skipped entirely —
+            each finding is populated from deterministic fallbacks (evidence
+            grade, calibrated exploitability, framework-aware remediation).
+            The resulting vulnerabilities have ``ai_analysis_status=skipped``.
+            """
             if not vulnerabilities:
                 return vulnerabilities
 
-            BATCH_SIZE = get_settings().ai_batch_size
+            settings = get_settings()
+            if not settings.ai_analysis_enabled:
+                logger.info(
+                    "AI analysis disabled (AI_ANALYSIS_ENABLED=false); "
+                    "populating %d finding(s) with deterministic fallbacks",
+                    len(vulnerabilities),
+                )
+                for vuln in vulnerabilities:
+                    grade = self.evidence_grader.grade(vuln)
+                    fallback = self._get_fallback_for(
+                        vuln.vuln_type, scan.technology_stack, proof_type=grade.proof_type
+                    )
+                    req_snippet = (vuln.evidence.request_snippet or "").lower()
+                    requires_auth = "cookie" in req_snippet or "authorization" in req_snippet
+                    cvss = CvssCalculator.from_vulnerability_context(
+                        vuln_type=vuln.vuln_type,
+                        requires_auth=requires_auth,
+                        confidence=fallback["confidence"],
+                        impact=0.9 if vuln.severity.value in {"Critical", "High"} else 0.5,
+                    )
+                    vuln.cvss_score = cvss.score
+                    vuln.cvss_vector = cvss.vector
+                    vuln.ai_analysis.exploitability = normalize_exploitability(fallback["exploitability"])
+                    vuln.ai_analysis.business_impact = fallback["business_impact"]
+                    vuln.ai_analysis.false_positive_probability = fallback["false_positive_probability"]
+                    vuln.ai_analysis.evidence_grade = grade.grade
+                    vuln.ai_analysis.evidence_grade_reason = grade.reason
+                    vuln.ai_analysis.remediation = fallback["remediation"]
+                    vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
+                    vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.skipped
+                return vulnerabilities
+
+            BATCH_SIZE = settings.ai_batch_size
             analyzed: list[Vulnerability] = []
 
             tech_stack_str = ", ".join(t.name for t in scan.technology_stack) if scan.technology_stack else "Unknown"
@@ -1128,18 +1301,23 @@ class ScanOrchestrator:
                     len(vulnerabilities),
                 )
 
+                # Pre-grade findings BEFORE the AI call — the proof characterization
+                # (proof_type, ceiling, brief) is needed to build the discriminative
+                # evidence brief in the prompt.
+                batch_grades = [self.evidence_grader.grade(v) for v in batch]
+
                 results = []
                 try:
                     if BATCH_SIZE == 1:
-                        result = await self._analyze_single(batch[0], tech_stack_str)
+                        result = await self._analyze_single(batch[0], tech_stack_str, batch_grades[0])
                         results = [result]
                     else:
-                        results = await self._analyze_batch(batch, tech_stack_str)
+                        results = await self._analyze_batch(batch, tech_stack_str, batch_grades)
                 except Exception as e:
                     logger.warning("Analysis call failed, falling back to individual processing: %s: %s", type(e).__name__, e)
-                    for vuln in batch:
+                    for i, vuln in enumerate(batch):
                         try:
-                            res = await self._analyze_single(vuln, tech_stack_str)
+                            res = await self._analyze_single(vuln, tech_stack_str, batch_grades[i])
                             results.append(res)
                         except Exception as single_e:
                             logger.warning("Single analysis failed for %s: %s", vuln.id, single_e)
@@ -1147,11 +1325,10 @@ class ScanOrchestrator:
 
                 # Apply AI results back to each vulnerability
                 for idx, (vuln, result) in enumerate(zip(batch, results), start=batch_start + 1):
-                    # Pre-grade the finding deterministically BEFORE applying AI output
-                    grade = self.evidence_grader.grade(vuln)
+                    grade = batch_grades[idx - batch_start - 1]
                     logger.info(
-                        "Evidence grade: vuln_type=%r grade=%s fp_ceiling=%.2f reason=%r url=%s",
-                        vuln.vuln_type, grade.grade, grade.fp_ceiling, grade.reason, vuln.location.url,
+                        "Evidence grade: vuln_type=%r proof_type=%s grade=%s fp_ceiling=%.2f url=%s",
+                        vuln.vuln_type, grade.proof_type, grade.grade, grade.fp_ceiling, vuln.location.url,
                     )
 
                     if result.get("ai_analysis_status") == "failed" or "results" in result:
@@ -1171,27 +1348,32 @@ class ScanOrchestrator:
                             vuln.cvss_score = cvss.score
                             vuln.cvss_vector = cvss.vector
                             vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
-                            # Even on AI failure, apply the grader ceiling
-                            vuln.ai_analysis.false_positive_probability = grade.fp_ceiling
+                            # When AI fails: undeniable proof stays confirmed (low FP),
+                            # interpretive proof goes to needs_review (can't verify
+                            # without AI judgment — don't blindly confirm or suppress).
+                            if grade.proof_type in ("auth_differential", "pattern_match", "heuristic", "timing_weak"):
+                                vuln.ai_analysis.false_positive_probability = 0.5
+                            else:
+                                vuln.ai_analysis.false_positive_probability = grade.fp_ceiling
                             vuln.ai_analysis.evidence_grade = grade.grade
                             vuln.ai_analysis.evidence_grade_reason = grade.reason
                             analyzed.append(vuln)
                             continue
 
-                    fallback = self._get_fallback_for(vuln.vuln_type, scan.technology_stack)
+                    fallback = self._get_fallback_for(vuln.vuln_type, scan.technology_stack, proof_type=grade.proof_type)
                     confidence = float(result.get("confidence", fallback["confidence"]))
 
-                    # AI FP output is advisory: clamp to grader ceiling.
-                    # AI can LOWER the FP probability (confirm a finding) but
-                    # never RAISE it above what the evidence grade allows.
+                    # AI FP output is clamped to the proof-type ceiling.
+                    # For active_output/error_echo/structural/timing_strong: low ceiling
+                    # (the proof is undeniable — AI cannot dismiss it).
+                    # For auth_differential/pattern_match: ceiling is 1.0 (no cap —
+                    # AI judges freely from the discriminative evidence brief).
                     raw_ai_fp = float(result.get("false_positive_probability", fallback["false_positive_probability"]))
                     fp_prob = min(raw_ai_fp, grade.fp_ceiling)
                     if raw_ai_fp > grade.fp_ceiling:
                         logger.info(
-                            "Clamped AI FP probability: vuln_type=%r ai_fp=%.2f -> ceiling=%.2f "
-                            "grade=%s reason=%r url=%s",
-                            vuln.vuln_type, raw_ai_fp, grade.fp_ceiling,
-                            grade.grade, grade.reason, vuln.location.url,
+                            "Clamped AI FP probability: vuln_type=%r proof_type=%s ai_fp=%.2f -> ceiling=%.2f url=%s",
+                            vuln.vuln_type, grade.proof_type, raw_ai_fp, grade.fp_ceiling, vuln.location.url,
                         )
 
                     impact = 0.9 if vuln.severity.value in {"Critical", "High"} else 0.5
@@ -1229,7 +1411,7 @@ class ScanOrchestrator:
 
             return analyzed
 
-    async def _analyze_batch(self, batch: list[Vulnerability], tech_stack_str: str) -> list[dict]:
+    async def _analyze_batch(self, batch: list[Vulnerability], tech_stack_str: str, grades: list[EvidenceGrade]) -> list[dict]:
         vuln_descriptions = []
         for i, vuln in enumerate(batch):
             req = vuln.evidence.request_snippet or ""
@@ -1237,26 +1419,23 @@ class ScanOrchestrator:
             payload = vuln.evidence.payload or ""
             auth_ctx = "requires_auth" if "cookie" in req.lower() else "unknown_auth"
             auth_ctx = vuln.auth_context.value if getattr(vuln, "auth_context", None) else auth_ctx
-            evidence_strength = vuln.evidence_strength.value if getattr(vuln, "evidence_strength", None) else "possible"
 
-            # Evidence is what the LLM must ground on. Keep it class-agnostic but
-            # include request/response/payload so fp scoring can vary by finding.
-            parsed = urlparse(vuln.location.url)
-            app_hint = parsed.path.split("/")[-1] or parsed.path
+            # Discriminative evidence brief — replaces the old descriptive block
+            # that exposed detector_verified/confidence_score (which caused the
+            # AI to defer to the detector circularly). The brief gives the AI
+            # the proof TYPE, markers, and weaknesses so it can judge the finding
+            # on the evidence itself.
+            evidence_brief = self.evidence_grader.build_evidence_brief(vuln, grades[i])
             evidence_block = (
                 "evidence_block=\n"
                 f"- url={vuln.location.url}\n"
                 f"- http_method={vuln.location.http_method}\n"
                 f"- parameter={vuln.location.parameter or 'none'}\n"
-                f"- detector_verified={vuln.evidence.verified}\n"
-                f"- evidence_strength={evidence_strength}\n"
                 f"- auth_context={auth_ctx}\n"
-                f"- detector_confidence_score={vuln.evidence.confidence_score:.1f}/100\n"
-                f"- detection_method={vuln.evidence.detection_method or 'unknown'}\n"
-                f"- detection_evidence={json.dumps(vuln.evidence.detection_evidence)[:1200] if vuln.evidence.detection_evidence else '{}'}\n"
                 f"- payload={payload or 'n/a'}\n"
                 f"- request_snippet={req[:1600] if req else 'n/a'}\n"
                 f"- response_snippet={resp[:1600] if resp else 'n/a'}\n"
+                f"- {evidence_brief}\n"
             )
 
             vuln_descriptions.append(
@@ -1269,28 +1448,24 @@ class ScanOrchestrator:
         return await self.ai_client.generate_json_list(prompt, expected_count=len(batch))
 
 
-    async def _analyze_single(self, vuln: Vulnerability, tech_stack_str: str) -> dict:
+    async def _analyze_single(self, vuln: Vulnerability, tech_stack_str: str, grade: EvidenceGrade) -> dict:
         req = vuln.evidence.request_snippet or ""
         resp = vuln.evidence.response_snippet or ""
         payload = vuln.evidence.payload or ""
         auth_ctx = "requires_auth" if "cookie" in req.lower() else "unknown_auth"
         auth_ctx = vuln.auth_context.value if getattr(vuln, "auth_context", None) else auth_ctx
-        evidence_strength = vuln.evidence_strength.value if getattr(vuln, "evidence_strength", None) else "possible"
 
+        evidence_brief = self.evidence_grader.build_evidence_brief(vuln, grade)
         evidence_block = (
             "evidence_block=\n"
             f"- url={vuln.location.url}\n"
             f"- http_method={vuln.location.http_method}\n"
             f"- parameter={vuln.location.parameter or 'none'}\n"
-            f"- detector_verified={vuln.evidence.verified}\n"
-            f"- evidence_strength={evidence_strength}\n"
             f"- auth_context={auth_ctx}\n"
-            f"- detector_confidence_score={vuln.evidence.confidence_score:.1f}/100\n"
-            f"- detection_method={vuln.evidence.detection_method or 'unknown'}\n"
-            f"- detection_evidence={json.dumps(vuln.evidence.detection_evidence)[:1200] if vuln.evidence.detection_evidence else '{}'}\n"
             f"- payload={payload or 'n/a'}\n"
             f"- request_snippet={req[:1600] if req else 'n/a'}\n"
             f"- response_snippet={resp[:1600] if resp else 'n/a'}\n"
+            f"- {evidence_brief}\n"
         )
 
         vuln_desc = (
@@ -1357,18 +1532,26 @@ class ScanOrchestrator:
 
         verification_guardrails = (
             "FALSE POSITIVE SCORING RULES:\n"
-            "The detection engine has already pre-scored false_positive_probability based on "
-            "objective evidence markers. Your FP score is ADVISORY ONLY:\n"
-            "- You may LOWER false_positive_probability if you see additional confirming evidence.\n"
-            "- For pattern-match findings (Verbose Error Handling, path disclosure, info leakage): "
-            "you MUST independently evaluate whether the matched text is causally connected to an "
-            "actual error condition. If the match appears only in reflected payload text, navigation "
-            "HTML, or normal page content, you may raise false_positive_probability accordingly.\n"
-            "- For structural findings (missing headers, GET credentials, TLS issues, admin paths), "
-            "the finding itself IS the proof - do NOT mark these as false positives.\n"
-            "- Focus your analysis on remediation specificity, business_impact depth, and "
-            "exploitability_reasoning quality.\n"
-            "- Do NOT invent evidence. If a proof marker is absent, say so in false_positive_reasoning.\n\n"
+            "Each finding's evidence_block includes a PROOF TYPE that tells you what kind "
+            "of evidence demonstrates the vulnerability. Judge the PROOF itself, not the "
+            "detector's verdict:\n"
+            "- active_output / error_echo: the proof is IN the response (command output, "
+            "file contents, DB error string). This is undeniable — do NOT flag as FP.\n"
+            "- structural (missing headers, TLS, admin paths): the observation IS the proof. "
+            "Do NOT flag as FP.\n"
+            "- timing_strong: a large response delay matching the sleep argument is strong. "
+            "Only flag as FP if the delay could plausibly be network noise.\n"
+            "- auth_differential (access-control, IDOR, data exposure): a 200 response is NOT "
+            "proof. You MUST evaluate whether the data is genuinely restricted. If anonymous "
+            "and authenticated responses are identical with no secret fields, the endpoint is "
+            "PUBLIC by design — raise false_positive_probability (this is a false positive).\n"
+            "- pattern_match (verbose error, credential disclosure): a regex hit is NOT proof. "
+            "You MUST evaluate whether the matched text is a genuine error or reflected payload "
+            "/ normal content. If the match is the injected payload echoed back, raise "
+            "false_positive_probability.\n"
+            "- Use the JUDGE THIS question in each evidence_block as your primary criterion.\n"
+            "- Do NOT invent evidence. If a proof marker is absent, say so in "
+            "false_positive_reasoning.\n\n"
         )
 
         # KEY CHANGE 3: Explicit schema with value constraints + anchoring to evidence
@@ -1421,7 +1604,165 @@ class ScanOrchestrator:
                 + "\n".join(vuln_descriptions)
             )
         
-    def _get_fallback_for(self, vuln_type: str, tech_stack: list['TechnologyComponent'] = None) -> dict:
+    async def _enrich_tech_from_errors(self, scan, findings: list) -> None:
+        """Add technologies revealed by error responses to ``scan.technology_stack``.
+
+        Harvests error/stack-trace text from the findings the detectors produced
+        (source-agnostic: any finding that captured an error contributes), maps
+        it to named technologies + versions via the generic error-signature table,
+        merges into the existing stack (filling versions for entries that lacked
+        one), CVE-enriches only the newly discovered components, and appends them.
+        """
+        # 1. Harvest candidate error text from finding evidence fields.
+        texts: list[str] = []
+        for f in findings or []:
+            for attr in ("verification_response_snippet", "evidence"):
+                val = getattr(f, attr, None)
+                if isinstance(val, str) and val:
+                    texts.append(val)
+            det_ev = getattr(f, "detection_evidence", None)
+            if isinstance(det_ev, dict):
+                for v in det_ev.values():
+                    if isinstance(v, str) and v:
+                        texts.append(v)
+        if not texts:
+            return
+
+        # 2. Fingerprint from error text (+ the same text through the markup engine,
+        #    cheaply, in case a normal-markup pattern such as an error-page banner hits).
+        discovered = list(error_fingerprints.match_error_evidence(texts))
+        try:
+            from app.integrations.wappalyzer_engine import Evidence as _TechEvidence, match as engine_match
+
+            markup_hits = engine_match(_TechEvidence(html="\n".join(texts)))
+            discovered.extend(markup_hits)
+        except Exception as exc:
+            logger.debug("markup re-match on error text failed: %s", exc)
+
+        if not discovered:
+            return
+
+        # 3. Merge into the existing stack: skip known names, back-fill missing versions.
+        existing = {c.name.lower(): c for c in (scan.technology_stack or [])}
+        new_components: list[TechnologyComponent] = []
+        seen_new: set[str] = set()
+        for comp in discovered:
+            key = comp.name.lower()
+            if key in existing:
+                if comp.version and not existing[key].version:
+                    existing[key].version = comp.version
+                continue
+            if key in seen_new:
+                continue
+            seen_new.add(key)
+            new_components.append(
+                TechnologyComponent(name=comp.name, version=comp.version, category=comp.category)
+            )
+
+        if not new_components:
+            return
+
+        # 4. CVE-enrich only the newly discovered components, then append.
+        try:
+            enriched = await self.cve_service.enrich_components(new_components)
+        except Exception as exc:
+            logger.debug("CVE enrichment of error-derived components failed: %s", exc)
+            enriched = new_components
+
+        scan.technology_stack = list(scan.technology_stack or []) + enriched
+        logger.info(
+            "error-based tech enrichment: +%d component(s) [%s]",
+            len(enriched),
+            ", ".join(f"{c.name}{'/' + c.version if c.version else ''}" for c in enriched),
+        )
+
+    async def _enrich_tech_from_manifests(self, scan, crawl_result) -> None:
+        """Back-fill component *versions* from manifests and version headers.
+
+        The supply-chain gate needs a version before it can emit an A03 finding.
+        Header/HTML/runtime fingerprinting names technologies but rarely versions
+        them; this harvests the version-bearing surfaces most apps expose —
+        ecosystem-standard package manifests/lockfiles and ``Server`` /
+        ``X-Powered-By`` / ``X-AspNet-Version`` headers — via the generic
+        :mod:`app.integrations.version_probe`.
+
+        Merge semantics mirror :meth:`_enrich_tech_from_errors`: back-fill a
+        missing version onto an existing component, add a genuinely-new versioned
+        component, never overwrite an existing version. Unlike the error path,
+        an existing component whose version *newly resolves* is re-sent to CVE
+        enrichment, because the version determines which CVEs apply.
+        """
+        from app.integrations import version_probe
+        from app.utils.scan_http import build_scan_headers, create_scan_client
+
+        existing_names = [c.name for c in (scan.technology_stack or [])]
+
+        # 1. Version-bearing response headers already captured during the crawl.
+        header_map: dict[str, str] = {}
+        for obs in getattr(crawl_result, "requests", []) or []:
+            for hname, hval in (getattr(obs, "response_headers", {}) or {}).items():
+                header_map.setdefault(str(hname).lower(), str(hval))
+        discovered = list(version_probe.extract_header_versions(header_map))
+
+        # 2. Ecosystem-standard manifests, bounded + only for detected ecosystems.
+        try:
+            auth_headers = getattr(crawl_result, "auth_headers", {}) or {}
+            session_cookies = getattr(crawl_result, "session_cookies", {}) or {}
+            async with create_scan_client(
+                headers=build_scan_headers(auth_headers),
+                cookies=session_cookies or None,
+                follow_redirects=True,
+            ) as client:
+                discovered.extend(
+                    await version_probe.probe_versions(scan.target_url, client, existing_names)
+                )
+        except Exception as exc:
+            logger.debug("manifest version probe failed: %s", exc)
+
+        if not discovered:
+            return
+
+        # 3. Merge: back-fill versions, collect new versioned components, and
+        #    track existing components whose version newly resolved.
+        existing = {c.name.lower(): c for c in (scan.technology_stack or [])}
+        new_components: list[TechnologyComponent] = []
+        resolved_existing: list[TechnologyComponent] = []
+        seen_new: dict[str, TechnologyComponent] = {}
+        for comp in discovered:
+            if not comp.version:
+                continue
+            key = comp.name.lower()
+            if key in existing:
+                if not existing[key].version:
+                    existing[key].version = comp.version
+                    resolved_existing.append(existing[key])
+                continue
+            if key in seen_new:
+                continue
+            new = TechnologyComponent(name=comp.name, version=comp.version, category=comp.category)
+            seen_new[key] = new
+            new_components.append(new)
+
+        to_enrich = resolved_existing + new_components
+        if not to_enrich:
+            return
+
+        # 4. CVE-enrich everything whose version newly resolved (existing + new).
+        try:
+            await self.cve_service.enrich_components(to_enrich)
+        except Exception as exc:
+            logger.debug("CVE enrichment of manifest-derived components failed: %s", exc)
+
+        if new_components:
+            scan.technology_stack = list(scan.technology_stack or []) + new_components
+        logger.info(
+            "manifest/header version enrichment: %d version(s) resolved, +%d new component(s) [%s]",
+            len(resolved_existing),
+            len(new_components),
+            ", ".join(f"{c.name}{'/' + c.version if c.version else ''}" for c in to_enrich),
+        )
+
+    def _get_fallback_for(self, vuln_type: str, tech_stack: list['TechnologyComponent'] = None, *, proof_type: str = "heuristic") -> dict:
         remediation = "Apply defense-in-depth controls appropriate to this vulnerability class."
         for key, value in self._remediation_fallbacks.items():
             if key.lower() in vuln_type.lower() or vuln_type.lower() in key.lower():
@@ -1453,11 +1794,19 @@ class ScanOrchestrator:
                 remediation = "Use csurf middleware."
             elif "spring" in stack_names or "java" in stack_names:
                 remediation = "Enable Spring Security CSRF protection."
+
+        # Fallback FP probability varies by proof type — when the AI doesn't
+        # provide a value, the fallback should reflect the proof's reliability.
+        # Undeniable proof types get low FP; interpretive types get high FP
+        # (needs_review) since without AI judgment we can't confirm them.
+        _undeniable = {"active_output", "error_echo", "structural", "timing_strong"}
+        fallback_fp = 0.1 if proof_type in _undeniable else 0.4
+
         return {
             "exploitability": "Medium",
             "business_impact": f"Potential security impact from {vuln_type or 'this issue'}.",
             "confidence": 0.8,
-            "false_positive_probability": 0.1,
+            "false_positive_probability": fallback_fp,
             "remediation": remediation,
         }
 
@@ -1675,7 +2024,7 @@ class ScanOrchestrator:
                 
         return chains
 
-    def _to_vulnerability(self, finding: Finding) -> Vulnerability:
+    def _to_vulnerability(self, finding: Finding, extra_secrets: Iterable[str] = ()) -> Vulnerability:
         evidence_strength = self._classify_evidence_strength(finding)
         auth_context = self._classify_auth_context(finding)
         cvss_score = 0.0
@@ -1701,13 +2050,19 @@ class ScanOrchestrator:
             location=LocationInfo(
                 url=finding.url,
                 parameter=finding.parameter,
+                parameters=(
+                    list(getattr(finding, "affected_parameters", None) or [])
+                    or ([finding.parameter] if finding.parameter else [])
+                ),
                 http_method=finding.method,
                 parameter_location=(getattr(finding, "parameter_location", None) or None),
             ),
             evidence=Evidence(
-                payload=finding.payload,
-                request_snippet=getattr(finding, "verification_request_snippet", None),
-                response_snippet=self._finding_response_snippet(finding),
+                payload=redact_secrets(finding.payload, extra_secrets),
+                request_snippet=redact_secrets(
+                    getattr(finding, "verification_request_snippet", None), extra_secrets
+                ),
+                response_snippet=redact_secrets(self._finding_response_snippet(finding), extra_secrets),
                 verified=getattr(finding, "verified", False),
                 confidence_score=float(getattr(finding, "confidence_score", 0.0) or 0.0),
                 detection_method=getattr(finding, "detection_method", None),
@@ -1717,8 +2072,141 @@ class ScanOrchestrator:
             ),
             evidence_strength=evidence_strength,
             auth_context=auth_context,
-            detected_at=datetime.now(timezone.utc),
         )
+
+    @staticmethod
+    def _collect_redaction_secrets(accounts: list | None) -> list[str]:
+        """Plaintext account passwords used by this scan, for evidence redaction.
+
+        ``redact_secrets`` already masks auth headers, cookies, JWTs, and
+        credential-labeled JSON fields by structure. The one blind spot is a
+        plaintext password echoed outside a ``password:``-labeled field (e.g.
+        in a response body); passing the exact password values closes that
+        gap. Usernames are excluded so reviewers can still see which identity a
+        finding pertains to.
+        """
+        secrets: list[str] = []
+        for account in accounts or []:
+            password = getattr(account, "password", None)
+            if password:
+                secrets.append(str(password))
+        return secrets
+
+    @staticmethod
+    def _calculate_aggregate_risk(vulnerabilities: list[Vulnerability]) -> tuple[float, str]:
+        """Aggregate per-vulnerability CVSS into one 0-100 posture score + qualitative band.
+
+        Standards-aligned design. CVSS base scores are per-vulnerability severity metrics
+        and must NOT be averaged: averaging dilutes the worst finding, and an attacker only
+        needs to exploit a single vulnerability (FIRST CVSS guidance; OWASP Risk Rating).
+        Instead:
+
+          * anchor  — worst-case. The highest verified-weighted CVSS, scaled to 0-100.
+                      This dominates, so a single confirmed Critical reads as Critical and
+                      is never diluted by lower-severity noise.
+          * breadth — a bounded, saturating bonus for the *additional* attack surface,
+                      severity-weighted (Critical > High > Medium > Low) so many low
+                      findings can never outweigh one severe one. It can fill at most
+                      ``BREADTH_CAP`` of the headroom above the anchor, with diminishing
+                      returns, so the score stays anchored and does not trivially saturate
+                      at 100 the way a volume multiplier did.
+
+        Verified findings weigh 1.0, unverified 0.7 (applied to both anchor and breadth).
+        The band label reuses the CVSS severity thresholds via ``CvssCalculator.get_severity``.
+
+        Returns ``(score 0-100, band)`` where band is Critical/High/Medium/Low/Info.
+        """
+        active = [v for v in vulnerabilities if not v.is_false_positive]
+        if not active:
+            return 0.0, CvssCalculator.get_severity(0.0)
+
+        # Severity → breadth weight: many low findings must never outweigh one severe one.
+        tier_weight = {
+            SeverityLevel.critical: 1.0,
+            SeverityLevel.high: 0.6,
+            SeverityLevel.medium: 0.3,
+            SeverityLevel.low: 0.1,
+            SeverityLevel.info: 0.0,
+        }
+        BREADTH_CAP = 0.5   # breadth fills at most 50% of the headroom above the anchor
+        BREADTH_K = 0.35    # saturation rate of the breadth bonus vs. severity-weighted volume
+
+        weighted_cvss: list[float] = []
+        sev_weight_sum = 0.0
+        for v in active:
+            w = 1.0 if v.evidence.verified else 0.7
+            weighted_cvss.append(v.cvss_score * w)
+            sev_weight_sum += tier_weight.get(v.severity, 0.3) * w
+
+        anchor = max(weighted_cvss) * 10.0                      # worst-case, 0-100
+        headroom = 100.0 - anchor
+        breadth = headroom * BREADTH_CAP * (1.0 - math.exp(-BREADTH_K * sev_weight_sum))
+
+        score = round(min(100.0, anchor + breadth), 2)
+        return score, CvssCalculator.get_severity(score / 10.0)
+
+    @staticmethod
+    def _count_discovered_surface(crawl_result) -> int:
+        """Distinct discovered URLs across the HTTP spider, SPA routes, and API endpoints.
+
+        ``crawl_result.urls`` alone only holds the HTTP-spider seed surface — for a
+        browser-crawled SPA that is often just the shell (1 URL), which badly understates
+        coverage. The honest "URLs crawled" figure is the deduplicated union of the pages
+        navigated (``routes``) and the API endpoints discovered (``api_endpoints``) plus
+        the HTTP URLs. Same-origin/dead-route filtering has already been applied upstream.
+        """
+        discovered: set[str] = set()
+        for url in getattr(crawl_result, "urls", []) or []:
+            if url:
+                discovered.add(url)
+        for route in getattr(crawl_result, "routes", []) or []:
+            url = getattr(route, "url", "")
+            if url:
+                discovered.add(url)
+        for endpoint in getattr(crawl_result, "api_endpoints", []) or []:
+            url = getattr(endpoint, "url", "")
+            if url:
+                discovered.add(url)
+        return len(discovered)
+
+    @staticmethod
+    def _count_protected_targets_verified(crawl_result) -> int:
+        """Distinct data endpoints the authenticated session actually reached with
+        an authorized (2xx) response.
+
+        Under a verified session every observed browser request carries the
+        session, so a 2xx response to a genuine data endpoint (a JSON/data body,
+        or any state-changing method) is a protected resource we confirmed
+        authenticated access to. Static assets and the HTML shell are excluded so
+        the figure reflects real application surface, not page chrome. Replaces the
+        former hardcoded ``1`` placeholder with a truthful, framework-agnostic
+        count (keyed on HTTP shape only, no app-specific paths). Returns 0 when the
+        crawl observed no such responses (e.g. a static site with no XHR)."""
+        from urllib.parse import urlparse
+
+        from app.core.crawler.url_parser import is_static_asset
+
+        verified: set[tuple[str, str]] = set()
+        for observation in getattr(crawl_result, "requests", []) or []:
+            status = getattr(observation, "response_status", None)
+            try:
+                status_int = int(status) if status is not None else 0
+            except (TypeError, ValueError):
+                continue
+            if not (200 <= status_int < 300):
+                continue
+            url = str(getattr(observation, "url", "") or "")
+            if not url or is_static_asset(url):
+                continue
+            method = str(getattr(observation, "method", "GET") or "GET").upper()
+            content_type = str(getattr(observation, "response_content_type", "") or "").lower()
+            is_data = "json" in content_type or method in {"POST", "PUT", "PATCH", "DELETE"}
+            if not is_data:
+                continue
+            # Collapse query strings so ?id=1 vs ?id=2 count as one protected target.
+            path_key = urlparse(url)._replace(query="", fragment="").geturl()
+            verified.add((method, path_key))
+        return len(verified)
 
     def _update_crawl_metadata(self, scan: 'Scan', crawl_result, crawl_context: dict | None = None) -> None:
         auth_state = getattr(crawl_result, "auth_state", "unauthenticated")
@@ -1773,6 +2261,7 @@ class ScanOrchestrator:
             observed_json_body_targets=body_target_telemetry["observed_json_body_targets"],
             observed_form_body_targets=body_target_telemetry["observed_form_body_targets"],
             static_synth_body_targets=body_target_telemetry["static_synth_body_targets"],
+            derived_update_body_targets=body_target_telemetry.get("derived_update_body_targets", 0),
             skipped_unresolved_body_targets=body_target_telemetry["skipped_unresolved_body_targets"],
             post_bodies=post_bodies,
             workflow_states_visited=int(getattr(crawl_result, "workflow_states_visited", 0) or 0),
@@ -1781,11 +2270,18 @@ class ScanOrchestrator:
             file_inputs_discovered=int(getattr(crawl_result, "file_inputs_discovered", 0) or 0),
             dynamic_status=dynamic_status,
         )
+        # Authenticated surface actually scanned. ``crawl_result.urls`` alone holds
+        # only the HTTP-spider seed surface — for a browser-crawled SPA that is
+        # often just the shell (1 URL), which badly understates coverage. Use the
+        # deduplicated union of pages navigated + API endpoints reached, exactly as
+        # ``total_urls_crawled`` does, so the auth-coverage figure is truthful.
+        scanned_surface = self._count_discovered_surface(crawl_result)
+        protected_verified = self._count_protected_targets_verified(crawl_result) if verified else 0
         scan.report_metadata.auth_coverage = AuthCoverage(
             state=auth_state_value,
-            authenticated_url_count=len(getattr(crawl_result, "urls", []) or []) if verified else 0,
-            unauthenticated_url_count=0 if verified else len(getattr(crawl_result, "urls", []) or []),
-            protected_targets_verified=1 if verified else 0,
+            authenticated_url_count=scanned_surface if verified else 0,
+            unauthenticated_url_count=0 if verified else scanned_surface,
+            protected_targets_verified=protected_verified,
             auth_headers_present=has_headers,
             session_cookies_present=has_session,
         )

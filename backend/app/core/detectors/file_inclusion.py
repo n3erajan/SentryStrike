@@ -2,7 +2,7 @@ import asyncio
 import base64
 import logging
 import re
-from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode, quote
+from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse, urlencode, quote
 
 import httpx
 
@@ -11,7 +11,7 @@ from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.param_selection import FILE_NAME_TOKENS, file_candidate
 from app.core.payload_profile import PayloadProfile, build_payload_profile
-from app.core.verification.response_analyzer import ResponseAnalyzer
+from app.core.verification.response_analyzer import ResponseAnalyzer, is_dead_baseline
 from app.core.verification.verification_framework import HttpVerifier
 from app.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.scan_http import build_scan_headers
@@ -101,6 +101,185 @@ class FileInclusionDetector(BaseDetector):
         if profile.confidence in ("high", "confirmed"):
             return []
         return cls.RFI_PAYLOADS
+
+    # --- Poison-null-byte extension-filter bypass (directory-served files) ----
+    #
+    # A server that serves files from a directory but restricts them by extension
+    # (``.md``/``.pdf`` only) can be bypassed with a poison null byte: the
+    # DOUBLE URL-encoded null (``%2500``) survives one server-side decode to
+    # ``%00``, which truncates the path at the filesystem layer, while the
+    # appended allowed extension satisfies the whitelist. So a file that is
+    # forbidden directly (``/ftp/package.json.bak`` -> 403) becomes readable as
+    # ``/ftp/package.json.bak%2500.md`` -> 200. Framework-agnostic: the null-byte
+    # form, the forbidden files, and the allowed extension are all derived from
+    # observed behaviour (a directory listing + per-file status codes), never
+    # hardcoded to any target.
+    _NULL_BYTE = "%2500"
+    _ALLOWED_EXT_FALLBACKS: tuple[str, ...] = ("md", "pdf", "txt", "png", "jpg", "html")
+    _NB_MAX_LISTING_DIRS = 6
+    _NB_MAX_ENTRY_PROBES = 80          # global cap on per-entry status probes
+    _NB_MAX_FORBIDDEN_TARGETS = 20     # global cap on files we attempt to bypass
+    _NB_MAX_EXTS_PER_TARGET = 3
+
+    @staticmethod
+    def _looks_like_directory_listing(body: str) -> bool:
+        """Generic autoindex/directory-listing signature across common servers."""
+        lowered = body.lower()
+        if any(
+            tok in lowered
+            for tok in ("listing directory", "index of /", "[to parent directory]")
+        ):
+            return True
+        hrefs = re.findall(r'<a\s+[^>]*href=["\']?([^"\'>\s]+)', body, re.IGNORECASE)
+        return len(hrefs) >= 5 and any(
+            h in ("..", "../") or h.rstrip("/").endswith("..") for h in hrefs
+        )
+
+    async def _detect_null_byte_filter_bypass(
+        self,
+        urls: list[str],
+        verifier: HttpVerifier,
+        semaphore: asyncio.Semaphore,
+        spa_root_html: str,
+    ) -> list[Finding]:
+        """Find directory-served files whose extension whitelist a poison null
+        byte bypasses, yielding arbitrary file read.
+
+        Flow (all evidence-driven, no hardcoded paths): derive same-origin
+        directories from discovered file URLs -> fetch each -> if it is an
+        autoindex listing, probe its entries to learn the allowed extensions
+        (200 responses) and the forbidden files (401/403) -> for each forbidden
+        file, append ``%2500.<allowed-ext>`` and confirm a 200 whose body differs
+        from both the forbidden baseline and a non-existent-file control (so a
+        catch-all/SPA shell can never be mistaken for a real read).
+        """
+        findings: list[Finding] = []
+        verifier.set_request_context(module="lfi_nullbyte")
+
+        # 1. Same-origin directories that contain at least one discovered file.
+        dirs: list[str] = []
+        seen_dirs: set[str] = set()
+        for raw in urls:
+            parsed = urlparse(raw)
+            if not parsed.scheme or not parsed.netloc:
+                continue
+            path = parsed.path or "/"
+            if "." not in path.rsplit("/", 1)[-1]:
+                continue  # only directories that actually hold a file
+            dir_path = path[: path.rfind("/") + 1] or "/"
+            dir_url = urlunparse((parsed.scheme, parsed.netloc, dir_path, "", "", ""))
+            if dir_url not in seen_dirs:
+                seen_dirs.add(dir_url)
+                dirs.append(dir_url)
+            if len(dirs) >= self._NB_MAX_LISTING_DIRS:
+                break
+
+        async def _get(url: str, phase: str, payload: str | None = None):
+            async with semaphore:
+                return await verifier.send_request(
+                    url, "GET", None, None, test_phase=phase, payload=payload
+                )
+
+        entry_probe_budget = self._NB_MAX_ENTRY_PROBES
+        forbidden_budget = self._NB_MAX_FORBIDDEN_TARGETS
+
+        for dir_url in dirs:
+            if forbidden_budget <= 0 or entry_probe_budget <= 0:
+                break
+            try:
+                listing = await _get(dir_url, "nullbyte_dir_probe")
+            except Exception:
+                continue
+            if listing.status_code != 200 or not self._looks_like_directory_listing(listing.body):
+                continue
+
+            dir_origin = urlparse(dir_url)[:2]
+            hrefs = re.findall(r'<a\s+[^>]*href=["\']?([^"\'>\s]+)', listing.body, re.IGNORECASE)
+            allowed_exts: list[str] = []
+            forbidden: list[tuple[str, object]] = []
+            for href in hrefs:
+                if entry_probe_budget <= 0:
+                    break
+                href = (href or "").strip()
+                if not href or href in (".", "./", "..", "../") or href.startswith("?"):
+                    continue
+                entry_url = urljoin(dir_url, href)
+                ep = urlparse(entry_url)
+                if ep[:2] != dir_origin:
+                    continue  # same-origin only
+                entry_name = (ep.path or "").rsplit("/", 1)[-1]
+                if "." not in entry_name or ep.path.endswith("/"):
+                    continue  # skip subdirectories and extension-less entries
+                entry_probe_budget -= 1
+                try:
+                    resp = await _get(entry_url, "nullbyte_entry_probe")
+                except Exception:
+                    continue
+                ext = entry_name.rsplit(".", 1)[-1].lower()
+                if resp.status_code == 200:
+                    if ext and ext not in allowed_exts:
+                        allowed_exts.append(ext)
+                elif resp.status_code in (401, 403):
+                    forbidden.append((entry_url, resp))
+
+            if not forbidden:
+                continue
+            exts = (allowed_exts or list(self._ALLOWED_EXT_FALLBACKS))[: self._NB_MAX_EXTS_PER_TARGET]
+
+            for entry_url, baseline in forbidden:
+                if forbidden_budget <= 0:
+                    break
+                forbidden_budget -= 1
+                for ext in exts:
+                    bypass_url = f"{entry_url}{self._NULL_BYTE}.{ext}"
+                    try:
+                        inj = await _get(bypass_url, "nullbyte_injection", payload=f"{self._NULL_BYTE}.{ext}")
+                    except Exception:
+                        continue
+                    if inj.status_code != 200 or len(inj.body or "") < 16:
+                        continue
+                    if inj.body == (baseline.body or ""):
+                        continue  # nothing changed -> not bypassed
+                    if spa_root_html and inj.body[:120] == spa_root_html[:120]:
+                        continue  # SPA shell, not a real file read
+                    # Control: a non-existent sibling with the same bypass suffix
+                    # must NOT return the same 200 body (that would mean a
+                    # catch-all/soft-200, not a genuine per-file read).
+                    control_url = f"{dir_url}sentry_nx_probe_{ext}{self._NULL_BYTE}.{ext}"
+                    try:
+                        ctrl = await _get(control_url, "nullbyte_control")
+                    except Exception:
+                        ctrl = None
+                    if ctrl is not None and ctrl.status_code == 200 and (ctrl.body or "") == inj.body:
+                        continue
+                    findings.append(
+                        Finding(
+                            category=OwaspCategory.a05,
+                            vuln_type="Path Traversal / Arbitrary File Read (poison null byte)",
+                            severity=SeverityLevel.high,
+                            url=entry_url,
+                            parameter=urlparse(entry_url).path.rsplit("/", 1)[-1],
+                            method="GET",
+                            payload=bypass_url,
+                            evidence=(
+                                f"Extension-filter bypass: {entry_url} is forbidden "
+                                f"(HTTP {baseline.status_code}) when requested directly, but "
+                                f"appending a poison null byte and an allowed extension "
+                                f"({self._NULL_BYTE}.{ext}) returns HTTP 200 with the file's "
+                                f"contents. The null byte truncates the path server-side while "
+                                f"the appended extension satisfies the whitelist — arbitrary "
+                                f"read of an otherwise-blocked file."
+                            ),
+                            confidence_score=95.0,
+                            detection_method="poison_null_byte_extension_bypass",
+                            reproducible=True,
+                            verified=True,
+                            verification_request_snippet=inj.request_snippet,
+                            verification_response_snippet=inj.response_snippet,
+                        )
+                    )
+                    break  # one confirmed extension is enough for this file
+        return findings
 
     @staticmethod
     def _is_direct_path_traversal(payload: str) -> bool:
@@ -203,12 +382,26 @@ class FileInclusionDetector(BaseDetector):
             if file_candidate(candidate.parameter, candidate.value)
         ]
 
-        if not candidates:
-            return []
-
         semaphore = asyncio.Semaphore(4)
         verifier = HttpVerifier(cookies=session_cookies, headers=build_scan_headers(auth_headers))
         verifier.set_request_context(module="lfi")
+
+        # Poison-null-byte extension-filter bypass on directory-served files.
+        # The injection point is a static file's own path segment (not a query or
+        # body parameter), so this runs independently of ``candidates`` — there is
+        # no ``AttackSurface`` candidate for a plain ``/dir/file.ext`` URL.
+        try:
+            findings.extend(
+                await self._detect_null_byte_filter_bypass(
+                    urls, verifier, semaphore, str(kwargs.get("spa_root_html") or "")
+                )
+            )
+        except Exception as exc:  # never let this pass abort the LFI/RFI suite
+            logger.debug("poison-null-byte filter-bypass pass failed: %s", exc)
+
+        if not candidates:
+            await verifier.close()
+            return findings
 
         rfi_fingerprints = await self._fetch_rfi_fingerprints() if rfi_payloads else {}
 
@@ -251,6 +444,13 @@ class FileInclusionDetector(BaseDetector):
                     baseline_len = len(baseline.body)
 
                     if ResponseAnalyzer.is_phpinfo_or_debug_page(baseline.body or ""):
+                        return cand_findings
+
+                    # Dead-baseline abort: a 401/403/404/405 baseline means the
+                    # endpoint is unreachable/unauthorized as sent, so no path or
+                    # wrapper differential can exist — skip rather than fire the
+                    # traversal/wrapper payload set into 4xx noise.
+                    if is_dead_baseline(baseline):
                         return cand_findings
 
                     control_url, control_params, control_data, control_json, control_headers, control_cookies = (

@@ -5,6 +5,8 @@ import httpx
 import ipaddress
 
 from app.config import get_settings
+from app.core.crawler.url_parser import is_static_asset
+from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer
 from app.models.vulnerability import OwaspCategory, SeverityLevel
@@ -65,6 +67,11 @@ _MEDIUM_PATTERNS: list[re.Pattern] = [
     for p in [
         r"traceback \(most recent call last\)",         # Python
         r"at \w[\w\.]+\([\w\.]+\.(?:java|kt):\d+\)",   # Java / Kotlin stack frame
+        # Node.js / JavaScript / TypeScript stack frames (CWE-550). Two shapes:
+        #   at <fn> (/app/file.js:line:col) | at <fn> (node:internal/...:line:col)
+        #   at /app/file.js:line:col                     | at node:internal/...:line:col
+        r"at \w[\w\.\[\] ]*\s*\([^)]*\.(?:js|mjs|cjs|ts|jsx|tsx):\d+:\d+\)",
+        r"at (?:/[\w./-]+|node:[\w/-]+):\d+:\d+",
         r"system\.exception",                           # .NET
         r"unhandled exception",                         # .NET / generic
         r"microsoft\.aspnetcore",                       # ASP.NET Core
@@ -126,6 +133,8 @@ _STACK_TRACE_CORROBORATORS: list[re.Pattern] = [
         r"caught exception:",
         r"traceback \(most recent call last\)",
         r"at \w[\w\.]+\([\w\.]+\.(?:java|kt):\d+\)",
+        r"at \w[\w\.\[\] ]*\s*\([^)]*\.(?:js|mjs|cjs|ts|jsx|tsx):\d+:\d+\)",
+        r"at (?:/[\w./-]+|node:[\w/-]+):\d+:\d+",
         r"fatal error:",
         r"warning:\s+mysql(?:i)?_",
         r"pdoexception",
@@ -154,6 +163,9 @@ _FUZZ_PAYLOADS: list[tuple[str, str]] = [
 ]
 
 _DEFAULT_URL_LIMIT = 20
+# Cap on how many shared attack targets are error-fuzzed (targets are already
+# ranked by the AttackPlanner, so this keeps the highest-value ones).
+_DEFAULT_TARGET_LIMIT = 40
 _EVIDENCE_SNIPPET_LEN = 300
 _MAX_CONCURRENT = 5
 _GATEWAY_CODES = {501, 502, 503, 504}
@@ -314,22 +326,6 @@ def _observed_text_from_finding(finding: Finding) -> str:
     # Only evaluate the actual HTTP response body snippet returned by the server
     return finding.verification_response_snippet or ""
 
-def _replace_param_values(url: str, replacement: str) -> str:
-    if "?" not in url:
-        return url
-    base, qs = url.split("?", 1)
-    pairs = []
-    for part in qs.split("&"):
-        if "=" in part:
-            key, _ = part.split("=", 1)
-            if key.lower() == "submit":
-                pairs.append(part)
-            else:
-                pairs.append(f"{key}={urllib.parse.quote(replacement, safe='')}")
-        else:
-            pairs.append(part)
-    return f"{base}?{'&'.join(pairs)}"
-
 def _reflection_guard(
     body: str,
     payload: str | None,
@@ -397,17 +393,43 @@ class ExceptionHandlingDetector(BaseDetector):
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
 
+        # Single source of truth for attack targets. Consume the shared
+        # AttackPlanner (built once per scan) — or rebuild the identical
+        # AttackSurface when no planner was threaded in — instead of fabricating
+        # request shapes from raw urls/forms. This is what keeps the detector from
+        # POSTing to SPA client routes (``/#/score-board``) or fuzzing synthetic
+        # ``mat-input-N`` DOM fields: the central builder already drops
+        # route-fragment URLs, skips transport noise, dedupes, and carries the
+        # real observed endpoints/params/bodies. Every other injection detector
+        # already sources targets this way — exception handling now matches.
+        planner = kwargs.get("attack_planner")
+        if planner is not None and hasattr(planner, "targets_for"):
+            targets = list(planner.targets_for(self.name))
+        else:
+            targets = AttackSurface.build(
+                urls,
+                forms,
+                parameters=kwargs.get("parameters") or [],
+                api_endpoints=kwargs.get("api_endpoints") or [],
+                requests=kwargs.get("requests") or [],
+            )
+        target_limit = getattr(self.settings, "exception_target_limit", _DEFAULT_TARGET_LIMIT)
+        targets = targets[:target_limit]
+
         async with create_scan_client(
             timeout=self.settings.request_timeout_seconds,
-            follow_redirects=False,   
+            follow_redirects=False,
             cookies=auth_cookies,
             headers=default_headers,
             event_hooks={"response": [make_httpx_response_logger("exception_handling", "error_probe")]},
         ) as client:
 
             # ── Technique 1: 404 / non-existent path probing ─────────────
+            # URL-level error-template probing on real HTML pages only. Static
+            # assets (js/css/txt/…) have no error surface and the crawler already
+            # excluded SPA shells, so probe just the genuine pages.
             url_limit = getattr(self.settings, "exception_url_limit", _DEFAULT_URL_LIMIT)
-            probe_urls = _prioritise_urls(urls)[:url_limit]
+            probe_urls = [u for u in _prioritise_urls(urls) if not is_static_asset(u)][:url_limit]
 
             tasks_404 = [self._probe_404(client, semaphore, url) for url in probe_urls]
             results_404 = await asyncio.gather(*tasks_404, return_exceptions=True)
@@ -415,37 +437,19 @@ class ExceptionHandlingDetector(BaseDetector):
                 if isinstance(result, Finding):
                     _add_finding(result, findings, seen)
 
-            # ── Technique 2: Parameter fuzzing on GET URLs ────────────────
-            param_urls = [u for u in urls if "?" in u]
+            # ── Technique 2: Parameter/body error fuzzing ────────────────
+            # One unified loop over the shared targets (replaces the old separate
+            # GET-param / single-param / form passes that each rebuilt requests
+            # from raw urls/forms). Each target's own parameter is fuzzed with the
+            # error-inducing payloads via the shared ``build_request`` — the exact
+            # request shape every other detector uses, against real endpoints.
             fuzz_tasks = [
-                self._probe_get_params(client, semaphore, url, payload, desc)
-                for url in param_urls
+                self._probe_target(client, semaphore, target, payload, desc)
+                for target in targets
                 for payload, desc in _FUZZ_PAYLOADS
             ]
             results_fuzz = await asyncio.gather(*fuzz_tasks, return_exceptions=True)
             for result in results_fuzz:
-                if isinstance(result, Finding):
-                    _add_finding(result, findings, seen)
-
-            # ── Technique 3: Form field fuzzing (POST / GET forms) ────────
-            form_tasks = [
-                self._probe_form(client, semaphore, form, payload, desc)
-                for form in (forms or [])
-                for payload, desc in _FUZZ_PAYLOADS
-            ]
-            results_forms = await asyncio.gather(*form_tasks, return_exceptions=True)
-            for result in results_forms:
-                if isinstance(result, Finding):
-                    _add_finding(result, findings, seen)
-
-            # ── Technique 4: Co-parameter surgical fuzzing ─────────────
-            coparam_tasks = [
-                self._probe_get_param_single(client, semaphore, url, payload, desc)
-                for url in param_urls
-                for payload, desc in _FUZZ_PAYLOADS
-            ]
-            results_coparam = await asyncio.gather(*coparam_tasks, return_exceptions=True)
-            for result in results_coparam:
                 if isinstance(result, Finding):
                     _add_finding(result, findings, seen)
 
@@ -605,21 +609,43 @@ class ExceptionHandlingDetector(BaseDetector):
             return None
         return finding
 
-    async def _probe_get_params(
+    async def _probe_target(
         self,
         client: httpx.AsyncClient,
         semaphore: asyncio.Semaphore,
-        url: str,
+        target: AttackTarget,
         payload: str,
         payload_desc: str,
     ) -> Finding | None:
-        fuzzed_url = _replace_param_values(url, payload)
-        if fuzzed_url == url:
+        """Fuzz one shared ``AttackTarget``'s parameter with an error-inducing
+        payload and analyse the response for verbose-error disclosure.
+
+        The concrete request is built by ``AttackTarget.build_request`` — the same
+        shared builder every detector uses — so the injection point, location
+        (query/form/json/path), method, headers and cookies are exactly what the
+        crawler observed. No SPA client-route URL can appear here because the
+        central AttackSurface already dropped route-fragment targets.
+        """
+        try:
+            prepared = target.build_request(payload)
+        except Exception:
             return None
+
+        request_kwargs: dict[str, object] = {}
+        if prepared.params:
+            request_kwargs["params"] = prepared.params
+        if prepared.json_body is not None:
+            request_kwargs["json"] = prepared.json_body
+        elif prepared.data is not None:
+            request_kwargs["data"] = prepared.data
+        if prepared.headers:
+            request_kwargs["headers"] = prepared.headers
+        if prepared.cookies:
+            request_kwargs["cookies"] = prepared.cookies
 
         async with semaphore:
             try:
-                response = await client.get(fuzzed_url)
+                response = await client.request(prepared.method, prepared.url, **request_kwargs)
             except Exception:
                 return None
 
@@ -627,120 +653,15 @@ class ExceptionHandlingDetector(BaseDetector):
             return None
 
         return self._analyse_response(
-            url=fuzzed_url, method="GET", status=response.status_code,
-            body=response.text, headers=response.headers, trigger=payload_desc,
-            parameter="QueryString", payload=payload
+            url=str(getattr(response, "url", prepared.url)),
+            method=prepared.method,
+            status=response.status_code,
+            body=response.text,
+            headers=response.headers,
+            trigger=f"{target.location.value} fuzz - {payload_desc}",
+            parameter=target.parameter,
+            payload=payload,
         )
-
-    async def _probe_form(
-        self,
-        client: httpx.AsyncClient,
-        semaphore: asyncio.Semaphore,
-        form: object,
-        payload: str,
-        payload_desc: str,
-    ) -> Finding | None:
-        action = getattr(form, "action", None) or getattr(form, "url", None)
-        method = (getattr(form, "method", "post") or "post").upper()
-        fields = getattr(form, "fields", None) or getattr(form, "inputs", None) or []
-
-        if not action:
-            return None
-
-        fuzzed_param = "unknown"
-        data: dict[str, str] = {}
-        for field in fields:
-            name = getattr(field, "name", None) or (field if isinstance(field, str) else None)
-            if not name:
-                continue
-            
-            if any(kw in name.lower() for kw in ("token", "csrf", "_method", "utf8")):
-                data[name] = getattr(field, "value", "") or ""
-            elif name.lower() == "submit":
-                data[name] = getattr(field, "value", "Submit") or "Submit"
-            else:
-                data[name] = payload
-                fuzzed_param = name
-
-        if not data:
-            return None
-
-        async with semaphore:
-            try:
-                if method == "GET":
-                    response = await client.get(action, params=data)
-                else:
-                    response = await client.post(action, data=data)
-            except Exception:
-                return None
-
-        if response.status_code in {301, 302, 303, 307, 308}:
-            return None
-
-        # Build full URI for context logging
-        full_uri = str(response.url) if hasattr(response, "url") else action
-
-        return self._analyse_response(
-            url=full_uri, method=method, status=response.status_code,
-            body=response.text, headers=response.headers, trigger=f"form fuzz - {payload_desc}",
-            parameter=fuzzed_param, payload=payload
-        )
-
-    async def _probe_get_param_single(
-        self,
-        client: httpx.AsyncClient,
-        semaphore: asyncio.Semaphore,
-        url: str,
-        payload: str,
-        payload_desc: str,
-    ) -> Finding | None:
-        if "?" not in url:
-            return None
-
-        base, qs = url.split("?", 1)
-        original_pairs: list[tuple[str, str]] = []
-        for part in qs.split("&"):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                original_pairs.append((k, urllib.parse.unquote_plus(v)))
-            else:
-                original_pairs.append((part, ""))
-
-        if len(original_pairs) <= 1:
-            return None
-
-        for target_idx, (target_key, _) in enumerate(original_pairs):
-            if target_key.lower() == "submit":
-                continue
-
-            fuzzed_qs_parts = []
-            for idx, (k, v) in enumerate(original_pairs):
-                if idx == target_idx:
-                    fuzzed_qs_parts.append(f"{k}={urllib.parse.quote(payload, safe='')}")
-                else:
-                    fuzzed_qs_parts.append(f"{k}={urllib.parse.quote(v, safe='')}")
-
-            fuzzed_url = f"{base}?{'&'.join(fuzzed_qs_parts)}"
-
-            async with semaphore:
-                try:
-                    response = await client.get(fuzzed_url)
-                except Exception:
-                    continue
-
-            if response.status_code in {301, 302, 303, 307, 308}:
-                continue
-
-            finding = self._analyse_response(
-                url=fuzzed_url, method="GET", status=response.status_code,
-                body=response.text, headers=response.headers,
-                trigger=f"single-param fuzz on '{target_key}' - {payload_desc}",
-                parameter=target_key, payload=payload
-            )
-            if finding:
-                return finding
-
-        return None
 
     def _analyse_response(
         self,
@@ -766,19 +687,21 @@ class ExceptionHandlingDetector(BaseDetector):
         severity = _reclassify_severity(matched)
 
         sensitive_hdrs = _sensitive_headers_present(headers, http_status=status)
-        is_bare_500 = status == 500 and not matched
 
-        if require_body_match and not matched:
-            return None
-
-        if not matched and not is_bare_500:
+        # A response is "verbose error handling" only when its BODY discloses
+        # internal detail — a stack trace, server file path, SQL echo, or a
+        # framework exception (all captured by the pattern sets). A bare error
+        # status with a generic message (``{"message":"internal error"}``) leaks
+        # nothing actionable and is NOT a finding, even when the response carries
+        # tech-fingerprint headers (``x-powered-by`` …): those are a host-global
+        # concern owned by the security-header detector, not a per-endpoint
+        # verbose-error signal. Reporting one such 500 per fuzzed parameter was
+        # the primary source of low-value error-handling noise.
+        if not matched:
             return None
 
         if not severity:
             severity = SeverityLevel.low
-
-        if is_bare_500 and sensitive_hdrs:
-            severity = SeverityLevel.medium
 
         evidence = _build_evidence(
             url=url, method=method, status=status, body=body,

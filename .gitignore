@@ -93,3 +93,8 @@ playwright/.auth/
 .roo/
 .continue/
 .agents/
+.playwright-mcp/
+.WARP.md
+.github/
+brain/
+audit_evidence

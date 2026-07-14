@@ -7,104 +7,96 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Ollama model families that support the `think` parameter.
-# For unsupported models the parameter is silently ignored by Ollama, but
-# we skip it entirely to keep payloads clean and avoid log noise.
-_THINKING_CAPABLE_PREFIXES = ("qwen3", "deepseek-r1", "qwq")
 
+class AIClient:
+    """Single LLM client speaking the OpenAI Chat Completions API.
 
-def _model_supports_thinking(model_name: str) -> bool:
-    """Return True if *model_name* is known to support Ollama's ``think`` param."""
-    name_lower = (model_name or "").lower()
-    return any(name_lower.startswith(prefix) for prefix in _THINKING_CAPABLE_PREFIXES)
+    One client, one config set — works with any OpenAI-compatible endpoint.
+    Point ``AI_BASE_URL`` at the provider's ``/v1`` root and set ``AI_MODEL``
+    (and ``AI_API_KEY`` for hosted providers). Local Ollama needs no key: its
+    OpenAI-compatible endpoint lives at ``http://localhost:11434/v1``.
 
+    The scanner calls ``generate_json`` (one JSON object) and
+    ``generate_json_list`` (a JSON array of a known length). JSON parsing,
+    retries, and length validation are shared here; subclasses are not needed.
+    """
 
-class OllamaClient:
+    provider_name: str = "ai"
+
     def __init__(self) -> None:
         self.settings = get_settings()
-        self._thinking_capable = _model_supports_thinking(self.settings.ollama_model)
+        self._base_url = self.settings.ai_base_url.rstrip("/")
+        self._model = self.settings.ai_model
+        self._api_key = self.settings.ai_api_key
+        self._timeout = self.settings.ai_timeout_seconds
+        self._json_mode = self.settings.ai_json_mode
 
-    @property
-    def thinking_capable(self) -> bool:
-        """True if the configured model supports Ollama's ``think`` parameter."""
-        return self._thinking_capable
-
-    def _build_payload(self, prompt: str, *, thinking: bool) -> dict:
-        """Construct the Ollama /api/generate payload.
-
-        ``think=True``  → chain-of-thought reasoning (slower, more accurate).
-        ``think=False`` → direct answer, no <think> block (faster).
-
-        The ``think`` key is only injected for models that support it so the
-        payload stays clean for qwen2.5-coder and other non-thinking models.
-        """
+    async def _complete(self, prompt: str) -> str:
+        """Return raw model text for *prompt* via Chat Completions."""
         payload: dict = {
-            "model": self.settings.ollama_model,
-            "prompt": prompt,
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "format": "json",
+            "temperature": 0.2,
         }
-        if self._thinking_capable:
-            payload["think"] = thinking
-            logger.debug("thinking mode: %s for model %s", thinking, self.settings.ollama_model)
-        return payload
+        if self._json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        headers: dict[str, str] = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        logger.debug(
+            "%s request to %s (model=%s, json_mode=%s, prompt_len=%d)",
+            self.provider_name, self._base_url, self._model, self._json_mode, len(prompt),
+        )
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.post(
+                f"{self._base_url}/chat/completions", json=payload, headers=headers
+            )
+            if response.status_code >= 400:
+                logger.warning(
+                    "%s provider returned status %s: %s",
+                    self.provider_name, response.status_code, response.text,
+                )
+            response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
 
-    async def generate_json(self, prompt: str, *, thinking: bool = False) -> dict:
-        """Generate a single JSON dict from *prompt*.
-
-        Args:
-            prompt:   The full prompt string.
-            thinking: Whether to enable chain-of-thought reasoning.
-                      Pass ``True`` for borderline/ambiguous findings;
-                      leave ``False`` (default) for clear-cut, high-confidence ones.
-        """
-        payload = self._build_payload(prompt, thinking=thinking)
-
+    async def generate_json(self, prompt: str) -> dict:
+        """Generate a single JSON dict from *prompt* with retries."""
         for attempt in range(1, self.settings.ai_max_retries + 2):
             try:
-                logger.debug("ollama request payload: %s", payload)
-                async with httpx.AsyncClient(timeout=self.settings.ollama_timeout_seconds) as client:
-                    response = await client.post(f"{self.settings.ollama_base_url}/api/generate", json=payload)
-                    if response.status_code >= 400:
-                        logger.warning("ollama returned status %s: %s", response.status_code, response.text)
-                    response.raise_for_status()
-                text = response.json().get("response", "")
+                text = await self._complete(prompt)
                 return self._extract_json(text)
             except Exception as exc:
-                logger.warning("ollama call attempt %s failed: %s: %s", attempt, type(exc).__name__, exc)
+                logger.warning(
+                    "%s call attempt %s failed: %s: %s",
+                    self.provider_name, attempt, type(exc).__name__, exc,
+                )
+        raise RuntimeError(f"{self.provider_name} failed to generate JSON after retries")
 
-        raise RuntimeError("Ollama failed to generate JSON after retries")
+    async def generate_json_list(self, prompt: str, expected_count: int) -> list[dict]:
+        """Send a single prompt expecting a JSON array with *expected_count* items.
 
-    async def generate_json_list(self, prompt: str, expected_count: int, *, thinking: bool = False) -> list[dict]:
-        """Send a single prompt expecting a JSON array response with *expected_count* items.
-
-        Args:
-            prompt:         The full prompt string.
-            expected_count: Number of result objects expected in the array.
-            thinking:       Whether to enable chain-of-thought reasoning.
-
-        Raises RuntimeError if the AI response cannot be
-        parsed or has the wrong length after retries.
+        Raises RuntimeError if the response cannot be parsed or has the wrong
+        length after retries.
         """
-        payload = self._build_payload(prompt, thinking=thinking)
-
         for attempt in range(1, self.settings.ai_max_retries + 2):
             try:
-                logger.debug("ollama batch request payload length: %d chars", len(prompt))
-                async with httpx.AsyncClient(timeout=self.settings.ollama_timeout_seconds) as client:
-                    response = await client.post(f"{self.settings.ollama_base_url}/api/generate", json=payload)
-                    if response.status_code >= 400:
-                        logger.warning("ollama returned status %s: %s", response.status_code, response.text)
-                    response.raise_for_status()
-                text = response.json().get("response", "")
+                text = await self._complete(prompt)
                 items = self._extract_json_list(text, expected_count)
                 if items is not None:
                     return items
-                logger.warning("ollama batch response had wrong structure; retrying (attempt %s)", attempt)
+                logger.warning(
+                    "%s batch response had wrong structure; retrying (attempt %s)",
+                    self.provider_name, attempt,
+                )
             except Exception as exc:
-                logger.warning("ollama batch call attempt %s failed: %s: %s", attempt, type(exc).__name__, exc)
-
-        raise RuntimeError(f"Ollama failed to return a list of {expected_count} items after retries")
+                logger.warning(
+                    "%s batch call attempt %s failed: %s: %s",
+                    self.provider_name, attempt, type(exc).__name__, exc,
+                )
+        raise RuntimeError(
+            f"{self.provider_name} failed to return a list of {expected_count} items after retries"
+        )
 
     # ------------------------------------------------------------------
     # JSON extraction helpers

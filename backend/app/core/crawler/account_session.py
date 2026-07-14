@@ -192,3 +192,78 @@ async def provision_secondary_session(root_url: str, allow_override: bool | None
         logger.warning("secondary identity provisioning errored on %s: %s", root_url, exc)
 
     return session
+
+
+@dataclass
+class DisposableAccount:
+    """A self-provisioned throwaway account whose credentials the caller knows.
+
+    Unlike the shared secondary IDOR identity, this account is intended to be
+    *mutated* (e.g. its password changed) by a single test in isolation, so it
+    must never be reused for anything else.
+    """
+
+    email: str
+    password: str
+    session: ResolvedSession
+
+
+async def provision_disposable_account(
+    root_url: str, allow_override: bool | None = None
+) -> DisposableAccount | None:
+    """Register a fresh throwaway account and return it WITH its credentials.
+
+    Separate from :func:`provision_secondary_session` on purpose: the returned
+    account is meant to be destructively mutated by one test (e.g. a password
+    change) without corrupting the shared IDOR second identity or the user's real
+    scan session. Gated by ``allow_secondary_provisioning``. Never raises; returns
+    ``None`` when provisioning is disabled or not possible.
+    """
+    settings = get_settings()
+    allowed = allow_override if allow_override is not None else getattr(settings, "allow_secondary_provisioning", False)
+    if not allowed:
+        return None
+
+    try:
+        async with create_scan_client(
+            timeout=settings.request_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "SentryStrikeScanner/1.0"},
+        ) as client:
+            result = await SmartAuthenticator(settings).acquire_secondary_identity(client, root_url)
+            if not (result and result.authenticated and result.account_email and result.account_password):
+                return None
+            session = ResolvedSession()
+            session.cookies.update(result.cookies or {})
+            for cookie in client.cookies.jar:
+                session.cookies.setdefault(cookie.name, cookie.value)
+            if result.bearer_token:
+                session.headers["Authorization"] = f"Bearer {result.bearer_token}"
+            return DisposableAccount(
+                email=result.account_email,
+                password=result.account_password,
+                session=session,
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("disposable account provisioning errored on %s: %s", root_url, exc)
+        return None
+
+
+async def account_login_succeeds(root_url: str, email: str, password: str) -> bool:
+    """True when ``email``/``password`` authenticate against ``root_url``.
+
+    Used as a zero-FP confirmation oracle: after a password-change probe, a
+    successful login with the NEW password proves the change actually took effect.
+    """
+    settings = get_settings()
+    try:
+        async with create_scan_client(
+            timeout=settings.request_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "SentryStrikeScanner/1.0"},
+        ) as client:
+            result = await SmartAuthenticator(settings).authenticate(client, root_url, email, password)
+            return bool(result and result.authenticated)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("disposable account login check errored on %s: %s", root_url, exc)
+        return False

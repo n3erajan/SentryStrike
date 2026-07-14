@@ -32,6 +32,46 @@ def redact_secret(value: str | None) -> str:
     return f"{value[:6]}...{value[-4:]} len={len(value)}"
 
 
+async def _merge_session_storage(storage_state: Any, page: Any) -> Any:
+    """Merge the live page's sessionStorage into a Playwright ``storage_state``.
+
+    Playwright's ``context.storage_state()`` captures cookies + localStorage but
+    NOT sessionStorage, so session-scoped values an SPA keeps there (cart/basket
+    id, CSRF token, wizard progress) are lost when the blob is replayed into a
+    fresh crawl context — and the flows that need them (e.g. an add-to-basket
+    POST attaching a sessionStorage id) can never fire. This reads the page's
+    sessionStorage and attaches it, per origin, so the crawler's restore path
+    (``browser_engine._session_storage_init_script``) has data to re-seed. Purely
+    generic: no key is inspected or special-cased. Best-effort — any failure
+    leaves ``storage_state`` unchanged."""
+    if not isinstance(storage_state, dict):
+        return storage_state
+    try:
+        raw = await page.evaluate("() => JSON.stringify(sessionStorage)")
+        data = json.loads(raw or "{}")
+    except Exception:
+        return storage_state
+    if not isinstance(data, dict) or not data:
+        return storage_state
+    entries = [{"name": str(k), "value": str(v)} for k, v in data.items()]
+    try:
+        origin = await page.evaluate("() => location.origin")
+    except Exception:
+        origin = None
+    origins = storage_state.setdefault("origins", [])
+    target = None
+    if origin:
+        for o in origins:
+            if isinstance(o, dict) and o.get("origin") == origin:
+                target = o
+                break
+    if target is None:
+        target = {"origin": origin} if origin else {}
+        origins.append(target)
+    target["sessionStorage"] = entries
+    return storage_state
+
+
 class AuthStrategy(str, Enum):
     redirect = "redirect"
     html_form = "html_form"
@@ -70,6 +110,11 @@ class AuthResult:
     state: AuthVerificationState = AuthVerificationState.unauthenticated
     verification_evidence: str = ""
     storage_state: dict | None = None
+    # Populated only for self-provisioned throwaway accounts, so callers that need
+    # to re-authenticate the account later (e.g. to confirm a password change) know
+    # the credentials that were used. Never set for the user's real scan session.
+    account_email: str | None = None
+    account_password: str | None = None
 
 
 @dataclass
@@ -361,6 +406,7 @@ class SmartAuthenticator:
                     storage_state = await context.storage_state()
                 except Exception:
                     pass
+                storage_state = await _merge_session_storage(storage_state, page)
                 bearer_token = None
                 try:
                     local_storage = await page.evaluate("() => JSON.stringify(localStorage)")
@@ -940,6 +986,7 @@ class SmartAuthenticator:
                     storage_state = await context.storage_state()
                 except Exception as e:
                     logger.debug("[auth] Failed to capture storage_state: %s", e)
+                storage_state = await _merge_session_storage(storage_state, page)
 
                 local_storage = await page.evaluate("() => JSON.stringify(localStorage)")
                 bearer_token = None
@@ -1252,12 +1299,16 @@ class SmartAuthenticator:
         verified = await self._verify_auth(client)
         if verified.authenticated:
             logger.info("[auth] Secondary identity active from registration response")
+            verified.account_email = username
+            verified.account_password = password
             return verified
 
         # Otherwise log the new user in via the normal cascade.
         result = await self.authenticate(client, root_url, username, password)
         if result and result.authenticated:
             logger.info("[auth] Secondary identity logged in via cascade")
+            result.account_email = username
+            result.account_password = password
             return result
         logger.info("[auth] Secondary identity registered but login failed")
         return None
@@ -1419,6 +1470,7 @@ class SmartAuthenticator:
 
                 await page.wait_for_timeout(500)
                 storage_state = await context.storage_state()
+                storage_state = await _merge_session_storage(storage_state, page)
                 await context.close()
                 await browser.close()
                 return storage_state

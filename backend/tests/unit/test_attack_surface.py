@@ -49,6 +49,40 @@ def test_attack_surface_extracts_browser_observed_json_request():
     assert build_json_body(target.json_template, target, "http://127.0.0.1/")["url"] == "http://127.0.0.1/"
 
 
+def test_hash_route_translates_to_server_path_candidate():
+    assert (
+        AttackSurface._translate_hash_route_to_server_url("http://example.com/#/ftp/legal.md")
+        == "http://example.com/ftp/legal.md"
+    )
+
+    targets = AttackSurface.build(
+        ["http://example.com/#/ftp/legal.md?file=legal.md"],
+        [],
+        filter_fn=lambda name: name == "file",
+    )
+
+    assert any(target.url == "http://example.com/ftp/legal.md?file=legal.md" for target in targets)
+    assert not any("#/ftp" in target.url for target in targets)
+
+
+def test_attack_surface_filter_can_read_whole_candidate():
+    endpoint = ApiEndpoint(
+        url="http://example.com/api/profile",
+        method="POST",
+        request_body={"city": "Berlin", "url": "https://example.test/"},
+        headers={"Content-Type": "application/json"},
+    )
+
+    targets = AttackSurface.build(
+        [],
+        [],
+        api_endpoints=[endpoint],
+        filter_fn=lambda candidate: candidate.name == "city" and candidate.baseline_value == "Berlin",
+    )
+
+    assert [target.parameter for target in targets] == ["city"]
+
+
 def test_attack_surface_extracts_browser_observed_form_encoded_request():
     request = RequestObservation(
         url="http://example.com/login",
