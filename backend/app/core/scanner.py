@@ -6,7 +6,7 @@ import re
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from uuid import uuid4
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from app.config import get_settings
 
@@ -114,23 +114,11 @@ class ScanOrchestrator:
         self.ai_report = AiReportGenerator()
         self.evidence_grader = EvidenceGrader()
 
-        self.detectors = [
-            AccessControlDetector(),
-            SecurityHeadersDetector(),
-            CryptoFailuresDetector(),
-            SQLInjectionDetector(),
-            XSSDetector(),
-            AuthenticationFailuresDetector(),
-            ExceptionHandlingDetector(),
-            CommandInjectionDetector(),
-            NoSqlInjectionDetector(),
-            FileInclusionDetector(),
-            CSRFDetector(),
-            SSRFDetector(),
-            OpenRedirectDetector(),
-            FileUploadDetector(),
-            SensitivePathsDetector(),
-        ]
+        # Default instances stay on self so tests/embedders can inject fakes. A
+        # PRODUCTION run_scan replaces these with fresh per-scan instances so two
+        # concurrent scans never share cookies/auth/HTTP clients/verifier state
+        # (Issue 1). See _build_detectors and the isolation guard in run_scan.
+        self.detectors = self._build_detectors()
         self.supply_chain_detector = SupplyChainDetector()
 
         self._tasks: dict[str, asyncio.Task] = {}
@@ -217,6 +205,53 @@ class ScanOrchestrator:
             ),
         }
 
+    @staticmethod
+    def _build_detectors() -> list:
+        """Build a fresh detector graph for one scan.
+
+        Several detectors own mutable HTTP clients, cookies, request context, and
+        verifiers. Reusing one graph across concurrent scans can cross-contaminate
+        auth state or let one scan close another scan's client (Issue 1).
+        """
+        return [
+            AccessControlDetector(),
+            SecurityHeadersDetector(),
+            CryptoFailuresDetector(),
+            SQLInjectionDetector(),
+            XSSDetector(),
+            AuthenticationFailuresDetector(),
+            ExceptionHandlingDetector(),
+            CommandInjectionDetector(),
+            NoSqlInjectionDetector(),
+            FileInclusionDetector(),
+            CSRFDetector(),
+            SSRFDetector(),
+            OpenRedirectDetector(),
+            FileUploadDetector(),
+            SensitivePathsDetector(),
+        ]
+
+    @staticmethod
+    def _scope_forms_to_origin(target_url: str, forms: list, is_same_origin) -> list:
+        """Keep only forms whose RESOLVED submission target is same-origin.
+
+        A form's ``page_url`` locates the page it was found on; its ``action`` is
+        where it submits. Scope is decided by the action ONLY — page_url just
+        resolves a relative/empty action. Accepting a form because its page is
+        same-origin would let a same-origin page carrying an off-origin action
+        turn into an AttackTarget aimed at a third party (Issue 2). The resolved
+        absolute action is written back so downstream targeting uses it verbatim.
+        """
+        scoped: list = []
+        for form in forms:
+            page_url = str(getattr(form, "page_url", "") or target_url)
+            action = str(getattr(form, "action", "") or page_url)
+            resolved_action = urljoin(page_url, action)
+            if is_same_origin(target_url, resolved_action):
+                form.action = resolved_action
+                scoped.append(form)
+        return scoped
+
     async def queue_scan(self, scan_id: str, auth_accounts: list | None = None, scan_config: ScanConfig | None = None) -> None:
         if auth_accounts:
             self._scan_credentials[scan_id] = auth_accounts
@@ -301,6 +336,25 @@ class ScanOrchestrator:
             logger.error("scan %s not found", scan_id)
             return
 
+        # Isolate mutable crawl/detector state for every production scan so
+        # concurrent scans cannot share cookies/auth/HTTP clients/verifier state
+        # (Issue 1). Injected fakes (tests/embedders) are preserved: only the
+        # default self-built instances are swapped for fresh per-scan ones.
+        scan_spider = WebSpider() if type(self.spider) is WebSpider else self.spider
+
+        default_detector_types = [type(d) for d in self._build_detectors()]
+        configured_detector_types = [type(d) for d in self.detectors]
+        scan_detectors = (
+            self._build_detectors()
+            if configured_detector_types == default_detector_types
+            else self.detectors
+        )
+        scan_supply_chain = (
+            SupplyChainDetector()
+            if type(self.supply_chain_detector) is SupplyChainDetector
+            else self.supply_chain_detector
+        )
+
         try:
             await self._set_progress(scan, 5, ScanPhase.initializing, "Starting scan")
             await self._check_cancelled(scan_id)
@@ -319,9 +373,9 @@ class ScanOrchestrator:
             await self._set_progress(scan, 10, ScanPhase.crawling, "Crawling target and discovering attack surface")
             if scan.crawl_mode == CrawlMode.single:
                 logger.info("single-path scan: skipping spider discovery for %s", scan.target_url)
-                crawl_result = await self.spider.fetch_single(scan.target_url)
+                crawl_result = await scan_spider.fetch_single(scan.target_url)
             else:
-                crawl_result = await self.spider.crawl(scan.target_url, auth_override=main_account, scan_config=scan_config)
+                crawl_result = await scan_spider.crawl(scan.target_url, auth_override=main_account, scan_config=scan_config)
 
             # Filter all crawl results to strictly enforce same-origin target isolation (Issue 2)
             target_url = scan.target_url
@@ -346,10 +400,11 @@ class ScanOrchestrator:
                     if is_same_origin(target_url, getattr(req, "url", ""))
                 ]
             crawl_result.parameters = [p for p in crawl_result.parameters if is_same_origin(target_url, getattr(p, "url", ""))]
-            crawl_result.forms = [
-                f for f in crawl_result.forms 
-                if is_same_origin(target_url, getattr(f, "action", "")) or is_same_origin(target_url, getattr(f, "page_url", ""))
-            ]
+            # A form is in scope only when its RESOLVED submission target is same-origin.
+            # page_url is used only to resolve a relative/empty action — never as scope
+            # proof on its own, or a same-origin page carrying an off-origin form action
+            # would let active payloads and credentials reach a third party (Issue 2).
+            crawl_result.forms = self._scope_forms_to_origin(target_url, crawl_result.forms, is_same_origin)
 
             scan.statistics.total_urls_crawled = self._count_discovered_surface(crawl_result)
             await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {scan.statistics.total_urls_crawled} URL(s) discovered")
@@ -395,7 +450,7 @@ class ScanOrchestrator:
             skip_in_single_path = (SensitivePathsDetector,)
             active_detectors = [
                 detector
-                for detector in self.detectors
+                for detector in scan_detectors
                 if not isinstance(detector, (CryptoFailuresDetector, SecurityHeadersDetector))
                 and not (scan.crawl_mode == CrawlMode.single and isinstance(detector, skip_in_single_path))
             ]
@@ -525,7 +580,7 @@ class ScanOrchestrator:
                     record_metric(metric)
                     findings.extend(result_findings)
 
-                exception_detector = next((detector for detector in self.detectors if isinstance(detector, ExceptionHandlingDetector)), None)
+                exception_detector = next((detector for detector in scan_detectors if isinstance(detector, ExceptionHandlingDetector)), None)
                 if exception_detector is not None:
                     observed_exception_findings = exception_detector.findings_from_observed_evidence(findings, target_url=scan.target_url)
                     self._tag_detector_findings(observed_exception_findings, self._detector_name(exception_detector))
@@ -540,7 +595,7 @@ class ScanOrchestrator:
                         self._add_findings_to_metric(metric, observed_exception_findings)
                         findings.extend(observed_exception_findings)
 
-                auth_detector_obj = next((detector for detector in self.detectors if isinstance(detector, AuthenticationFailuresDetector)), None)
+                auth_detector_obj = next((detector for detector in scan_detectors if isinstance(detector, AuthenticationFailuresDetector)), None)
                 if auth_detector_obj is not None:
                     observed_credential_findings = auth_detector_obj.findings_from_observed_evidence(findings)
                     self._tag_detector_findings(observed_credential_findings, self._detector_name(auth_detector_obj))
@@ -563,7 +618,7 @@ class ScanOrchestrator:
                 self._merge_same_source_derived_findings(findings)
 
                 # Provide the scan root URL so site-wide detectors can avoid duplicate page-level findings.
-                crypto_detector = next((detector for detector in self.detectors if isinstance(detector, CryptoFailuresDetector)), None)
+                crypto_detector = next((detector for detector in scan_detectors if isinstance(detector, CryptoFailuresDetector)), None)
                 if crypto_detector is not None:
                     crypto_findings = await crypto_detector.detect(crawl_result.urls, crawl_result.forms, **crawl_context)
                     self._tag_detector_findings(crypto_findings, self._detector_name(crypto_detector))
@@ -577,7 +632,7 @@ class ScanOrchestrator:
                     )
                     findings.extend(crypto_findings)
 
-                header_detector = next((detector for detector in self.detectors if isinstance(detector, SecurityHeadersDetector)), None)
+                header_detector = next((detector for detector in scan_detectors if isinstance(detector, SecurityHeadersDetector)), None)
                 if header_detector is not None:
                     header_findings = await header_detector.detect(crawl_result.urls, crawl_result.forms, **crawl_context)
                     self._tag_detector_findings(header_findings, self._detector_name(header_detector))
@@ -591,16 +646,16 @@ class ScanOrchestrator:
                     )
                     findings.extend(header_findings)
 
-                supply_chain_findings = await self.supply_chain_detector.detect(
+                supply_chain_findings = await scan_supply_chain.detect(
                     crawl_result.urls,
                     crawl_result.forms,
                     technologies=scan.technology_stack,
                     **crawl_context,
                 )
-                self._tag_detector_findings(supply_chain_findings, self._detector_name(self.supply_chain_detector))
+                self._tag_detector_findings(supply_chain_findings, self._detector_name(scan_supply_chain))
                 record_metric(
                     self._detector_metric_for_findings(
-                        self.supply_chain_detector,
+                        scan_supply_chain,
                         supply_chain_findings,
                         coverage_context,
                         technology_stack=scan.technology_stack,

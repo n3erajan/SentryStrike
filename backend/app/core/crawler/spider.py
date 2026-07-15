@@ -213,7 +213,7 @@ class WebSpider:
             sitemap_urls = []
             try:
                 robots_url = normalize_url(root_url, "/robots.txt")
-                robots_response = await client.get(robots_url)
+                robots_response = await client.get(robots_url, follow_redirects=False)
                 if robots_response.status_code == 200:
                     for line in robots_response.text.splitlines():
                         if line.lower().startswith("sitemap:"):
@@ -225,7 +225,15 @@ class WebSpider:
 
             for sitemap_url in sitemap_urls:
                 try:
-                    resp = await client.get(sitemap_url)
+                    # A robots.txt Sitemap: directive is target-controlled. Resolve and
+                    # origin-check it BEFORE fetching, and do not auto-follow a same-origin
+                    # sitemap into a third-party redirect, or a hostile robots file could
+                    # make the scanner fetch an arbitrary external URL (Issue 4).
+                    sitemap_url = normalize_url(root_url, sitemap_url)
+                    if not same_domain(root_url, sitemap_url):
+                        logger.warning("ignoring off-origin sitemap declared by robots.txt: %s", sitemap_url)
+                        continue
+                    resp = await client.get(sitemap_url, follow_redirects=False)
                     if resp.status_code == 200:
                         locs = re.findall(r"<loc>(.*?)</loc>", resp.text, re.I)
                         for loc in locs:
