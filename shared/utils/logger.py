@@ -8,8 +8,7 @@ from shared.config import get_infrastructure_settings
 
 def configure_logging() -> None:
     settings = get_infrastructure_settings()
-    log_dir = Path(settings.log_file).parent
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = (settings.log_file or "").strip()
 
     # Windows consoles default to cp1252, which cannot encode symbols like "≥"
     # used in verifier log messages. Force UTF-8 so logging never crashes on
@@ -32,14 +31,15 @@ def configure_logging() -> None:
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-
-    file_handler = RotatingFileHandler(
-        settings.log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
-    )
-    file_handler.setFormatter(formatter)
-
     root_logger.addHandler(console_handler)
-    root_logger.addHandler(file_handler)
+
+    if log_file:
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+        )
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
 
     # Browser-engine debug logs are valuable for diagnosing Playwright/crawl
     # issues without raising the global log level to DEBUG.

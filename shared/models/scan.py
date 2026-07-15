@@ -183,6 +183,7 @@ class Scan(Document):
     completed_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    eta_seconds: int | None = None
 
     statistics: ScanStatistics = Field(default_factory=ScanStatistics)
     overall_risk_score: float = Field(default=0.0, ge=0, le=100)

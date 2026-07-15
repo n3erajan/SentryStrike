@@ -46,7 +46,8 @@ class InfrastructureSettings(BaseSettings):
     )
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
-    log_file: str = Field(default="logs/app.log", alias="LOG_FILE")
+    # Optional. Empty/unset = console only (typical for the API). Scanner sets a path.
+    log_file: str | None = Field(default=None, alias="LOG_FILE")
 
 
 @lru_cache

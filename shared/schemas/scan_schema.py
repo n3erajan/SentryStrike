@@ -250,6 +250,8 @@ class ScanStatusResponse(BaseModel):
     progress: int
     current_phase: ScanPhase = ScanPhase.queued
     phase_message: str = "Scan queued"
+    started_at: datetime | None = None
+    eta_seconds: int | None = None
     error_message: str | None = None
 
 

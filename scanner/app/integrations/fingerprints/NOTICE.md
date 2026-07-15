@@ -19,7 +19,7 @@ documented pattern format in `../wappalyzer_engine.py`).
 Run the updater to pull the latest fingerprints:
 
 ```
-python backend/scripts/update_fingerprints.py
+python scanner/scripts/update_fingerprints.py
 ```
 
-This regenerates both JSON files from upstream. Review the diff before committing.
+This regenerates both JSON files from upstream.

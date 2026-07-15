@@ -4,7 +4,9 @@ import logging
 import math
 import re
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from time import perf_counter
 from uuid import uuid4
 from urllib.parse import urljoin, urlparse
 
@@ -71,10 +73,130 @@ from shared.models.vulnerability import (
 )
 from app.utils.cvss_calculator import CvssCalculator
 from app.utils.redaction import redact_secrets
+from app.utils.scan_http import create_scan_client
 from app.utils.scan_metrics import begin_request_counting, end_request_counting, snapshot_request_counts
 from app.core.request_governor import begin_governor, end_governor, denied_snapshot
 
 logger = logging.getLogger(__name__)
+
+
+# Phase weights — rough share of total scan time, tuned from real scans
+PHASE_WEIGHTS = {
+    ScanPhase.initializing: 2,
+    ScanPhase.crawling: 25,
+    ScanPhase.technology_detection: 5,
+    ScanPhase.tls_analysis: 3,
+    ScanPhase.vulnerability_detection: 45,
+    ScanPhase.deduplication: 3,
+    ScanPhase.ai_analysis: 12,
+    ScanPhase.risk_scoring: 2,
+    ScanPhase.report_generation: 3,
+}
+
+# Approximate HTTP requests per planned target. Branching verifiers make exact
+# counts unknowable without executing; governor caps keep this from runaway.
+DETECTOR_PAYLOADS_PER_TARGET: dict[str, int] = {
+    "injection_sql_command": 20,
+    "xss": 22,
+    "command_injection": 12,
+    "nosql_injection": 15,
+    "file_inclusion": 16,
+    "ssrf": 10,
+    "open_redirect": 8,
+    "csrf": 4,
+    "file_upload": 10,
+    "access_control": 6,
+    "authentication_failures": 8,
+    "exception_handling": 5,
+    "sensitive_paths": 2,
+    "default": 10,
+}
+
+# Relative wall-clock cost vs a simple GET. XSS/SQLi verify with multi-step
+# probes (and sometimes a browser); light detectors are closer to 1×.
+DETECTOR_COST_WEIGHT: dict[str, float] = {
+    "xss": 4.0,
+    "injection_sql_command": 3.5,
+    "command_injection": 3.0,
+    "file_upload": 3.0,
+    "nosql_injection": 2.5,
+    "file_inclusion": 2.5,
+    "ssrf": 2.5,
+    "open_redirect": 2.0,
+    "authentication_failures": 2.0,
+    "access_control": 2.0,
+    "csrf": 1.5,
+    "exception_handling": 1.2,
+    "sensitive_paths": 1.0,
+    "default": 1.5,
+}
+
+# Fixed priors for short / hard-to-model phases (seconds).
+SHORT_PHASE_PRIOR_S: dict[ScanPhase, float] = {
+    ScanPhase.technology_detection: 5.0,
+    ScanPhase.tls_analysis: 3.0,
+    ScanPhase.deduplication: 2.0,
+    ScanPhase.risk_scoring: 2.0,
+    ScanPhase.report_generation: 8.0,
+}
+
+# Used for AI ETA until the first batch is timed.
+AI_PRIOR_PER_FINDING_S = 8.0
+# Placeholder AI time while findings are still accumulating during detection.
+AI_PENDING_PRIOR_S = 60.0
+# Until crawl finishes / detector work is measured, keep a realistic total ETA
+# (old code left these phases at 0s → starting ETA under a minute).
+CRAWL_PRIOR_S = 150.0
+DETECTOR_PENDING_PRIOR_S = 480.0
+DEFAULT_LATENCY_MS = 200.0
+# Probe GET understates active/verifier work; floor + multiplier correct that.
+DETECTOR_LATENCY_MULTIPLIER = 4.0
+DETECTOR_LATENCY_FLOOR_MS = 350.0
+
+
+def _elapsed_utc_seconds(started_at: datetime) -> float:
+    """Seconds since ``started_at``.
+
+    MongoDB/Beanie round-trips UTC datetimes as naive, while wall-clock reads
+    here use aware UTC. Normalize before subtracting.
+    """
+    now = datetime.now(timezone.utc)
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    else:
+        started_at = started_at.astimezone(timezone.utc)
+    return (now - started_at).total_seconds()
+
+
+@dataclass
+class _EtaState:
+    """Per-scan work-model inputs for server-side ETA (not persisted)."""
+
+    measured_latency_ms: float = DEFAULT_LATENCY_MS
+    detector_total_s: float | None = None
+    detector_fraction: float = 0.0
+    # Work units per detector (targets × payloads × cost weight, capped).
+    detector_work_units: dict[str, float] = field(default_factory=dict)
+    detector_total_work: float = 0.0
+    detector_completed_work: float = 0.0
+    detector_phase_started: float | None = None
+    ai_total_s: float | None = None
+    ai_remaining_s: float | None = None
+    ai_fraction: float = 0.0
+    findings_count: int = 0
+    phase_order: tuple[ScanPhase, ...] = field(
+        default_factory=lambda: (
+            ScanPhase.initializing,
+            ScanPhase.crawling,
+            ScanPhase.technology_detection,
+            ScanPhase.tls_analysis,
+            ScanPhase.vulnerability_detection,
+            ScanPhase.deduplication,
+            ScanPhase.ai_analysis,
+            ScanPhase.risk_scoring,
+            ScanPhase.report_generation,
+        )
+    )
 
 
 async def _never_cancelled(_: str) -> bool:
@@ -131,6 +253,7 @@ class ScanOrchestrator:
         # (Issue 1). See _build_detectors and the isolation guard in run_scan.
         self.detectors = self._build_detectors()
         self.supply_chain_detector = SupplyChainDetector()
+        self._eta_state = _EtaState()
 
         self._remediation_fallbacks: dict[str, str] = {
             "Cross-Site Request Forgery (CSRF)": (
@@ -348,7 +471,8 @@ class ScanOrchestrator:
         )
 
         try:
-            await self._set_progress(scan, 5, ScanPhase.initializing, "Starting scan")
+            self._eta_state = _EtaState()
+            await self._set_phase_progress(scan, ScanPhase.initializing, 1.0, "Starting scan")
             await self._check_cancelled(scan_id)
 
             # The worker received these accounts in the Redis job payload. BLPOP
@@ -358,7 +482,7 @@ class ScanOrchestrator:
             auth_accounts_by_role = {account.role.value: account for account in submitted_accounts}
             main_account = auth_accounts_by_role.get("main")
 
-            await self._set_progress(scan, 10, ScanPhase.crawling, "Crawling target and discovering attack surface")
+            await self._set_phase_progress(scan, ScanPhase.crawling, 0.0, "Crawling target and discovering attack surface")
             if scan.crawl_mode == CrawlMode.single:
                 logger.info("single-path scan: skipping spider discovery for %s", scan.target_url)
                 crawl_result = await scan_spider.fetch_single(scan.target_url)
@@ -395,10 +519,10 @@ class ScanOrchestrator:
             crawl_result.forms = self._scope_forms_to_origin(target_url, crawl_result.forms, is_same_origin)
 
             scan.statistics.total_urls_crawled = self._count_discovered_surface(crawl_result)
-            await self._set_progress(scan, 20, ScanPhase.crawling, f"Crawl complete: {scan.statistics.total_urls_crawled} URL(s) discovered")
+            await self._set_phase_progress(scan, ScanPhase.crawling, 1.0, f"Crawl complete: {scan.statistics.total_urls_crawled} URL(s) discovered")
             await self._check_cancelled(scan_id)
 
-            await self._set_progress(scan, 25, ScanPhase.technology_detection, "Detecting technology stack and known CVEs")
+            await self._set_phase_progress(scan, ScanPhase.technology_detection, 0.0, "Detecting technology stack and known CVEs")
             technologies = await self.technology_detector.detect(
                 scan.target_url,
                 crawl_result=crawl_result,
@@ -414,10 +538,10 @@ class ScanOrchestrator:
                 await self._enrich_tech_from_manifests(scan, crawl_result)
             except Exception as exc:
                 logger.debug("manifest/header version enrichment failed: %s", exc)
-            await self._set_progress(scan, 35, ScanPhase.technology_detection, f"Technology analysis complete: {len(scan.technology_stack)} component(s) identified")
+            await self._set_phase_progress(scan, ScanPhase.technology_detection, 1.0, f"Technology analysis complete: {len(scan.technology_stack)} component(s) identified")
             await self._check_cancelled(scan_id)
 
-            await self._set_progress(scan, 40, ScanPhase.tls_analysis, "Analyzing TLS and transport security")
+            await self._set_phase_progress(scan, ScanPhase.tls_analysis, 0.0, "Analyzing TLS and transport security")
             ssl_result = await self.ssl_analyzer.analyze(scan.target_url)
             findings: list[Finding] = []
             if not ssl_result.get("valid", True):
@@ -434,6 +558,7 @@ class ScanOrchestrator:
                         reproducible=True,
                     )
                 )
+            await self._set_phase_progress(scan, ScanPhase.tls_analysis, 1.0, "TLS analysis complete")
 
             skip_in_single_path = (SensitivePathsDetector,)
             active_detectors = [
@@ -506,7 +631,38 @@ class ScanOrchestrator:
             }
             self._update_crawl_metadata(scan, crawl_result, crawl_context)
 
-            await self._set_progress(scan, 45, ScanPhase.vulnerability_detection, f"Running {len(active_detectors)} active detector(s)")
+            self._eta_state.measured_latency_ms = await self._measure_target_latency_ms(scan.target_url)
+            work_units, detector_prior_s = self._estimate_detector_work(
+                attack_planner,
+                active_detectors,
+                latency_ms=self._eta_state.measured_latency_ms,
+                parallelism=detector_parallelism,
+                per_detector_cap=(
+                    scan_config.get_val(
+                        "scanner_per_detector_request_cap",
+                        get_settings().scanner_per_detector_request_cap,
+                    )
+                    if scan_config
+                    else get_settings().scanner_per_detector_request_cap
+                ),
+            )
+            self._eta_state.detector_work_units = work_units
+            self._eta_state.detector_total_work = sum(work_units.values())
+            self._eta_state.detector_completed_work = 0.0
+            self._eta_state.detector_total_s = detector_prior_s
+            self._eta_state.detector_fraction = 0.0
+            self._eta_state.detector_phase_started = perf_counter()
+            logger.info(
+                "detector ETA model: ~%.0fs prior (%d detectors, %.0f work-units, "
+                "latency=%.0fms, parallelism=%d)",
+                self._eta_state.detector_total_s,
+                len(active_detectors),
+                self._eta_state.detector_total_work,
+                self._eta_state.measured_latency_ms,
+                detector_parallelism,
+            )
+
+            await self._set_phase_progress(scan, ScanPhase.vulnerability_detection, 0.0, f"Running {len(active_detectors)} active detector(s)")
             detector_metrics: list[DetectorCoverageMetric] = []
             metric_by_detector: dict[str, DetectorCoverageMetric] = {}
 
@@ -550,11 +706,16 @@ class ScanOrchestrator:
                 _governor_settings.scanner_per_parameter_request_cap,
             )
             try:
-                detector_results = await asyncio.gather(
-                    *[run_detector(detector) for detector in active_detectors],
-                    return_exceptions=True,
-                )
-                for result in detector_results:
+                # Run detectors concurrently but consume them as they finish so
+                # progress ticks on work completed (not detector headcount).
+                detector_total = max(1, len(active_detectors))
+                detector_done = 0
+                for coro in asyncio.as_completed(
+                    [run_detector(detector) for detector in active_detectors]
+                ):
+                    result = await coro
+                    detector_done += 1
+                    finished_name = "unknown"
                     if isinstance(result, Exception):
                         logger.warning("detector failure: %s", result)
                         record_metric(
@@ -563,10 +724,35 @@ class ScanOrchestrator:
                                 skipped_reasons={"detector_exception": 1},
                             )
                         )
-                        continue
-                    _, result_findings, metric = result
-                    record_metric(metric)
-                    findings.extend(result_findings)
+                    else:
+                        finished_detector, result_findings, metric = result
+                        finished_name = metric.detector or self._detector_name(finished_detector)
+                        record_metric(metric)
+                        findings.extend(result_findings)
+                    work = self._eta_state.detector_work_units.get(finished_name, 0.0)
+                    if work <= 0 and self._eta_state.detector_total_work > 0:
+                        # Unknown/exception: spread remaining average so progress moves.
+                        remaining_detectors = max(1, detector_total - detector_done + 1)
+                        remaining_work = max(
+                            0.0,
+                            self._eta_state.detector_total_work - self._eta_state.detector_completed_work,
+                        )
+                        work = remaining_work / remaining_detectors
+                    self._eta_state.detector_completed_work = min(
+                        self._eta_state.detector_total_work,
+                        self._eta_state.detector_completed_work + work,
+                    )
+                    self._eta_state.findings_count = len(findings)
+                    total_work = max(self._eta_state.detector_total_work, 1e-9)
+                    self._eta_state.detector_fraction = (
+                        self._eta_state.detector_completed_work / total_work
+                    )
+                    await self._set_phase_progress(
+                        scan,
+                        ScanPhase.vulnerability_detection,
+                        self._eta_state.detector_fraction,
+                        f"Detectors {detector_done}/{detector_total} complete: {len(findings)} raw finding(s)",
+                    )
 
                 exception_detector = next((detector for detector in scan_detectors if isinstance(detector, ExceptionHandlingDetector)), None)
                 if exception_detector is not None:
@@ -662,7 +848,12 @@ class ScanOrchestrator:
                 coverage_context.get("attack_planner"),
             )
 
-            await self._set_progress(scan, 60, ScanPhase.vulnerability_detection, f"Detector phase complete: {len(findings)} raw finding(s)")
+            await self._set_phase_progress(
+                scan,
+                ScanPhase.vulnerability_detection,
+                1.0,
+                f"Detector phase complete: {len(findings)} raw finding(s)",
+            )
             await self._check_cancelled(scan_id)
 
             # Enrich the technology stack from error responses the detectors just
@@ -677,7 +868,7 @@ class ScanOrchestrator:
 
             # DEDUPLICATION PHASE: Merge duplicate findings from different detectors
             # Findings with same (url, parameter, vuln_type) are consolidated
-            await self._set_progress(scan, 65, ScanPhase.deduplication, "Deduplicating and filtering findings")
+            await self._set_phase_progress(scan, ScanPhase.deduplication, 0.0, "Deduplicating and filtering findings")
             findings = FindingDeduplicator.deduplicate(findings)
             logger.info("deduplication complete: %d findings after merging", len(findings))
 
@@ -815,10 +1006,18 @@ class ScanOrchestrator:
                 self._to_vulnerability(f, extra_secrets=redaction_secrets) for f in findings
             ]
             logger.info("phase 1 complete: detected %d vulnerabilities", len(vulnerabilities))
+            await self._set_phase_progress(scan, ScanPhase.deduplication, 1.0, f"Deduplication complete: {len(vulnerabilities)} finding(s)")
 
             # PHASE 2: Analyze all findings with AI
             logger.info("phase 2 starting: analyzing %d findings", len(vulnerabilities))
-            await self._set_progress(scan, 75, ScanPhase.ai_analysis, f"Analyzing {len(vulnerabilities)} finding(s)")
+            self._eta_state.findings_count = len(vulnerabilities)
+            self._eta_state.ai_fraction = 0.0
+            self._eta_state.ai_remaining_s = None
+            if vulnerabilities and get_settings().ai_analysis_enabled:
+                self._eta_state.ai_total_s = len(vulnerabilities) * AI_PRIOR_PER_FINDING_S
+            else:
+                self._eta_state.ai_total_s = 1.0
+            await self._set_phase_progress(scan, ScanPhase.ai_analysis, 0.0, f"Analyzing {len(vulnerabilities)} finding(s)")
             vulnerabilities = await self._analyze_all_findings(vulnerabilities, scan)
 
             # Phase 2.1: Sync severity from CVSS (pre-FP adjustment)
@@ -836,7 +1035,7 @@ class ScanOrchestrator:
             scan.vulnerabilities = vulnerabilities
             
             # Phase 4.4 Attack chain synthesis
-            await self._set_progress(scan, 90, ScanPhase.risk_scoring, "Calculating severity, evidence strength, and risk score")
+            await self._set_phase_progress(scan, ScanPhase.risk_scoring, 0.0, "Calculating severity, evidence strength, and risk score")
             scan.report_metadata.attack_chains = self._synthesize_attack_chains(vulnerabilities)
             scan.report_metadata.evidence_strength_breakdown = self._evidence_strength_breakdown(vulnerabilities)
             scan.statistics.total_vulnerabilities = len(vulnerabilities)
@@ -849,10 +1048,11 @@ class ScanOrchestrator:
             scan.overall_risk_score, scan.overall_risk_level = self._calculate_aggregate_risk(
                 vulnerabilities
             )
+            await self._set_phase_progress(scan, ScanPhase.risk_scoring, 1.0, "Risk scoring complete")
 
             # PHASE 3: Generate final report from analyzed findings
             logger.info("phase 3 starting: generating report")
-            await self._set_progress(scan, 95, ScanPhase.report_generation, "Generating final report summary")
+            await self._set_phase_progress(scan, ScanPhase.report_generation, 0.0, "Generating final report summary")
             report = await self.ai_report.generate(scan)
             scan.report_metadata.generated_at = datetime.now(timezone.utc)
             
@@ -1258,6 +1458,210 @@ class ScanOrchestrator:
                 )
         return warnings
 
+    async def _set_phase_progress(
+        self,
+        scan: Scan,
+        phase: ScanPhase,
+        fraction: float,
+        message: str,
+        *,
+        status: ScanStatus = ScanStatus.running,
+    ) -> None:
+        """Set progress based on phase weight and fractional completion within that phase.
+
+        Args:
+            scan: The scan to update
+            phase: Current phase
+            fraction: Completion within this phase (0.0 to 1.0)
+            message: Progress message
+            status: Scan status
+        """
+        order = list(self._eta_state.phase_order)
+
+        # Calculate base from completed phases
+        try:
+            phase_idx = order.index(phase)
+            base = sum(PHASE_WEIGHTS[p] for p in order[:phase_idx])
+        except (ValueError, KeyError):
+            # Phase not in order or weights — fall back to current progress
+            base = scan.progress
+            phase_idx = -1
+
+        # Add weighted fraction of current phase
+        phase_weight = PHASE_WEIGHTS.get(phase, 0)
+        pct = base + phase_weight * max(0.0, min(1.0, fraction))
+
+        # Never go backwards, round to int
+        progress = max(scan.progress, round(pct))
+
+        scan.eta_seconds = self._compute_eta_seconds(scan, phase, fraction, progress)
+
+        await self._set_progress(scan, progress, phase, message, status=status)
+
+    def _compute_eta_seconds(
+        self,
+        scan: Scan,
+        phase: ScanPhase,
+        fraction: float,
+        progress: int,
+    ) -> int | None:
+        """Remaining seconds from work-weighted detector model; crawl falls back to pace."""
+        eta = self._eta_state
+        clamped = max(0.0, min(1.0, fraction))
+        order = list(eta.phase_order)
+
+        try:
+            phase_idx = order.index(phase)
+        except ValueError:
+            phase_idx = -1
+
+        remaining = 0.0
+
+        # Current-phase remainder
+        if phase == ScanPhase.vulnerability_detection and eta.detector_total_s is not None:
+            remaining += self._detector_remaining_seconds()
+        elif phase == ScanPhase.vulnerability_detection:
+            remaining += DETECTOR_PENDING_PRIOR_S * (1.0 - clamped)
+        elif phase == ScanPhase.ai_analysis:
+            if eta.ai_remaining_s is not None:
+                remaining += eta.ai_remaining_s
+            else:
+                ai_total = eta.ai_total_s
+                if ai_total is None and eta.findings_count:
+                    ai_total = eta.findings_count * AI_PRIOR_PER_FINDING_S
+                if ai_total is not None:
+                    remaining += ai_total * (1.0 - clamped)
+                else:
+                    remaining += SHORT_PHASE_PRIOR_S.get(phase, 0.0) * (1.0 - clamped)
+        elif phase == ScanPhase.crawling:
+            if scan.started_at and progress > 5:
+                # Pace from elapsed progress for the whole scan once crawl has moved.
+                elapsed = _elapsed_utc_seconds(scan.started_at)
+                return max(0, round(elapsed * (100 - progress) / progress))
+            remaining += CRAWL_PRIOR_S * (1.0 - clamped)
+        elif phase in SHORT_PHASE_PRIOR_S:
+            remaining += SHORT_PHASE_PRIOR_S[phase] * (1.0 - clamped)
+
+        # Future phases
+        if phase_idx >= 0:
+            for future in order[phase_idx + 1 :]:
+                if future == ScanPhase.vulnerability_detection:
+                    if eta.detector_total_s is not None:
+                        remaining += eta.detector_total_s
+                    else:
+                        remaining += DETECTOR_PENDING_PRIOR_S
+                elif future == ScanPhase.crawling:
+                    remaining += CRAWL_PRIOR_S
+                elif future == ScanPhase.ai_analysis:
+                    if eta.ai_total_s is not None:
+                        remaining += eta.ai_total_s
+                    elif eta.findings_count:
+                        remaining += eta.findings_count * AI_PRIOR_PER_FINDING_S
+                    else:
+                        # Findings still accumulating — keep a real prior, not ~8s.
+                        remaining += AI_PENDING_PRIOR_S
+                else:
+                    remaining += SHORT_PHASE_PRIOR_S.get(future, 0.0)
+
+        if remaining <= 0 and scan.started_at and progress > 5:
+            elapsed = _elapsed_utc_seconds(scan.started_at)
+            return max(0, round(elapsed * (100 - progress) / progress))
+
+        return max(0, round(remaining)) if remaining > 0 else None
+
+    def _detector_remaining_seconds(self) -> float:
+        """Remaining detector wall-clock from work units + observed pace.
+
+        Uses max(prior share, observed pace) so a fast wave of light detectors
+        cannot collapse ETA while a heavy XSS/SQLi job is still running.
+        """
+        eta = self._eta_state
+        prior_total = float(eta.detector_total_s or 0.0)
+        total_work = eta.detector_total_work
+        completed = min(eta.detector_completed_work, total_work)
+        remaining_work = max(0.0, total_work - completed)
+
+        if total_work <= 0:
+            return max(0.0, prior_total * (1.0 - eta.detector_fraction))
+
+        prior_remaining = prior_total * (remaining_work / total_work)
+        if remaining_work <= 0:
+            return 0.0
+
+        if completed > 0 and eta.detector_phase_started is not None:
+            elapsed = max(0.001, perf_counter() - eta.detector_phase_started)
+            pace_remaining = remaining_work * (elapsed / completed)
+            return max(prior_remaining, pace_remaining)
+
+        return prior_remaining
+
+    def _estimate_detector_work(
+        self,
+        attack_planner: AttackPlanner,
+        active_detectors: list,
+        *,
+        latency_ms: float,
+        parallelism: int,
+        per_detector_cap: int,
+    ) -> tuple[dict[str, float], float]:
+        """Per-detector work units and a wall-clock prior (seconds).
+
+        Work unit = min(targets × payloads, cap) × cost_weight. Wall-clock prior
+        divides by actual detector parallelism (not full scanner concurrency) and
+        uses a latency floor/multiplier because probe GETs understate verifier cost.
+        """
+        work_units: dict[str, float] = {}
+        for detector in active_detectors:
+            name = self._detector_name(detector)
+            targets = len(attack_planner.targets_for(name))
+            payloads = DETECTOR_PAYLOADS_PER_TARGET.get(
+                name, DETECTOR_PAYLOADS_PER_TARGET["default"]
+            )
+            weight = DETECTOR_COST_WEIGHT.get(name, DETECTOR_COST_WEIGHT["default"])
+            raw_requests = min(max(0, targets) * max(1, payloads), max(1, per_detector_cap))
+            # Detectors with no planned targets still burn a little time starting up.
+            units = max(float(raw_requests), 1.0) * weight
+            work_units[name] = units
+
+        effective_latency_ms = max(
+            DETECTOR_LATENCY_FLOOR_MS,
+            max(20.0, latency_ms) * DETECTOR_LATENCY_MULTIPLIER,
+        )
+        effective_parallelism = max(1, parallelism)
+        total_units = sum(work_units.values())
+        prior_s = (total_units * (effective_latency_ms / 1000.0)) / effective_parallelism
+        return work_units, prior_s
+
+    def _estimate_detector_seconds(
+        self,
+        attack_planner: AttackPlanner,
+        active_detectors: list,
+        *,
+        latency_ms: float,
+        concurrency: int,
+        per_detector_cap: int,
+    ) -> float:
+        """Backward-compatible wrapper: prior seconds from the work-weighted model."""
+        _, prior_s = self._estimate_detector_work(
+            attack_planner,
+            active_detectors,
+            latency_ms=latency_ms,
+            parallelism=concurrency,
+            per_detector_cap=per_detector_cap,
+        )
+        return prior_s
+
+    async def _measure_target_latency_ms(self, url: str) -> float:
+        """One timed GET against the target; falls back to DEFAULT_LATENCY_MS on failure."""
+        try:
+            async with create_scan_client() as client:
+                started = perf_counter()
+                await client.get(url)
+                return max(20.0, (perf_counter() - started) * 1000.0)
+        except Exception as exc:
+            logger.debug("latency probe failed for %s: %s — using prior %.0fms", url, exc, DEFAULT_LATENCY_MS)
+            return DEFAULT_LATENCY_MS
+
     async def _set_progress(
         self,
         scan: Scan,
@@ -1276,6 +1680,7 @@ class ScanOrchestrator:
             scan.started_at = datetime.now(timezone.utc)
         if status in {ScanStatus.completed, ScanStatus.failed, ScanStatus.cancelled} and scan.completed_at is None:
             scan.completed_at = datetime.now(timezone.utc)
+            scan.eta_seconds = 0
         await scan.save()
 
     async def _check_cancelled(self, scan_id: str) -> None:
@@ -1330,6 +1735,8 @@ class ScanOrchestrator:
 
             tech_stack_str = ", ".join(t.name for t in scan.technology_stack) if scan.technology_stack else "Unknown"
 
+            total_findings = len(vulnerabilities)
+            batch_seconds: list[float] = []
             for batch_start in range(0, len(vulnerabilities), BATCH_SIZE):
                 batch = vulnerabilities[batch_start : batch_start + BATCH_SIZE]
                 logger.info(
@@ -1345,6 +1752,7 @@ class ScanOrchestrator:
                 batch_grades = [self.evidence_grader.grade(v) for v in batch]
 
                 results = []
+                batch_started = perf_counter()
                 try:
                     if BATCH_SIZE == 1:
                         result = await self._analyze_single(batch[0], tech_stack_str, batch_grades[0])
@@ -1360,6 +1768,16 @@ class ScanOrchestrator:
                         except Exception as single_e:
                             logger.warning("Single analysis failed for %s: %s", vuln.id, single_e)
                             results.append({"ai_analysis_status": "failed"})
+                batch_elapsed = max(0.1, perf_counter() - batch_started)
+                batch_seconds.append(batch_elapsed)
+
+                # Calibrate AI ETA from measured batch pace (rolling average).
+                avg_batch_s = sum(batch_seconds) / len(batch_seconds)
+                remaining_findings = max(0, total_findings - (batch_start + len(batch)))
+                remaining_batches = math.ceil(remaining_findings / BATCH_SIZE) if remaining_findings else 0
+                self._eta_state.ai_remaining_s = remaining_batches * avg_batch_s
+                self._eta_state.ai_total_s = sum(batch_seconds) + self._eta_state.ai_remaining_s
+                self._eta_state.ai_fraction = (batch_start + len(batch)) / total_findings
 
                 # Apply AI results back to each vulnerability
                 for idx, (vuln, result) in enumerate(zip(batch, results), start=batch_start + 1):
@@ -1446,6 +1864,15 @@ class ScanOrchestrator:
                     vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.success
 
                     analyzed.append(vuln)
+
+                # Tick progress after each batch
+                batch_end = min(batch_start + BATCH_SIZE, total_findings)
+                await self._set_phase_progress(
+                    scan,
+                    ScanPhase.ai_analysis,
+                    batch_end / total_findings,
+                    f"Analyzing findings: {batch_end}/{total_findings} complete",
+                )
 
             return analyzed
 

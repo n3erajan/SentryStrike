@@ -2649,12 +2649,6 @@ class AuthenticationFailuresDetector(BaseDetector):
             has_hidden   = "hidden" in input_types
 
             # 1. Login form discovered → run active auth tests.
-            # The passive "Login Form Discovered" finding has been removed: it
-            # always emits verified=False/confidence=0 and is dropped by
-            # verified-scan-mode filtering, while giving the false impression
-            # that brute-force protection was checked. The active probe in
-            # _test_active_auth() produces a verified finding only when
-            # protection is actually absent, which is the signal that matters.
             if has_username and has_password:
                 # A form whose action is a client-side (hash) route posts to the
                 # SPA shell, not a login handler — every attempt returns the app

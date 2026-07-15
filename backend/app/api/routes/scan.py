@@ -164,6 +164,8 @@ async def get_scan_status(
         "progress": scan.progress,
         "current_phase": scan.current_phase,
         "phase_message": scan.phase_message,
+        "started_at": scan.started_at,
+        "eta_seconds": scan.eta_seconds,
         "error": scan.error_message,
         "updated_at": scan.updated_at,
     })
