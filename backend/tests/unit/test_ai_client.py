@@ -183,8 +183,8 @@ async def test_reasoning_effort_sent_when_configured(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reasoning_effort_absent_by_default(monkeypatch):
-    """When unset, no reasoning_effort key is sent — provider default preserved."""
+async def test_reasoning_effort_defaults_to_none(monkeypatch):
+    """When unset, reasoning_effort defaults to "none" — thinking disabled by default."""
     monkeypatch.setenv("AI_API_KEY", "sk-test")
     monkeypatch.delenv("AI_REASONING_EFFORT", raising=False)
     get_settings.cache_clear()
@@ -192,7 +192,7 @@ async def test_reasoning_effort_absent_by_default(monkeypatch):
         capture: dict = {}
         _patch_post(monkeypatch, capture, _chat_response('{"a": 1}'))
         await AIClient().generate_json("x")
-        assert "reasoning_effort" not in capture["json"]
+        assert capture["json"]["reasoning_effort"] == "none"
     finally:
         get_settings.cache_clear()
 
