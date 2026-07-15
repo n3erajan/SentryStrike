@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+from typing import Protocol
+
+from pydantic import BaseModel, Field, ValidationError
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
+from shared.config import get_infrastructure_settings
+from shared.models.scan import ScanAuthAccount
+from shared.schemas.scan_schema import ScanConfig
+
+
+class ScanJob(BaseModel):
+    scan_id: str = Field(min_length=1)
+    auth_accounts: list[ScanAuthAccount] = Field(default_factory=list)
+    scan_config: ScanConfig | None = None
+
+
+class ScanQueueError(RuntimeError):
+    """Raised when the shared scan queue cannot complete an operation."""
+
+
+class ScanQueue(Protocol):
+    async def enqueue(self, job: ScanJob) -> None: ...
+
+    async def dequeue(self) -> ScanJob: ...
+
+    async def request_cancel(self, scan_id: str) -> None: ...
+
+    async def is_cancelled(self, scan_id: str) -> bool: ...
+
+    async def clear_cancel(self, scan_id: str) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+class RedisScanQueue:
+    def __init__(
+        self,
+        client: Redis,
+        *,
+        queue_name: str,
+        cancel_key_prefix: str,
+        cancel_ttl_seconds: int,
+        heartbeat_key_prefix: str,
+        heartbeat_ttl_seconds: int,
+    ) -> None:
+        self.client = client
+        self.queue_name = queue_name
+        self.cancel_key_prefix = cancel_key_prefix.rstrip(":")
+        self.cancel_ttl_seconds = cancel_ttl_seconds
+        self.heartbeat_key_prefix = heartbeat_key_prefix.rstrip(":")
+        self.heartbeat_ttl_seconds = heartbeat_ttl_seconds
+
+    @classmethod
+    def from_settings(cls) -> RedisScanQueue:
+        settings = get_infrastructure_settings()
+        client = Redis.from_url(settings.redis_url, decode_responses=True)
+        return cls(
+            client,
+            queue_name=settings.scan_queue_name,
+            cancel_key_prefix=settings.scan_cancel_key_prefix,
+            cancel_ttl_seconds=settings.scan_cancel_ttl_seconds,
+            heartbeat_key_prefix=settings.worker_heartbeat_prefix,
+            heartbeat_ttl_seconds=settings.worker_heartbeat_ttl_seconds,
+        )
+
+    def _cancel_key(self, scan_id: str) -> str:
+        return f"{self.cancel_key_prefix}:{scan_id}"
+
+    async def enqueue(self, job: ScanJob) -> None:
+        try:
+            await self.client.rpush(
+                self.queue_name,
+                job.model_dump_json(exclude_none=True),
+            )
+        except RedisError as exc:
+            raise ScanQueueError("Unable to enqueue scan") from exc
+
+    async def dequeue(self) -> ScanJob:
+        try:
+            item = await self.client.blpop(self.queue_name, timeout=0)
+        except RedisError as exc:
+            raise ScanQueueError("Unable to read from scan queue") from exc
+
+        if item is None:
+            raise ScanQueueError("Redis returned no scan job")
+
+        _, payload = item
+        try:
+            return ScanJob.model_validate_json(payload)
+        except ValidationError as exc:
+            raise ScanQueueError("Discarded invalid scan job payload") from exc
+
+    async def request_cancel(self, scan_id: str) -> None:
+        try:
+            await self.client.set(
+                self._cancel_key(scan_id),
+                "1",
+                ex=self.cancel_ttl_seconds,
+            )
+        except RedisError as exc:
+            raise ScanQueueError("Unable to request scan cancellation") from exc
+
+    async def is_cancelled(self, scan_id: str) -> bool:
+        try:
+            return bool(await self.client.exists(self._cancel_key(scan_id)))
+        except RedisError as exc:
+            raise ScanQueueError("Unable to check scan cancellation") from exc
+
+    async def clear_cancel(self, scan_id: str) -> None:
+        try:
+            await self.client.delete(self._cancel_key(scan_id))
+        except RedisError as exc:
+            raise ScanQueueError("Unable to clear scan cancellation") from exc
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    def _heartbeat_key(self, worker_id: str) -> str:
+        return f"{self.heartbeat_key_prefix}:{worker_id}"
+
+    async def set_heartbeat(self, worker_id: str) -> None:
+        try:
+            await self.client.set(
+                self._heartbeat_key(worker_id),
+                "1",
+                ex=self.heartbeat_ttl_seconds,
+            )
+        except RedisError as exc:
+            raise ScanQueueError("Unable to set worker heartbeat") from exc
+
+    async def clear_heartbeat(self, worker_id: str) -> None:
+        try:
+            await self.client.delete(self._heartbeat_key(worker_id))
+        except RedisError as exc:
+            raise ScanQueueError("Unable to clear worker heartbeat") from exc
+
+    async def count_active_scanners(self) -> int:
+        try:
+            keys = await self.client.keys(f"{self.heartbeat_key_prefix}:*")
+            return len(keys)
+        except RedisError as exc:
+            raise ScanQueueError("Unable to count active workers") from exc

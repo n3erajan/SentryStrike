@@ -3,10 +3,9 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
-from app.analyzers.report_generator import AiReportGenerator
 from app.api.dependencies import get_current_user, get_scan_repository, json_response
-from app.database.repositories.scan_repository import ScanRepository
-from app.models.user import User
+from shared.database.repositories.scan_repository import ScanRepository
+from shared.models.user import User
 from app.utils.pdf_generator import build_scan_pdf
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -65,23 +64,6 @@ async def get_report_data(
         raise HTTPException(status_code=404, detail="Scan not found")
 
     return json_response(_build_report_payload(scan, scan_id))
-
-
-@router.post("/{scan_id}/generate")
-async def generate_ai_report(
-    scan_id: str,
-    repo: ScanRepository = Depends(get_scan_repository),
-    current_user: User = Depends(get_current_user),
-) -> dict:
-    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
-    if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
-
-    report = await AiReportGenerator().generate(scan)
-    scan.report_metadata.generated_at = datetime.now()
-    scan.report_metadata.summary = report.get("executive_summary")
-    await scan.save()
-    return json_response(report, "report generated")
 
 
 @router.get("/{scan_id}/pdf")

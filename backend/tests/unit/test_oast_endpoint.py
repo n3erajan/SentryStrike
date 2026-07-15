@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from app.core.verification.oast import OastClient, INTERACTION_ID_RE
+from shared.verification.oast import OastClient, INTERACTION_ID_RE
 
 
 def test_is_valid_interaction_id_accepts_genuine_minted_id():
@@ -128,7 +128,7 @@ async def test_oastclient_poll_parses_route_json_shape():
     """OastClient.poll must consume the exact list-of-dicts shape /oast/poll
     emits (each dict carries the interaction_id), so the collaborator and the
     detector agree end to end."""
-    import app.core.verification.oast as oast_mod
+    import shared.verification.oast as oast_mod
 
     genuine = "ssrf-" + "1" * 32
     # Exactly the shape backend/app/api/routes/oast.py::poll returns.

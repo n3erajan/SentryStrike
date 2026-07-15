@@ -1,20 +1,20 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.dependencies import get_current_user, get_scan_repository, json_response
-from app.core.scanner import ScanOrchestrator
-from app.database.repositories.scan_repository import ScanRepository
-from app.models.scan import ScanAuthAccount, ScanAuthRole
-from app.models.user import User
-from app.schemas.scan_schema import CreateScanRequest, ScanCredentials
+from shared.database.repositories.scan_repository import ScanRepository
+from shared.models.scan import ScanAuthAccount, ScanAuthRole, ScanPhase, ScanStatus
+from shared.models.user import User
+from shared.scan_queue import ScanJob, ScanQueue, ScanQueueError
+from shared.schemas.scan_schema import CreateScanRequest, ScanCredentials
 
 router = APIRouter(prefix="/scans", tags=["scans"])
 
-orchestrator: ScanOrchestrator | None = None
+scan_queue: ScanQueue | None = None
 
 
-def set_orchestrator(instance: ScanOrchestrator) -> None:
-    global orchestrator
-    orchestrator = instance
+def set_scan_queue(instance: ScanQueue) -> None:
+    global scan_queue
+    scan_queue = instance
 
 
 def _auth_accounts_from_payload(credentials: ScanCredentials | None) -> list[ScanAuthAccount]:
@@ -71,8 +71,8 @@ async def create_scan(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    # Credentials are held in memory only and handed to the orchestrator below;
-    # the Scan document persists just the non-secret list of roles supplied.
+    # Credentials are serialized into the Redis job as plaintext and removed
+    # atomically when a worker claims the job. MongoDB persists only role names.
     auth_accounts = _auth_accounts_from_payload(payload.credentials)
     scan = await repo.create(
         str(payload.target_url),
@@ -83,9 +83,29 @@ async def create_scan(
         crawl_mode=payload.crawl_mode,
         auth_roles_provided=[account.role for account in auth_accounts],
     )
-    if orchestrator is None:
-        raise HTTPException(status_code=500, detail="Scanner orchestrator not initialized")
-    await orchestrator.queue_scan(str(scan.id), auth_accounts=auth_accounts, scan_config=payload.config)
+    if scan_queue is None:
+        raise HTTPException(status_code=500, detail="Scan queue not initialized")
+    try:
+        await scan_queue.enqueue(
+            ScanJob(
+                scan_id=str(scan.id),
+                auth_accounts=auth_accounts,
+                scan_config=payload.config,
+            )
+        )
+    except ScanQueueError as exc:
+        await repo.update_status(
+            scan,
+            ScanStatus.failed,
+            progress=scan.progress,
+            current_phase=ScanPhase.failed,
+            phase_message="Scan queue unavailable",
+            error_message="Scan queue unavailable",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Scan queue unavailable",
+        ) from exc
     return json_response(
         {
             "scan_id": str(scan.id),
@@ -158,7 +178,24 @@ async def cancel_scan(
     scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
-    if orchestrator is None:
-        raise HTTPException(status_code=500, detail="Scanner orchestrator not initialized")
-    cancelled = await orchestrator.cancel_scan(scan_id)
-    return json_response({"cancelled": cancelled})
+    if scan.status in {ScanStatus.completed, ScanStatus.failed, ScanStatus.cancelled}:
+        return json_response({"cancelled": False})
+    if scan_queue is None:
+        raise HTTPException(status_code=500, detail="Scan queue not initialized")
+    try:
+        await scan_queue.request_cancel(scan_id)
+    except ScanQueueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Scan queue unavailable",
+        ) from exc
+
+    if scan.status == ScanStatus.queued:
+        await repo.update_status(
+            scan,
+            ScanStatus.cancelled,
+            progress=scan.progress,
+            current_phase=ScanPhase.cancelled,
+            phase_message="Scan cancelled by user",
+        )
+    return json_response({"cancelled": True})

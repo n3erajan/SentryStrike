@@ -2,7 +2,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from app.api.routes.reports import SCANNER_LIMITATIONS, _build_report_payload
-from app.models.scan import (
+from shared.models.scan import (
     AuthCoverage,
     EvidenceStrengthBreakdown,
     ReportMetadata,

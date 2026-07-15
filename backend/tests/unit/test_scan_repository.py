@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.database.repositories.scan_repository import ScanRepository
-from app.models.scan import ScanPhase, ScanStatus
+from shared.database.repositories.scan_repository import ScanRepository
+from shared.models.scan import ScanPhase, ScanStatus
 
 
 class FakeScan:

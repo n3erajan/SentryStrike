@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from app.api.dependencies import get_auth_service, get_current_user, get_session_token, json_response
 from app.config import get_settings
 from app.core.auth import AuthError, AuthService
-from app.models.user import User
+from shared.models.user import User
 from app.schemas.auth_schema import AuthResponse, LoginRequest, RegisterRequest, UserResponse
 
 router = APIRouter(prefix="/auth", tags=["auth"])

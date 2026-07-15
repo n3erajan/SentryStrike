@@ -9,10 +9,9 @@ from app.api.dependencies import get_current_user
 from app.api.routes import analysis, auth, health, oast, reports, scan
 from app.config import get_settings
 from app.core.exceptions import AppError
-from app.core.scanner import ScanOrchestrator
-from app.database.connection import close_db, init_db
-from app.database.repositories.scan_repository import ScanRepository
-from app.utils.logger import configure_logging
+from shared.database.connection import close_db, init_db
+from shared.scan_queue import RedisScanQueue
+from shared.utils.logger import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +21,14 @@ async def lifespan(app: FastAPI):
     configure_logging()
     await init_db()
 
-    repository = ScanRepository()
-    scanner_orchestrator = ScanOrchestrator(repository)
-    scan.set_orchestrator(scanner_orchestrator)
-
-    yield
-
-    await close_db()
+    scan_queue = RedisScanQueue.from_settings()
+    scan.set_scan_queue(scan_queue)
+    app.state.scan_queue = scan_queue
+    try:
+        yield
+    finally:
+        await scan_queue.close()
+        await close_db()
 
 
 def create_app() -> FastAPI:
