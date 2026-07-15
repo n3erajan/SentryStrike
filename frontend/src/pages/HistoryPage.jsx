@@ -67,7 +67,7 @@ function HistoryPage() {
         </div>
         <button
           className='btn-dl btn-dl-primary'
-          onClick={() => navigate("/app/scan")}
+          onClick={() => navigate("/scan")}
         >
           New scan
         </button>
@@ -98,7 +98,7 @@ function HistoryPage() {
           <button
             className='btn-dl btn-dl-primary'
             style={{ marginTop: 6 }}
-            onClick={() => navigate("/app/scan")}
+            onClick={() => navigate("/scan")}
           >
             Start your first scan
           </button>
@@ -115,11 +115,11 @@ function HistoryPage() {
             // live active-scan view. Terminal-but-empty states aren't clickable.
             const open = () => {
               if (completed) {
-                navigate(`/app/report/${scan.id}`, {
+                navigate(`/report/${scan.id}`, {
                   state: { target: scan.target_url },
                 });
               } else if (active) {
-                navigate(`/app/active/${scan.id}`, {
+                navigate(`/active/${scan.id}`, {
                   state: { target: scan.target_url },
                 });
               }

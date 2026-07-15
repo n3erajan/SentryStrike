@@ -213,7 +213,7 @@ function ScanPage() {
   async function handleStart() {
     const result = await startScan();
     if (result) {
-      navigate(`/app/active/${result.scanId}`, {
+      navigate(`/active/${result.scanId}`, {
         state: { target: result.target },
       });
     }

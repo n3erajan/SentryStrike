@@ -21,7 +21,7 @@ function formatDate(iso) {
   return Number.isNaN(d.getTime()) ? "-" : d.toLocaleString();
 }
 
-// Dashboard of all in-flight scans (route /app/active). Because the backend
+// Dashboard of all in-flight scans (route /active). Because the backend
 // runs scans concurrently, several can be live at once; each row links to its
 // own active-scan page. The list polls via the shared useActiveScans hook.
 function ActiveScansPage() {
@@ -42,7 +42,7 @@ function ActiveScansPage() {
         </div>
         <button
           className='btn-dl btn-dl-primary'
-          onClick={() => navigate("/app/scan")}
+          onClick={() => navigate("/scan")}
         >
           <ShieldCheck size={16} weight='bold' /> New scan
         </button>
@@ -66,7 +66,7 @@ function ActiveScansPage() {
           <button
             className='btn-dl btn-dl-primary'
             style={{ marginTop: 6 }}
-            onClick={() => navigate("/app/scan")}
+            onClick={() => navigate("/scan")}
           >
             Start a scan
           </button>
@@ -83,13 +83,13 @@ function ActiveScansPage() {
                 role='button'
                 tabIndex={0}
                 onClick={() =>
-                  navigate(`/app/active/${scan.id}`, {
+                  navigate(`/active/${scan.id}`, {
                     state: { target: scan.target_url },
                   })
                 }
                 onKeyDown={(e) =>
                   e.key === "Enter" &&
-                  navigate(`/app/active/${scan.id}`, {
+                  navigate(`/active/${scan.id}`, {
                     state: { target: scan.target_url },
                   })
                 }

@@ -22,7 +22,7 @@ function AppLayout() {
         <header className='app-top'>
           <div className='crumb'>SentryStrike / <b>{crumbFor(location.pathname)}</b></div>
           {!onScanPage && (
-            <button className='btn primary app-new-scan' onClick={() => navigate("/app/scan")}>
+            <button className='btn primary app-new-scan' onClick={() => navigate("/scan")}>
               <Plus size={16} weight='bold' /> New assessment
             </button>
           )}

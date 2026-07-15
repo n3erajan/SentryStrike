@@ -1,7 +1,7 @@
 import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "../context/AuthContext.jsx";
 
-// Gate for the authenticated `/app/*` section. When there's no signed-in user
+// Gate for authenticated routes. When there's no signed-in user
 // we bounce to /login, remembering where the user was headed so login can send
 // them back. Renders the nested routes via <Outlet /> otherwise.
 function ProtectedRoute() {
@@ -19,7 +19,7 @@ function ProtectedRoute() {
 export function PublicOnlyRoute() {
   const { user } = useAuth();
   if (user) {
-    return <Navigate to='/app/scan' replace />;
+    return <Navigate to='/scan' replace />;
   }
   return <Outlet />;
 }

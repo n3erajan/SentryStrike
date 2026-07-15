@@ -16,7 +16,7 @@ function Sidebar() {
 
   return (
     <aside className='sidebar'>
-      <NavLink to='/app/scan' className='brand sidebar-brand'>
+      <NavLink to='/scan' className='brand sidebar-brand'>
         <span className='mark'><ShieldCheck size={19} weight='bold' /></span>
         SentryStrike
       </NavLink>

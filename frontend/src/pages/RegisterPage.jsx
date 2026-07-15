@@ -28,7 +28,7 @@ function RegisterPage() {
     setSubmitting(true);
     try {
       await register({ email, password });
-      navigate("/app/scan", { replace: true });
+      navigate("/scan", { replace: true });
     } catch (err) {
       setError(err.message || "Unable to create account. Please try again.");
     } finally {

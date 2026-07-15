@@ -12,8 +12,8 @@ import ActiveScanPage from "./pages/ActiveScanPage.jsx";
 import HistoryPage from "./pages/HistoryPage.jsx";
 import ReportPage from "./pages/ReportPage.jsx";
 
-// Route map (see plan). Public marketing + auth screens live at the root; the
-// authenticated app is nested under /app behind the vertical-sidebar layout.
+// Public marketing and auth screens live at the root. Authenticated routes
+// share the vertical-sidebar layout without an additional URL prefix.
 function App() {
   return (
     <Routes>
@@ -26,13 +26,12 @@ function App() {
 
       {/* Protected app shell with the left sidebar. */}
       <Route element={<ProtectedRoute />}>
-        <Route path='/app' element={<AppLayout />}>
-          <Route index element={<Navigate to='scan' replace />} />
-          <Route path='scan' element={<ScanPage />} />
-          <Route path='active' element={<ActiveScansPage />} />
-          <Route path='active/:scanId' element={<ActiveScanPage />} />
-          <Route path='history' element={<HistoryPage />} />
-          <Route path='report/:scanId' element={<ReportPage />} />
+        <Route element={<AppLayout />}>
+          <Route path='/scan' element={<ScanPage />} />
+          <Route path='/active' element={<ActiveScansPage />} />
+          <Route path='/active/:scanId' element={<ActiveScanPage />} />
+          <Route path='/history' element={<HistoryPage />} />
+          <Route path='/report/:scanId' element={<ReportPage />} />
         </Route>
       </Route>
 

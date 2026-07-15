@@ -81,7 +81,7 @@ function ReportPage() {
   const [busy, setBusy] = useState(""); // "" | "pdf" | "ai"
   const [notice, setNotice] = useState("");
 
-  const onBack = useCallback(() => navigate("/app/history"), [navigate]);
+  const onBack = useCallback(() => navigate("/history"), [navigate]);
 
   const load = useCallback(
     async (signal) => {

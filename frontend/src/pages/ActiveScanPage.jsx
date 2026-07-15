@@ -20,11 +20,11 @@ const STATUS_LABEL = {
   cancelled: "Cancelled",
 };
 
-// Live view for one running scan (route /app/active/:scanId). Polls status via
+// Live view for one running scan (route /active/:scanId). Polls status via
 // useScanStatus and shows progress, stage chips, and a running log. On
 // completion it surfaces a CTA to the report; while running the user can cancel
 // or leave — the scan keeps running on the backend and stays visible under
-// /app/active.
+// /active.
 function ActiveScanPage() {
   const { scanId } = useParams();
   const navigate = useNavigate();
@@ -37,13 +37,13 @@ function ActiveScanPage() {
   // "complete" state is visible first.
   useEffect(() => {
     if (status !== "completed") return undefined;
-    const id = setTimeout(() => navigate(`/app/report/${scanId}`), 1200);
+    const id = setTimeout(() => navigate(`/report/${scanId}`), 1200);
     return () => clearTimeout(id);
   }, [status, scanId, navigate]);
 
   return (
     <div className='page'>
-      <button className='report-back' onClick={() => navigate("/app/active")}>
+      <button className='report-back' onClick={() => navigate("/active")}>
         <ArrowLeft size={15} weight='bold' /> All active scans
       </button>
 
@@ -120,14 +120,14 @@ function ActiveScanPage() {
             </button>
           ) : status === "completed" ? (
             <Link
-              to={`/app/report/${scanId}`}
+              to={`/report/${scanId}`}
               className='btn-dl btn-dl-primary'
             >
               <ShieldCheck size={16} weight='bold' /> View report
               <ArrowRight size={15} weight='bold' />
             </Link>
           ) : (
-            <Link to='/app/scan' className='btn-ghost'>
+            <Link to='/scan' className='btn-ghost'>
               Start a new scan
             </Link>
           )}

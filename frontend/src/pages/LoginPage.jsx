@@ -10,7 +10,7 @@ function LoginPage() {
   const { login } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
-  const dest = location.state?.from?.pathname || "/app/scan";
+  const dest = location.state?.from?.pathname || "/scan";
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [touched, setTouched] = useState({});
