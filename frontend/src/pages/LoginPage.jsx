@@ -1,12 +1,6 @@
-import { useState } from "react";
-import { Link, useNavigate, useLocation } from "react-router-dom";
-import {
-  EnvelopeSimple,
-  Lock,
-  CheckCircle,
-  WarningCircle,
-  CircleNotch,
-} from "@phosphor-icons/react";
+﻿import { useState } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { CheckCircle, CircleNotch, ShieldCheck, WarningCircle } from "@phosphor-icons/react";
 import { useAuth } from "../context/AuthContext.jsx";
 import AuthBrand from "../components/AuthBrand.jsx";
 
@@ -16,15 +10,12 @@ function LoginPage() {
   const { login } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
-  // Return the user to wherever ProtectedRoute bounced them from, else the app.
   const dest = location.state?.from?.pathname || "/app/scan";
-
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [touched, setTouched] = useState({});
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-
   const emailValid = EMAIL_RE.test(email);
   const passwordValid = password.length >= 8;
   const canSubmit = emailValid && passwordValid && !submitting;
@@ -46,96 +37,37 @@ function LoginPage() {
   }
 
   return (
-    <div className='auth-split'>
-      <AuthBrand />
-
-      <div className='auth-form-panel'>
-        <div className='auth-form-inner'>
-          <div className='auth-head'>
-            <h1 className='auth-title'>Welcome back</h1>
-            <p className='auth-sub'>Sign in to continue to SentryStrike</p>
-          </div>
-
+    <div className='auth-shell'>
+      <div className='auth-left'>
+        <Link to='/' className='brand auth-brand-link'><span className='mark'><ShieldCheck size={19} weight='bold' /></span>SentryStrike</Link>
+        <div className='auth-box'>
+          <h1>Welcome back</h1>
+          <p>Sign in to manage assessments and reports.</p>
           <form onSubmit={handleSubmit} noValidate>
-            {error && (
-              <div className='auth-error'>
-                <WarningCircle size={16} weight='fill' /> {error}
+            {error && <div className='auth-error'><WarningCircle size={16} weight='fill' />{error}</div>}
+            <div className='field'>
+              <label htmlFor='login-email'>Work email</label>
+              <div className={`control auth-control ${touched.email && !emailValid ? "error" : emailValid ? "valid" : ""}`}>
+                <input id='login-email' type='email' autoComplete='email' value={email} onChange={(event) => setEmail(event.target.value)} onBlur={() => setTouched((value) => ({ ...value, email: true }))} disabled={submitting} />
+                {emailValid && <CheckCircle size={17} weight='fill' />}
               </div>
-            )}
-
-            <label className='form-label' htmlFor='login-email'>
-              Email
-            </label>
-            <div
-              className={`input-group ${touched.email && !emailValid ? "error" : emailValid ? "valid" : ""}`}
-            >
-              <EnvelopeSimple className='field-icon' size={17} />
-              <input
-                id='login-email'
-                type='email'
-                autoComplete='email'
-                placeholder='Email'
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                onBlur={() => setTouched((t) => ({ ...t, email: true }))}
-                disabled={submitting}
-              />
-              {emailValid && (
-                <CheckCircle className='input-ok' size={17} weight='fill' />
-              )}
+              {touched.email && !emailValid && <p className='field-error'>Enter a valid email address</p>}
             </div>
-            {touched.email && !emailValid && (
-              <p className='field-error'>Enter a valid email address</p>
-            )}
-
-            <label
-              className='form-label'
-              htmlFor='login-password'
-              style={{ marginTop: 16 }}
-            >
-              Password
-            </label>
-            <div
-              className={`input-group ${touched.password && !passwordValid ? "error" : passwordValid ? "valid" : ""}`}
-            >
-              <Lock className='field-icon' size={17} />
-              <input
-                id='login-password'
-                type='password'
-                autoComplete='current-password'
-                value={password}
-                placeholder='Password'
-                onChange={(e) => setPassword(e.target.value)}
-                onBlur={() => setTouched((t) => ({ ...t, password: true }))}
-                disabled={submitting}
-              />
+            <div className='field'>
+              <label htmlFor='login-password'>Password</label>
+              <div className={`control auth-control ${touched.password && !passwordValid ? "error" : passwordValid ? "valid" : ""}`}>
+                <input id='login-password' type='password' autoComplete='current-password' value={password} onChange={(event) => setPassword(event.target.value)} onBlur={() => setTouched((value) => ({ ...value, password: true }))} disabled={submitting} />
+              </div>
+              {touched.password && !passwordValid && <p className='field-error'>Password must be at least 8 characters</p>}
             </div>
-            {touched.password && !passwordValid && (
-              <p className='field-error'>
-                Password must be at least 8 characters
-              </p>
-            )}
-
-            <button className='btn-primary' type='submit' disabled={!canSubmit}>
-              {submitting ? (
-                <>
-                  <CircleNotch className='spin' size={17} weight='bold' />{" "}
-                  Signing in
-                </>
-              ) : (
-                <>Sign In</>
-              )}
+            <button className='btn primary auth-submit' type='submit' disabled={!canSubmit}>
+              {submitting ? <><CircleNotch className='spin' size={17} weight='bold' />Signing in</> : "Sign in"}
             </button>
           </form>
-
-          <p className='auth-switch'>
-            Don&apos;t have an account?{" "}
-            <Link className='auth-link' to='/register'>
-              Create one
-            </Link>
-          </p>
+          <div className='auth-switch'>No account? <Link className='text-btn' to='/register'>Create account</Link></div>
         </div>
       </div>
+      <AuthBrand mode='login' />
     </div>
   );
 }

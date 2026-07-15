@@ -1,12 +1,6 @@
-import { useState } from "react";
+﻿import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import {
-  EnvelopeSimple,
-  Lock,
-  CheckCircle,
-  WarningCircle,
-  CircleNotch,
-} from "@phosphor-icons/react";
+import { CheckCircle, CircleNotch, ShieldCheck, WarningCircle } from "@phosphor-icons/react";
 import { useAuth } from "../context/AuthContext.jsx";
 import AuthBrand from "../components/AuthBrand.jsx";
 
@@ -15,14 +9,12 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 function RegisterPage() {
   const { register } = useAuth();
   const navigate = useNavigate();
-
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [touched, setTouched] = useState({});
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-
   const emailValid = EMAIL_RE.test(email);
   const passwordValid = password.length >= 8;
   const confirmValid = confirm.length > 0 && confirm === password;
@@ -45,125 +37,45 @@ function RegisterPage() {
   }
 
   return (
-    <div className='auth-split'>
-      <AuthBrand />
-
-      <div className='auth-form-panel'>
-        <div className='auth-form-inner'>
-          <div className='auth-head'>
-            <h1 className='auth-title'>Create your account</h1>
-            <p className='auth-sub'>Start scanning targets in minutes</p>
-          </div>
-
+    <div className='auth-shell'>
+      <div className='auth-left'>
+        <Link to='/' className='brand auth-brand-link'><span className='mark'><ShieldCheck size={19} weight='bold' /></span>SentryStrike</Link>
+        <div className='auth-box'>
+          <h1>Create your account</h1>
+          <p>Set up SentryStrike and run your first assessment.</p>
           <form onSubmit={handleSubmit} noValidate>
-            {error && (
-              <div className='auth-error'>
-                <WarningCircle size={16} weight='fill' /> {error}
+            {error && <div className='auth-error'><WarningCircle size={16} weight='fill' />{error}</div>}
+            <div className='field'>
+              <label htmlFor='register-email'>Work email</label>
+              <div className={`control auth-control ${touched.email && !emailValid ? "error" : emailValid ? "valid" : ""}`}>
+                <input id='register-email' type='email' autoComplete='email' value={email} onChange={(event) => setEmail(event.target.value)} onBlur={() => setTouched((value) => ({ ...value, email: true }))} disabled={submitting} />
+                {emailValid && <CheckCircle size={17} weight='fill' />}
               </div>
-            )}
-
-            <label className='form-label' htmlFor='register-email'>
-              Email
-            </label>
-            <div
-              className={`input-group ${touched.email && !emailValid ? "error" : emailValid ? "valid" : ""}`}
-            >
-              <EnvelopeSimple className='field-icon' size={17} />
-              <input
-                id='register-email'
-                type='email'
-                autoComplete='email'
-                placeholder='Email'
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                onBlur={() => setTouched((t) => ({ ...t, email: true }))}
-                disabled={submitting}
-              />
-              {emailValid && (
-                <CheckCircle className='input-ok' size={17} weight='fill' />
-              )}
+              {touched.email && !emailValid && <p className='field-error'>Enter a valid email address</p>}
             </div>
-            {touched.email && !emailValid && (
-              <p className='field-error'>Enter a valid email address</p>
-            )}
-
-            <label
-              className='form-label'
-              htmlFor='register-password'
-              style={{ marginTop: 16 }}
-            >
-              Password
-            </label>
-            <div
-              className={`input-group ${touched.password && !passwordValid ? "error" : passwordValid ? "valid" : ""}`}
-            >
-              <Lock className='field-icon' size={17} />
-              <input
-                id='register-password'
-                type='password'
-                autoComplete='new-password'
-                placeholder='Password'
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                onBlur={() => setTouched((t) => ({ ...t, password: true }))}
-                disabled={submitting}
-              />
+            <div className='field'>
+              <label htmlFor='register-password'>Password</label>
+              <div className={`control auth-control ${touched.password && !passwordValid ? "error" : passwordValid ? "valid" : ""}`}>
+                <input id='register-password' type='password' autoComplete='new-password' value={password} onChange={(event) => setPassword(event.target.value)} onBlur={() => setTouched((value) => ({ ...value, password: true }))} disabled={submitting} />
+              </div>
+              {touched.password && !passwordValid && <p className='field-error'>Password must be at least 8 characters</p>}
             </div>
-            {touched.password && !passwordValid && (
-              <p className='field-error'>
-                Password must be at least 8 characters
-              </p>
-            )}
-
-            <label
-              className='form-label'
-              htmlFor='register-confirm'
-              style={{ marginTop: 16 }}
-            >
-              Confirm password
-            </label>
-            <div
-              className={`input-group ${touched.confirm && !confirmValid ? "error" : confirmValid ? "valid" : ""}`}
-            >
-              <Lock className='field-icon' size={17} />
-              <input
-                id='register-confirm'
-                type='password'
-                autoComplete='new-password'
-                placeholder='Confirm Password'
-                value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
-                onBlur={() => setTouched((t) => ({ ...t, confirm: true }))}
-                disabled={submitting}
-              />
-              {confirmValid && (
-                <CheckCircle className='input-ok' size={17} weight='fill' />
-              )}
+            <div className='field'>
+              <label htmlFor='register-confirm'>Confirm password</label>
+              <div className={`control auth-control ${touched.confirm && !confirmValid ? "error" : confirmValid ? "valid" : ""}`}>
+                <input id='register-confirm' type='password' autoComplete='new-password' value={confirm} onChange={(event) => setConfirm(event.target.value)} onBlur={() => setTouched((value) => ({ ...value, confirm: true }))} disabled={submitting} />
+                {confirmValid && <CheckCircle size={17} weight='fill' />}
+              </div>
+              {touched.confirm && !confirmValid && <p className='field-error'>Passwords do not match</p>}
             </div>
-            {touched.confirm && !confirmValid && (
-              <p className='field-error'>Passwords do not match</p>
-            )}
-
-            <button className='btn-primary' type='submit' disabled={!canSubmit}>
-              {submitting ? (
-                <>
-                  <CircleNotch className='spin' size={17} weight='bold' />{" "}
-                  Creating account
-                </>
-              ) : (
-                <>Create Account</>
-              )}
+            <button className='btn primary auth-submit' type='submit' disabled={!canSubmit}>
+              {submitting ? <><CircleNotch className='spin' size={17} weight='bold' />Creating account</> : "Create account"}
             </button>
           </form>
-
-          <p className='auth-switch'>
-            Already have an account?{" "}
-            <Link className='auth-link' to='/login'>
-              Sign in
-            </Link>
-          </p>
+          <div className='auth-switch'>Already registered? <Link className='text-btn' to='/login'>Sign in</Link></div>
         </div>
       </div>
+      <AuthBrand mode='register' />
     </div>
   );
 }
