@@ -12,7 +12,6 @@ import {
   Warning,
   DownloadSimple,
   FileText,
-  Sparkle,
 } from "@phosphor-icons/react";
 import SeverityBadge from "../components/SeverityBadge.jsx";
 import ScoreRing from "../components/ScoringRing.jsx";
@@ -21,7 +20,6 @@ import { SEVERITIES, SEVERITY_META } from "../data/constants.js";
 import {
   getReport,
   downloadReportPdf,
-  generateAiReport,
 } from "../services/reports.js";
 import { downloadFile, saveBlob } from "../utils/helpers.js";
 
@@ -78,7 +76,7 @@ function ReportPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [filter, setFilter] = useState("all");
-  const [busy, setBusy] = useState(""); // "" | "pdf" | "ai"
+  const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
 
   const onBack = useCallback(() => navigate("/history"), [navigate]);
@@ -128,22 +126,6 @@ function ReportPage() {
       setBusy("");
     }
   }, [scanId]);
-
-  // Re-run the AI executive-summary pass (POST /reports/{id}/generate) and
-  // reload the report so the fresh summary shows.
-  const handleRegenerate = useCallback(async () => {
-    setBusy("ai");
-    setNotice("");
-    try {
-      await generateAiReport(scanId);
-      await load();
-      setNotice("AI summary regenerated.");
-    } catch (err) {
-      setNotice(err.message || "Could not regenerate the AI summary.");
-    } finally {
-      setBusy("");
-    }
-  }, [scanId, load]);
 
   if (loading) {
     return (
@@ -296,22 +278,6 @@ function ReportPage() {
             onClick={handleDownloadJson}
           >
             <FileText size={16} weight='bold' /> Download JSON
-          </button>
-          <button
-            className='btn-dl btn-dl-secondary'
-            onClick={handleRegenerate}
-            disabled={busy === "ai"}
-            title='Re-run the AI stage to rewrite the executive summary'
-          >
-            {busy === "ai" ? (
-              <>
-                <CircleNotch className='spin' size={16} weight='bold' /> Regenerating
-              </>
-            ) : (
-              <>
-                <Sparkle size={16} weight='bold' /> Regenerate AI summary
-              </>
-            )}
           </button>
         </div>
       </div>

@@ -1,36 +1,37 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { SCAN_STAGES } from "../data/constants.js";
+import { SCAN_PHASES } from "../data/constants.js";
 import { getScanStatus, cancelScan } from "../services/scan.js";
 
 const POLL_INTERVAL_MS = 4000;
 
-// The backend reports numeric progress + a status string; it does not stream
-// per-stage labels. We derive a stage from progress so the UI stays in step
-// with real work instead of a fake timer.
-function stageForProgress(progress, status) {
-  if (status === "completed") return SCAN_STAGES.length - 1;
+// Prefer the worker's named phase. The progress fallback keeps the view usable
+// with older scan records that predate current_phase.
+function stageForProgress(progress, status, currentPhase) {
+  if (status === "completed") return SCAN_PHASES.length;
   if (status === "queued" || !status) return 0;
-  const idx = Math.floor((progress / 100) * (SCAN_STAGES.length - 1));
-  return Math.max(0, Math.min(SCAN_STAGES.length - 2, idx));
+  const phaseIdx = SCAN_PHASES.findIndex(({ key }) => key === currentPhase);
+  if (phaseIdx >= 0) return phaseIdx;
+  const idx = Math.floor((progress / 100) * SCAN_PHASES.length);
+  return Math.max(1, Math.min(SCAN_PHASES.length - 1, idx));
 }
 
-// Polls GET /scans/{id}/status for a single scan and derives a live view:
-// progress, stage, ETA, and a running log of stage transitions. Terminal
-// statuses stop the poll. Extracted from the old useScan so the active-scan
-// page can own the lifecycle of one scan independently of the submit form.
+// Polls one scan's backend-owned lifecycle. Terminal statuses stop polling;
+// cancellation remains pending until the scanner worker acknowledges it.
 function useScanStatus(scanId) {
   const [status, setStatus] = useState(null);
   const [progress, setProgress] = useState(0);
+  const [phase, setPhase] = useState("queued");
+  const [phaseMessage, setPhaseMessage] = useState("Scan queued");
   const [eta, setEta] = useState(null);
   const [logs, setLogs] = useState([]);
   const [error, setError] = useState("");
+  const [cancelling, setCancelling] = useState(false);
 
   const logRef = useRef(null);
-  const startRef = useRef(Date.now());
-  const lastStageRef = useRef(-1);
+  const lastPhaseRef = useRef("");
   const doneRef = useRef(false);
 
-  const stageIdx = stageForProgress(progress, status);
+  const stageIdx = stageForProgress(progress, status, phase);
   const active = status === "queued" || status === "running" || status === null;
 
   const pushLog = useCallback((kind, text) => {
@@ -38,56 +39,82 @@ function useScanStatus(scanId) {
   }, []);
 
   const cancel = useCallback(async () => {
-    if (!scanId) return;
-    pushLog("warn", "[!] Cancelling scan…");
+    if (!scanId || cancelling) return;
+    setCancelling(true);
+    setError("");
+    pushLog("warn", "[pending] Cancellation requested");
     try {
-      await cancelScan(scanId);
-    } catch {
-      // Best-effort — polling will reflect the real terminal state.
+      const result = await cancelScan(scanId);
+      if (!result?.cancelled) {
+        setCancelling(false);
+        pushLog("warn", "[info] This scan can no longer be cancelled");
+      }
+    } catch (err) {
+      setCancelling(false);
+      setError(err.message || "Could not request cancellation.");
     }
-  }, [scanId, pushLog]);
+  }, [scanId, cancelling, pushLog]);
 
   useEffect(() => {
     if (!scanId) return undefined;
 
     let stopped = false;
+    let polling = false;
+    let id = null;
     const controller = new AbortController();
-    startRef.current = Date.now();
-    lastStageRef.current = -1;
+    lastPhaseRef.current = "";
     doneRef.current = false;
 
+    function stopPolling() {
+      if (id) clearInterval(id);
+      id = null;
+    }
+
     async function poll() {
+      if (stopped || polling) return;
+      polling = true;
       try {
-        const s = await getScanStatus(scanId, controller.signal);
+        const scan = await getScanStatus(scanId, controller.signal);
         if (stopped) return;
 
-        const p = typeof s.progress === "number" ? s.progress : 0;
-        setProgress(p);
-        setStatus(s.status);
+        const nextProgress =
+          typeof scan.progress === "number" ? scan.progress : 0;
+        const nextPhase = scan.current_phase || "queued";
+        const nextMessage = scan.phase_message || "Scan in progress";
 
-        const stage = stageForProgress(p, s.status);
-        if (stage !== lastStageRef.current && s.status === "running") {
-          lastStageRef.current = stage;
-          pushLog("ok", `[✓] ${SCAN_STAGES[stage]}`);
+        setProgress(nextProgress);
+        setStatus(scan.status);
+        setPhase(nextPhase);
+        setPhaseMessage(nextMessage);
+        setEta(
+          typeof scan.eta_seconds === "number" && scan.eta_seconds >= 0
+            ? scan.eta_seconds
+            : null,
+        );
+
+        if (
+          nextPhase !== lastPhaseRef.current &&
+          scan.status === "running"
+        ) {
+          lastPhaseRef.current = nextPhase;
+          pushLog("ok", `[phase] ${nextMessage}`);
         }
 
-        const elapsed = (Date.now() - startRef.current) / 1000;
-        if (p > 3 && p < 100 && elapsed > 0) {
-          setEta(Math.max(1, Math.ceil((elapsed / p) * (100 - p))));
-        }
-
-        if (s.status === "completed" && !doneRef.current) {
+        if (scan.status === "completed" && !doneRef.current) {
           doneRef.current = true;
           setProgress(100);
           setEta(0);
-          pushLog("ok", "[✓] Scan complete — report ready");
+          setCancelling(false);
+          pushLog("ok", "[complete] Report ready");
           stopPolling();
-        } else if (s.status === "failed") {
-          setError(s.error || "The scan failed. Please try again.");
-          pushLog("warn", `[!] ${s.error || "Scan failed"}`);
+        } else if (scan.status === "failed") {
+          setError(scan.error || "The scan failed. Please try again.");
+          pushLog("warn", `[!] ${scan.error || "Scan failed"}`);
+          setCancelling(false);
           stopPolling();
-        } else if (s.status === "cancelled") {
+        } else if (scan.status === "cancelled") {
           pushLog("warn", "[!] Scan cancelled");
+          setCancelling(false);
           stopPolling();
         }
       } catch (err) {
@@ -95,25 +122,20 @@ function useScanStatus(scanId) {
         setError(err.message || "Lost connection to the scan.");
         pushLog("warn", `[!] ${err.message || "Lost connection to the scan."}`);
         stopPolling();
+      } finally {
+        polling = false;
       }
     }
 
-    let id = null;
-    function stopPolling() {
-      if (id) clearInterval(id);
-      id = null;
-    }
-
-    poll();
     id = setInterval(poll, POLL_INTERVAL_MS);
+    poll();
     return () => {
       stopped = true;
       controller.abort();
-      if (id) clearInterval(id);
+      stopPolling();
     };
   }, [scanId, pushLog]);
 
-  // Keep the live log scrolled to the newest line.
   useEffect(() => {
     logRef.current?.scrollTo({
       top: logRef.current.scrollHeight,
@@ -121,7 +143,20 @@ function useScanStatus(scanId) {
     });
   }, [logs]);
 
-  return { status, progress, stageIdx, eta, logs, logRef, error, active, cancel };
+  return {
+    status,
+    progress,
+    phase,
+    phaseMessage,
+    stageIdx,
+    eta,
+    logs,
+    logRef,
+    error,
+    active,
+    cancelling,
+    cancel,
+  };
 }
 
 export { useScanStatus, stageForProgress };

@@ -9,6 +9,7 @@ import {
   ShieldCheck,
 } from "@phosphor-icons/react";
 import { useActiveScans } from "../hooks/useActiveScans.js";
+import { useBackendHealth } from "../hooks/useBackendHealth.js";
 
 const STATUS_LABEL = {
   queued: "Queued",
@@ -27,6 +28,8 @@ function formatDate(iso) {
 function ActiveScansPage() {
   const navigate = useNavigate();
   const { scans, loading, error } = useActiveScans();
+  const { health } = useBackendHealth();
+  const workerCount = health?.active_scanners;
 
   return (
     <div className='page-wide'>
@@ -40,12 +43,26 @@ function ActiveScansPage() {
             parallel — start another any time.
           </p>
         </div>
-        <button
-          className='btn-dl btn-dl-primary'
-          onClick={() => navigate("/scan")}
-        >
-          <ShieldCheck size={16} weight='bold' /> New scan
-        </button>
+        <div className='active-head-actions'>
+          {Number.isInteger(workerCount) && (
+            <div className={`worker-status ${workerCount === 0 ? "offline" : ""}`}>
+              {workerCount === 0 ? (
+                <WarningCircle size={15} weight='fill' />
+              ) : (
+                <Pulse size={15} weight='bold' />
+              )}
+              {workerCount === 0
+                ? "No scanner workers online"
+                : `${workerCount} scanner ${workerCount === 1 ? "worker" : "workers"} online`}
+            </div>
+          )}
+          <button
+            className='btn-dl btn-dl-primary'
+            onClick={() => navigate("/scan")}
+          >
+            <ShieldCheck size={16} weight='bold' /> New scan
+          </button>
+        </div>
       </div>
 
       {loading && scans.length === 0 ? (

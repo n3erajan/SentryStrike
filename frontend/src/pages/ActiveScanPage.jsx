@@ -10,7 +10,7 @@ import {
   ShieldCheck,
 } from "@phosphor-icons/react";
 import { useScanStatus } from "../hooks/useScanStatus.js";
-import { SCAN_STAGES } from "../data/constants.js";
+import { SCAN_PHASES } from "../data/constants.js";
 
 const STATUS_LABEL = {
   queued: "Queued",
@@ -19,6 +19,16 @@ const STATUS_LABEL = {
   failed: "Failed",
   cancelled: "Cancelled",
 };
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  if (seconds < 60) return `${Math.ceil(seconds)}s`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
+}
 
 // Live view for one running scan (route /active/:scanId). Polls status via
 // useScanStatus and shows progress, stage chips, and a running log. On
@@ -30,8 +40,19 @@ function ActiveScanPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const target = location.state?.target || "";
-  const { status, progress, stageIdx, eta, logs, logRef, error, active, cancel } =
-    useScanStatus(scanId);
+  const {
+    status,
+    progress,
+    phaseMessage,
+    stageIdx,
+    eta,
+    logs,
+    logRef,
+    error,
+    active,
+    cancelling,
+    cancel,
+  } = useScanStatus(scanId);
 
   // When the scan finishes, nudge toward the report after a short beat so the
   // "complete" state is visible first.
@@ -70,7 +91,7 @@ function ActiveScanPage() {
             ) : (
               <Check size={16} weight='bold' />
             )}
-            {SCAN_STAGES[stageIdx]}
+            {phaseMessage || STATUS_LABEL[status] || "Scan queued"}
           </div>
           <div className='progress-meta'>
             <span className={`status-pill status-${status || "queued"}`}>
@@ -78,7 +99,7 @@ function ActiveScanPage() {
             </span>
             <span className='progress-pct'>{Math.round(progress)}%</span>
             {eta != null && eta > 0 && (
-              <span className='progress-eta'>~{eta}s left</span>
+              <span className='progress-eta'>About {formatDuration(eta)} left</span>
             )}
           </div>
         </div>
@@ -86,15 +107,20 @@ function ActiveScanPage() {
           <div className='progress-fill' style={{ width: `${progress}%` }} />
         </div>
         <div className='stage-chips'>
-          {SCAN_STAGES.slice(0, -1).map((stage, index) => (
-            <div
-              key={stage}
-              className={`stage-chip ${index <= stageIdx ? "done" : "pending"}`}
-            >
-              {index <= stageIdx && <Check size={12} weight='bold' />}
-              {stage.replace("...", "")}
-            </div>
-          ))}
+          {SCAN_PHASES.slice(1).map((scanPhase, chipIndex) => {
+            const phaseIndex = chipIndex + 1;
+            const completed = status === "completed" || phaseIndex < stageIdx;
+            const current = active && phaseIndex === stageIdx;
+            return (
+              <div
+                key={scanPhase.key}
+                className={`stage-chip ${completed ? "done" : current ? "active" : "pending"}`}
+              >
+                {completed && <Check size={12} weight='bold' />}
+                {scanPhase.label}
+              </div>
+            );
+          })}
         </div>
 
         {error && (
@@ -115,8 +141,13 @@ function ActiveScanPage() {
 
         <div className='scan-progress-actions'>
           {active ? (
-            <button type='button' className='btn-ghost' onClick={cancel}>
-              Cancel scan
+            <button
+              type='button'
+              className='btn-ghost'
+              onClick={cancel}
+              disabled={cancelling}
+            >
+              {cancelling ? "Cancellation requested" : "Cancel scan"}
             </button>
           ) : status === "completed" ? (
             <Link

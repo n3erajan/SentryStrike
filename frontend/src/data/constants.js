@@ -60,14 +60,19 @@ const SEVERITY_META = {
   },
 };
 
-const SCAN_STAGES = [
-  "Initializing scanner...",
-  "Crawling target...",
-  "Detecting vulnerabilities...",
-  "Running OWASP checks...",
-  "AI analysis in progress...",
-  "Generating security report...",
-  "Scan complete",
+// Ordered to match shared.models.scan.ScanPhase. The worker reports these
+// phase keys directly, so live progress remains accurate as phase weights vary.
+const SCAN_PHASES = [
+  { key: "queued", label: "Queued" },
+  { key: "initializing", label: "Initializing" },
+  { key: "crawling", label: "Crawling" },
+  { key: "technology_detection", label: "Technology detection" },
+  { key: "tls_analysis", label: "TLS analysis" },
+  { key: "vulnerability_detection", label: "Vulnerability detection" },
+  { key: "deduplication", label: "Deduplication" },
+  { key: "ai_analysis", label: "AI analysis" },
+  { key: "risk_scoring", label: "Risk scoring" },
+  { key: "report_generation", label: "Report generation" },
 ];
 
 // Scan verification mode — maps to CreateScanRequest.config.scan_mode.
@@ -366,7 +371,7 @@ const NAV_ITEMS = [
 export {
   SEVERITIES,
   SEVERITY_META,
-  SCAN_STAGES,
+  SCAN_PHASES,
   SCAN_MODES,
   CONFIG_GROUPS,
   CRED_ROLES,

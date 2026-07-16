@@ -7,7 +7,8 @@
 //                                 -> 202 { scan_id, status, progress, ... }
 //   GET    /scans                 ?skip&limit -> { items: [...], total }
 //   GET    /scans/{id}            -> full scan document
-//   GET    /scans/{id}/status     -> { id, status, progress, error }
+//   GET    /scans/{id}/status     -> { id, status, progress, current_phase,
+//                                     phase_message, eta_seconds, error }
 //   POST   /scans/{id}/cancel     -> { cancelled: bool }
 //
 // `status` is one of: queued | running | completed | failed | cancelled
