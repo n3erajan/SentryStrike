@@ -1,4 +1,4 @@
-import { Routes, Route, Navigate } from "react-router-dom";
+import { Routes, Route } from "react-router-dom";
 import "./App.css";
 import AppLayout from "./components/AppLayout.jsx";
 import ProtectedRoute from "./components/ProtectedRoute.jsx";
@@ -11,6 +11,7 @@ import ActiveScansPage from "./pages/ActiveScansPage.jsx";
 import ActiveScanPage from "./pages/ActiveScanPage.jsx";
 import HistoryPage from "./pages/HistoryPage.jsx";
 import ReportPage from "./pages/ReportPage.jsx";
+import NotFoundPage from "./pages/NotFoundPage.jsx";
 
 // Public marketing and auth screens live at the root. Authenticated routes
 // share the vertical-sidebar layout without an additional URL prefix.
@@ -35,7 +36,7 @@ function App() {
         </Route>
       </Route>
 
-      <Route path='*' element={<Navigate to='/' replace />} />
+      <Route path='*' element={<NotFoundPage />} />
     </Routes>
   );
 }

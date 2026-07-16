@@ -1,87 +1,20 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 
 function ringColor(score, higherIsWorse) {
-  const good = "#22c55e";
-  const warn = "#eab308";
-  const bad = "#f97316";
-  const crit = "#ef4444";
-  if (higherIsWorse) {
-    if (score >= 75) return crit;
-    if (score >= 50) return bad;
-    if (score >= 25) return warn;
-    return good;
-  }
-  if (score >= 80) return good;
-  if (score >= 60) return warn;
-  if (score >= 40) return bad;
-  return crit;
+  if (higherIsWorse) return score >= 75 ? "#de3d34" : score >= 50 ? "#b54708" : score >= 25 ? "#8a6108" : "#1c8742";
+  return score >= 80 ? "#1c8742" : score >= 60 ? "#8a6108" : score >= 40 ? "#b54708" : "#de3d34";
 }
 
-// A circular gauge. `higherIsWorse` flips the color scale so a risk score
-// (0 = safe, 100 = maximum risk) reads red at the top end.
 function ScoreRing({ score = 0, caption = "/ 100", higherIsWorse = false }) {
   const value = Math.max(0, Math.min(100, Math.round(score)));
-  const r = 46;
-  const circ = 2 * Math.PI * r;
-  const offset = circ - (value / 100) * circ;
+  const r = 46; const circ = 2 * Math.PI * r; const offset = circ - (value / 100) * circ;
   const color = ringColor(value, higherIsWorse);
-
   const [animated, setAnimated] = useState(false);
-  useEffect(() => {
-    const id = setTimeout(() => setAnimated(true), 100);
-    return () => clearTimeout(id);
-  }, []);
-
-  return (
-    <div className='score-ring-wrap'>
-      <div style={{ position: "relative", width: 120, height: 120 }}>
-        <svg
-          width='120'
-          height='120'
-          style={{ transform: "rotate(-90deg)" }}
-          viewBox='0 0 100 100'
-        >
-          <circle
-            cx='50'
-            cy='50'
-            r={r}
-            fill='none'
-            stroke='rgba(0,0,0,0.08)'
-            strokeWidth='7'
-          />
-          <circle
-            cx='50'
-            cy='50'
-            r={r}
-            fill='none'
-            stroke={color}
-            strokeWidth='7'
-            strokeLinecap='round'
-            strokeDasharray={circ}
-            strokeDashoffset={animated ? offset : circ}
-            style={{
-              transition: "stroke-dashoffset 1.4s cubic-bezier(0.4,0,0.2,1)",
-            }}
-          />
-        </svg>
-        <div
-          style={{
-            position: "absolute",
-            inset: 0,
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          <div className='score-num' style={{ color }}>
-            {value}
-          </div>
-          <div className='score-sub'>{caption}</div>
-        </div>
-      </div>
-    </div>
-  );
+  useEffect(() => { const id = setTimeout(() => setAnimated(true), 100); return () => clearTimeout(id); }, []);
+  return <div className='relative size-28 shrink-0'>
+    <svg className='size-28 -rotate-90' viewBox='0 0 100 100' aria-hidden='true'><circle cx='50' cy='50' r={r} fill='none' stroke='#cbd5e3' strokeWidth='6' /><circle cx='50' cy='50' r={r} fill='none' stroke={color} strokeWidth='6' strokeLinecap='round' strokeDasharray={circ} strokeDashoffset={animated ? offset : circ} className='transition-[stroke-dashoffset] duration-1000' /></svg>
+    <div className='absolute inset-0 flex flex-col items-center justify-center'><span className='font-mono text-2xl font-semibold tabular-nums' style={{ color }}>{value}</span><span className='text-[8px] text-[#6f7c8c]'>{caption}</span></div>
+  </div>;
 }
 
 export default ScoreRing;

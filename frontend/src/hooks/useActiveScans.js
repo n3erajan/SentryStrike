@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { listScans } from "../services/scan.js";
 
 const POLL_INTERVAL_MS = 5000;
@@ -13,12 +13,10 @@ export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
   const [scans, setScans] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const tick = useRef(0);
-  const [, force] = useState(0);
+  const [refreshToken, setRefreshToken] = useState(0);
 
   const refresh = useCallback(() => {
-    tick.current += 1;
-    force((n) => n + 1);
+    setRefreshToken((value) => value + 1);
   }, []);
 
   useEffect(() => {
@@ -47,8 +45,7 @@ export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
       controller.abort();
       clearInterval(id);
     };
-    // tick.current changes via refresh() -> force() re-render, re-running this effect.
-  }, [intervalMs, tick.current]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [intervalMs, refreshToken]);
 
   return { scans, loading, error, count: scans.length, refresh };
 }
