@@ -6,20 +6,31 @@ from fastapi.testclient import TestClient
 
 from app.api.dependencies import get_current_user, get_scan_repository
 from app.api.routes import analysis, reports, scan
-from app.models.scan import CrawlMode, ReportMetadata, ScanPhase, ScanStatistics, ScanStatus
+from shared.models.scan import CrawlMode, ReportMetadata, ScanPhase, ScanStatistics, ScanStatus
+from shared.scan_queue import ScanQueueError
 
 
-class FakeOrchestrator:
-    def __init__(self) -> None:
+class FakeScanQueue:
+    def __init__(
+        self,
+        *,
+        enqueue_error: Exception | None = None,
+        cancel_error: Exception | None = None,
+    ) -> None:
         self.queued: list[str] = []
         self.cancelled: list[str] = []
+        self.enqueue_error = enqueue_error
+        self.cancel_error = cancel_error
 
-    async def queue_scan(self, scan_id: str, auth_accounts: list | None = None, **kwargs) -> None:
-        self.queued.append(scan_id)
+    async def enqueue(self, job) -> None:
+        if self.enqueue_error is not None:
+            raise self.enqueue_error
+        self.queued.append(job.scan_id)
 
-    async def cancel_scan(self, scan_id: str) -> bool:
+    async def request_cancel(self, scan_id: str) -> None:
+        if self.cancel_error is not None:
+            raise self.cancel_error
         self.cancelled.append(scan_id)
-        return True
 
 
 class FakeScan:
@@ -103,6 +114,26 @@ class FakeScanRepository:
             return None
         return item
 
+    async def update_status(
+        self,
+        item: FakeScan,
+        status: ScanStatus,
+        progress: int | None = None,
+        current_phase: ScanPhase | None = None,
+        phase_message: str | None = None,
+        error_message: str | None = None,
+    ) -> FakeScan:
+        item.status = status
+        if progress is not None:
+            item.progress = progress
+        if current_phase is not None:
+            item.current_phase = current_phase
+        if phase_message is not None:
+            item.phase_message = phase_message
+        if error_message is not None:
+            item.error_message = error_message
+        return item
+
 def _client(repo: FakeScanRepository, user_id: str = "user-1") -> TestClient:
     app = FastAPI()
     app.include_router(scan.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
@@ -115,7 +146,7 @@ def _client(repo: FakeScanRepository, user_id: str = "user-1") -> TestClient:
 
 def test_create_scan_requires_authorization_confirmation() -> None:
     repo = FakeScanRepository()
-    scan.set_orchestrator(FakeOrchestrator())
+    scan.set_scan_queue(FakeScanQueue())
     client = _client(repo)
 
     response = client.post("/api/v1/scans", json={"target_url": "https://target.example"})
@@ -126,8 +157,8 @@ def test_create_scan_requires_authorization_confirmation() -> None:
 
 def test_create_scan_binds_owner_and_authorization_metadata() -> None:
     repo = FakeScanRepository()
-    orchestrator = FakeOrchestrator()
-    scan.set_orchestrator(orchestrator)
+    scan_queue = FakeScanQueue()
+    scan.set_scan_queue(scan_queue)
     client = _client(repo)
 
     response = client.post(
@@ -144,7 +175,54 @@ def test_create_scan_binds_owner_and_authorization_metadata() -> None:
     assert repo.created_kwargs["owner_email"] == "user-1@example.test"
     assert repo.created_kwargs["authorization_confirmed"] is True
     assert repo.created_kwargs["authorization_text"] == "Ticket SEC-123"
-    assert orchestrator.queued == ["scan-new"]
+    assert scan_queue.queued == ["scan-new"]
+
+
+def test_create_scan_marks_scan_failed_when_queue_is_unavailable() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue(enqueue_error=ScanQueueError("offline")))
+    client = _client(repo)
+
+    response = client.post(
+        "/api/v1/scans",
+        json={
+            "target_url": "https://target.example",
+            "authorization_confirmed": True,
+        },
+    )
+
+    assert response.status_code == 503
+    created = repo.scans["scan-new"]
+    assert created.status == ScanStatus.failed
+    assert created.current_phase == ScanPhase.failed
+    assert created.phase_message == "Scan queue unavailable"
+    assert created.error_message == "Scan queue unavailable"
+
+
+def test_cancel_queued_scan_marks_it_cancelled_and_sets_queue_key() -> None:
+    repo = FakeScanRepository()
+    scan_queue = FakeScanQueue()
+    scan.set_scan_queue(scan_queue)
+    client = _client(repo)
+
+    response = client.post("/api/v1/scans/scan-owned/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["cancelled"] is True
+    assert scan_queue.cancelled == ["scan-owned"]
+    assert repo.scans["scan-owned"].status == ScanStatus.cancelled
+    assert repo.scans["scan-owned"].current_phase == ScanPhase.cancelled
+
+
+def test_cancel_scan_returns_service_unavailable_when_queue_is_offline() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue(cancel_error=ScanQueueError("offline")))
+    client = _client(repo)
+
+    response = client.post("/api/v1/scans/scan-owned/cancel")
+
+    assert response.status_code == 503
+    assert repo.scans["scan-owned"].status == ScanStatus.queued
 
 
 def test_list_scans_only_returns_current_users_scans() -> None:

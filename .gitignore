@@ -99,5 +99,6 @@ playwright/.auth/
 brain/
 audit_evidence
 
-----------
+# ----------
 UI-ideas/
+shared.egg-

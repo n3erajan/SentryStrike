@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, Response
 
-from app.core.verification.oast import OastClient
-from app.models.oast_interaction import OastInteractionRecord
+from shared.verification.oast import OastClient
+from shared.models.oast_interaction import OastInteractionRecord
 
 router = APIRouter(prefix="/oast", tags=["oast"])
 

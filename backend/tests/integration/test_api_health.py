@@ -17,3 +17,4 @@ async def test_health_endpoint() -> None:
     body = response.json()
     assert body["success"] is True
     assert body["data"]["status"] == "healthy"
+    assert body["data"]["active_scanners"] == 0

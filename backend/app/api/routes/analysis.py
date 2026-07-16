@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.dependencies import get_current_user, get_scan_repository, json_response
-from app.database.repositories.scan_repository import ScanRepository
-from app.models.user import User
+from shared.database.repositories.scan_repository import ScanRepository
+from shared.models.user import User
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 

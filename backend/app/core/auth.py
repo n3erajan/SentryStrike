@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from beanie import PydanticObjectId
 
 from app.config import get_settings
-from app.models.user import User, UserSession
+from shared.models.user import User, UserSession
 
 PASSWORD_ALGORITHM = "pbkdf2_sha256"
 PASSWORD_ITERATIONS = 260_000

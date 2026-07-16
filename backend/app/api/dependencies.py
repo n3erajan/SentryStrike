@@ -4,8 +4,8 @@ from fastapi import Depends, Header, HTTPException, Request, status
 
 from app.config import get_settings
 from app.core.auth import AuthService, InvalidSessionError
-from app.database.repositories.scan_repository import ScanRepository
-from app.models.user import User
+from shared.database.repositories.scan_repository import ScanRepository
+from shared.models.user import User
 
 scan_repository = ScanRepository()
 auth_service = AuthService()
