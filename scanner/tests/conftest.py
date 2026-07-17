@@ -17,6 +17,12 @@ def _isolated_scanner_settings(monkeypatch):
     monkeypatch.setenv("CRAWL_BROWSER_WORKERS", "1")
     monkeypatch.setenv("SCAN_AUTH_USERNAME", "")
     monkeypatch.setenv("SCAN_AUTH_PASSWORD", "")
+    # A developer's local scanner/.env may point OAST at a live collaborator.
+    # Left set, detectors that build an OAST client from settings (e.g. SSRF)
+    # would attempt real callback/poll network requests during unit tests.
+    # Neutralize them so tests exercise the OAST-unconfigured default path.
+    monkeypatch.setenv("OAST_CALLBACK_BASE_URL", "")
+    monkeypatch.setenv("OAST_POLL_URL", "")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

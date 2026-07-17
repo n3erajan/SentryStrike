@@ -95,9 +95,18 @@ _SIGNATURES: list[_Sig] = [
     _Sig(r"\bgoroutine \d+ \[|\b[\w./-]+\.go:\d+ \+0x|panic: ", "Go", "language"),
 
     # ---- Web frameworks (from error markup / trace signatures) ----
-    # pnpm layout embeds the exact Express version in the stack file path; the
-    # remaining alternatives keep the existing existence-only markers.
-    _Sig(r"node_modules[/\\]\.pnpm[/\\]express@([0-9]+\.[0-9][0-9.]*)|node_modules[/\\]express[/\\]lib|at Layer\.handle \[as handle_request\]|at (?:Route|Router)\.(?:dispatch|handle)", "Express", "framework", 1),
+    # Express version surfaces in two error-page shapes: the pnpm layout embeds
+    # the exact version in the stack file path (``.pnpm/express@<ver>``), and
+    # many Express error-page banners print ``Express <ver>`` in their title
+    # (e.g. "OWASP Juice Shop (Express ^4.22.1)"), tolerating the npm caret /
+    # ``v`` prefix / ``version`` keyword. Two signatures, same name, each with
+    # its own single capture group at index 1 — ``match_error_evidence`` merges
+    # by name and back-fills whichever signature captures a version. The third
+    # signature keeps the existence-only markers (plain-npm path, stack-frame
+    # names) so detection still fires when no version is present.
+    _Sig(r"node_modules[/\\]\.pnpm[/\\]express@([0-9]+\.[0-9][0-9.]*)", "Express", "framework", 1),
+    _Sig(r"\bExpress\s+(?:v?\^?|version\s+)([0-9]+\.[0-9][0-9.]*)", "Express", "framework", 1),
+    _Sig(r"node_modules[/\\]express[/\\]lib|at Layer\.handle \[as handle_request\]|at (?:Route|Router)\.(?:dispatch|handle)", "Express", "framework"),
     _Sig(r"Django Version:\s*([0-9]+\.[0-9][0-9.]*)", "Django", "framework", 1),
     _Sig(r"You're seeing this error because you have <code>DEBUG = True|django\.core\.handlers", "Django", "framework"),
     _Sig(r"\brails \(([0-9]+\.[0-9][0-9.]*)\)", "Ruby on Rails", "framework", 1),

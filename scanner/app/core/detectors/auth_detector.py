@@ -11,6 +11,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 
 from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.utils.scan_http import build_observed_request_snippet
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 
 logger = logging.getLogger(__name__)
@@ -1561,6 +1562,15 @@ class AuthenticationFailuresDetector(BaseDetector):
         # security answer is defence-in-depth, not security-question-only recovery.
         if fields.get("token") or fields.get("mfa_code"):
             return []
+        # This is a structural finding over an OBSERVED reset request; reconstruct
+        # the request snippet from the recorded url/method/headers/body so the
+        # report shows the exact request the weakness was found in.
+        request_snippet = build_observed_request_snippet(
+            url=record["url"],
+            method=record["method"],
+            headers=record.get("headers"),
+            body=record.get("body"),
+        )
         return [
             self._finding(
                 vuln_type="Password Reset Relies on Security Question (Weak Recovery)",
@@ -1577,6 +1587,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                 verified=True,
                 detection_method="security_question_recovery_pattern",
                 confidence_score=65.0,
+                verification_request_snippet=request_snippet,
                 detection_evidence={
                     "security_answer_field": fields.get("security_answer"),
                     "new_password_field": fields.get("new_password"),
@@ -2310,6 +2321,15 @@ class AuthenticationFailuresDetector(BaseDetector):
                 if key in seen:
                     continue
                 seen.add(key)
+                # Derived from an OBSERVED request; reconstruct its snippet so the
+                # report shows the exact request whose response set the weak cookie.
+                request_snippet = build_observed_request_snippet(
+                    url=key[0],
+                    method=str(getattr(request, "method", "GET") or "GET"),
+                    headers=getattr(request, "request_headers", None),
+                    cookies=getattr(request, "request_cookies", None),
+                    body=getattr(request, "post_data", None),
+                )
                 findings.append(
                     self._finding(
                         vuln_type="Insecure Session Cookie Attributes",
@@ -2320,6 +2340,7 @@ class AuthenticationFailuresDetector(BaseDetector):
                         detection_method="observed_set_cookie_inspection",
                         confidence_score=90.0,
                         detection_evidence={"missing_attributes": missing},
+                        verification_request_snippet=request_snippet,
                     )
                 )
         return findings

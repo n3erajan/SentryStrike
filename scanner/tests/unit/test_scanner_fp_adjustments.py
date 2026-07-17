@@ -17,6 +17,7 @@ from shared.models.scan import (
 )
 from shared.models.vulnerability import (
     AiAnalysis,
+    AiVerdict,
     Evidence,
     EvidenceStrength,
     Exploitability,
@@ -57,6 +58,8 @@ def test_to_vulnerability_preserves_detector_verification_metadata() -> None:
     assert vulnerability.evidence.confidence_score == 90.0
     assert vulnerability.evidence.detection_method == "time_based"
     assert vulnerability.evidence.detection_evidence == {"timing_delta_ms": 5100}
+    assert vulnerability.cvss_score == 9.1
+    assert vulnerability.cvss_vector == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
 
 
 def test_to_vulnerability_redacts_credentials_in_evidence() -> None:
@@ -432,6 +435,56 @@ def test_unverified_non_heuristic_evidence_is_probable() -> None:
     assert strength == EvidenceStrength.probable
 
 
+def test_ssrf_inband_differential_without_callback_is_probable() -> None:
+    finding = Finding(
+        category=OwaspCategory.a01,
+        vuln_type="Server-Side Request Forgery (SSRF) - Probable",
+        severity=SeverityLevel.high,
+        url="http://target.test/profile/image/url",
+        evidence="Internal target timed out while the control returned immediately.",
+        verified=False,
+        confidence_score=60.0,
+        detection_method="ssrf_inband_differential",
+        detection_evidence={"oast_available": False},
+    )
+
+    strength = _orchestrator()._classify_evidence_strength(finding)
+
+    assert strength == EvidenceStrength.probable
+
+
+def test_ssrf_inband_ai_verdict_cannot_be_confirmed_without_callback() -> None:
+    finding = Finding(
+        category=OwaspCategory.a01,
+        vuln_type="Server-Side Request Forgery (SSRF) - Probable",
+        severity=SeverityLevel.medium,
+        url="http://target.test/profile/image/url",
+        verified=False,
+        confidence_score=60.0,
+        detection_method="ssrf_inband_differential",
+        detection_evidence={
+            "differential_reason": "internal target timed out",
+            "control_samples": [{"status_code": 200}],
+            "internal_samples": [{"status_code": 0}],
+            "oast_available": False,
+        },
+    )
+    orchestrator = _orchestrator()
+    vulnerability = orchestrator._to_vulnerability(finding)
+    grade = orchestrator.evidence_grader.grade(vulnerability)
+
+    _fp_probability, verdict = orchestrator._calibrate_ai_false_positive(
+        vulnerability,
+        grade,
+        0.05,
+        "confirmed",
+        "The internal target timed out.",
+    )
+
+    assert grade.proof_type == "ssrf_differential"
+    assert verdict == AiVerdict.uncertain
+
+
 def test_low_risk_coverage_note_is_informational() -> None:
     finding = Finding(
         category=OwaspCategory.a02,
@@ -526,6 +579,7 @@ def test_verified_time_based_sqli_is_not_auto_suppressed_by_high_ai_fp_probabili
             confidence_score=90.0,
             detection_method="time_based",
             detection_evidence={"timing_delta_ms": 5200},
+            evidence_strength=EvidenceStrength.confirmed_exploit,
         ),
         ai_analysis=AiAnalysis(
             false_positive_probability=0.85,
@@ -537,9 +591,17 @@ def test_verified_time_based_sqli_is_not_auto_suppressed_by_high_ai_fp_probabili
     orchestrator = _orchestrator()
     grade = orchestrator.evidence_grader.grade(vulnerability)
     vulnerability.ai_analysis.evidence_grade = grade.grade
-    vulnerability.ai_analysis.false_positive_probability = min(vulnerability.ai_analysis.false_positive_probability, grade.fp_ceiling)
-    
-    orchestrator._apply_false_positive_adjustments([vulnerability])
+    fp_prob, verdict = orchestrator._calibrate_ai_false_positive(
+        vulnerability,
+        grade,
+        0.85,
+        "likely_false_positive",
+        "Reflected payload without SQL error.",
+    )
+    vulnerability.ai_analysis.false_positive_probability = fp_prob
+    vulnerability.ai_analysis.verdict = verdict
+
+    orchestrator._apply_ai_review_statuses([vulnerability])
 
     assert vulnerability.is_false_positive is False
     assert vulnerability.review_status == ReviewStatus.confirmed
@@ -549,9 +611,10 @@ def test_verified_time_based_sqli_is_not_auto_suppressed_by_high_ai_fp_probabili
     # strong but indirect (time delta, not output), so the AI has slightly
     # more room than for error_echo/active_output.
     assert vulnerability.ai_analysis.false_positive_probability == 0.15
+    assert vulnerability.ai_analysis.verdict == AiVerdict.confirmed
 
 
-def test_unverified_high_fp_finding_is_still_suppressed() -> None:
+def test_ai_false_positive_estimate_never_suppresses_or_changes_cvss() -> None:
     vulnerability = Vulnerability(
         id="v-2",
         category=OwaspCategory.a05,
@@ -565,23 +628,144 @@ def test_unverified_high_fp_finding_is_still_suppressed() -> None:
             verified=False,
             confidence_score=20.0,
             detection_method="heuristic",
+            evidence_strength=EvidenceStrength.possible,
         ),
         ai_analysis=AiAnalysis(
-            false_positive_probability=0.9,
+            verdict=AiVerdict.likely_false_positive,
+            false_positive_probability=0.4,
             false_positive_reasoning="Payload was reflected but not executed.",
         ),
     )
 
     orchestrator = _orchestrator()
-    grade = orchestrator.evidence_grader.grade(vulnerability)
-    vulnerability.ai_analysis.evidence_grade = grade.grade
-    vulnerability.ai_analysis.false_positive_probability = min(vulnerability.ai_analysis.false_positive_probability, grade.fp_ceiling)
-    
-    orchestrator._apply_false_positive_adjustments([vulnerability])
+    orchestrator._apply_ai_review_statuses([vulnerability])
 
     assert vulnerability.is_false_positive is False
+    assert vulnerability.review_status == ReviewStatus.needs_review
     assert vulnerability.cvss_score == 6.1
     assert vulnerability.severity == SeverityLevel.medium
+
+
+def test_public_identical_auth_response_can_request_review_but_not_suppression() -> None:
+    vulnerability = Vulnerability(
+        id="v-public",
+        category=OwaspCategory.a01,
+        vuln_type="Unauthenticated API Data Exposure",
+        severity=SeverityLevel.medium,
+        cvss_score=5.5,
+        location=LocationInfo(url="http://target.test/api/catalog"),
+        evidence=Evidence(
+            verified=True,
+            evidence_strength=EvidenceStrength.confirmed_observation,
+            detection_method="authorization_matrix",
+            detection_evidence={
+                "serves_public_data": True,
+                "has_object_reference": False,
+                "states": {
+                    "unauthenticated": {
+                        "status_code": 200,
+                        "json_shape": ["name", "price"],
+                        "secret_fields": [],
+                    },
+                    "low": {
+                        "status_code": 200,
+                        "json_shape": ["name", "price"],
+                        "secret_fields": [],
+                    },
+                },
+            },
+        ),
+    )
+
+    orchestrator = _orchestrator()
+    grade = orchestrator.evidence_grader.grade(vulnerability)
+    fp_prob, verdict = orchestrator._calibrate_ai_false_positive(
+        vulnerability,
+        grade,
+        0.9,
+        "likely_false_positive",
+        "responses_identical: true, so this is public by design",
+    )
+    vulnerability.ai_analysis.false_positive_probability = fp_prob
+    vulnerability.ai_analysis.verdict = verdict
+    orchestrator._apply_ai_review_statuses([vulnerability])
+
+    assert fp_prob == 0.9
+    assert verdict == AiVerdict.likely_false_positive
+    assert vulnerability.review_status == ReviewStatus.needs_review
+    assert vulnerability.is_false_positive is False
+    assert vulnerability.cvss_score == 5.5
+
+
+def test_unsupported_high_fp_verdict_is_downgraded_to_uncertain() -> None:
+    vulnerability = Vulnerability(
+        id="v-unsupported",
+        category=OwaspCategory.a01,
+        vuln_type="Missing Authorization on State-Changing Request",
+        severity=SeverityLevel.high,
+        cvss_score=8.0,
+        location=LocationInfo(url="http://target.test/reviews"),
+        evidence=Evidence(
+            verified=True,
+            evidence_strength=EvidenceStrength.confirmed_observation,
+            detection_method="mutating_authz_differential",
+            detection_evidence={"unauth_status": 201, "owner_status": 201},
+        ),
+    )
+
+    orchestrator = _orchestrator()
+    grade = orchestrator.evidence_grader.grade(vulnerability)
+    fp_prob, verdict = orchestrator._calibrate_ai_false_positive(
+        vulnerability,
+        grade,
+        0.9,
+        "likely_false_positive",
+        "The endpoint may be public by design.",
+    )
+
+    assert fp_prob == 0.49
+    assert verdict == AiVerdict.uncertain
+
+
+def test_priority_rank_does_not_use_ai_false_positive_probability() -> None:
+    def make_vulnerability(vuln_id: str, fp_prob: float) -> Vulnerability:
+        return Vulnerability(
+            id=vuln_id,
+            category=OwaspCategory.a05,
+            vuln_type="SQL Injection (Error-Based)",
+            severity=SeverityLevel.high,
+            cvss_score=8.0,
+            location=LocationInfo(url=f"http://target.test/{vuln_id}"),
+            evidence=Evidence(evidence_strength=EvidenceStrength.confirmed_exploit),
+            ai_analysis=AiAnalysis(
+                exploitability=Exploitability.medium,
+                false_positive_probability=fp_prob,
+            ),
+        )
+
+    low_fp = make_vulnerability("low-fp", 0.0)
+    high_fp = make_vulnerability("high-fp", 0.9)
+
+    ranked = _orchestrator()._compute_priority_ranks([high_fp, low_fp])
+
+    assert ranked[0].id == "high-fp"
+    assert {v.ai_analysis.priority_rank for v in ranked} == {1, 2}
+    assert ranked[0].cvss_score == ranked[1].cvss_score
+
+
+def test_ai_prompt_separates_false_positive_from_impact_uncertainty() -> None:
+    prompt = _orchestrator()._build_prompt(
+        "Express, Node.js",
+        ["type=Test; evidence_block=proof"],
+        is_batch=False,
+    )
+
+    assert "A false positive means the reported vulnerability did NOT occur" in prompt
+    assert "missing exploit chaining" in prompt
+    assert "auth_confirmed" in prompt
+    assert '"verdict": "confirmed"' in prompt
+    assert "exactly confirmed, uncertain, or likely_false_positive" in prompt
+    assert '"confidence"' not in prompt
 
 
 def test_incompatible_lfi_ai_remediation_is_detected() -> None:

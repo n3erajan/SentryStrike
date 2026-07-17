@@ -45,6 +45,11 @@ def test_observed_response_finds_source_map_api_docs_stack_trace_and_secret_valu
     assert "Verbose Stack Trace Exposure" in vuln_types
     assert "Secret-Like Value Exposure" in vuln_types
     assert all(finding.detection_evidence["proof_type"] == "content_verified_observed_response" for finding in findings)
+    # Each finding is derived from a real observed request, so it must carry a
+    # reconstructed request snippet (not left empty).
+    for finding in findings:
+        assert finding.verification_request_snippet, finding.vuln_type
+        assert finding.verification_request_snippet.startswith("GET /")
 
 
 def test_plain_env_without_secret_pattern_is_not_classified_as_sensitive():
@@ -153,6 +158,15 @@ async def test_sensitive_path_detector_reports_openapi_with_content_proof(monkey
         finding.detection_evidence["proof_type"] == "content_verified_path_probe"
         for finding in findings
     )
+    # The path_content_fingerprint snippet must be HTTP-formatted
+    # ("GET <path> HTTP/1.1\nHost: …"), not the old bare "GET <absolute-url>".
+    api_docs = next(
+        (f for f in findings if f.vuln_type == "Exposed API Documentation"), None
+    )
+    assert api_docs is not None
+    assert api_docs.verification_request_snippet is not None
+    assert api_docs.verification_request_snippet.startswith("GET /openapi.json HTTP/1.1\nHost:")
+    assert "example.test" in api_docs.verification_request_snippet
 
 
 def test_classify_content_detects_apache_autoindex():

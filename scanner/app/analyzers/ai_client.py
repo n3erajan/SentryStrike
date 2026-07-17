@@ -38,7 +38,8 @@ class AIClient:
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "temperature": 0.2,
+            # Evidence adjudication should be stable across repeated scans.
+            "temperature": 0.1,
         }
         if self._json_mode:
             payload["response_format"] = {"type": "json_object"}

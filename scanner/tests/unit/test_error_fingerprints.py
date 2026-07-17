@@ -94,6 +94,16 @@ _CORPUS = {
         "(/app/node_modules/.pnpm/express@4.18.2/node_modules/express/lib/router/layer.js:95)",
         {"Sequelize", "Express"}, {"Sequelize": "6.28.0", "Express": "4.18.2"},
     ),
+    "express-error-banner": (
+        "<html><head><title>Error: SQLITE_ERROR</title></head>"
+        "<body><h1>OWASP Juice Shop (Express ^4.22.1)</h1>"
+        "<h2><em>500</em> Error: SQLITE_ERROR: unrecognized token</h2></body></html>",
+        {"Express"}, {"Express": "4.22.1"},
+    ),
+    "express-banner-vprefix": (
+        "Internal Server Error (Express v4.18.2) - request failed",
+        {"Express"}, {"Express": "4.18.2"},
+    ),
 }
 
 

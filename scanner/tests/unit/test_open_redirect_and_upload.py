@@ -300,7 +300,12 @@ async def test_file_upload_detector_replays_browser_observed_multipart_request(m
     assert uploads[0]["files"]["avatar"][0] == "sentry_test.php"
     assert uploads[0]["data"]["userId"] == "sentry_test_val"
     assert uploads[0]["headers"] == {"authorization": "Bearer token"}
+    upload_finding = next(f for f in findings if f.vuln_type == "Unrestricted File Upload")
     assert any(f.vuln_type == "Unrestricted File Upload" for f in findings)
+    # The finding is backed by the real upload HTTP exchange, so it must carry the
+    # request snippet reconstructed from the response (not left empty).
+    assert upload_finding.verification_request_snippet
+    assert "POST /api/upload" in upload_finding.verification_request_snippet
 
 
 @pytest.mark.asyncio

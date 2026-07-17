@@ -510,12 +510,8 @@ def test_deduplicate_collapses_repeated_verbose_sql_error_evidence() -> None:
     assert deduped[0].evidence.count("You have an error in your SQL syntax") == 1
 
 
-def test_deduplicate_collapses_verbose_errors_across_endpoints_but_not_metrics() -> None:
-    """Verbose error / stack-trace disclosure is one app-wide misconfiguration (a
-    single global error handler): it collapses to one finding per origin across
-    every endpoint that trips it. A Debug/Metrics Endpoint Exposed finding shares
-    the exception_disclosure family but is a distinct vuln on its own path and must
-    stay separate."""
+def test_deduplicate_keeps_verbose_errors_per_route_and_metrics_separate() -> None:
+    """Each erroring handler keeps its own reproducer and location."""
     endpoints = [
         ("http://t.test/api/Feedbacks/", "captchaId"),
         ("http://t.test/api/BasketItems/", "ProductId"),
@@ -529,6 +525,7 @@ def test_deduplicate_collapses_verbose_errors_across_endpoints_but_not_metrics()
             severity=SeverityLevel.medium,
             url=url,
             parameter=param,
+            method="POST",
             evidence=f"POST {url} -> HTTP 500 stack trace leaked",
             confidence_score=90.0,
             verified=True,
@@ -550,10 +547,70 @@ def test_deduplicate_collapses_verbose_errors_across_endpoints_but_not_metrics()
 
     deduped = FindingDeduplicator.deduplicate(findings)
 
-    by_type = {f.vuln_type: f for f in deduped}
+    assert len(deduped) == 5
+    verbose = [f for f in deduped if f.vuln_type == "Verbose Error Handling"]
+    assert len(verbose) == 4
+    assert {FindingDeduplicator._canonical_url(f.url) for f in verbose} == {
+        FindingDeduplicator._canonical_url(url) for url, _ in endpoints
+    }
+    assert any(f.vuln_type == "Debug / Metrics Endpoint Exposed" for f in deduped)
+
+
+def test_verbose_error_preserves_endpoint_and_parameter_context() -> None:
+    endpoints = [
+        ("http://t.test/api/Feedbacks/", "captchaId", 90.0),
+        ("http://t.test/rest/user/reset-password", "email", 100.0),
+        ("http://t.test/api/Cards/576", "fullName", 85.0),
+    ]
+    findings = [
+        Finding(
+            category=OwaspCategory.a10,
+            vuln_type="Verbose Error Handling",
+            severity=SeverityLevel.medium,
+            url=url,
+            parameter=param,
+            method="POST",
+            evidence=f"POST {url} stack trace leaked",
+            confidence_score=conf,
+            verified=True,
+        )
+        for url, param, conf in endpoints
+    ]
+
+    deduped = FindingDeduplicator.deduplicate(findings)
+
+    assert len(deduped) == 3
+    by_url = {FindingDeduplicator._canonical_url(f.url): f for f in deduped}
+    for url, parameter, _ in endpoints:
+        finding = by_url[FindingDeduplicator._canonical_url(url)]
+        assert finding.url == url
+        assert finding.parameter == parameter
+        assert finding.affected_parameters == [parameter]
+
+
+def test_verbose_errors_on_different_methods_keep_separate_reproducers() -> None:
+    findings = [
+        Finding(
+            category=OwaspCategory.a10,
+            vuln_type="Verbose Error Handling",
+            severity=SeverityLevel.medium,
+            url="http://t.test/api/profile",
+            method=method,
+            evidence=f"{method} /api/profile leaked a stack trace",
+            verification_request_snippet=f"{method} /api/profile HTTP/1.1",
+            confidence_score=90.0,
+            verified=True,
+        )
+        for method in ("GET", "POST")
+    ]
+
+    deduped = FindingDeduplicator.deduplicate(findings)
+
     assert len(deduped) == 2
-    assert "Verbose Error Handling" in by_type
-    assert "Debug / Metrics Endpoint Exposed" in by_type
-    # every affected endpoint survives in the collapsed verbose finding's evidence
-    for url, _ in endpoints:
-        assert url in by_type["Verbose Error Handling"].evidence
+    assert {finding.method for finding in deduped} == {"GET", "POST"}
+    assert {
+        finding.verification_request_snippet for finding in deduped
+    } == {
+        "GET /api/profile HTTP/1.1",
+        "POST /api/profile HTTP/1.1",
+    }

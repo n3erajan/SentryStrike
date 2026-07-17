@@ -546,10 +546,15 @@ async def test_security_question_weak_recovery_is_flagged():
     with patch.object(HttpVerifier, "send_request", send_request):
         findings = await detector.detect(urls=[], forms=[], api_endpoints=[endpoint])
 
-    assert any(
-        f.vuln_type == "Password Reset Relies on Security Question (Weak Recovery)"
-        for f in findings
+    weak_recovery = next(
+        f for f in findings
+        if f.vuln_type == "Password Reset Relies on Security Question (Weak Recovery)"
     )
+    # The finding is derived from a real observed reset request, so it must carry
+    # a reconstructed request snippet rather than leaving request evidence empty.
+    assert weak_recovery.verification_request_snippet
+    assert "POST /api/password/reset" in weak_recovery.verification_request_snippet
+    assert "securityAnswer" in weak_recovery.verification_request_snippet
 
 
 @pytest.mark.asyncio

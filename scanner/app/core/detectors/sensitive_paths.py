@@ -10,7 +10,11 @@ from app.core.crawler.spa import SpaFallbackDetector
 from app.core.detectors.base_detector import BaseDetector, Finding
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
-from app.utils.scan_http import create_scan_client
+from app.utils.scan_http import (
+    build_httpx_evidence_snippets,
+    build_observed_request_snippet,
+    create_scan_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +306,13 @@ class SensitivePathsDetector(BaseDetector):
             if key in seen:
                 continue
             seen.add(key)
+            request_snippet = build_observed_request_snippet(
+                url=url,
+                method=str(getattr(request, "method", "GET") or "GET"),
+                headers=getattr(request, "request_headers", None),
+                cookies=getattr(request, "request_cookies", None),
+                body=getattr(request, "post_data", None),
+            )
             findings.append(
                 self._finding(
                     vuln_type=vuln_type,
@@ -311,6 +322,7 @@ class SensitivePathsDetector(BaseDetector):
                     detection_method="observed_response_content",
                     proof_type="content_verified_observed_response",
                     response_snippet=body[:500],
+                    request_snippet=request_snippet,
                 )
             )
         return findings
@@ -417,6 +429,13 @@ class SensitivePathsDetector(BaseDetector):
                             content_type,
                         )
                         if matched:
+                            pcfr_request_snippet, pcfr_response_snippet = (
+                                build_httpx_evidence_snippets(
+                                    response,
+                                    fallback_url=target_url,
+                                    fallback_method="GET",
+                                )
+                            )
                             return self._finding(
                                 vuln_type=vuln_type,
                                 severity=severity,
@@ -427,8 +446,8 @@ class SensitivePathsDetector(BaseDetector):
                                 ),
                                 detection_method="path_content_fingerprint",
                                 proof_type="content_verified_path_probe",
-                                request_snippet=f"GET {target_url}",
-                                response_snippet=response.text[:500],
+                                request_snippet=pcfr_request_snippet,
+                                response_snippet=pcfr_response_snippet or response.text[:500],
                                 confidence_score=95.0,
                             )
                     except Exception as e:

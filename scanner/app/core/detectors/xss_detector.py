@@ -7,6 +7,7 @@ from app.core.crawler.models import ParameterLocation
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer, ResponseData
+from app.utils.scan_http import build_observed_request_snippet
 from app.core.verification.xss_verifier import (
     PLAYWRIGHT_AVAILABLE,
     PendingBrowserVerification,
@@ -489,6 +490,7 @@ class XSSDetector(BaseDetector):
                 seen_hits.add(key)
                 winning_vector = result.get("vector")
                 winning_surface = result.get("surface")
+                winning_url = result.get("url") or route_url
                 winning_payload = result.get("payload") or (
                     f"<img src=x onerror=window.sentry_hook('{canary}')>"
                 )
@@ -519,6 +521,12 @@ class XSSDetector(BaseDetector):
                         },
                         reproducible=True,
                         verified=True,
+                        verification_request_snippet=build_observed_request_snippet(
+                            url=winning_url,
+                            method="GET",
+                            headers={"User-Agent": "SentryStrikeScanner/1.0"},
+                            cookies=session_cookies,
+                        ),
                     )
                 )
         except Exception as exc:

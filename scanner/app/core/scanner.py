@@ -58,6 +58,7 @@ from app.integrations import error_fingerprints
 from shared.models.scan import CrawlMode, Scan, ScanPhase, ScanStatus
 from shared.models.scan import AuthCoverage, DetectorCoverageMetric, EvidenceStrengthBreakdown, SpaApiCoverage
 from shared.models.vulnerability import (
+    AiVerdict,
     AuthContext,
     Evidence,
     EvidenceStrength,
@@ -328,6 +329,153 @@ class ScanOrchestrator:
                 "Restrict access to debug, metrics, and actuator endpoints by IP allowlist, "
                 "reverse-proxy rules, or authentication. Disable in production or serve on a "
                 "separate administrative port."
+            ),
+        }
+
+        # Plain-language, jargon-free explanations of what each vulnerability
+        # class IS — for report readers who don't know what "IDOR" or "BOLA"
+        # means. These are the FALLBACK: the AI writes a finding-specific
+        # description when analysis succeeds; when it fails or omits one, the
+        # matching entry here is used (see ``_description_for``). Keyed by the
+        # same vuln_type strings the detectors emit; matched by substring both
+        # ways, longest key first, so specific types win over generic ones.
+        self._description_fallbacks: dict[str, str] = {
+            "SQL Injection": (
+                "The application builds database queries by pasting user input directly into them. "
+                "An attacker can send crafted input that changes what the query does, letting them "
+                "read, modify, or delete data in the database they were never meant to touch."
+            ),
+            "NoSQL Injection": (
+                "The application passes user input straight into a NoSQL database query (e.g. MongoDB). "
+                "An attacker can send specially shaped input that alters the query's logic — for "
+                "example, to bypass a login check or return records that should be hidden."
+            ),
+            "OS Command Injection": (
+                "User input reaches a system shell command. An attacker can smuggle in extra commands "
+                "that run on the server itself, potentially taking full control of the machine."
+            ),
+            "Server-Side Request Forgery (SSRF)": (
+                "The server fetches a URL supplied by the user. An attacker can point it at internal "
+                "systems the outside world can't normally reach — cloud metadata services, internal "
+                "admin panels, or private APIs — and read the responses."
+            ),
+            "Path Traversal / Arbitrary File Read": (
+                "A file name or path from the user isn't restricted to the intended folder. By adding "
+                "sequences like ../ an attacker can step outside that folder and read arbitrary files "
+                "on the server, such as configuration files or credentials."
+            ),
+            "Local File Inclusion (LFI)": (
+                "The application loads a file whose path is chosen by user input. An attacker can point "
+                "it at unintended files on the server to read their contents or, in some setups, run "
+                "their own code."
+            ),
+            "XML External Entity (XXE) Injection": (
+                "The application parses XML in a way that lets the document reference external files or "
+                "URLs. An attacker can abuse this to read files off the server or make the server issue "
+                "requests to other systems."
+            ),
+            "Stored XSS": (
+                "An attacker's script gets saved by the application (e.g. in a comment or profile) and "
+                "then runs in the browser of everyone who views that content. It can steal sessions, "
+                "impersonate users, or deface the page — victims need only open the page."
+            ),
+            "DOM-Based XSS": (
+                "Client-side JavaScript takes attacker-controllable input and writes it into the page "
+                "unsafely, so a malicious script runs in the victim's browser. It can steal session "
+                "tokens or perform actions as the victim."
+            ),
+            "Reflected XSS": (
+                "Input from a request is echoed straight back into the page, so a crafted link can make "
+                "the victim's browser run an attacker's script — used to steal sessions or perform "
+                "actions as the victim."
+            ),
+            "Broken Object-Level Authorization": (
+                "The application trusts an ID in the request without checking the requester is allowed "
+                "to access that specific record. By changing the ID, an attacker can read or modify "
+                "other users' data. (Also known as BOLA or IDOR.)"
+            ),
+            "Insecure Direct Object Reference (IDOR)": (
+                "Records are addressed by a predictable ID (like a number in the URL), and the app "
+                "doesn't verify the record belongs to the requester. Changing the ID exposes other "
+                "users' data. (The access-control name for this is BOLA.)"
+            ),
+            "Horizontal Authorization Bypass": (
+                "A user can reach another user's data or actions at the same permission level — the app "
+                "confirms who you are but not that the specific item is yours."
+            ),
+            "Missing Authorization on State-Changing Request": (
+                "An action that changes data (create, update, delete) doesn't check whether the caller "
+                "is allowed to perform it, so any user — sometimes any anonymous visitor — can trigger it."
+            ),
+            "Mass Assignment / Privilege Field Injection": (
+                "The application blindly maps submitted fields onto internal objects. An attacker can "
+                "add fields that shouldn't be user-editable — such as \"role\": \"admin\" — to escalate "
+                "their own privileges."
+            ),
+            "Cross-Site Request Forgery (CSRF)": (
+                "A state-changing action can be triggered using only the victim's logged-in session, "
+                "with no unguessable token to prove intent. A malicious page the victim visits can "
+                "silently make their browser perform the action on the real site."
+            ),
+            "Open Redirect": (
+                "The application redirects users to a URL taken from the request without restriction. "
+                "Attackers use this to send victims to phishing sites via a link that appears to point "
+                "at the trusted domain."
+            ),
+            "Verbose Error Handling": (
+                "When something goes wrong the server returns detailed internal errors — stack traces, "
+                "file paths, SQL statements, library versions. On its own this leaks nothing critical, "
+                "but it hands attackers a map of the system that makes other attacks easier."
+            ),
+            "Credential / Config Disclosure in Response Body": (
+                "A server response contains secrets it shouldn't — passwords, API keys, or configuration "
+                "values. Anyone who sees the response gains credentials they can reuse to access the "
+                "system or connected services."
+            ),
+            "Secret-Like Value Exposure": (
+                "A response exposes a value that looks like a secret (a token, key, or credential). If it "
+                "is a live secret, an attacker can reuse it to access protected functionality."
+            ),
+            "Exposed API Documentation": (
+                "Internal API documentation is reachable without authentication. It reveals the full list "
+                "of endpoints and parameters, giving an attacker a detailed blueprint of the attack surface."
+            ),
+            "Debug / Metrics Endpoint Exposed": (
+                "An administrative debug or metrics endpoint is publicly reachable. It can leak internal "
+                "state, configuration, or operational data useful for planning further attacks."
+            ),
+            "JWT alg=none Forgery Accepted": (
+                "The server accepts JSON Web Tokens signed with \"none\" — i.e. not signed at all. An "
+                "attacker can forge a token claiming to be any user, including an admin, and be trusted."
+            ),
+            "JWT Missing Expiration Claim": (
+                "Authentication tokens never expire. If one is ever leaked or stolen, it stays valid "
+                "forever because there is no built-in cutoff."
+            ),
+            "Missing File Type Validation": (
+                "Uploaded files aren't checked for type, so an attacker may upload dangerous content "
+                "(such as a script) that the server later serves or executes."
+            ),
+            "Password Reset Relies on Security Question (Weak Recovery)": (
+                "Account recovery depends on a security-question answer, which is often guessable or "
+                "publicly known. An attacker who answers it can take over the account without the password."
+            ),
+            "API Login Lacks Safe-Probe Rate-Limit Signal": (
+                "The login endpoint shows no sign of rate limiting, so an attacker can try large numbers "
+                "of username/password guesses (credential stuffing or brute force) without being slowed."
+            ),
+            "No TLS Configuration": (
+                "The service is served over plain HTTP with no encryption. Anyone on the network path can "
+                "read or tamper with the traffic, including passwords and session cookies."
+            ),
+            "Missing Security Header": (
+                "A recommended HTTP security header is absent. The browser therefore misses a layer of "
+                "protection (against clickjacking, content sniffing, or script injection, depending on "
+                "the header), making related attacks easier."
+            ),
+            "Vulnerable Component": (
+                "The application uses a third-party component with a known, publicly documented security "
+                "flaw. Attackers can exploit that flaw using techniques that are already published."
             ),
         }
 
@@ -866,8 +1014,9 @@ class ScanOrchestrator:
             except Exception as exc:
                 logger.debug("error-based technology enrichment failed: %s", exc)
 
-            # DEDUPLICATION PHASE: Merge duplicate findings from different detectors
-            # Findings with same (url, parameter, vuln_type) are consolidated
+            # DEDUPLICATION PHASE: merge repeated proof for the same normalized
+            # route and vulnerability family. Verbose errors additionally retain
+            # the HTTP method because it identifies the request handler/reproducer.
             await self._set_phase_progress(scan, ScanPhase.deduplication, 0.0, "Deduplicating and filtering findings")
             findings = FindingDeduplicator.deduplicate(findings)
             logger.info("deduplication complete: %d findings after merging", len(findings))
@@ -1020,13 +1169,14 @@ class ScanOrchestrator:
             await self._set_phase_progress(scan, ScanPhase.ai_analysis, 0.0, f"Analyzing {len(vulnerabilities)} finding(s)")
             vulnerabilities = await self._analyze_all_findings(vulnerabilities, scan)
 
-            # Phase 2.1: Sync severity from CVSS (pre-FP adjustment)
+            # Phase 2.1: Sync severity from the deterministic CVSS score.
             for v in vulnerabilities:
                 severity_str = CvssCalculator.get_severity(v.cvss_score)
                 v.severity = SeverityLevel(severity_str)
 
-            # Phase 2.2: Downgrade severity/CVSS for high false-positive probability findings
-            self._apply_false_positive_adjustments(vulnerabilities)
+            # Phase 2.2: Apply advisory review labels. AI never changes CVSS,
+            # severity, suppression, or aggregate-risk membership.
+            self._apply_ai_review_statuses(vulnerabilities)
 
             vulnerabilities = self._compute_priority_ranks(vulnerabilities)
             vulnerabilities.sort(key=lambda v: v.cvss_score, reverse=True)
@@ -1198,8 +1348,15 @@ class ScanOrchestrator:
         ):
             skipped_reasons["second_user_account_missing"] = 1
         if detector_name == "ssrf":
-            oast_url = scan_config.oast_callback_base_url if scan_config else settings.oast_callback_base_url
-            if not oast_url:
+            oast_callback = (
+                (scan_config.oast_callback_base_url if scan_config else None)
+                or settings.oast_callback_base_url
+            )
+            oast_poll = (
+                (scan_config.oast_poll_url if scan_config else None)
+                or settings.oast_poll_url
+            )
+            if not (oast_callback and oast_poll):
                 # OAST-verified blind SSRF is unavailable, but the in-band differential
                 # fallback still runs (probable/unverified findings). Flag it as a
                 # confidence-limiting gap rather than a hard skip.
@@ -1678,8 +1835,9 @@ class ScanOrchestrator:
         scan.updated_at = datetime.now(timezone.utc)
         if status == ScanStatus.running and scan.started_at is None:
             scan.started_at = datetime.now(timezone.utc)
-        if status in {ScanStatus.completed, ScanStatus.failed, ScanStatus.cancelled} and scan.completed_at is None:
-            scan.completed_at = datetime.now(timezone.utc)
+        if status in {ScanStatus.completed, ScanStatus.failed, ScanStatus.cancelled}:
+            if scan.completed_at is None:
+                scan.completed_at = datetime.now(timezone.utc)
             scan.eta_seconds = 0
         await scan.save()
 
@@ -1710,19 +1868,17 @@ class ScanOrchestrator:
                     fallback = self._get_fallback_for(
                         vuln.vuln_type, scan.technology_stack, proof_type=grade.proof_type
                     )
-                    req_snippet = (vuln.evidence.request_snippet or "").lower()
-                    requires_auth = "cookie" in req_snippet or "authorization" in req_snippet
-                    cvss = CvssCalculator.from_vulnerability_context(
-                        vuln_type=vuln.vuln_type,
-                        requires_auth=requires_auth,
-                        confidence=fallback["confidence"],
-                        impact=0.9 if vuln.severity.value in {"Critical", "High"} else 0.5,
-                    )
-                    vuln.cvss_score = cvss.score
-                    vuln.cvss_vector = cvss.vector
                     vuln.ai_analysis.exploitability = normalize_exploitability(fallback["exploitability"])
                     vuln.ai_analysis.business_impact = fallback["business_impact"]
                     vuln.ai_analysis.false_positive_probability = fallback["false_positive_probability"]
+                    vuln.ai_analysis.verdict = (
+                        AiVerdict.confirmed
+                        if grade.proof_type in {
+                            "active_output", "error_echo", "structural",
+                            "timing_strong", "auth_confirmed",
+                        }
+                        else AiVerdict.uncertain
+                    )
                     vuln.ai_analysis.evidence_grade = grade.grade
                     vuln.ai_analysis.evidence_grade_reason = grade.reason
                     vuln.ai_analysis.remediation = fallback["remediation"]
@@ -1793,59 +1949,56 @@ class ScanOrchestrator:
                             result = result["results"][0]
                         else:
                             vuln.ai_analysis.ai_analysis_status = AiAnalysisStatus.failed
-                            req_snippet = (vuln.evidence.request_snippet or "").lower()
-                            requires_auth = "cookie" in req_snippet or "authorization" in req_snippet
-                            cvss = CvssCalculator.from_vulnerability_context(
-                                vuln_type=vuln.vuln_type,
-                                requires_auth=requires_auth,
-                                confidence=0.8,
-                                impact=0.9 if vuln.severity.value in {"Critical", "High"} else 0.5,
-                            )
-                            vuln.cvss_score = cvss.score
-                            vuln.cvss_vector = cvss.vector
                             vuln.ai_analysis.exploitability = self._calibrate_exploitability(vuln)
-                            # When AI fails: undeniable proof stays confirmed (low FP),
-                            # interpretive proof goes to needs_review (can't verify
-                            # without AI judgment — don't blindly confirm or suppress).
-                            if grade.proof_type in ("auth_differential", "pattern_match", "heuristic", "timing_weak"):
-                                vuln.ai_analysis.false_positive_probability = 0.5
+                            # When AI fails: preserve deterministic proof. Interpretive
+                            # evidence records an uncertain advisory estimate, but review
+                            # status still comes from evidence strength.
+                            if grade.proof_type in (
+                                "auth_differential",
+                                "pattern_match",
+                                "heuristic",
+                                "timing_weak",
+                                "ssrf_differential",
+                            ):
+                                vuln.ai_analysis.false_positive_probability = 0.49
+                                vuln.ai_analysis.verdict = AiVerdict.uncertain
                             else:
                                 vuln.ai_analysis.false_positive_probability = grade.fp_ceiling
+                                vuln.ai_analysis.verdict = AiVerdict.confirmed
                             vuln.ai_analysis.evidence_grade = grade.grade
                             vuln.ai_analysis.evidence_grade_reason = grade.reason
+                            # AI produced nothing usable — fall back to the curated
+                            # plain-language description so the reader still gets one.
+                            vuln.ai_analysis.description = self._description_for(vuln.vuln_type)
                             analyzed.append(vuln)
                             continue
 
                     fallback = self._get_fallback_for(vuln.vuln_type, scan.technology_stack, proof_type=grade.proof_type)
-                    confidence = float(result.get("confidence", fallback["confidence"]))
-
                     # AI FP output is clamped to the proof-type ceiling.
                     # For active_output/error_echo/structural/timing_strong: low ceiling
                     # (the proof is undeniable — AI cannot dismiss it).
                     # For auth_differential/pattern_match: ceiling is 1.0 (no cap —
                     # AI judges freely from the discriminative evidence brief).
-                    raw_ai_fp = float(result.get("false_positive_probability", fallback["false_positive_probability"]))
-                    fp_prob = min(raw_ai_fp, grade.fp_ceiling)
-                    if raw_ai_fp > grade.fp_ceiling:
-                        logger.info(
-                            "Clamped AI FP probability: vuln_type=%r proof_type=%s ai_fp=%.2f -> ceiling=%.2f url=%s",
-                            vuln.vuln_type, grade.proof_type, raw_ai_fp, grade.fp_ceiling, vuln.location.url,
+                    raw_ai_fp = float(
+                        result.get(
+                            "false_positive_probability",
+                            fallback["false_positive_probability"],
                         )
-
-                    impact = 0.9 if vuln.severity.value in {"Critical", "High"} else 0.5
-                    cvss = CvssCalculator.from_vulnerability_context(
-                        vuln_type=vuln.vuln_type,
-                        requires_auth=False,
-                        confidence=confidence,
-                        impact=impact,
+                    )
+                    fp_prob, ai_verdict = self._calibrate_ai_false_positive(
+                        vuln,
+                        grade,
+                        raw_ai_fp,
+                        result.get("verdict"),
+                        result.get("false_positive_reasoning"),
                     )
 
-                    vuln.cvss_score = cvss.score
-                    vuln.cvss_vector = cvss.vector
                     vuln.ai_analysis.exploitability = normalize_exploitability(
                         result.get("exploitability", fallback["exploitability"])
                     )
+                    vuln.ai_analysis.description = _normalize_llm_string(result.get("description")) or fallback["description"]
                     vuln.ai_analysis.business_impact = _normalize_llm_string(result.get("business_impact", fallback["business_impact"]))
+                    vuln.ai_analysis.verdict = ai_verdict
                     vuln.ai_analysis.false_positive_probability = fp_prob
                     vuln.ai_analysis.false_positive_reasoning = _normalize_llm_string(result.get("false_positive_reasoning"))
                     vuln.ai_analysis.exploitability_reasoning = _normalize_llm_string(result.get("exploitability_reasoning"))
@@ -1897,6 +2050,9 @@ class ScanOrchestrator:
                 f"- http_method={vuln.location.http_method}\n"
                 f"- parameter={vuln.location.parameter or 'none'}\n"
                 f"- auth_context={auth_ctx}\n"
+                f"- detection_method={vuln.evidence.detection_method or 'unknown'}\n"
+                f"- verification_completed={vuln.evidence.verified}\n"
+                f"- deterministic_evidence_strength={vuln.evidence_strength.value}\n"
                 f"- payload={payload or 'n/a'}\n"
                 f"- request_snippet={req[:1600] if req else 'n/a'}\n"
                 f"- response_snippet={resp[:1600] if resp else 'n/a'}\n"
@@ -1927,6 +2083,9 @@ class ScanOrchestrator:
             f"- http_method={vuln.location.http_method}\n"
             f"- parameter={vuln.location.parameter or 'none'}\n"
             f"- auth_context={auth_ctx}\n"
+            f"- detection_method={vuln.evidence.detection_method or 'unknown'}\n"
+            f"- verification_completed={vuln.evidence.verified}\n"
+            f"- deterministic_evidence_strength={vuln.evidence_strength.value}\n"
             f"- payload={payload or 'n/a'}\n"
             f"- request_snippet={req[:1600] if req else 'n/a'}\n"
             f"- response_snippet={resp[:1600] if resp else 'n/a'}\n"
@@ -1951,7 +2110,9 @@ class ScanOrchestrator:
             "You are a senior penetration tester writing a verified security report. "
             "For each finding, perform these steps IN ORDER before writing JSON:\n"
             "  Step 1: Read the evidence_block carefully. Identify the EXACT proof markers present.\n"
-            "  Step 2: Decide if this is real or a false positive based ONLY on what is in the evidence.\n"
+            "  Step 2: Decide whether the evidence supports the vulnerability definition. "
+            "Do not confuse incomplete impact, missing exploit chaining, or remediation uncertainty "
+            "with a false positive.\n"
             "  Step 3: For pattern-match findings (e.g., Verbose Error Handling, path disclosure): "
             "determine whether the matched string is causally connected to the payload or is a "
             "genuine error condition - or if it could merely be from normal page content, reflected "
@@ -1959,6 +2120,8 @@ class ScanOrchestrator:
             "face value; independently reason about the plausibility of the match.\n"
             "  Step 4: Write remediation that is specific to the vuln_type AND the tech stack below.\n"
             "  Step 5: Describe business_impact in terms of what data/capability is concretely at risk.\n"
+            "  Step 6: Write a plain-language description of what this vulnerability class IS, so a "
+            "non-technical reader understands it without knowing the jargon.\n"
             "Output ONLY the JSON. No preamble, no explanation outside the JSON.\n\n"
         )
 
@@ -1966,7 +2129,19 @@ class ScanOrchestrator:
         # Small models learn format from examples far better than from instructions
         output_examples = (
             "OUTPUT QUALITY RULES WITH EXAMPLES:\n"
-            
+
+            "description - Explain what this class of vulnerability IS in plain language for a "
+            "non-technical reader. Define any acronym. Do NOT reference this specific finding's "
+            "URL/parameter or the fix (that belongs in business_impact/remediation):\n"
+            "  BAD:  'IDOR on the /api/user endpoint via the id parameter.'\n"
+            "  GOOD (IDOR): 'Insecure Direct Object Reference (IDOR) means the application trusts an "
+            "identifier supplied by the user - such as an account or order number in the web address - "
+            "without checking they are allowed to see it, so changing that number can reveal someone "
+            "else's data.'\n"
+            "  GOOD (CSRF): 'Cross-Site Request Forgery (CSRF) tricks a logged-in user's browser into "
+            "silently submitting an action they did not intend, because the site cannot tell a genuine "
+            "click apart from one triggered by a malicious page.'\n\n"
+
             "business_impact - Reference the parameter name, URL path, and attacker capability:\n"
             "  BAD:  'An attacker can access sensitive information and compromise the server.'\n"
             "  GOOD (OS Command Injection on exec/ via ip param): "
@@ -1996,45 +2171,69 @@ class ScanOrchestrator:
         )
 
         verification_guardrails = (
-            "FALSE POSITIVE SCORING RULES:\n"
+            "FALSE-POSITIVE ADJUDICATION RULES:\n"
+            "A false positive means the reported vulnerability did NOT occur. It does NOT mean "
+            "the impact is limited, the exploit requires authentication, retrieval was not tested, "
+            "or a larger exploit chain was not demonstrated. Those facts affect impact or "
+            "exploitability, not whether the finding is true.\n"
             "Each finding's evidence_block includes a PROOF TYPE that tells you what kind "
             "of evidence demonstrates the vulnerability. Judge the PROOF itself, not the "
             "detector's verdict:\n"
-            "- active_output / error_echo: the proof is IN the response (command output, "
-            "file contents, DB error string). This is undeniable — do NOT flag as FP.\n"
+            "- active_output / error_echo: the proof is IN the response (accepted forged token, "
+            "file contents, persisted privilege field, database error, executed canary). Mark "
+            "verdict=confirmed and false_positive_probability <= 0.05. Do not demand an additional "
+            "exploit chain beyond the vulnerability definition.\n"
             "- structural (missing headers, TLS, admin paths): the observation IS the proof. "
-            "Do NOT flag as FP.\n"
+            "Mark verdict=confirmed and false_positive_probability <= 0.10.\n"
             "- timing_strong: a large response delay matching the sleep argument is strong. "
-            "Only flag as FP if the delay could plausibly be network noise.\n"
+            "Mark confirmed unless a recorded control demonstrates equivalent delay.\n"
+            "- ssrf_differential: repeated internal/control timeout, status, or body differences "
+            "are indirect evidence only. Without reflected internal content or a correlated OAST "
+            "interaction, use verdict=uncertain — never confirmed.\n"
+            "- auth_confirmed: distinct users or roles crossed the reported object/privilege "
+            "boundary. Shared restricted identifiers or fields are the proof. Mark confirmed; "
+            "anonymous denial does not weaken a horizontal authorization finding.\n"
             "- auth_differential (access-control, IDOR, data exposure): a 200 response is NOT "
             "proof. You MUST evaluate whether the data is genuinely restricted. If anonymous "
             "and authenticated responses are identical with no secret fields, the endpoint is "
-            "PUBLIC by design — raise false_positive_probability (this is a false positive).\n"
+            "PUBLIC by design — use verdict=likely_false_positive and cite the exact "
+            "responses_identical marker.\n"
             "- pattern_match (verbose error, credential disclosure): a regex hit is NOT proof. "
             "You MUST evaluate whether the matched text is a genuine error or reflected payload "
-            "/ normal content. If the match is the injected payload echoed back, raise "
-            "false_positive_probability.\n"
+            "/ normal content. Use likely_false_positive only when a marker directly shows "
+            "reflection or benign baseline content.\n"
             "- Use the JUDGE THIS question in each evidence_block as your primary criterion.\n"
-            "- Do NOT invent evidence. If a proof marker is absent, say so in "
-            "false_positive_reasoning.\n\n"
+            "- verdict=uncertain means evidence is incomplete or ambiguous; uncertainty alone "
+            "must stay below 0.50 FP probability.\n"
+            "- verdict=likely_false_positive requires a concrete contradictory marker already "
+            "present in the evidence. Cite it verbatim in false_positive_reasoning.\n"
+            "- Do NOT invent evidence or application intent.\n"
+            "Probability calibration: 0.00-0.05 direct/structural proof; 0.10-0.20 "
+            "strong repeatable differential; 0.30-0.49 genuinely ambiguous evidence; "
+            "0.60-0.79 strong alternative explanation; 0.80-1.00 only a concrete "
+            "contradiction proving the detector's interpretation wrong.\n\n"
         )
 
         # KEY CHANGE 3: Explicit schema with value constraints + anchoring to evidence
         schema_keys = (
             "Return a flat JSON object with EXACTLY these keys (no extras, no nesting):\n"
             "{\n"
-            '  "exploitability": "Easy" | "Medium" | "Hard",\n'
-            '    // Easy = unauthenticated + single HTTP request + no user interaction\n'
-            '    // Medium = requires auth session OR multi-step workflow\n'
-            '    // Hard = requires special server config, chaining, or privileged access\n'
-            '  "exploitability_reasoning": "<1 sentence citing a specific evidence marker that justifies the rating>",\n'
-            '  "business_impact": "<2 sentences: sentence 1 = what attacker gains right now; sentence 2 = worst-case escalation path>",\n'
-            '  "confidence": <float 0.0-1.0>,\n'
-            '    // 1.0 = proof of execution in response. 0.7 = strong indirect evidence. 0.4 = ambiguous.\n'
-            '  "false_positive_probability": <float 0.0-1.0>,\n'
-            '  "false_positive_reasoning": "<cite which evidence marker is present or absent>",\n'
-            '  "remediation": "<specific function call or config change for the exact tech stack; include a 1-line code example if applicable>"\n'
-            "}\n\n"
+            '  "description": "plain-language vulnerability-class description",\n'
+            '  "exploitability": "Easy",\n'
+            '  "exploitability_reasoning": "specific evidence marker",\n'
+            '  "business_impact": "current attacker gain and worst-case escalation",\n'
+            '  "verdict": "confirmed",\n'
+            '  "false_positive_probability": 0.05,\n'
+            '  "false_positive_reasoning": "strongest supporting or contradictory marker",\n'
+            '  "remediation": "specific stack-appropriate fix"\n'
+            "}\n"
+            "Constraints: description is 2-3 sentences and expands acronyms; exploitability is "
+            "exactly Easy, Medium, or Hard (Easy=single request/no interaction; Medium=auth or "
+            "multi-step; Hard=special configuration, chaining, or privileged access); verdict is "
+            "exactly confirmed, uncertain, or likely_false_positive; false_positive_probability "
+            "is a JSON number from 0.0 to 1.0; reasoning cites evidence; business_impact has two "
+            "sentences; remediation names the relevant function/config and includes a one-line "
+            "example when applicable.\n\n"
         )
 
         # KEY CHANGE 4: Pass application context to anchor business_impact
@@ -2262,18 +2461,157 @@ class ScanOrchestrator:
 
         # Fallback FP probability varies by proof type — when the AI doesn't
         # provide a value, the fallback should reflect the proof's reliability.
-        # Undeniable proof types get low FP; interpretive types get high FP
-        # (needs_review) since without AI judgment we can't confirm them.
-        _undeniable = {"active_output", "error_echo", "structural", "timing_strong"}
+        # Strong proof types get low FP; interpretive types use an explicitly
+        # uncertain advisory estimate. Review status is derived separately from
+        # deterministic evidence strength.
+        _undeniable = {
+            "active_output", "error_echo", "structural", "timing_strong",
+            "auth_confirmed",
+        }
         fallback_fp = 0.1 if proof_type in _undeniable else 0.4
 
         return {
             "exploitability": "Medium",
+            "description": self._description_for(vuln_type),
             "business_impact": f"Potential security impact from {vuln_type or 'this issue'}.",
-            "confidence": 0.8,
             "false_positive_probability": fallback_fp,
             "remediation": remediation,
         }
+
+    @staticmethod
+    def _normalize_ai_verdict(value: object, fp_prob: float) -> AiVerdict:
+        """Normalize model verdicts while keeping legacy responses compatible."""
+        try:
+            return AiVerdict(str(value).strip().lower())
+        except (TypeError, ValueError):
+            if fp_prob >= 0.8:
+                return AiVerdict.likely_false_positive
+            if fp_prob >= 0.4:
+                return AiVerdict.uncertain
+            return AiVerdict.confirmed
+
+    def _calibrate_ai_false_positive(
+        self,
+        vuln: Vulnerability,
+        grade: EvidenceGrade,
+        raw_fp_prob: float,
+        raw_verdict: object,
+        reasoning: object,
+    ) -> tuple[float, AiVerdict]:
+        """Constrain model judgment to the deterministic proof contract.
+
+        The probability answers only whether the finding itself is incorrect. It
+        must not encode missing impact, exploit-chain completeness, or remediation
+        uncertainty. Strong proof classes therefore remain confirmed. Interpretive
+        findings can receive a high FP estimate only when the evidence brief contains
+        a concrete contradiction such as an identical public response or mere payload
+        reflection.
+        """
+        raw_fp_prob = min(1.0, max(0.0, raw_fp_prob))
+        verdict = self._normalize_ai_verdict(raw_verdict, raw_fp_prob)
+        strong_proof_types = {
+            "active_output",
+            "error_echo",
+            "structural",
+            "timing_strong",
+            "auth_confirmed",
+        }
+
+        if grade.proof_type in strong_proof_types:
+            calibrated = min(raw_fp_prob, grade.fp_ceiling)
+            verdict = AiVerdict.confirmed
+        elif grade.proof_type == "ssrf_differential" and verdict == AiVerdict.confirmed:
+            calibrated = min(raw_fp_prob, grade.fp_ceiling, 0.49)
+            verdict = AiVerdict.uncertain
+        elif verdict == AiVerdict.confirmed:
+            calibrated = min(raw_fp_prob, grade.fp_ceiling, 0.15)
+        elif verdict == AiVerdict.uncertain:
+            # Uncertainty is not evidence that the detector is wrong.
+            calibrated = min(raw_fp_prob, grade.fp_ceiling, 0.49)
+        elif self._has_concrete_fp_contradiction(vuln, grade, reasoning):
+            calibrated = min(raw_fp_prob, grade.fp_ceiling)
+        else:
+            calibrated = min(raw_fp_prob, grade.fp_ceiling, 0.49)
+            verdict = AiVerdict.uncertain
+            logger.info(
+                "Downgraded unsupported AI false-positive verdict: "
+                "vuln_type=%r proof_type=%s ai_fp=%.2f url=%s reasoning=%r",
+                vuln.vuln_type,
+                grade.proof_type,
+                raw_fp_prob,
+                vuln.location.url,
+                reasoning,
+            )
+
+        if calibrated != raw_fp_prob:
+            logger.info(
+                "Calibrated AI FP estimate: vuln_type=%r proof_type=%s "
+                "ai_fp=%.2f -> %.2f verdict=%s url=%s",
+                vuln.vuln_type,
+                grade.proof_type,
+                raw_fp_prob,
+                calibrated,
+                verdict.value,
+                vuln.location.url,
+            )
+        return calibrated, verdict
+
+    def _has_concrete_fp_contradiction(
+        self,
+        vuln: Vulnerability,
+        grade: EvidenceGrade,
+        reasoning: object,
+    ) -> bool:
+        """Return whether high-FP reasoning cites a contradiction in the evidence."""
+        reasoning_text = (_normalize_llm_string(reasoning) or "").lower()
+        markers = self.evidence_grader.build_evidence_brief(vuln, grade).lower()
+
+        if grade.proof_type == "auth_differential":
+            public_response = "responses_identical: true" in markers
+            no_secrets = "secret_fields_in_anonymous_response: none" in markers
+            not_object_scoped = "object_scoped_request: true" not in markers
+            cites_public_marker = any(
+                phrase in reasoning_text
+                for phrase in ("responses_identical", "identical response", "public by design")
+            )
+            return public_response and no_secrets and not_object_scoped and cites_public_marker
+
+        if grade.proof_type == "pattern_match":
+            reflected_only = "payload_reflected_in_response: true" in markers
+            cites_reflection = any(
+                phrase in reasoning_text
+                for phrase in ("payload_reflected", "reflected payload", "normal page content")
+            )
+            return reflected_only and cites_reflection
+
+        return False
+
+    def _description_for(self, vuln_type: str) -> str:
+        """Curated plain-language description for a vuln_type, matched by substring.
+
+        Used only when the AI does not supply a description. Matching is two-phase,
+        longest key first each phase:
+          1. forward — a canonical key is contained in the detector's vuln_type
+             (e.g. "SQL Injection" in "SQL Injection (Error-Based)"). Doing this
+             first avoids cross-family reverse matches such as "sql injection"
+             being a substring of the "NoSQL Injection" key.
+          2. reverse — the (shorter) vuln_type is contained in a key, covering
+             abbreviations like "IDOR" -> "Insecure Direct Object Reference (IDOR)".
+        """
+        vt = (vuln_type or "").strip().lower()
+        if vt:
+            keys_by_len = sorted(self._description_fallbacks, key=len, reverse=True)
+            for key in keys_by_len:
+                if key.lower() in vt:
+                    return self._description_fallbacks[key]
+            for key in keys_by_len:
+                if vt in key.lower():
+                    return self._description_fallbacks[key]
+        return (
+            f"A security weakness of type '{vuln_type}' was identified. It could allow an "
+            "attacker to compromise the confidentiality, integrity, or availability of the "
+            "application or its data."
+        )
 
     def _remediation_is_incompatible(self, vuln_type: str, remediation: object) -> bool:
         text = str(remediation or "").lower()
@@ -2292,135 +2630,52 @@ class ScanOrchestrator:
             return True
         return False
 
-    def _apply_false_positive_adjustments(self, vulnerabilities: list[Vulnerability]) -> None:
-        """Downgrade CVSS score and severity for findings with high false-positive probability.
+    def _apply_ai_review_statuses(self, vulnerabilities: list[Vulnerability]) -> None:
+        """Apply advisory review statuses without changing risk or suppression.
 
-        Now grader-aware: the FP probability has already been clamped to the
-        evidence-grade ceiling during ``_analyze_all_findings``.  This method
-        only applies CVSS/severity adjustments for findings that *still* have
-        elevated FP probability after clamping (i.e., Grade C/D findings where
-        the AI legitimately flagged weak evidence).
-
-        Thresholds:
-          fp_prob >= 0.90  →  cap CVSS at 1.0  (Info-level)
-          fp_prob >= 0.75  →  cap CVSS at 2.5  (Low-level)
-          fp_prob >= 0.50  →  reduce CVSS by 40 %
-
-        Grade A/B findings will never reach these thresholds because their
-        ceiling is 0.05-0.15.
+        AI can request human review when it produced a calibrated
+        ``likely_false_positive`` verdict. It cannot set ``is_false_positive``,
+        suppress a finding, or alter CVSS/severity. Explicitly marked false
+        positives remain suppressed for future manual-review workflows.
         """
-        for v in vulnerabilities:
-            fp_prob = v.ai_analysis.false_positive_probability
-            if fp_prob is None:
-                continue
-
-            original_cvss = v.cvss_score
-            original_severity = v.severity
-
-            # --- Review status assignment ---
-            if fp_prob >= 0.80:
-                # Only auto-suppress if the grader grade allows it (D-grade).
-                # Grade A/B findings can never reach this threshold.
-                evidence_grade = getattr(v.ai_analysis, "evidence_grade", None)
-                if evidence_grade in ("A", "B", "B+"):
-                    # Should not happen after clamping, but guard against it
-                    v.is_false_positive = False
-                    v.review_status = ReviewStatus.confirmed
-                    logger.warning(
-                        "Grade %s finding had fp_prob=%.2f >= 0.80 - this should not happen "
-                        "after clamping. Forcing confirmed. vuln_type=%r url=%s",
-                        evidence_grade, fp_prob, v.vuln_type, v.location.url,
-                    )
-                    continue
-
-                reasoning = (v.ai_analysis.false_positive_reasoning or "").lower()
-                has_evidence_markers = any(
-                    kw in reasoning
-                    for kw in [
-                        "no sql", "sql error", "pdoexception", "mysql", "postgres", "sqlstate",
-                        "root:x", "boot loader", "file path", "system file",
-                        "time", "delta", "sleep", "timing",
-                        "csrf", "token", "samesite", "form",
-                        "canary", "reflected", "execution", "not executed",
-                        "difference", "baseline",
-                    ]
-                )
-
-                if not has_evidence_markers:
-                    v.is_false_positive = False
-                    v.review_status = ReviewStatus.needs_review
-                    logger.info(
-                        "Skipping auto-FP suppression due to insufficient reasoning markers: "
-                        "vuln_type=%r fp_prob=%.2f grade=%s url=%s reasoning=%r",
-                        v.vuln_type, fp_prob, evidence_grade, v.location.url,
-                        v.ai_analysis.false_positive_reasoning,
-                    )
-                    # Also skip CVSS adjustment - insufficient evidence to suppress
-                    # means insufficient evidence to reduce the score.
-                    continue
-                else:
-                    v.is_false_positive = True
-                    v.review_status = ReviewStatus.needs_review
-                    logger.info(
-                        "Auto-suppressed as FP: vuln_type=%r fp_prob=%.2f grade=%s url=%s",
-                        v.vuln_type, fp_prob, evidence_grade, v.location.url,
-                    )
-            elif fp_prob >= 0.50:
-                v.review_status = ReviewStatus.needs_review
+        for vuln in vulnerabilities:
+            if vuln.is_false_positive:
+                vuln.review_status = ReviewStatus.suppressed
+            elif (
+                vuln.ai_analysis.verdict == AiVerdict.likely_false_positive
+                and (vuln.ai_analysis.false_positive_probability or 0.0) >= 0.8
+            ):
+                vuln.review_status = ReviewStatus.needs_review
+            elif (
+                vuln.evidence_strength == EvidenceStrength.confirmed_observation
+                and vuln.ai_analysis.verdict == AiVerdict.uncertain
+                and (vuln.ai_analysis.false_positive_probability or 0.0) >= 0.3
+            ):
+                vuln.review_status = ReviewStatus.needs_review
+            elif vuln.evidence_strength == EvidenceStrength.informational:
+                vuln.review_status = ReviewStatus.informational
+            elif vuln.evidence_strength == EvidenceStrength.probable:
+                vuln.review_status = ReviewStatus.likely
+            elif vuln.evidence_strength == EvidenceStrength.possible:
+                vuln.review_status = ReviewStatus.needs_review
             else:
-                v.is_false_positive = False
-                v.review_status = ReviewStatus.confirmed
-
-            # --- CVSS adjustments ---
-            if fp_prob >= 0.90:
-                adjusted_cvss = min(original_cvss, 1.0)
-            elif fp_prob >= 0.75:
-                adjusted_cvss = min(original_cvss, 2.5)
-            elif fp_prob >= 0.50:
-                adjusted_cvss = round(original_cvss * 0.60, 1)
-            else:
-                # Low false-positive probability - no CVSS adjustment needed
-                continue
-
-            adjusted_cvss = max(0.0, round(adjusted_cvss, 1))
-            adjusted_severity = SeverityLevel(CvssCalculator.get_severity(adjusted_cvss))
-
-            if adjusted_cvss != original_cvss or adjusted_severity != original_severity:
-                logger.info(
-                    "FP adjustment: vuln_type=%r fp_prob=%.2f grade=%s  "
-                    "cvss %s -> %s  severity %s -> %s  url=%s",
-                    v.vuln_type,
-                    fp_prob,
-                    getattr(v.ai_analysis, 'evidence_grade', '?'),
-                    original_cvss,
-                    adjusted_cvss,
-                    original_severity.value,
-                    adjusted_severity.value,
-                    v.location.url,
-                )
-                v.cvss_score = adjusted_cvss
-                v.severity = adjusted_severity
-
-    def _effective_false_positive_probability(self, vuln: Vulnerability, fp_prob: float) -> float:
-        """Constrain AI FP scoring using the evidence grader ceiling.
-
-        This is now a lightweight wrapper: the grader does the heavy lifting.
-        Kept for backward compatibility with ``_compute_priority_ranks`` which
-        calls this method directly.
-        """
-        grade = self.evidence_grader.grade(vuln)
-        return min(fp_prob, grade.fp_ceiling)
+                vuln.review_status = ReviewStatus.confirmed
 
     def _compute_priority_ranks(self, vulnerabilities: list[Vulnerability]) -> list[Vulnerability]:
         exploitability_weight = {"Easy": 3.0, "Medium": 2.0, "Hard": 1.0}
+        evidence_weight = {
+            EvidenceStrength.confirmed_exploit: 1.0,
+            EvidenceStrength.confirmed_observation: 0.9,
+            EvidenceStrength.probable: 0.7,
+            EvidenceStrength.possible: 0.5,
+            EvidenceStrength.informational: 0.1,
+        }
 
         def risk_score(vuln: Vulnerability) -> float:
             exploit_value = vuln.ai_analysis.exploitability.value if vuln.ai_analysis.exploitability else "Medium"
             exploit_w = exploitability_weight.get(exploit_value, 2.0)
-            raw_fp_prob = vuln.ai_analysis.false_positive_probability
-            fp_prob = self._effective_false_positive_probability(vuln, raw_fp_prob) if raw_fp_prob is not None else 0.1
-            fp_penalty = 1.0 - fp_prob
-            return vuln.cvss_score * exploit_w * fp_penalty
+            proof_w = evidence_weight.get(vuln.evidence_strength, 0.5)
+            return vuln.cvss_score * exploit_w * proof_w
 
         vulnerabilities.sort(key=risk_score, reverse=True)
         for rank, vuln in enumerate(vulnerabilities, start=1):
@@ -2492,19 +2747,20 @@ class ScanOrchestrator:
     def _to_vulnerability(self, finding: Finding, extra_secrets: Iterable[str] = ()) -> Vulnerability:
         evidence_strength = self._classify_evidence_strength(finding)
         auth_context = self._classify_auth_context(finding)
-        cvss_score = 0.0
-        if finding.severity == SeverityLevel.critical:
-            cvss_score = 9.5
-        elif finding.severity == SeverityLevel.high:
-            cvss_score = 8.0
-        elif finding.severity == SeverityLevel.medium:
-            cvss_score = 5.5
-        elif finding.severity == SeverityLevel.low:
-            cvss_score = 2.5
-        
-        # If finding is unverified, reduce score by 30% to weight verified findings more heavily
-        if not getattr(finding, "verified", False):
-            cvss_score = max(1.0, round(cvss_score * 0.7, 1)) if cvss_score > 0 else 0.0
+        if finding.severity == SeverityLevel.info:
+            cvss_score = 0.0
+            cvss_vector = None
+        else:
+            requires_auth = auth_context in {
+                AuthContext.authenticated,
+                AuthContext.requires_user_session,
+            }
+            cvss = CvssCalculator.from_vulnerability_context(
+                vuln_type=finding.vuln_type,
+                requires_auth=requires_auth,
+            )
+            cvss_score = cvss.score
+            cvss_vector = cvss.vector
 
         return Vulnerability(
             id=str(uuid4()),
@@ -2512,6 +2768,7 @@ class ScanOrchestrator:
             vuln_type=finding.vuln_type,
             severity=finding.severity,
             cvss_score=cvss_score,
+            cvss_vector=cvss_vector,
             location=LocationInfo(
                 url=finding.url,
                 parameter=finding.parameter,
@@ -2864,12 +3121,20 @@ class ScanOrchestrator:
         if not (settings.authentication_second_cookie or settings.authentication_second_header):
             warnings.append("No second-user account configured; horizontal IDOR comparison was not tested.")
         scan_config = (crawl_context or {}).get("scan_config")
-        oast_url = scan_config.oast_callback_base_url if scan_config else settings.oast_callback_base_url
-        if not oast_url:
+        oast_callback = (
+            (scan_config.oast_callback_base_url if scan_config else None)
+            or settings.oast_callback_base_url
+        )
+        oast_poll = (
+            (scan_config.oast_poll_url if scan_config else None)
+            or settings.oast_poll_url
+        )
+        if not (oast_callback and oast_poll):
             warnings.append(
-                "No OAST callback configured (OAST_CALLBACK_BASE_URL); blind SSRF was "
+                "OAST callback/polling is not fully configured; blind SSRF was "
                 "assessed with the in-band differential fallback only, so SSRF findings "
-                "are probable/unverified. Configure OAST for confirmed blind SSRF."
+                "are probable/unverified. Configure OAST_CALLBACK_BASE_URL and OAST_POLL_URL "
+                "for confirmed blind SSRF."
             )
         return warnings
 
@@ -2905,6 +3170,21 @@ class ScanOrchestrator:
         )
         if finding.severity == SeverityLevel.info or any(term in vt for term in informational_terms):
             return EvidenceStrength.informational
+
+        # A timeout/status differential can indicate SSRF, but without reflected
+        # internal content or an OAST callback it is not a confirmed exploit.
+        if method == "ssrf_inband_differential":
+            return EvidenceStrength.probable
+
+        confirmed_exploit_methods = {
+            "nosql_boolean_operator",
+            "jwt_active_forgery",
+            "xxe_external_entity_file_read",
+            "poison_null_byte_extension_bypass",
+            "second_user_idor",
+        }
+        if verified and method in confirmed_exploit_methods:
+            return EvidenceStrength.confirmed_exploit
 
         if method == "union_based" and "sql injection" in vt:
             evidence = getattr(finding, "detection_evidence", {}) or {}

@@ -11,7 +11,11 @@ from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.verification.response_analyzer import ResponseAnalyzer
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
-from app.utils.scan_http import create_scan_client
+from app.utils.scan_http import (
+    build_httpx_request_snippet,
+    build_observed_request_snippet,
+    create_scan_client,
+)
 
 # ---------------------------------------------------------------------------
 # Detection patterns
@@ -150,6 +154,19 @@ _WEAK_STANDALONE = frozenset({
     r"/home/\w+/",
 })
 
+# Query-shape echoes ("SELECT ... FROM ... WHERE", "INSERT INTO ... VALUES") prove
+# only that SQL statement text appears in the body. In a SQL-injection verifier's
+# OWN response that echo IS the injection proof — already owned by the A05 finding —
+# not independent verbose-error disclosure. Excluded from the observed-evidence
+# derivation path so an A05 SQLi echo (often on a 2xx response) is not re-reported
+# as A10 verbose error handling. A raw DB *engine* error ("SQLITE_ERROR",
+# "you have an error in your SQL syntax", a stack trace) is a genuine disclosure and
+# is matched by other patterns, so it still derives an A10 finding.
+_QUERY_ECHO_PATTERNS = frozenset({
+    r"select\s+.+\s+from\s+.+where\b",
+    r"insert\s+into\s+.+\bvalues\b",
+})
+
 _FUZZ_PAYLOADS: list[tuple[str, str]] = [
     ("'", "single quote - SQL metacharacter / template error trigger"),
     ("\x00", "null byte - triggers path/string handling errors"),
@@ -161,6 +178,13 @@ _FUZZ_PAYLOADS: list[tuple[str, str]] = [
     ("<script>", "HTML/XML metacharacter - XML parser or sanitiser errors"),
     ("%00%0d%0a", "URL-encoded null + CRLF - header injection / parser errors"),
 ]
+
+
+def _response_request_snippet(response: httpx.Response) -> str | None:
+    try:
+        return build_httpx_request_snippet(response.request)
+    except Exception:
+        return None
 
 _DEFAULT_URL_LIMIT = 20
 # Cap on how many shared attack targets are error-fuzzed (targets are already
@@ -307,13 +331,14 @@ def _matched_texts(body: str, matched_patterns: list[str]) -> list[str]:
 def _build_evidence(
     url: str,
     method: str,
-    status: int,
+    status: int | None,
     body: str,
     matched_patterns: list[str],
     sensitive_hdrs: list[str],
     trigger: str = "",
 ) -> str:
-    parts = [f"{method} {url} → HTTP {status}"]
+    status_text = f"HTTP {status}" if status is not None else "HTTP (status unrecorded)"
+    parts = [f"{method} {url} → {status_text}"]
     if trigger:
         parts.append(f"Trigger: {trigger}")
     if matched_patterns:
@@ -496,6 +521,12 @@ class ExceptionHandlingDetector(BaseDetector):
             # Apply reflection guard: the source finding's payload might be echoed
             # in the observed text, causing a pattern match that is not a real error.
             matched = _reflection_guard(observed_text, source.payload, matched)
+
+            # Drop bare query-shape echoes: a "SELECT ... FROM ... WHERE" match in a
+            # SQLi verifier's OWN response is the A05 injection proof, not independent
+            # A10 verbose-error disclosure. Only a real engine error / stack trace
+            # (matched by the other patterns) should derive a verbose-error finding.
+            matched = [p for p in matched if p not in _QUERY_ECHO_PATTERNS]
             severity = _reclassify_severity(matched)
             if not matched or not severity:
                 continue
@@ -505,10 +536,13 @@ class ExceptionHandlingDetector(BaseDetector):
                 if getattr(source, "vuln_type", None)
                 else "observed during active verification"
             )
+            # The source finding does not carry the HTTP status of the observed
+            # response, so do not fabricate one (previously hardcoded "HTTP 200",
+            # which mislabeled 500 error pages). Render the status as unrecorded.
             evidence = _build_evidence(
                 url=source.url,
                 method=source.method,
-                status=200,
+                status=None,
                 body=observed_text,
                 matched_patterns=matched,
                 sensitive_hdrs=[],
@@ -580,7 +614,8 @@ class ExceptionHandlingDetector(BaseDetector):
             url=test_url, method="GET", status=probe_response.status_code,
             body=probe_response.text, headers=probe_response.headers,
             trigger="non-existent path probe", require_body_match=True,
-            parameter=None, payload=None
+            parameter=None, payload=None,
+            request_snippet=_response_request_snippet(probe_response),
         )
 
         # Baseline diffing: if both baseline and probe returned 200, suppress
@@ -661,6 +696,7 @@ class ExceptionHandlingDetector(BaseDetector):
             trigger=f"{target.location.value} fuzz - {payload_desc}",
             parameter=target.parameter,
             payload=payload,
+            request_snippet=_response_request_snippet(response),
         )
 
     def _analyse_response(
@@ -674,6 +710,7 @@ class ExceptionHandlingDetector(BaseDetector):
         require_body_match: bool = False,
         parameter: str | None = None,
         payload: str | None = None,
+        request_snippet: str | None = None,
     ) -> Finding | None:
         if status in _GATEWAY_CODES:
             return None
@@ -720,7 +757,9 @@ class ExceptionHandlingDetector(BaseDetector):
             confidence_score=100.0 if severity == SeverityLevel.high else 85.0,
             verified=True,
             reproducible=True,
-            verification_request_snippet=f"{method} {url} HTTP/1.1\nUser-Agent: Sentry/2.0\nPayload: {payload}",
+            verification_request_snippet=request_snippet or build_observed_request_snippet(
+                url=url, method=method, body=payload,
+            ),
             verification_response_snippet=ResponseAnalyzer.build_evidence_response_snippet(
                 status_code=status,
                 body=body,
