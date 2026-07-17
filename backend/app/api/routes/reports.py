@@ -31,6 +31,12 @@ def _build_report_payload(scan, scan_id: str) -> dict:
     return {
         "scan_id": scan_id,
         "generated_at": generated_at,
+        "target_url": getattr(scan, "target_url", None),
+        "crawl_mode": getattr(scan, "crawl_mode", None),
+        "status": getattr(scan, "status", None),
+        "started_at": getattr(scan, "started_at", None),
+        "completed_at": getattr(scan, "completed_at", None),
+        "created_at": getattr(scan, "created_at", None),
         "executive_summary": scan.report_metadata.summary or "No summary available.",
         "owner_user_id": getattr(scan, "owner_user_id", None),
         "owner_email": getattr(scan, "owner_email", None),

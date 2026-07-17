@@ -6,5 +6,15 @@
   --font-mono: "IBM Plex Mono", monospace;
 }
 
-* { box-sizing: border-box; }
-body { min-width: 320px; }
+* {
+  box-sizing: border-box;
+}
+
+html {
+  font-family: "DM Sans", system-ui, sans-serif;
+}
+
+body {
+  min-width: 320px;
+  font-family: inherit;
+}

@@ -19,7 +19,7 @@ function ProtectedRoute() {
 export function PublicOnlyRoute() {
   const { user } = useAuth();
   if (user) {
-    return <Navigate to='/scan' replace />;
+    return <Navigate to='/home' replace />;
   }
   return <Outlet />;
 }

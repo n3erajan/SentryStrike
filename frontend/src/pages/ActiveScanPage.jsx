@@ -1,14 +1,6 @@
 import { useEffect } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import {
-  ArrowLeft,
-  ArrowRight,
-  Check,
-  CircleNotch,
-  Globe,
-  ShieldCheck,
-  WarningCircle,
-} from "@phosphor-icons/react";
+import { ArrowRight, Check, Loader2, ShieldCheck } from "lucide-react";
 import { useScanStatus } from "../hooks/useScanStatus.js";
 import { SCAN_PHASES } from "../data/constants.js";
 
@@ -19,14 +11,30 @@ const STATUS_LABEL = {
   failed: "Failed",
   cancelled: "Cancelled",
 };
-function formatDuration(seconds) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+
+function formatEta(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "—";
   if (seconds < 60) return `${Math.ceil(seconds)}s`;
-  const minutes = Math.ceil(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const remainder = minutes % 60;
-  return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
+  const mins = Math.ceil(seconds / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  const rem = mins % 60;
+  return rem ? `${hours}h ${rem}m` : `${hours}h`;
+}
+
+function formatDuration(iso) {
+  if (!iso) return "";
+  const start = new Date(iso).getTime();
+  if (Number.isNaN(start)) return "";
+  const diff = Math.max(0, Date.now() - start);
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} minutes ago`;
+  return `${Math.floor(mins / 60)}h ago`;
+}
+
+function timeStr(date) {
+  return date.toTimeString().slice(0, 8);
 }
 
 function ActiveScanPage() {
@@ -47,172 +55,131 @@ function ActiveScanPage() {
     cancelling,
     cancel,
   } = useScanStatus(scanId);
+
   useEffect(() => {
     if (status !== "completed") return undefined;
     const id = setTimeout(() => navigate(`/report/${scanId}`), 1200);
     return () => clearTimeout(id);
   }, [status, scanId, navigate]);
 
-  return (
-    <div className='mx-auto w-full max-w-[1240px] px-4 py-8 sm:px-6 lg:px-8 lg:py-10'>
-      <button
-        className='inline-flex items-center gap-2 border-0 bg-transparent p-0 text-[10px] font-semibold text-[#415166] hover:text-[#006de2] focus-visible:outline-2 focus-visible:outline-[#006de2]'
-        onClick={() => navigate("/active")}
-      >
-        <ArrowLeft size={14} weight='bold' />
-        All active scans
-      </button>
-      <header className='mt-6 border-b border-[#cbd5e3] pb-7'>
-        <div className='flex flex-wrap items-center gap-3'>
-          <span
-            className={`rounded px-2 py-1 text-[9px] font-bold ${active ? "bg-[#e7f7ef] text-[#1c8742]" : status === "failed" ? "bg-[#fff0ef] text-[#de3d34]" : "bg-[#d4eaff] text-[#004bb7]"}`}
-          >
-            {STATUS_LABEL[status] || "Queued"}
-          </span>
-          <span className='font-mono text-[9px] text-[#6f7c8c]'>
-            ID {scanId}
-          </span>
-        </div>
-        <h1 className='mt-3 text-3xl font-semibold'>Live scan</h1>
-        {target && (
-          <div className='mt-3 flex min-w-0 items-center gap-2 text-[#415166]'>
-            <Globe className='shrink-0' size={15} weight='bold' />
-            <code className='truncate font-mono text-[11px]'>{target}</code>
-          </div>
-        )}
-      </header>
+  const surfaces = Math.max(1, stageIdx * 20);
+  const now = new Date();
 
-      <div className='mt-7 grid gap-7 lg:grid-cols-[minmax(0,1fr)_290px]'>
-        <section className='min-w-0 border border-[#cbd5e3] bg-white'>
-          <div className='flex flex-col gap-4 border-b border-[#cbd5e3] p-5 sm:flex-row sm:items-start sm:justify-between'>
-            <div>
-              <span className='flex items-center gap-2 text-[12px] font-semibold text-[#0a1421]'>
-                {active ? (
-                  <CircleNotch
-                    className='animate-spin text-[#006de2]'
-                    size={16}
-                    weight='bold'
+  return (
+    <div className='view'>
+      <button className='back' onClick={() => navigate("/active")}>
+        ← All active scans
+      </button>
+      <div className='head'>
+        <div>
+          <h1>Assessing {target ? new URL(target).hostname : "target"}</h1>
+          <p>
+            {target || `Scan ${scanId}`} · started {formatDuration()}{" "}
+          </p>
+        </div>
+        {active ? (
+          <button className='btn danger' onClick={cancel} disabled={cancelling}>
+            {cancelling ? "Cancelling…" : "Cancel"}
+          </button>
+        ) : status === "completed" ? (
+          <Link className='btn primary' to={`/report/${scanId}`}>
+            <ShieldCheck className='ico' />
+            View report
+            <ArrowRight className='ico' />
+          </Link>
+        ) : (
+          <Link className='btn' to='/scan'>
+            Start a new Scan
+          </Link>
+        )}
+      </div>
+
+      <div className='summary'>
+        <div className='stat'>
+          <strong>{Math.round(progress)}%</strong>
+          <span>Complete</span>
+        </div>
+        <div className='stat'>
+          <strong>{surfaces}</strong>
+          <span>Surfaces</span>
+        </div>
+        <div className='stat'>
+          <strong>{logs.filter((l) => l.kind === "warn").length}</strong>
+          <span>Alerts</span>
+        </div>
+        <div className='stat'>
+          <strong>{formatEta(eta)}</strong>
+          <span>Remaining</span>
+        </div>
+      </div>
+
+      <div className='app-progress'>
+        <span style={{ width: `${progress}%` }} />
+      </div>
+
+      {error && (
+        <div className='auth-error' style={{ marginBottom: 16 }}>
+          {error}
+        </div>
+      )}
+
+      <div className='activity'>
+        {SCAN_PHASES.slice(1).map((p, i) => {
+          const idx = i + 1;
+          const done = status === "completed" || idx < stageIdx;
+          const current = active && idx === stageIdx;
+          const state = done ? "Complete" : current ? "Running" : "Pending";
+          const cls = done ? "low" : current ? "" : "small";
+          return (
+            <div key={p.key}>
+              <time>
+                {done ? (
+                  <Check size={13} />
+                ) : current ? (
+                  <Loader2
+                    size={13}
+                    style={{ animation: "spin 1s linear infinite" }}
                   />
                 ) : (
-                  <Check className='text-[#1c8742]' size={16} weight='bold' />
+                  "—"
                 )}
-                {phaseMessage || STATUS_LABEL[status] || "Scan queued"}
-              </span>
-              {eta != null && eta > 0 && (
-                <span className='mt-1 block text-[10px] text-[#6f7c8c]'>
-                  About {formatDuration(eta)} remaining
-                </span>
-              )}
+              </time>
+              <span>{p.label}</span>
+              <b className={cls}>{state}</b>
             </div>
-            <span className='font-mono text-2xl font-semibold tabular-nums text-[#172033]'>
-              {Math.round(progress)}%
-            </span>
-          </div>
-          <div className='h-1.5 bg-[#e8ecf2]'>
-            <div
-              className='h-full bg-[#006de2] transition-[width] duration-500'
-              style={{ width: `${progress}%` }}
-            />
-          </div>
-          <div className='p-5'>
-            {error && (
-              <div className='mb-5 flex items-start gap-2 rounded-md border border-[#efbbb7] bg-[#fff0ef] px-3 py-2.5 text-[12px] text-[#de3d34]'>
-                <WarningCircle size={16} weight='fill' />
-                {error}
-              </div>
-            )}
-            <div className='flex items-center justify-between'>
-              <h2 className='text-[10px] font-semibold uppercase tracking-[0.13em] text-[#6f7c8c]'>
-                Activity log
-              </h2>
-              <span className='text-[9px] text-[#a1aabb]'>Worker events</span>
-            </div>
-            <div
-              className='mt-3 h-72 overflow-y-auto bg-[#172033] p-4 font-mono text-[10px] leading-6 text-[#b9c4d6]'
-              ref={logRef}
-            >
-              {logs.length ? (
-                logs.map((line, i) => (
-                  <div
-                    key={i}
-                    className={
-                      line.kind === "error"
-                        ? "text-[#ff9b95]"
-                        : line.kind === "warn"
-                          ? "text-[#ffd27a]"
-                          : ""
-                    }
-                  >
-                    {line.text}
-                  </div>
-                ))
-              ) : (
-                <div className='text-[#78869e]'>
-                  Waiting for scanner activity...
-                </div>
-              )}
-            </div>
-            <div className='mt-5 flex justify-end'>
-              {active ? (
-                <button
-                  type='button'
-                  className='min-h-9 rounded-md border border-[#de3d34] bg-white px-3.5 text-[10px] font-semibold text-[#de3d34] transition hover:bg-[#fff0ef] disabled:cursor-not-allowed disabled:opacity-50'
-                  onClick={cancel}
-                  disabled={cancelling}
-                >
-                  {cancelling ? "Cancellation requested" : "Cancel scan"}
-                </button>
-              ) : status === "completed" ? (
-                <Link
-                  to={`/report/${scanId}`}
-                  className='inline-flex min-h-9 items-center gap-2 rounded-md bg-[#006de2] px-3.5 text-[10px] font-semibold text-white no-underline'
-                >
-                  <ShieldCheck size={15} weight='bold' />
-                  View report
-                  <ArrowRight size={14} weight='bold' />
-                </Link>
-              ) : (
-                <Link
-                  to='/scan'
-                  className='inline-flex min-h-9 items-center rounded-md border border-[#cbd5e3] px-3.5 text-[10px] font-semibold text-[#415166] no-underline'
-                >
-                  Start a new scan
-                </Link>
-              )}
-            </div>
-          </div>
-        </section>
-
-        <aside className='border border-[#cbd5e3] bg-white p-5 lg:self-start'>
-          <h2 className='text-[10px] font-semibold uppercase tracking-[0.13em] text-[#6f7c8c]'>
-            Scan phases
-          </h2>
-          <ol className='mt-4 grid'>
-            {SCAN_PHASES.slice(1).map((scanPhase, chipIndex) => {
-              const phaseIndex = chipIndex + 1;
-              const completed = status === "completed" || phaseIndex < stageIdx;
-              const current = active && phaseIndex === stageIdx;
-              return (
-                <li
-                  key={scanPhase.key}
-                  className='grid grid-cols-[22px_minmax(0,1fr)] gap-2 border-l border-[#cbd5e3] pb-4 pl-3 last:border-transparent last:pb-0'
-                >
-                  <span
-                    className={`-ml-[24px] grid size-[22px] place-items-center rounded-full border text-[9px] ${completed ? "border-[#1c8742] bg-[#1c8742] text-white" : current ? "border-[#006de2] bg-white text-[#006de2]" : "border-[#cbd5e3] bg-[#f8f9fb] text-[#a1aabb]"}`}
-                  >
-                    {completed ? <Check size={11} weight='bold' /> : phaseIndex}
-                  </span>
-                  <span
-                    className={`pt-0.5 text-[10px] font-medium ${current ? "text-[#004bb7]" : completed ? "text-[#415166]" : "text-[#a1aabb]"}`}
-                  >
-                    {scanPhase.label}
-                  </span>
-                </li>
-              );
-            })}
-          </ol>
-        </aside>
+          );
+        })}
       </div>
+
+      <div className='panel'>
+        <div className='panel-h'>Activity log</div>
+        <div className='panel-b'>
+          <div className='scan-log' ref={logRef}>
+            {logs.length ? (
+              logs.map((line, i) => (
+                <div
+                  key={i}
+                  className={
+                    line.kind === "warn"
+                      ? "warn"
+                      : line.kind === "ok"
+                        ? "ok"
+                        : ""
+                  }
+                >
+                  [{timeStr(now)}] {line.text}
+                </div>
+              ))
+            ) : (
+              <div>Waiting for scanner activity…</div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <p className='muted-text' style={{ marginTop: 12 }}>
+        Current phase: <b>{phaseMessage || STATUS_LABEL[status] || "Queued"}</b>
+      </p>
     </div>
   );
 }

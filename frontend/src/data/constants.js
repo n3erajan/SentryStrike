@@ -1,67 +1,52 @@
 import {
-  WarningOctagon,
-  Warning,
-  WarningCircle,
-  Info,
-  CheckCircle,
-  TreeStructure,
-  Gauge,
-  Bug,
-  Browsers,
-  ShieldCheck,
-  Pulse,
-  ClockCounterClockwise,
-} from "@phosphor-icons/react";
+  Home,
+  Boxes,
+  ShieldPlus,
+  Activity,
+  FileBarChart,
+  Users,
+  Settings,
+} from "lucide-react";
+
+const NAV_ITEMS = [
+  { to: "/home", label: "Home", Icon: Home, end: true },
+  { to: "/apps", label: "Web applications", Icon: Boxes },
+  { to: "/scan", label: "New Scan", Icon: ShieldPlus },
+  { to: "/active", label: "Active scans", Icon: Activity, badge: "active" },
+  { to: "/reports", label: "Reports", Icon: FileBarChart },
+  { to: "/team", label: "Team", Icon: Users },
+  { to: "/settings", label: "Settings", Icon: Settings },
+];
+
+const MOBILE_NAV = [
+  { to: "/home", label: "Home", Icon: Home },
+  { to: "/apps", label: "Apps", Icon: Boxes },
+  { to: "/scan", label: "Assess", Icon: ShieldPlus },
+  { to: "/reports", label: "Reports", Icon: FileBarChart },
+  { to: "/settings", label: "Settings", Icon: Settings },
+];
+
+const ROUTE_NAMES = {
+  "/home": "Home",
+  "/apps": "Web applications",
+  "/scan": "New Scan",
+  "/active": "Active scans",
+  "/reports": "Reports",
+  "/team": "Team",
+  "/settings": "Settings",
+};
 
 const SEVERITIES = ["critical", "high", "medium", "low", "info"];
 
 const SEVERITY_META = {
-  critical: {
-    color: "#ef4444",
-    bg: "rgba(239,68,68,0.12)",
-    border: "rgba(239,68,68,0.35)",
-    label: "CRITICAL",
-    Icon: WarningOctagon,
-  },
-  high: {
-    color: "#f97316",
-    bg: "rgba(249,115,22,0.12)",
-    border: "rgba(249,115,22,0.35)",
-    label: "HIGH",
-    Icon: Warning,
-  },
-  medium: {
-    color: "#eab308",
-    bg: "rgba(234,179,8,0.12)",
-    border: "rgba(234,179,8,0.35)",
-    label: "MEDIUM",
-    Icon: WarningCircle,
-  },
-  low: {
-    color: "#38bdf8",
-    bg: "rgba(56,189,248,0.12)",
-    border: "rgba(56,189,248,0.35)",
-    label: "LOW",
-    Icon: Info,
-  },
-  info: {
-    color: "#64748b",
-    bg: "rgba(100,116,139,0.12)",
-    border: "rgba(100,116,139,0.35)",
-    label: "INFO",
-    Icon: Info,
-  },
-  safe: {
-    color: "#22c55e",
-    bg: "rgba(34,197,94,0.12)",
-    border: "rgba(34,197,94,0.35)",
-    label: "SAFE",
-    Icon: CheckCircle,
-  },
+  critical: { color: "var(--bad)", label: "CRITICAL" },
+  high: { color: "var(--bad)", label: "HIGH" },
+  medium: { color: "var(--warn)", label: "MEDIUM" },
+  low: { color: "var(--good)", label: "LOW" },
+  info: { color: "var(--muted)", label: "INFO" },
+  safe: { color: "var(--good)", label: "SAFE" },
 };
 
-// Ordered to match shared.models.scan.ScanPhase. The worker reports these
-// phase keys directly, so live progress remains accurate as phase weights vary.
 const SCAN_PHASES = [
   { key: "queued", label: "Queued" },
   { key: "initializing", label: "Initializing" },
@@ -75,21 +60,15 @@ const SCAN_PHASES = [
   { key: "report_generation", label: "Report generation" },
 ];
 
-// Scan verification mode — maps to CreateScanRequest.config.scan_mode.
 const SCAN_MODES = [
   ["verified", "Verified", "Only evidence-verified findings"],
   ["heuristic", "Heuristic", "Adds strong heuristic matches"],
   ["aggressive", "Aggressive", "Widest checks, more noise"],
 ];
 
-// Every ScanConfig override, grouped for the advanced panel. Each field maps
-// 1:1 to a backend ScanConfig key; `type`/`min`/`max`/`step` mirror the
-// pydantic constraints so the UI can't submit out-of-range values. Leaving a
-// field blank omits it, so the backend falls back to its global default.
 const CONFIG_GROUPS = [
   {
     title: "Crawler",
-    icon: TreeStructure,
     blurb: "How far and how fast SentryStrike discovers pages.",
     fields: [
       {
@@ -99,7 +78,6 @@ const CONFIG_GROUPS = [
         min: 1,
         max: 10,
         placeholder: "e.g. 3",
-        help: "Maximum link-follow depth from the root.",
       },
       {
         key: "crawl_max_urls",
@@ -108,7 +86,6 @@ const CONFIG_GROUPS = [
         min: 10,
         max: 5000,
         placeholder: "e.g. 500",
-        help: "Maximum number of URLs to discover.",
       },
       {
         key: "crawl_rate_limit_per_second",
@@ -119,7 +96,6 @@ const CONFIG_GROUPS = [
         step: 0.5,
         unit: "req/s",
         placeholder: "e.g. 10",
-        help: "HTTP requests per second during crawling.",
       },
       {
         key: "crawl_browser_mode",
@@ -130,7 +106,6 @@ const CONFIG_GROUPS = [
           ["always", "Always"],
           ["never", "Never"],
         ],
-        help: "When to use a real browser for discovery.",
       },
       {
         key: "crawl_browser_max_interactions",
@@ -139,7 +114,6 @@ const CONFIG_GROUPS = [
         min: 1,
         max: 200,
         placeholder: "e.g. 40",
-        help: "Max clicks/navigations per page in browser mode.",
       },
       {
         key: "crawl_browser_budget_seconds",
@@ -149,13 +123,11 @@ const CONFIG_GROUPS = [
         max: 3600,
         unit: "s",
         placeholder: "e.g. 120",
-        help: "Max wall-clock seconds for browser discovery.",
       },
     ],
   },
   {
     title: "Scanner engine",
-    icon: Gauge,
     blurb: "Throughput and timeouts for the active probing phase.",
     fields: [
       {
@@ -165,7 +137,6 @@ const CONFIG_GROUPS = [
         min: 1,
         max: 50,
         placeholder: "e.g. 10",
-        help: "Concurrent HTTP workers during scanning.",
       },
       {
         key: "request_timeout_seconds",
@@ -175,7 +146,6 @@ const CONFIG_GROUPS = [
         max: 120,
         unit: "s",
         placeholder: "e.g. 30",
-        help: "HTTP request timeout in seconds.",
       },
       {
         key: "sensitive_paths_permutation_cap",
@@ -184,13 +154,11 @@ const CONFIG_GROUPS = [
         min: 0,
         max: 2000,
         placeholder: "e.g. 500",
-        help: "Maximum sensitive-path permutations to probe.",
       },
     ],
   },
   {
     title: "Injection & SSRF",
-    icon: Bug,
     blurb: "Timing thresholds and out-of-band callbacks for blind findings.",
     fields: [
       {
@@ -201,7 +169,6 @@ const CONFIG_GROUPS = [
         max: 1,
         step: 0.05,
         placeholder: "0.1 – 1.0",
-        help: "Fraction of expected delay used as the blind-injection threshold.",
       },
       {
         key: "ssrf_inband_timing_delta_ms",
@@ -211,7 +178,6 @@ const CONFIG_GROUPS = [
         max: 30000,
         unit: "ms",
         placeholder: "e.g. 1000",
-        help: "Min internal/external response-time delta for in-band SSRF.",
       },
       {
         key: "oast_callback_base_url",
@@ -219,7 +185,6 @@ const CONFIG_GROUPS = [
         type: "text",
         maxLength: 2048,
         placeholder: "https://oast.example/…",
-        help: "Out-of-band callback URL for SSRF confirmation.",
       },
       {
         key: "oast_poll_url",
@@ -227,13 +192,11 @@ const CONFIG_GROUPS = [
         type: "text",
         maxLength: 2048,
         placeholder: "https://oast.example/poll",
-        help: "URL to retrieve OAST callback results.",
       },
     ],
   },
   {
     title: "DOM XSS sweep",
-    icon: Browsers,
     blurb: "Budget for the browser-driven client-side reflection sweep.",
     fields: [
       {
@@ -243,7 +206,6 @@ const CONFIG_GROUPS = [
         min: 0,
         max: 100,
         placeholder: "e.g. 20",
-        help: "Max route+param probes for the browser DOM-XSS sweep.",
       },
       {
         key: "xss_browser_dom_budget_seconds",
@@ -253,14 +215,11 @@ const CONFIG_GROUPS = [
         max: 600,
         unit: "s",
         placeholder: "e.g. 60",
-        help: "Wall-clock budget for the DOM-XSS browser sweep.",
       },
     ],
   },
 ];
 
-// The three credential roles accepted by ScanCredentials. Supplying an account
-// unlocks authenticated crawling and the corresponding access-control tests.
 const CRED_ROLES = [
   {
     key: "main",
@@ -279,8 +238,6 @@ const CRED_ROLES = [
   },
 ];
 
-// Fields on a single ScanAccountCredential. `advanced: true` fields are the
-// login-flow overrides most scans never need, so the UI can tuck them away.
 const CRED_FIELDS = [
   { key: "username", label: "Username / email", type: "text", maxLength: 320 },
   { key: "password", label: "Password", type: "password", maxLength: 512 },
@@ -291,7 +248,6 @@ const CRED_FIELDS = [
     maxLength: 8192,
     advanced: true,
     placeholder: "session=abc; csrf=def",
-    help: "Raw cookie fallback if username/password login isn't possible.",
   },
   {
     key: "header",
@@ -300,7 +256,6 @@ const CRED_FIELDS = [
     maxLength: 8192,
     advanced: true,
     placeholder: "Authorization: Bearer …",
-    help: "Raw header fallback, e.g. a bearer token.",
   },
   {
     key: "login_url",
@@ -308,7 +263,6 @@ const CRED_FIELDS = [
     type: "text",
     maxLength: 2048,
     advanced: true,
-    help: "Explicit login endpoint if it differs from the target root.",
   },
   {
     key: "success_url",
@@ -316,7 +270,6 @@ const CRED_FIELDS = [
     type: "text",
     maxLength: 2048,
     advanced: true,
-    help: "URL that confirms a logged-in session (e.g. /dashboard).",
   },
   {
     key: "success_text",
@@ -324,7 +277,6 @@ const CRED_FIELDS = [
     type: "text",
     maxLength: 256,
     advanced: true,
-    help: "Body text that confirms login success.",
   },
   {
     key: "success_regex",
@@ -332,7 +284,6 @@ const CRED_FIELDS = [
     type: "text",
     maxLength: 512,
     advanced: true,
-    help: "Regex matching a login-success signature.",
   },
   {
     key: "failure_text",
@@ -340,7 +291,6 @@ const CRED_FIELDS = [
     type: "text",
     maxLength: 256,
     advanced: true,
-    help: "Body text that indicates login failure.",
   },
   {
     key: "failure_regex",
@@ -348,7 +298,6 @@ const CRED_FIELDS = [
     type: "text",
     maxLength: 512,
     advanced: true,
-    help: "Regex matching a login-failure signature.",
   },
   {
     key: "validation_url",
@@ -356,19 +305,13 @@ const CRED_FIELDS = [
     type: "text",
     maxLength: 2048,
     advanced: true,
-    help: "Protected URL used to verify an active session.",
   },
 ];
 
-// Vertical-sidebar navigation. Active receives its queued/running count from
-// Sidebar, so no count lives here.
-const NAV_ITEMS = [
-  { to: "/scan", label: "New Scan", Icon: ShieldCheck, end: true },
-  { to: "/active", label: "Active", Icon: Pulse, badge: "active" },
-  { to: "/history", label: "History", Icon: ClockCounterClockwise },
-];
-
 export {
+  NAV_ITEMS,
+  MOBILE_NAV,
+  ROUTE_NAMES,
   SEVERITIES,
   SEVERITY_META,
   SCAN_PHASES,
@@ -376,5 +319,4 @@ export {
   CONFIG_GROUPS,
   CRED_ROLES,
   CRED_FIELDS,
-  NAV_ITEMS,
 };

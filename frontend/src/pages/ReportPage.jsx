@@ -1,80 +1,567 @@
 import { useCallback, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, CheckCircle, CircleNotch, Clock, DownloadSimple, FileText, Globe, Lightning, Warning, WarningCircle } from "@phosphor-icons/react";
-import ScoreRing from "../components/ScoringRing.jsx";
-import SeverityBadge from "../components/SeverityBadge.jsx";
-import VulnerabilityCard from "../components/VulnerabilityCard.jsx";
-import { SEVERITIES, SEVERITY_META } from "../data/constants.js";
+import { ChevronDown, Download, FileText } from "lucide-react";
 import { downloadReportPdf, getReport } from "../services/reports.js";
 import { downloadFile, saveBlob } from "../utils/helpers.js";
+import { SEVERITIES, SEVERITY_META } from "../data/constants.js";
+import { useToast } from "../components/Toast.jsx";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
-const SEV_STYLE = { critical: "border-[#efbbb7] bg-[#fff0ef] text-[#de3d34]", high: "border-[#f4c7a1] bg-[#fff5eb] text-[#b54708]", medium: "border-[#ead49a] bg-[#fff8e6] text-[#8a6108]", low: "border-[#a9ddc6] bg-[#edf9f3] text-[#1c8742]" };
-const outlineButton = "inline-flex min-h-9 items-center justify-center gap-2 rounded-md border border-[#cfd7e3] bg-white px-3.5 text-[10px] font-semibold text-[#3f4b60] transition hover:bg-[#e8eff8] active:translate-y-px disabled:cursor-not-allowed disabled:opacity-50";
-function sevKey(value) { return (value || "").toString().toLowerCase(); }
-function prettify(value) { return value === null || value === undefined || value === "" ? "-" : value.toString().replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()); }
-function boolText(value) { return value ? "Yes" : "No"; }
-function riskRating(score) { return score >= 75 ? "critical" : score >= 50 ? "high" : score >= 25 ? "medium" : score > 0 ? "low" : "safe"; }
-function formatDate(iso) { if (!iso) return "-"; const date = new Date(iso); return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString(); }
-function KV({ label, value }) { return <div className='grid grid-cols-[minmax(0,1fr)_auto] gap-4 border-b border-[#edf0f4] py-2.5 last:border-0'><dt className='text-[9px] text-[#6f7c8c]'>{label}</dt><dd className='m-0 max-w-[16rem] truncate text-right font-mono text-[9px] font-semibold text-[#415166]' title={String(value)}>{value}</dd></div>; }
-function Panel({ title, children, className = "" }) { return <section className={`border border-[#cbd5e3] bg-white ${className}`}><h2 className='border-b border-[#cbd5e3] px-4 py-3 text-[9px] font-semibold uppercase tracking-[0.12em] text-[#6f7c8c]'>{title}</h2><div className='p-4'>{children}</div></section>; }
+
+function sevKey(v) {
+  return (v || "").toString().toLowerCase();
+}
+
+function riskLine(score) {
+  if (score >= 75) return "Critical risk. Fix immediately before release.";
+  if (score >= 50) return "High risk. Fix critical issues before release.";
+  if (score >= 25) return "Medium risk. Plan remediation next sprint.";
+  return "Low risk. Monitor for regressions.";
+}
+
+function formatDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? "—"
+    : d.toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+      });
+}
+
+// Full date + time for the report header (the scan timestamp).
+function formatDateTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? "—"
+    : d.toLocaleString(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+}
+
+function crawlLabel(mode) {
+  return mode === "single" ? "Single page" : "Full site";
+}
+
+function severityBand(score) {
+  if (score >= 75) return "Critical";
+  if (score >= 50) return "High";
+  if (score >= 25) return "Medium";
+  return "Low";
+}
+
+function sevTagClass(severity) {
+  const s = sevKey(severity);
+  if (s === "medium") return "medium";
+  if (s === "low") return "low";
+  return "high";
+}
+
+function titleCase(value) {
+  const s = (value || "").toString().replace(/[_-]+/g, " ").trim();
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : "—";
+}
+
+function hostnameOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url || "Report";
+  }
+}
+
+// A single finding row that expands to reveal the full backend detail:
+// location, CVSS vector, evidence snippets, and the AI analysis block.
+function Finding({ v }) {
+  const [open, setOpen] = useState(false);
+  const loc = v.location || {};
+  const ev = v.evidence || {};
+  const ai = v.ai_analysis || {};
+  const cvss = Number.isFinite(v.cvss_score) ? v.cvss_score.toFixed(1) : "—";
+  const url = loc.url || "";
+  const params =
+    loc.parameters && loc.parameters.length
+      ? loc.parameters.join(", ")
+      : loc.parameter || "";
+
+  return (
+    <article className={`finding${open ? " open" : ""}`}>
+      <button
+        type='button'
+        className='finding-head'
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
+        <span className={`sev-dot ${sevTagClass(v.severity)}`} />
+        <div className='finding-title'>
+          <div className='rowtitle'>{titleCase(v.vuln_type)}</div>
+          <div className='small mono'>{url}</div>
+        </div>
+        <span className='finding-cat small'>{v.category}</span>
+        <span className={`sev-tag ${sevTagClass(v.severity)}`}>
+          {SEVERITY_META[sevKey(v.severity)]?.label || v.severity}
+        </span>
+        <span className='finding-cvss mono'>{cvss}</span>
+        <ChevronDown className='ico chev' />
+      </button>
+      {open && (
+        <div className='finding-body'>
+          <div className='kv-grid'>
+            <div className='kv-cell'>
+              <span>HTTP method</span>
+              <b>{loc.http_method || "GET"}</b>
+            </div>
+            {params && (
+              <div className='kv-cell'>
+                <span>Parameter(s)</span>
+                <b className='mono'>{params}</b>
+              </div>
+            )}
+            <div className='kv-cell'>
+              <span>Evidence strength</span>
+              <b>{titleCase(v.evidence_strength || ev.evidence_strength)}</b>
+            </div>
+            <div className='kv-cell'>
+              <span>Review status</span>
+              <b>{titleCase(v.review_status)}</b>
+            </div>
+            <div className='kv-cell'>
+              <span>Auth context</span>
+              <b>{titleCase(v.auth_context || ev.auth_context)}</b>
+            </div>
+            {ev.confidence_score > 0 && (
+              <div className='kv-cell'>
+                <span>Confidence</span>
+                <b>{Math.round(ev.confidence_score)}%</b>
+              </div>
+            )}
+            {ai.exploitability && (
+              <div className='kv-cell'>
+                <span>Exploitability</span>
+                <b>{ai.exploitability}</b>
+              </div>
+            )}
+          </div>
+
+          {v.cvss_vector && (
+            <p className='small mono' style={{ marginTop: 12 }}>
+              {v.cvss_vector}
+            </p>
+          )}
+
+          {ev.payload && (
+            <div className='finding-block'>
+              <h4>Payload</h4>
+              <pre>{ev.payload}</pre>
+            </div>
+          )}
+          {ev.request_snippet && (
+            <div className='finding-block'>
+              <h4>Request</h4>
+              <pre>{ev.request_snippet}</pre>
+            </div>
+          )}
+          {ev.response_snippet && (
+            <div className='finding-block'>
+              <h4>Response</h4>
+              <pre>{ev.response_snippet}</pre>
+            </div>
+          )}
+
+          {ai.business_impact && (
+            <div className='finding-block'>
+              <h4>Business impact</h4>
+              <p>{ai.business_impact}</p>
+            </div>
+          )}
+          {ai.remediation && (
+            <div className='finding-block'>
+              <h4>Remediation</h4>
+              <p>{ai.remediation}</p>
+            </div>
+          )}
+        </div>
+      )}
+    </article>
+  );
+}
 
 function ReportPage() {
-  const { scanId } = useParams(); const navigate = useNavigate(); const location = useLocation();
+  const { scanId } = useParams();
+  const navigate = useNavigate();
+  const location = useLocation();
   const target = location.state?.target || "";
-  const [report, setReport] = useState(null); const [loading, setLoading] = useState(true); const [error, setError] = useState(""); const [filter, setFilter] = useState("all"); const [busy, setBusy] = useState(""); const [notice, setNotice] = useState("");
-  const load = useCallback(async (signal) => { setLoading(true); setError(""); try { setReport(await getReport(scanId, signal)); } catch (err) { if (err.name !== "AbortError") setError(err.message || "Could not load the report."); } finally { if (!signal || !signal.aborted) setLoading(false); } }, [scanId]);
+  const toast = useToast();
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [busy, setBusy] = useState("");
+
+  const load = useCallback(
+    async (signal) => {
+      setLoading(true);
+      setError("");
+      try {
+        setReport(await getReport(scanId, signal));
+      } catch (err) {
+        if (err.name !== "AbortError")
+          setError(err.message || "Could not load the report.");
+      } finally {
+        if (!signal || !signal.aborted) setLoading(false);
+      }
+    },
+    [scanId],
+  );
+
   useEffect(() => {
     const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount
     load(controller.signal);
     return () => controller.abort();
   }, [load]);
-  const handleDownloadJson = useCallback(() => { if (report) downloadFile(JSON.stringify(report, null, 2), `sentrystrike-${scanId}.json`, "application/json"); }, [report, scanId]);
-  const handleDownloadPdf = useCallback(async () => { setBusy("pdf"); setNotice(""); try { saveBlob(await downloadReportPdf(scanId), `sentrystrike-${scanId}.pdf`); } catch (err) { setNotice(err.message || "Could not download the PDF."); } finally { setBusy(""); } }, [scanId]);
 
-  if (loading) return <div className='flex min-h-[calc(100dvh-64px)] items-center justify-center gap-3 text-[12px] text-[#6f7c8c]'><CircleNotch className='animate-spin text-[#006de2]' size={25} weight='bold' />Loading report</div>;
-  if (error) return <div className='mx-auto max-w-3xl px-4 py-10'><button className='inline-flex items-center gap-2 text-[10px] font-semibold text-[#415166]' onClick={() => navigate("/history")}><ArrowLeft size={14} weight='bold' />Back</button><div className='mt-6 flex flex-col items-start gap-4 border border-[#efbbb7] bg-[#fff0ef] p-5 text-[12px] text-[#de3d34]'><span className='flex gap-2'><WarningCircle size={16} weight='fill' />{error}</span><button className={outlineButton} onClick={() => load()}>Retry</button></div></div>;
+  const handleJson = useCallback(() => {
+    if (report)
+      downloadFile(
+        JSON.stringify(report, null, 2),
+        `sentrystrike-${scanId}.json`,
+        "application/json",
+      );
+  }, [report, scanId]);
+
+  const handlePdf = useCallback(async () => {
+    setBusy("pdf");
+    toast("PDF generation started");
+    try {
+      saveBlob(await downloadReportPdf(scanId), `sentrystrike-${scanId}.pdf`);
+    } catch (err) {
+      toast(err.message || "Could not download the PDF.");
+    } finally {
+      setBusy("");
+    }
+  }, [scanId, toast]);
+
+  if (loading)
+    return (
+      <div className='view'>
+        <div className='empty-state'>Loading report…</div>
+      </div>
+    );
+  if (error)
+    return (
+      <div className='view'>
+        <button className='back' onClick={() => navigate("/reports")}>
+          ← All reports
+        </button>
+        <div className='auth-error'>{error}</div>
+      </div>
+    );
   if (!report) return null;
 
-  const stats = report.statistics || {}; const breakdown = stats.severity_breakdown || {};
-  const vulns = (report.vulnerabilities || []).slice().sort((a, b) => ((SEV_ORDER[sevKey(a.severity)] ?? 9) - (SEV_ORDER[sevKey(b.severity)] ?? 9)) || ((b.cvss_score || 0) - (a.cvss_score || 0)));
-  const filtered = filter === "all" ? vulns : vulns.filter((vuln) => sevKey(vuln.severity) === filter);
-  const riskScore = Math.round(report.risk_score || 0); const rating = riskRating(riskScore);
-  const techs = report.technology_stack || []; const chains = report.attack_chains || []; const limitations = report.scanner_limitations || []; const auth = report.authorization || {};
-  const evidence = report.evidence_strength_breakdown || {}; const spa = report.spa_api_coverage || {}; const authCov = report.auth_coverage || {}; const warnings = report.report_metadata?.coverage_warnings || [];
-  const summaryStats = [["Vulnerabilities", stats.total_vulnerabilities ?? vulns.length], ["URLs crawled", stats.total_urls_crawled ?? "-"], ["Info findings", breakdown.info ?? 0], ["Technologies", techs.length]];
+  const stats = report.statistics || {};
+  const breakdown = stats.severity_breakdown || {};
+  const vulns = (report.vulnerabilities || [])
+    .slice()
+    .sort(
+      (a, b) =>
+        (SEV_ORDER[sevKey(a.severity)] ?? 9) -
+          (SEV_ORDER[sevKey(b.severity)] ?? 9) ||
+        (b.cvss_score || 0) - (a.cvss_score || 0),
+    );
+  const filtered =
+    filter === "all"
+      ? vulns
+      : vulns.filter((v) => sevKey(v.severity) === filter);
+  const score = Math.round(report.risk_score || 0);
+  const targetUrl = report.target_url || target || "";
+  const targetHost = hostnameOf(targetUrl);
+  const scanTime =
+    report.started_at || report.completed_at || report.generated_at;
+  const tech = report.technology_stack || [];
+  const authCov = report.auth_coverage || {};
+  const spaCov = report.spa_api_coverage || {};
+  const evidence = report.evidence_strength_breakdown || {};
+  const chains = report.attack_chains || [];
+  const limitations = report.scanner_limitations || [];
+  const coverage =
+    report.coverage_summary?.overall_coverage_pct ??
+    report.report_metadata?.coverage_percent;
+  const coverageStr = Number.isFinite(coverage)
+    ? `${Math.round(coverage)}%`
+    : "—";
 
   return (
-    <div className='mx-auto w-full max-w-[1440px] px-4 py-8 sm:px-6 lg:px-8 lg:py-10'>
-      <button className='inline-flex items-center gap-2 border-0 bg-transparent p-0 text-[10px] font-semibold text-[#415166] hover:text-[#006de2]' onClick={() => navigate("/history")}><ArrowLeft size={14} weight='bold' />Scan history</button>
-      <header className='mt-6 flex flex-col gap-5 border-b border-[#cbd5e3] pb-7 lg:flex-row lg:items-end lg:justify-between'>
-        <div><span className='text-[10px] font-semibold uppercase tracking-[0.16em] text-[#006de2]'>Security scan</span><h1 className='mt-2 text-3xl font-semibold leading-tight'>Report</h1><div className='mt-3 flex min-w-0 flex-wrap items-center gap-x-5 gap-y-2 text-[9px] text-[#6f7c8c]'><span className='flex min-w-0 items-center gap-1.5'><Globe size={13} weight='bold' /><code className='max-w-[36rem] truncate font-mono'>{target || report.scan_id}</code></span><span className='flex items-center gap-1.5'><Clock size={13} />{formatDate(report.generated_at)}</span>{auth.confirmed && <span className='flex items-center gap-1.5 text-[#1c8742]'><CheckCircle size={13} weight='fill' />Authorized</span>}</div></div>
-        <div className='flex flex-wrap gap-2'><button className={outlineButton} onClick={handleDownloadJson}><FileText size={14} weight='bold' />JSON</button><button className={`${outlineButton} border-[#006de2] bg-[#006de2] text-white hover:bg-[#004bb7]`} onClick={handleDownloadPdf} disabled={busy === "pdf"}>{busy === "pdf" ? <CircleNotch className='animate-spin' size={14} weight='bold' /> : <DownloadSimple size={14} weight='bold' />}{busy === "pdf" ? "Building PDF" : "Download PDF"}</button></div>
-      </header>
-      {notice && <div className='mt-5 border-l-2 border-[#de3d34] bg-[#fff0ef] px-4 py-3 text-[10px] text-[#de3d34]'>{notice}</div>}
-
-      <div className='mt-7 grid gap-6 lg:grid-cols-[220px_minmax(0,1fr)]'>
-        <aside className='grid gap-5 lg:sticky lg:top-24 lg:self-start'>
-          <Panel title='Risk score'><div className='flex flex-col items-center'><ScoreRing score={riskScore} caption='Risk / 100' higherIsWorse /><div className='mt-3 flex items-center gap-2 text-[9px] text-[#6f7c8c]'>Overall risk <SeverityBadge severity={rating} /></div></div></Panel>
-          <Panel title='Severity totals'><div className='grid gap-2'>{["critical", "high", "medium", "low", "info"].map((severity) => <div key={severity} className='flex items-center justify-between text-[9px]'><span className='capitalize text-[#415166]'>{severity}</span><strong className='font-mono text-[#0a1421]'>{breakdown[severity] ?? 0}</strong></div>)}</div></Panel>
-        </aside>
-        <main className='min-w-0 space-y-6'>
-          {report.executive_summary && <Panel title='Executive summary'><p className='whitespace-pre-line text-[11px] leading-6 text-[#415166]'>{report.executive_summary}</p></Panel>}
-          <section className='grid grid-cols-2 border border-[#cbd5e3] bg-white md:grid-cols-4'>{summaryStats.map(([label, value]) => <div key={label} className='border-b border-r border-[#cbd5e3] p-4 even:border-r-0 md:border-b-0 md:even:border-r md:last:border-r-0'><strong className='block font-mono text-xl font-semibold tabular-nums text-[#172033]'>{value}</strong><span className='mt-1 block text-[8px] uppercase tracking-[0.1em] text-[#6f7c8c]'>{label}</span></div>)}</section>
-          <section><div className='mb-3 flex items-end justify-between gap-4'><div><span className='text-[9px] font-semibold uppercase tracking-[0.12em] text-[#6f7c8c]'>Detailed findings</span><h2 className='mt-1 text-[16px] font-semibold'>{vulns.length} {vulns.length === 1 ? "vulnerability" : "vulnerabilities"}</h2></div><div className='flex max-w-full gap-1 overflow-x-auto'>{[["all", "All"], ...SEVERITIES.map((severity) => [severity, SEVERITY_META[severity].label])].map(([value, label]) => <button key={value} className={`min-h-8 shrink-0 rounded px-2.5 text-[9px] font-semibold transition ${filter === value ? "bg-[#172033] text-white" : "border border-[#cbd5e3] bg-white text-[#415166] hover:bg-[#e8eff8]"}`} onClick={() => setFilter(value)}>{label}</button>)}</div></div><div className='grid gap-2'>{filtered.length ? filtered.map((vuln, index) => <VulnerabilityCard key={vuln.id} vuln={vuln} defaultOpen={index === 0} />) : <div className='border border-[#cbd5e3] bg-white px-5 py-12 text-center text-[11px] text-[#6f7c8c]'>No findings for this severity.</div>}</div></section>
-          <div className='grid gap-6 xl:grid-cols-2'>
-            <Panel title='Evidence strength'><dl>{[["Confirmed exploit", evidence.confirmed_exploit ?? 0], ["Confirmed observation", evidence.confirmed_observation ?? 0], ["Probable", evidence.probable ?? 0], ["Possible", evidence.possible ?? 0], ["Informational", evidence.informational ?? 0]].map(([label, value]) => <KV key={label} label={label} value={value} />)}</dl></Panel>
-            <Panel title='Technology stack'>{techs.length ? <div className='grid gap-2'>{techs.map((tech, index) => <div key={`${tech.name}-${index}`} className='flex items-center justify-between border-b border-[#edf0f4] py-2 last:border-0'><span className='font-mono text-[9px] font-semibold text-[#415166]'>{tech.name}{tech.version ? ` ${tech.version}` : ""}</span>{(tech.cves || []).length > 0 && <span className='rounded bg-[#fff0ef] px-2 py-1 text-[8px] text-[#de3d34]'>{tech.cves.length} CVE</span>}</div>)}</div> : <p className='text-[10px] text-[#6f7c8c]'>No technologies fingerprinted.</p>}</Panel>
-          </div>
-          <div className='grid gap-6 xl:grid-cols-2'>
-            <Panel title='Authenticated coverage'><dl><KV label='Session state' value={prettify(authCov.state)} /><KV label='Authenticated URLs' value={authCov.authenticated_url_count ?? 0} /><KV label='Unauthenticated URLs' value={authCov.unauthenticated_url_count ?? 0} /><KV label='Protected targets verified' value={authCov.protected_targets_verified ?? 0} /><KV label='Auth headers present' value={boolText(authCov.auth_headers_present)} /><KV label='Session cookies present' value={boolText(authCov.session_cookies_present)} /></dl></Panel>
-            <Panel title='SPA and API coverage'><dl><KV label='SPA detected' value={boolText(spa.spa_detected)} /><KV label='Routes extracted' value={spa.routes_extracted ?? 0} /><KV label='API endpoints' value={spa.api_endpoints_extracted ?? 0} /><KV label='Parameters extracted' value={spa.parameters_extracted ?? 0} /><KV label='Browser requests' value={spa.browser_requests_observed ?? 0} /><KV label='Dynamic status' value={prettify(spa.dynamic_status)} /></dl></Panel>
-          </div>
-          <Panel title='Attack chains'>{chains.length ? <div className='grid gap-3'>{chains.map((chain, index) => <div key={chain.id || index} className='grid grid-cols-[28px_minmax(0,1fr)] gap-3 border-b border-[#edf0f4] pb-3 last:border-0 last:pb-0'><span className='grid size-7 place-items-center rounded-md bg-[#fff4dc] text-[#925f05]'><Lightning size={14} weight='bold' /></span><div><div className='flex items-center gap-2 text-[10px] font-semibold'>Attack chain {index + 1}{chain.severity && <SeverityBadge severity={sevKey(chain.severity)} />}</div><p className='mt-1 text-[9px] leading-5 text-[#415166]'>{chain.description}</p></div></div>)}</div> : <p className='text-[10px] text-[#6f7c8c]'>No attack chains were identified.</p>}</Panel>
-          {(warnings.length > 0 || limitations.length > 0) && <Panel title='Coverage notes'><div className='grid gap-4'>{warnings.length > 0 && <div className={`border p-3 ${SEV_STYLE.medium}`}><h3 className='flex items-center gap-2 text-[9px] font-semibold'><Warning size={13} weight='bold' />Coverage warnings</h3><ul className='mt-2 grid gap-1 pl-4 text-[9px] leading-5'>{warnings.map((line, index) => <li key={index}>{line}</li>)}</ul></div>}{limitations.length > 0 && <ul className='grid gap-2 pl-4 text-[9px] leading-5 text-[#415166]'>{limitations.map((line, index) => <li key={index}>{line}</li>)}</ul>}</div></Panel>}
-        </main>
+    <div className='view'>
+      <button className='back' onClick={() => navigate("/reports")}>
+        ← All reports
+      </button>
+      <div className='head'>
+        <div>
+          <h2>{targetHost}</h2>
+          <p className='mono' style={{ wordBreak: "break-all" }}>
+            {targetUrl}
+          </p>
+          <p> {crawlLabel(report.crawl_mode)}</p>
+          <p>{formatDateTime(scanTime)} </p>
+        </div>
+        <div className='app-actions'>
+          <button className='btn' onClick={handleJson}>
+            <FileText className='ico' />
+            JSON
+          </button>
+          <button
+            className='btn primary'
+            onClick={handlePdf}
+            disabled={busy === "pdf"}
+          >
+            <Download className='ico' />
+            {busy === "pdf" ? "Building PDF…" : "PDF"}
+          </button>
+        </div>
       </div>
+
+      <div className='reportgrid'>
+        <aside className='scorebox'>
+          <strong>{score}</strong>
+          <p>{riskLine(score)}</p>
+          <div className='kv'>
+            <span>Risk level</span>
+            <b>{report.risk_level || severityBand(score)}</b>
+          </div>
+          <div className='kv'>
+            <span>Verified findings</span>
+            <b>{stats.total_vulnerabilities ?? vulns.length}</b>
+          </div>
+          <div className='kv'>
+            <span>URLs crawled</span>
+            <b>{stats.total_urls_crawled ?? "—"}</b>
+          </div>
+          <div className='kv'>
+            <span>Crawl scope</span>
+            <b>{crawlLabel(report.crawl_mode)}</b>
+          </div>
+          <div className='kv'>
+            <span>Coverage</span>
+            <b>{coverageStr}</b>
+          </div>
+          {authCov.state && (
+            <div className='kv'>
+              <span>Auth state</span>
+              <b>{titleCase(authCov.state)}</b>
+            </div>
+          )}
+        </aside>
+        <div className='reportbody'>
+          <h2>
+            {report.executive_summary?.split("\n")[0] || "Assessment complete."}
+          </h2>
+          <p>
+            {report.executive_summary?.split("\n").slice(1).join(" ") ||
+              "Verified findings and coverage details are shown below."}
+          </p>
+          <div className='severity'>
+            <div>
+              <strong className='high'>{breakdown.critical ?? 0}</strong>
+              <span>Critical</span>
+            </div>
+            <div>
+              <strong className='high'>{breakdown.high ?? 0}</strong>
+              <span>High</span>
+            </div>
+            <div>
+              <strong className='medium'>{breakdown.medium ?? 0}</strong>
+              <span>Medium</span>
+            </div>
+            <div>
+              <strong className='low'>{breakdown.low ?? 0}</strong>
+              <span>Low</span>
+            </div>
+            <div>
+              <strong>{breakdown.info ?? 0}</strong>
+              <span>Info</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className='panel'>
+        <div className='panel-h'>Scan coverage</div>
+        <div className='panel-b'>
+          <div className='kv-grid'>
+            <div className='kv-cell'>
+              <span>Crawl scope</span>
+              <b>{crawlLabel(report.crawl_mode)}</b>
+            </div>
+            <div className='kv-cell'>
+              <span>URLs crawled</span>
+              <b>{stats.total_urls_crawled ?? "—"}</b>
+            </div>
+            <div className='kv-cell'>
+              <span>Auth state</span>
+              <b>{titleCase(authCov.state) || "Unauthenticated"}</b>
+            </div>
+            <div className='kv-cell'>
+              <span>Authed URLs</span>
+              <b>{authCov.authenticated_url_count ?? 0}</b>
+            </div>
+            <div className='kv-cell'>
+              <span>Protected targets verified</span>
+              <b>{authCov.protected_targets_verified ?? 0}</b>
+            </div>
+            <div className='kv-cell'>
+              <span>SPA detected</span>
+              <b>{spaCov.spa_detected ? "Yes" : "No"}</b>
+            </div>
+            <div className='kv-cell'>
+              <span>API endpoints found</span>
+              <b>{spaCov.api_endpoints_extracted ?? 0}</b>
+            </div>
+            <div className='kv-cell'>
+              <span>Routes extracted</span>
+              <b>{spaCov.routes_extracted ?? 0}</b>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {(evidence.confirmed_exploit ||
+        evidence.confirmed_observation ||
+        evidence.probable ||
+        evidence.possible ||
+        evidence.informational) > 0 && (
+        <div className='panel'>
+          <div className='panel-h'>Evidence strength</div>
+          <div className='panel-b'>
+            <div className='kv-grid'>
+              <div className='kv-cell'>
+                <span>Confirmed exploit</span>
+                <b>{evidence.confirmed_exploit ?? 0}</b>
+              </div>
+              <div className='kv-cell'>
+                <span>Confirmed observation</span>
+                <b>{evidence.confirmed_observation ?? 0}</b>
+              </div>
+              <div className='kv-cell'>
+                <span>Probable</span>
+                <b>{evidence.probable ?? 0}</b>
+              </div>
+              <div className='kv-cell'>
+                <span>Possible</span>
+                <b>{evidence.possible ?? 0}</b>
+              </div>
+              <div className='kv-cell'>
+                <span>Informational</span>
+                <b>{evidence.informational ?? 0}</b>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tech.length > 0 && (
+        <div className='panel'>
+          <div className='panel-h'>Technology stack</div>
+          <div className='panel-b'>
+            <div className='tech-list'>
+              {tech.map((t, i) => (
+                <div key={`${t.name}-${i}`} className='tech-item'>
+                  <div>
+                    <b>{t.name}</b>
+                    {t.version && (
+                      <span className='mono small'> {t.version}</span>
+                    )}
+                    <div className='small'>{titleCase(t.category)}</div>
+                  </div>
+                  {Array.isArray(t.cves) && t.cves.length > 0 && (
+                    <span className='sev-tag high'>
+                      {t.cves.length} CVE{t.cves.length > 1 ? "s" : ""}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {chains.length > 0 && (
+        <div className='panel'>
+          <div className='panel-h'>Attack chains</div>
+          <div className='panel-b'>
+            {chains.map((c) => (
+              <div key={c.id} className='chain-item'>
+                <span
+                  className={`sev-tag ${
+                    sevKey(c.severity) === "medium"
+                      ? "medium"
+                      : sevKey(c.severity) === "low"
+                        ? "low"
+                        : "high"
+                  }`}
+                >
+                  {c.severity}
+                </span>
+                <p>{c.description}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className='filter-tabs'>
+        <button
+          className={`filter-tab${filter === "all" ? " active" : ""}`}
+          onClick={() => setFilter("all")}
+        >
+          All ({vulns.length})
+        </button>
+        {SEVERITIES.map((s) => (
+          <button
+            key={s}
+            className={`filter-tab${filter === s ? " active" : ""}`}
+            onClick={() => setFilter(s)}
+          >
+            {SEVERITY_META[s].label} ({breakdown[s] ?? 0})
+          </button>
+        ))}
+      </div>
+
+      <div className='panel'>
+        <div className='panel-h'>Detailed findings</div>
+        <div className='panel-b'>
+          {filtered.length === 0 ? (
+            <p className='muted-text'>
+              No findings for this severity.
+            </p>
+          ) : (
+            <div className='findings'>
+              {filtered.map((v) => (
+                <Finding key={v.id} v={v} />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {limitations.length > 0 && (
+        <div className='panel'>
+          <div className='panel-h'>Scanner limitations</div>
+          <div className='panel-b'>
+            <ul className='limitations'>
+              {limitations.map((l, i) => (
+                <li key={i}>{l}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

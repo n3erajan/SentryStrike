@@ -1,41 +1,79 @@
-import { useState } from "react";
-import { Outlet, useLocation, useNavigate } from "react-router-dom";
-import { List, Plus } from "@phosphor-icons/react";
-import Sidebar from "./Sidebar.jsx";
+import { useEffect, useState } from "react";
+import { Outlet, NavLink, useLocation, useNavigate } from "react-router-dom";
+import { Menu, Plus } from "lucide-react";
+import Sidebar, { workspaceName } from "./Sidebar.jsx";
+import { MOBILE_NAV, ROUTE_NAMES } from "../data/constants.js";
+import { useAuth } from "../context/AuthContext.jsx";
 
 function crumbFor(pathname) {
-  if (pathname.includes("/report/")) return "History / Security report";
-  if (pathname.includes("/active/")) return "Active scans / Live scan";
-  if (pathname.endsWith("/active")) return "Active scans";
-  if (pathname.endsWith("/history")) return "Scan history";
-  return "New scan";
+  if (pathname.startsWith("/active/")) return "Active scans / Live scan";
+  if (pathname.startsWith("/report/")) return "Reports / Security report";
+  for (const [route, name] of Object.entries(ROUTE_NAMES)) {
+    if (pathname === route) return name;
+  }
+  return "Home";
 }
 
 function AppLayout() {
   const location = useLocation();
   const navigate = useNavigate();
+  const { user } = useAuth();
+  const onScanPage = location.pathname === "/scan";
   const [menuOpen, setMenuOpen] = useState(false);
-  const onScanPage = location.pathname.endsWith("/scan");
+
+  // Close the mobile drawer whenever the route changes.
+  useEffect(() => {
+    setMenuOpen(false);
+  }, [location.pathname]);
 
   return (
-    <div className='min-h-dvh bg-[#f6f9fd] font-sans text-[#172033] lg:grid lg:grid-cols-[224px_minmax(0,1fr)]'>
+    <div className='workspace-shell'>
       <Sidebar open={menuOpen} onClose={() => setMenuOpen(false)} />
-      <div className='min-w-0'>
-        <header className='sticky top-0 z-20 flex h-16 items-center justify-between border-b border-[#cbd5e3] bg-white/95 px-4 backdrop-blur-md sm:px-6 lg:px-8'>
-          <div className='flex min-w-0 items-center gap-3'>
-            <button className='grid size-9 shrink-0 place-items-center rounded-md border border-[#cbd5e3] bg-white text-[#415166] transition hover:bg-[#e8eff8] active:translate-y-px focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#006de2] lg:hidden' onClick={() => setMenuOpen(true)} aria-label='Open navigation'>
-              <List size={19} weight='bold' />
+      {menuOpen && (
+        <button
+          type='button'
+          className='side-overlay'
+          aria-label='Close menu'
+          onClick={() => setMenuOpen(false)}
+        />
+      )}
+      <main className='app-main'>
+        <header className='app-top'>
+          <div className='crumb'>
+            <button
+              type='button'
+              className='menu-btn'
+              aria-label='Open menu'
+              aria-expanded={menuOpen}
+              onClick={() => setMenuOpen(true)}
+            >
+              <Menu className='ico' />
             </button>
-            <div className='truncate text-[12px] text-[#6f7c8c]'>SentryStrike <span className='px-1 text-[#cbd5e3]'>/</span> <b className='font-semibold text-[#0a1421]'>{crumbFor(location.pathname)}</b></div>
+            {workspaceName(user)} / <b>{crumbFor(location.pathname)}</b>
           </div>
-          {!onScanPage && (
-            <button className='inline-flex min-h-9 shrink-0 items-center justify-center gap-2 rounded-md bg-[#006de2] px-3.5 text-[12px] font-semibold text-white transition hover:bg-[#004bb7] active:translate-y-px focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#006de2]' onClick={() => navigate("/scan")}>
-              <Plus size={15} weight='bold' /> <span className='hidden sm:inline'>New scan</span>
-            </button>
-          )}
+          <div className='app-actions'>
+            {!onScanPage && (
+              <button className='btn primary' onClick={() => navigate("/scan")}>
+                <Plus className='ico' />
+                New Scan
+              </button>
+            )}
+          </div>
         </header>
-        <main id='main-content' className='min-w-0'><Outlet /></main>
-      </div>
+        <Outlet />
+      </main>
+      <nav className='mobile' aria-label='Mobile navigation'>
+        {MOBILE_NAV.map(({ to, label, Icon }) => (
+          <NavLink
+            key={to}
+            to={to}
+            className={({ isActive }) => (isActive ? "active" : undefined)}
+          >
+            <Icon className='ico' />
+            {label}
+          </NavLink>
+        ))}
+      </nav>
     </div>
   );
 }

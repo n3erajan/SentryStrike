@@ -60,6 +60,13 @@ def _scan_summary(scan) -> dict:
         "phase_message": scan.phase_message,
         "authorization_confirmed": scan.authorization_confirmed,
         "authorization_confirmed_at": scan.authorization_confirmed_at,
+        "risk_score": scan.overall_risk_score,
+        "risk_level": scan.overall_risk_level,
+        "total_findings": scan.statistics.total_vulnerabilities,
+        "severity_breakdown": scan.statistics.severity_breakdown.model_dump(mode="json"),
+        "total_urls_crawled": scan.statistics.total_urls_crawled,
+        "started_at": scan.started_at,
+        "completed_at": scan.completed_at,
         "created_at": scan.created_at,
         "updated_at": scan.updated_at,
     }

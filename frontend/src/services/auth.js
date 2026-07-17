@@ -34,23 +34,32 @@ export function isAuthenticated() {
   return !!getToken();
 }
 
-async function authenticate(path, credentials) {
+async function authenticate(path, credentials, extras) {
+  const { email, password } = credentials;
   const data = await apiRequest(path, {
     method: "POST",
     auth: false,
-    body: credentials,
+    body: { email, password },
   });
   setToken(data.access_token);
-  saveUser(data.user);
-  return data.user;
+  const user = extras ? { ...data.user, ...extras } : data.user;
+  saveUser(user);
+  return user;
 }
 
 export function login(credentials) {
   return authenticate("/auth/login", credentials);
 }
 
-export function register(credentials) {
-  return authenticate("/auth/register", credentials);
+export function register({ email, password, fullName, company }) {
+  const extras = {};
+  if (fullName) extras.fullName = fullName;
+  if (company) extras.company = company;
+  return authenticate(
+    "/auth/register",
+    { email, password },
+    Object.keys(extras).length ? extras : null,
+  );
 }
 
 export async function logout() {
