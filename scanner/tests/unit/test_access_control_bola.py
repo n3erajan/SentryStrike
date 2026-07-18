@@ -169,9 +169,6 @@ async def test_second_user_blocked_yields_no_finding(monkeypatch):
 
 
 class _MockSettings:
-    authentication_cookie = None
-    authentication_username = None
-    authentication_password = None
     authentication_failure_text = None
     authentication_failure_regex = None
     authentication_success_text = None

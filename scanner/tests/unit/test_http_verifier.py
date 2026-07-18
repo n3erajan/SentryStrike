@@ -178,3 +178,33 @@ async def test_concurrent_send_requests_saturate_slots_without_deadlock(monkeypa
     assert [r.status_code for r in results] == [200] * parties
     await verifier.close()
 
+
+@pytest.mark.asyncio
+async def test_explicit_cookie_header_replaces_client_cookie_jar():
+    observed_cookie_headers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed_cookie_headers.append(request.headers.get("cookie", ""))
+        return httpx.Response(200, text="ok", request=request)
+
+    verifier = HttpVerifier(
+        timeout_seconds=5.0,
+        cookies={"security": "high", "session": "stale"},
+    )
+    verifier._client = create_scan_client(
+        cookies=verifier.cookies,
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = await verifier.send_request(
+        "http://target.test/app/probe",
+        headers={"Cookie": "session=fresh; security=low"},
+        cookies={"session": "fresh", "security": "low"},
+    )
+
+    assert observed_cookie_headers == ["session=fresh; security=low"]
+    assert response.request_snippet is not None
+    assert response.request_snippet.count("Cookie:") == 1
+    assert "security=high" not in response.request_snippet
+    await verifier.close()
+

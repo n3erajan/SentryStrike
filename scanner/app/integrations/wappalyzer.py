@@ -109,15 +109,22 @@ class TechnologyDetector:
                 if snippet and "<" in snippet and ">" in snippet:
                     html_parts.append(snippet)
 
-        # Fallback / supplement: one fetch of the root document.
-        if not headers and not html_parts:
+        # Fallback / supplement: one fetch of the root document. Fires when
+        # EITHER headers or HTML are missing — the spider captures spa_root_html
+        # on every HTML crawl, and crawl_result.requests only exists when the
+        # browser engine ran, so non-SPA targets otherwise get HTML evidence but
+        # no header evidence (Server / X-Powered-By), yielding zero detections.
+        # Only fills the missing pieces; crawl-derived evidence is never clobbered.
+        if not headers or not html_parts:
             try:
                 async with create_scan_client(timeout=self.settings.request_timeout_seconds) as client:
                     resp = await client.get(url)
-                headers = {k.lower(): v for k, v in resp.headers.items()}
-                for cname, cval in resp.cookies.items():
-                    cookies.setdefault(cname, cval)
-                html_parts.append(resp.text)
+                if not headers:
+                    headers = {k.lower(): v for k, v in resp.headers.items()}
+                    for cname, cval in resp.cookies.items():
+                        cookies.setdefault(cname, cval)
+                if not html_parts:
+                    html_parts.append(resp.text)
             except Exception as exc:
                 logger.debug("Technology fallback fetch failed for %s: %s", url, exc)
 

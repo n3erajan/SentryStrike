@@ -1115,6 +1115,8 @@ def build_executive_summary(data: dict, styles: dict) -> list:
         url = vulns[0].get("location", {}).get("url", "")
         target = "/".join(url.split("/")[:3]) if url else "N/A"
 
+    ai_model = (d.get("report_metadata") or {}).get("ai_model")
+
     meta_rows = [
         ["Scan Target",  target],
         ["Scan ID",      d.get("scan_id", "N/A")],
@@ -1122,6 +1124,7 @@ def build_executive_summary(data: dict, styles: dict) -> list:
         ["Authorization Confirmed", "Yes" if (d.get("authorization") or {}).get("confirmed") else "No"],
         ["Authorization Confirmed At", _fmt_dt((d.get("authorization") or {}).get("confirmed_at"))],
         ["Generated At", date_str],
+        ["AI Analysis Model", ai_model or "Disabled (deterministic report)"],
         ["Risk Score",   f"{d.get('risk_score', 0):.2f} / 100" + (f" ({d.get('risk_level')})" if d.get('risk_level') else "")],
         ["Classification", "CONFIDENTIAL"],
     ]

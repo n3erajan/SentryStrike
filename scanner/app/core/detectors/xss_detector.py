@@ -336,14 +336,13 @@ class XSSDetector(BaseDetector):
                     target=target,
                     stored_display_overrides=stored_display_overrides if stored_display_overrides else None,
                 )
-                pending: list[PendingBrowserVerification] = []
-                if result.evidence.get("browser_verification_pending"):
+                pending = list(result.evidence.get("pending_jobs") or [])
+                if not pending and result.evidence.get("browser_verification_pending"):
                     job = result.evidence.get("pending_job")
                     if job:
                         pending.append(job)
-                    return [], pending
-                if result.is_vulnerable:
-                    return result.findings, []
+                if result.is_vulnerable or pending:
+                    return result.findings if result.is_vulnerable else [], pending
             except Exception as e:
                 logger.error("XSS verification failed for %s param %s: %s", cand_url, param, e)
             finally:
@@ -390,9 +389,20 @@ class XSSDetector(BaseDetector):
             if auth_headers:
                 browser_verifier.http_verifier.headers = {**browser_verifier.http_verifier.headers, **auth_headers}
             try:
+                confirmed_keys: set[tuple[str, str, str, str]] = set()
                 for job in pending_browser_jobs:
+                    job_key = (
+                        job.url,
+                        job.parameter,
+                        job.method,
+                        job.partial_finding.vuln_type,
+                    )
+                    if job_key in confirmed_keys:
+                        continue
                     browser_findings = await browser_verifier.run_browser_verification(job)
                     findings.extend(browser_findings)
+                    if browser_findings:
+                        confirmed_keys.add(job_key)
             finally:
                 await browser_verifier.close()
 

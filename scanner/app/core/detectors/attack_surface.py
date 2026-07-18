@@ -41,6 +41,37 @@ class PreparedAttackRequest:
     files: dict[str, Any] | None = None
 
 
+def _headers_with_cookie_context(
+    headers: dict[str, str], cookies: dict[str, str]
+) -> dict[str, str]:
+    """Carry an observed cookie context through header-only verifier paths.
+
+    Several active verifiers historically retained ``PreparedAttackRequest.headers``
+    but dropped its separate ``cookies`` field when building payload requests.  That
+    made the clean baseline use the browser-observed cookies while the injected
+    request fell back to the scan-wide cookie jar.  Path-scoped cookies could then
+    select a different session/security context, producing systematic false
+    negatives across unrelated detector classes.
+
+    An explicit Cookie header is the request-level source of truth.  Rebuild it from
+    the observed cookie mapping so duplicate names from the client jar cannot be
+    appended, while keeping ``cookies`` on the prepared request for callers that use
+    the structured field directly.
+    """
+    if not cookies:
+        return headers
+
+    merged = {
+        str(name): str(value)
+        for name, value in headers.items()
+        if str(name).lower() != "cookie"
+    }
+    merged["Cookie"] = "; ".join(
+        f"{name}={value}" for name, value in cookies.items()
+    )
+    return merged
+
+
 @dataclass
 class _ObservedFormInput:
     name: str
@@ -75,6 +106,7 @@ class AttackTarget:
         method = self.method.upper()
         headers = dict(self.headers or {})
         cookies = dict(self.cookies or {})
+        headers = _headers_with_cookie_context(headers, cookies)
 
         if self.location == ParameterLocation.path:
             return PreparedAttackRequest(
@@ -141,6 +173,7 @@ class AttackTarget:
 
         if self.location == ParameterLocation.cookie:
             cookies[self.parameter] = str(value)
+            headers = _headers_with_cookie_context(headers, cookies)
             return PreparedAttackRequest(url=self.url, method=method, headers=headers or None, cookies=cookies or None)
 
         return PreparedAttackRequest(url=self.url, method=method, headers=headers or None, cookies=cookies or None)
@@ -220,10 +253,19 @@ class AttackSurface:
                 continue
             template = None
             form_inputs = candidate.context.get("form_inputs")
-            metadata_headers, metadata_cookies = request_metadata.get(
-                (candidate.url, candidate.method.upper()),
-                ({}, {}),
-            )
+            # Server-rendered query/form candidates already replay through the
+            # scan-wide authenticated client. Do not let a later browser form
+            # interaction overwrite that clean context with request-local cookies
+            # produced by an unrelated state mutation. Browser/API candidates keep
+            # exact observed metadata below, which is essential for SPA token and
+            # path-scoped session replay.
+            if candidate.source in {"query", "form"}:
+                metadata_headers, metadata_cookies = {}, {}
+            else:
+                metadata_headers, metadata_cookies = request_metadata.get(
+                    (candidate.url, candidate.method.upper()),
+                    ({}, {}),
+                )
             headers = {
                 **metadata_headers,
                 **(candidate.context.get("headers") or {}),
@@ -1105,8 +1147,13 @@ class AttackSurface:
     ) -> dict[tuple[str, str], tuple[dict[str, str], dict[str, str]]]:
         metadata: dict[tuple[str, str], tuple[dict[str, str], dict[str, str]]] = {}
         for request in requests:
-            metadata[(request.url, request.method.upper())] = (
-                AttackSurface._request_replay_metadata(request)
+            # The first observation is the closest to the seeded crawl state.
+            # Later repetitions may follow form submissions that deliberately
+            # mutate cookies or authorization context; replacing the first entry
+            # made replay order-dependent and contaminated unrelated targets.
+            metadata.setdefault(
+                (request.url, request.method.upper()),
+                AttackSurface._request_replay_metadata(request),
             )
         return metadata
 

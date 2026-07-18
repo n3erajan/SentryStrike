@@ -752,6 +752,12 @@ class ScanOrchestrator:
             # Expose the winning login recipe to detectors (the auth detector uses it
             # as a reliable login-flow record for default/weak-credential probing).
             crawl_context["auth_replay_state"] = main_replay
+            # The scanner's OWN login identity for this scan (from the submitted
+            # main account, if any). The auth detector uses it to avoid flagging
+            # its own credentials as an exposed app identity. No env fallback.
+            crawl_context["scanner_identity_username"] = (
+                main_account.username if main_account else None
+            )
             main_credentials = (
                 (main_account.username, main_account.password) if main_account else None
             )
@@ -1205,6 +1211,10 @@ class ScanOrchestrator:
             await self._set_phase_progress(scan, ScanPhase.report_generation, 0.0, "Generating final report summary")
             report = await self.ai_report.generate(scan)
             scan.report_metadata.generated_at = datetime.now(timezone.utc)
+            _ai_settings = get_settings()
+            scan.report_metadata.ai_model = (
+                _ai_settings.ai_model if _ai_settings.ai_analysis_enabled else None
+            )
             
             # Extract summary: handle if AI returns dict instead of string
             executive_summary = report.get("executive_summary", "")
@@ -1344,7 +1354,7 @@ class ScanOrchestrator:
         scan_config: ScanConfig | None = crawl_context.get("scan_config")
         settings = get_settings()
         if detector_name == "access_control" and not (
-            settings.authentication_second_cookie or settings.authentication_second_header
+            crawl_context.get("second_user_cookies") or crawl_context.get("second_user_headers")
         ):
             skipped_reasons["second_user_account_missing"] = 1
         if detector_name == "ssrf":
@@ -3118,9 +3128,10 @@ class ScanOrchestrator:
         if file_inputs == 0:
             warnings.append("No browser-visible file inputs were discovered; upload candidate coverage was limited.")
         settings = get_settings()
-        if not (settings.authentication_second_cookie or settings.authentication_second_header):
+        ctx = crawl_context or {}
+        if not (ctx.get("second_user_cookies") or ctx.get("second_user_headers")):
             warnings.append("No second-user account configured; horizontal IDOR comparison was not tested.")
-        scan_config = (crawl_context or {}).get("scan_config")
+        scan_config = ctx.get("scan_config")
         oast_callback = (
             (scan_config.oast_callback_base_url if scan_config else None)
             or settings.oast_callback_base_url
@@ -3255,12 +3266,24 @@ class ScanOrchestrator:
             return AuthContext.unauthenticated
         return AuthContext.unknown
 
+    # Defensive upper bound on the raw response excerpt stored per finding.
+    # ResponseAnalyzer.build_evidence_response_snippet already centers and
+    # bounds bodies (~1200 chars), but detectors that stash a response some
+    # other way could exceed that; cap here so the report can't be bloated.
+    _MAX_RESPONSE_EXCERPT_CHARS = 2000
+
     def _finding_response_snippet(self, finding: Finding) -> str | None:
         evidence = self._clean_evidence_text(finding.evidence or "")
         response_snippet = (getattr(finding, "verification_response_snippet", None) or "").strip()
 
         if not self._should_include_response_excerpt(finding):
             return f"VERIFICATION EVIDENCE:\n{evidence}" if evidence else None
+
+        if response_snippet and len(response_snippet) > self._MAX_RESPONSE_EXCERPT_CHARS:
+            response_snippet = (
+                response_snippet[: self._MAX_RESPONSE_EXCERPT_CHARS]
+                + "\n[...snip after excerpt...]"
+            )
 
         if evidence and response_snippet:
             return f"VERIFICATION EVIDENCE:\n{evidence}\n\nRESPONSE EXCERPT:\n{response_snippet}"
@@ -3325,8 +3348,15 @@ class ScanOrchestrator:
             "remote_include_error_oracle",
             "authorization_matrix",
             "authorization_matrix_second_user",
+            "authorization_matrix_cross_identity",
             "authorization_matrix_privileged_baseline",
         }:
             return True
 
-        return bool(response_snippet) and len(response_snippet) <= 600
+        # Any active finding that captured a real response body is proof worth
+        # showing. Passive/heuristic findings never populate
+        # ``verification_response_snippet``, so they stay excluded here. We do
+        # NOT gate on response length: the snippet is already centered and
+        # bounded around the proof at capture time, and a larger response body
+        # is stronger evidence for an active finding, not a reason to drop it.
+        return bool(response_snippet)

@@ -161,6 +161,9 @@ class HttpVerifier:
         # the same ``{METHOD} {path} HTTP/1.1\nHost: …\n{headers}\n\n{body}``
         # shape — no per-call inline f-string divergence.
         all_headers = {**self.headers, **(headers or {})}
+        has_explicit_cookie_header = any(
+            str(name).lower() == "cookie" for name in all_headers
+        )
         body_str = ""
         if json_body is not None:
             body_str = json.dumps(json_body, separators=(",", ":"), default=str)
@@ -177,7 +180,11 @@ class HttpVerifier:
             url=snippet_url,
             method=method,
             headers=all_headers,
-            cookies={**self.cookies, **(cookies or {})},
+            cookies=(
+                {}
+                if has_explicit_cookie_header
+                else {**self.cookies, **(cookies or {})}
+            ),
             body=body_str,
         )
 
@@ -190,7 +197,11 @@ class HttpVerifier:
             request_kwargs["json"] = json_body
         if headers:
             request_kwargs["headers"] = headers
-        if cookies:
+        # An explicit request-level Cookie header must replace the client's cookie
+        # jar, not be combined with it.  Combining both is how duplicate path-scoped
+        # names (for example two different security/session values) reached the
+        # server and changed the application context between baseline and payload.
+        if cookies and not has_explicit_cookie_header:
             request_kwargs["cookies"] = cookies
 
         # Build the same effective request httpx will send so evidence includes

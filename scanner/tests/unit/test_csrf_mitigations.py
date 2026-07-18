@@ -307,7 +307,67 @@ async def test_csrf_builds_candidate_from_mutating_api_schema(monkeypatch):
     # and no forced Content-Type header (the client sets it for form data).
     assert calls[0]["data"] == {"displayName": "sentry_test_val"}
     assert calls[0]["json_body"] is None
-    assert calls[0]["headers"] is None
+    assert calls[0]["headers"] == {
+        "Origin": "https://evil.example",
+        "Referer": "https://evil.example/malicious",
+    }
+
+
+@pytest.mark.asyncio
+async def test_csrf_plain_200_without_processing_evidence_is_not_verified(monkeypatch):
+    class _GenericOkVerifier(_FakeVerifier):
+        async def send_request(self, url, method, params, data, headers=None, test_phase="", **kwargs):
+            return _FakeResponse(status_code=200, body="Welcome to the application")
+
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _GenericOkVerifier)
+    detector = CSRFDetector()
+    form = {
+        "action": "http://target.test/profile/update",
+        "method": "POST",
+        "inputs": [{"name": "displayName", "type": "text"}],
+        "page_url": "http://target.test/profile",
+    }
+
+    findings = await detector.detect(
+        [],
+        [form],
+        session_cookies={"session": "abc123"},
+    )
+
+    assert findings == []
+
+
+@pytest.mark.asyncio
+async def test_csrf_token_bypass_requires_valid_control_and_equivalent_foreign_probe(monkeypatch):
+    phases: list[str] = []
+
+    class _TokenVerifier(_FakeVerifier):
+        async def send_request(self, url, method, params, data, headers=None, test_phase="", **kwargs):
+            phases.append(test_phase)
+            return _FakeResponse(status_code=200, body="Profile updated successfully")
+
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _TokenVerifier)
+    detector = CSRFDetector()
+    form = {
+        "action": "http://target.test/profile/update",
+        "method": "POST",
+        "inputs": [
+            {"name": "csrf", "type": "hidden", "value": "observed-valid-token"},
+            {"name": "displayName", "type": "text"},
+        ],
+        "page_url": "http://target.test/profile",
+    }
+
+    findings = await detector.detect(
+        [],
+        [form],
+        session_cookies={"session": "abc123"},
+    )
+
+    assert phases == ["valid_token_control", "origin_token_bypass"]
+    assert len(findings) == 1
+    assert findings[0].verified is True
+    assert findings[0].parameter == "csrf"
 
 
 @pytest.mark.asyncio

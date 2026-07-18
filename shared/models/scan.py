@@ -154,6 +154,7 @@ class AttackChain(BaseModel):
 class ReportMetadata(BaseModel):
     generated_at: datetime | None = None
     generated_by: str = "ai"
+    ai_model: str | None = None
     summary: str | None = None
     attack_chains: list[AttackChain] = Field(default_factory=list)
     spa_api_coverage: SpaApiCoverage = Field(default_factory=SpaApiCoverage)

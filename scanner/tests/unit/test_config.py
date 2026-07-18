@@ -6,7 +6,12 @@ def test_scanner_settings_exclude_backend_configuration() -> None:
 
     assert "ai_model" in fields
     assert "crawl_depth" in fields
-    assert "authentication_username" in fields
+    assert "authentication_login_url" in fields
+    # Scan credentials are supplied per-scan with the request, never via env.
+    assert "authentication_username" not in fields
+    assert "authentication_password" not in fields
+    assert "authentication_cookie" not in fields
+    assert "authentication_second_cookie" not in fields
     assert "app_name" not in fields
     assert "allow_registration" not in fields
     assert "auth_cookie_name" not in fields

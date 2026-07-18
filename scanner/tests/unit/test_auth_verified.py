@@ -832,11 +832,12 @@ def test_harvest_login_identities_prefers_app_domain_over_scanner_domain():
     kwargs = {
         "root_url": "https://shop.test",
         "requests": [reviews],
-        # simulate scanner's own identity via a JWT email claim on a foreign domain
         "auth_headers": {},
+        # scanner's own identity is threaded per-scan via crawl_context, on a
+        # foreign domain (a personal gmail registered against a corporate app)
+        "scanner_identity_username": "pentester@gmail.com",
     }
-    with patch.object(get_settings(), "authentication_username", "pentester@gmail.com", create=False):
-        emails, usernames, domains = detector._harvest_login_identities(kwargs, {})
+    emails, usernames, domains = detector._harvest_login_identities(kwargs, {})
     assert "shop.test" in domains
     # app domain (2 observed emails) ranks before the scanner's personal domain
     assert domains[0] == "shop.test"
@@ -888,10 +889,10 @@ async def test_api_default_credentials_detected_via_harvested_domain():
                             request_snippet=f"{method} {url}", response_snippet="401")
 
     with patch.object(HttpVerifier, "send_request", send_request):
-        with patch.object(get_settings(), "authentication_username", "pentester@gmail.com", create=False):
-            findings = await detector.detect(
-                urls=[], forms=[], api_endpoints=[endpoint], requests=[reviews], root_url="https://shop.test",
-            )
+        findings = await detector.detect(
+            urls=[], forms=[], api_endpoints=[endpoint], requests=[reviews], root_url="https://shop.test",
+            scanner_identity_username="pentester@gmail.com",
+        )
     dc = [f for f in findings if f.vuln_type == "Default Credentials Accepted"]
     assert len(dc) == 1
     assert dc[0].payload == "admin@shop.test:admin123"
@@ -1053,8 +1054,10 @@ async def test_csrf_token_check_not_fired_for_non_login_email_form():
                             request_snippet="", response_snippet="401")
 
     with patch.object(HttpVerifier, "send_request", send_request):
-        with patch.object(get_settings(), "authentication_username", "pentester@gmail.com", create=False):
-            findings = await detector.detect(urls=[], forms=[form], requests=[reviews], root_url="https://shop.test")
+        findings = await detector.detect(
+            urls=[], forms=[form], requests=[reviews], root_url="https://shop.test",
+            scanner_identity_username="pentester@gmail.com",
+        )
 
     dc = [f for f in findings if f.vuln_type == "Default Credentials Accepted"]
     assert len(dc) == 1

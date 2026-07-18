@@ -491,20 +491,24 @@ class AccessControlDetector(BaseDetector):
         settings = get_settings()
         session_cookies: dict[str, str] = dict(kwargs.get("session_cookies") or {})
         auth_headers: dict[str, str] = dict(kwargs.get("auth_headers") or {})
+        # Auth material is provided per-scan via kwargs (sessions minted from the
+        # submitted low/second/privileged accounts). There is no env fallback:
+        # without submitted accounts these stay empty and the cross-identity
+        # checks that need them are simply skipped.
         low_auth = _AuthMaterial(
             label="low",
-            cookies=session_cookies or self._parse_cookie_string(settings.authentication_cookie),
-            headers=auth_headers or self._parse_header_string(settings.authentication_header),
+            cookies=session_cookies,
+            headers=auth_headers,
         )
         second_auth = self._build_auth_material(
             label="second",
-            cookie_value=kwargs.get("second_user_cookies") or settings.authentication_second_cookie,
-            header_value=kwargs.get("second_user_headers") or settings.authentication_second_header,
+            cookie_value=kwargs.get("second_user_cookies"),
+            header_value=kwargs.get("second_user_headers"),
         )
         privileged_auth = self._build_auth_material(
             label="privileged",
-            cookie_value=kwargs.get("privileged_cookies") or settings.authentication_privileged_cookie,
-            header_value=kwargs.get("privileged_headers") or settings.authentication_privileged_header,
+            cookie_value=kwargs.get("privileged_cookies"),
+            header_value=kwargs.get("privileged_headers"),
         )
         is_spa = bool(kwargs.get("is_spa", False))
         spa_root_html = str(kwargs.get("spa_root_html") or "")

@@ -74,13 +74,13 @@ logger = logging.getLogger(__name__)
 _HIGH_CONFIDENCE_THRESHOLD = 85.0
 
 # ---------------------------------------------------------------------------
-# Boolean differential thresholds (sqlmap-style directional check)
+# Boolean differential response clustering
 # ---------------------------------------------------------------------------
 
-# TRUE  response must be >= this similar to baseline (query still returns rows)
-_BOOL_TRUE_MATCH_MIN  = 0.80
-# FALSE response must be <= this similar to baseline (query returns no rows)
-_BOOL_FALSE_MATCH_MAX = 0.60
+# Minimum separation used only when two identical baseline requests are byte-for-
+# byte stable. On naturally dynamic pages the required separation scales from the
+# measured baseline noise instead of relying on a universal page-similarity cutoff.
+_BOOL_MIN_SEPARATION = 0.000001
 
 # ---------------------------------------------------------------------------
 # Page stability
@@ -187,6 +187,21 @@ def _body_similarity(a: Optional[str], b: Optional[str]) -> float:
     if not a and not b:
         return 1.0
     return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _boolean_pair_is_directional(analysis: dict, baseline_stability: float) -> bool:
+    """Classify a TRUE/FALSE pair relative to measured natural page variance."""
+    true_sim = float(analysis.get("baseline_similarity_to_true", 0.0))
+    false_sim = float(analysis.get("baseline_similarity_to_false", 0.0))
+    true_false_sim = float(analysis.get("true_vs_false_similarity", 1.0))
+    natural_noise = max(0.0, 1.0 - baseline_stability)
+    required_separation = max(_BOOL_MIN_SEPARATION, natural_noise * 0.25)
+    true_floor = max(_STABILITY_FLOOR, baseline_stability - max(0.005, natural_noise))
+    return (
+        true_sim >= true_floor
+        and (true_sim - false_sim) >= required_separation
+        and (1.0 - true_false_sim) >= required_separation
+    )
 
 
 def _has_sql_specific_error(text: str) -> bool:
@@ -336,6 +351,7 @@ class SQLiVerifier(BaseVerifier):
             # ... content type checks ...
             pass
 
+        stability = 1.0
         # Gate 2: Per-Parameter Stability Check
         if _run_differential and pre_test_baseline is not None:
             stability = await self._measure_page_stability(
@@ -344,23 +360,11 @@ class SQLiVerifier(BaseVerifier):
             if stability < _STABILITY_FLOOR:
                 _run_differential = False
 
-        # Gate 3: Parameter Characterisation
-        if _run_differential and pre_test_baseline is not None:
-            char = await self._characterise_parameter(
-                url, parameter, method, baseline_value, form_inputs, pre_test_baseline, target=target
-            )
-            if not char["reflective"]:
-                logger.debug(
-                    "Parameter %s:%s characterised as non-reflective (sim≥0.90) - "
-                    "skipping boolean and UNION, going straight to time-based",
-                    url, parameter,
-                )
-                _run_differential = False
-
         # Technique 1: Boolean Differential (Pass baseline_value explicitly)
         if _run_differential:
             result = await self._verify_boolean_based(
-                url, parameter, method, baseline_value, form_inputs, pre_test_baseline, target=target
+                url, parameter, method, baseline_value, form_inputs, pre_test_baseline,
+                target=target, baseline_stability=stability,
             )
             if result.is_vulnerable:
                 results.append(result)
@@ -512,24 +516,6 @@ class SQLiVerifier(BaseVerifier):
         except Exception as e:
             return 1.0
         
-    async def _characterise_parameter(self, url, parameter, method, value, form_inputs, baseline, target=None):
-        """
-        Determine which techniques are applicable:
-          - reflective: true/false content difference exists → boolean/UNION viable
-          - error_visible: SQL errors appear in responses → error-based viable
-          - always: time-based always attempted (last resort)
-        """
-        false_url, false_params, false_data, false_json, false_headers = self._build_request_args(
-            url, parameter, "' AND '1'='2'--", method, form_inputs, baseline_value=value, target=target
-        )
-        false_resp = await self._send(false_url, method, false_params, false_data,
-                                      headers=false_headers,
-                                      json_body=false_json,
-                                      test_phase="characterise_false")
-        sim = _body_similarity(baseline.body, false_resp.body)
-        is_reflective = sim < 0.90
-        return {"reflective": is_reflective}
-        
     # ======================================================================
     # Technique 1: Boolean-based differential (sqlmap-style)
     # ======================================================================
@@ -543,14 +529,10 @@ class SQLiVerifier(BaseVerifier):
         form_inputs: Optional[list] = None,
         pre_test_baseline: Optional[ResponseData] = None,
         target: Optional[object] = None,
+        baseline_stability: float = 1.0,
     ) -> VerificationResult:
         """
-        Boolean-based blind SQLi using directional similarity checks.
-
-        For each injection context:
-          TRUE  response must be >= 0.80 similar to baseline (rows returned)
-          FALSE response must be <= 0.60 similar to baseline (no rows returned)
-          Status codes must match baseline across all payloads.
+        Boolean-based blind SQLi using noise-relative response clustering.
 
         On first passing context, a second independent confirmation pair must
         also pass before is_vulnerable is set True. Two rounds passing
@@ -565,6 +547,8 @@ class SQLiVerifier(BaseVerifier):
             confirmed_false_payload = None
             confirmed_analysis      = None
             confirmed_context       = None
+            confirmed_true_resp: Optional[ResponseData] = None
+            confirmed_false_resp: Optional[ResponseData] = None
 
             for true_payload, false_payload in _BOOL_PAYLOAD_PAIRS:
 
@@ -596,12 +580,12 @@ class SQLiVerifier(BaseVerifier):
                 true_sim  = analysis.get("baseline_similarity_to_true",  1.0)
                 false_sim = analysis.get("baseline_similarity_to_false", 1.0)
 
-                if not (true_sim >= _BOOL_TRUE_MATCH_MIN and false_sim <= _BOOL_FALSE_MATCH_MAX):
+                if not _boolean_pair_is_directional(analysis, baseline_stability):
                     logger.debug(
-                        "Boolean context '%s' failed directional check %s:%s "
-                        "(true_sim=%.2f≥%.2f, false_sim=%.2f≤%.2f)",
+                        "Boolean context '%s' failed noise-relative clustering %s:%s "
+                        "(stability=%.4f, true_sim=%.4f, false_sim=%.4f)",
                         true_payload, url, parameter,
-                        true_sim, _BOOL_TRUE_MATCH_MIN, false_sim, _BOOL_FALSE_MATCH_MAX,
+                        baseline_stability, true_sim, false_sim,
                     )
                     continue
 
@@ -623,6 +607,8 @@ class SQLiVerifier(BaseVerifier):
                     "context": true_payload,
                 }
                 confirmed_context = true_payload
+                confirmed_true_resp = true_resp
+                confirmed_false_resp = false_resp
                 break
 
             if confirmed_true_payload is None:
@@ -659,10 +645,20 @@ class SQLiVerifier(BaseVerifier):
             ct_sim = confirm_analysis.get("baseline_similarity_to_true",  1.0)
             cf_sim = confirm_analysis.get("baseline_similarity_to_false", 1.0)
 
-            if not (ct_sim >= _BOOL_TRUE_MATCH_MIN and cf_sim <= _BOOL_FALSE_MATCH_MAX):
+            first_true_to_confirm = _body_similarity(confirmed_true_resp.body, ct_resp.body)
+            first_false_to_confirm = _body_similarity(confirmed_false_resp.body, cf_resp.body)
+            natural_noise = max(0.0, 1.0 - baseline_stability)
+            repeat_floor = max(_STABILITY_FLOOR, baseline_stability - max(0.01, natural_noise))
+            if (
+                not _boolean_pair_is_directional(confirm_analysis, baseline_stability)
+                or first_true_to_confirm < repeat_floor
+                or first_false_to_confirm < repeat_floor
+            ):
                 logger.debug(
-                    "Boolean confirmation failed %s:%s (ct_sim=%.2f, cf_sim=%.2f)",
+                    "Boolean confirmation failed %s:%s "
+                    "(ct_sim=%.4f, cf_sim=%.4f, true_repeat=%.4f, false_repeat=%.4f)",
                     url, parameter, ct_sim, cf_sim,
+                    first_true_to_confirm, first_false_to_confirm,
                 )
                 return VerificationResult(
                     is_vulnerable=False, confidence_score=0.0,
@@ -671,10 +667,12 @@ class SQLiVerifier(BaseVerifier):
                         **confirmed_analysis,
                         "suppressed": "confirmation_failed",
                         "confirm_true_sim": ct_sim, "confirm_false_sim": cf_sim,
+                        "true_repeat_similarity": first_true_to_confirm,
+                        "false_repeat_similarity": first_false_to_confirm,
                     },
                 )
 
-            confidence = 80.0
+            confidence = 85.0
             finding = self._create_finding(
                 category=OwaspCategory.a05,
                 vuln_type="SQL Injection (Boolean-Based Blind)",
@@ -907,10 +905,17 @@ class SQLiVerifier(BaseVerifier):
                                 canary,
                             )
                             continue
+                        inj_body_low = (inj_resp.body or "").lower()
+                        if "union select" in inj_body_low and "union select" not in baseline_body_low:
+                            logger.debug(
+                                "UNION canary '%s' accompanied by literal query syntax; "
+                                "suppressing text reflection/storage false positive.",
+                                canary,
+                            )
+                            continue
                         # --------------------------------------------------------
                         # UNIVERSAL ANTI-XSS GUARD: Detect literal text reflection
                         # --------------------------------------------------------
-                        inj_body_low = (inj_resp.body or "").lower()
                         canary_low = canary.lower()
                         
                         xss_indicators = [
@@ -1223,13 +1228,9 @@ class SQLiVerifier(BaseVerifier):
         """
         Time-based blind SQLi.
 
-        Three safeguards:
-        1. Baseline mean > 2000ms: server too slow, skip entirely.
-        2. Relative floor: observed delay must be >= 60% of the intended sleep.
-           A hardcoded threshold breaks on high-latency targets; 60% of expected
-           is correct for both fast and slow networks.
-        3. Injected mean must itself be >= 50% of sleep duration - rules out a
-           coincidentally fast baseline sample making a normal response look delayed.
+        Each positive requires two independent control/injection/control rounds.
+        The adjacent controls reject target-wide queueing and session-lock delays,
+        which otherwise look exactly like a database sleep when detectors overlap.
         """
         sleep_payloads = [
             # Standard - needs baseline_value prefix (now fixed by Fix 1)
@@ -1253,109 +1254,102 @@ class SQLiVerifier(BaseVerifier):
                 url, parameter, value, method, form_inputs, inject=False, target=target
             )
 
-            baseline_times: list[float] = []
-            if pre_test_baseline is not None:
-                baseline_times.append(pre_test_baseline.response_time_ms)
-
-            for _ in range(3 - len(baseline_times)):
-                resp = await self._send(
-                    baseline_url, method, baseline_params, baseline_data,
-                    headers=baseline_headers,
-                    json_body=baseline_json,
-                    test_phase="time_baseline",
-                )
-                # Budget-denied baseline probe carries no timing; skip it.
-                if resp.not_tested:
-                    continue
-                baseline_times.append(resp.response_time_ms)
-                await asyncio.sleep(0.1)
-
-            if not baseline_times:
-                # Every baseline probe was budget-denied: untested, not a negative.
-                return VerificationResult(
-                    is_vulnerable=False, confidence_score=0.0,
-                    detection_method="time_based", findings=[],
-                    evidence={"skipped": "not_tested_budget_denied"},
-                )
-
-            baseline_mean = sum(baseline_times) / len(baseline_times)
-
-            if baseline_mean > 2000:
+            if pre_test_baseline is not None and pre_test_baseline.response_time_ms > 2000:
                 logger.debug(
                     "Time-based skipped %s:%s - baseline too slow (%.0fms)",
-                    url, parameter, baseline_mean,
+                    url, parameter, pre_test_baseline.response_time_ms,
                 )
                 return VerificationResult(
                     is_vulnerable=False, confidence_score=0.0,
                     detection_method="time_based", findings=[],
-                    evidence={"skipped": "baseline_too_slow", "baseline_mean_ms": baseline_mean},
+                    evidence={
+                        "skipped": "baseline_too_slow",
+                        "baseline_mean_ms": pre_test_baseline.response_time_ms,
+                    },
                 )
 
             threshold_fraction = getattr(self, "blind_timing_threshold", None) or get_settings().blind_injection_timing_threshold
 
             for payload, expected_ms in sleep_payloads:
-
                 inj_url, inj_params, inj_data, inj_json, inj_headers = self._build_request_args(
                     url, parameter, payload, method, form_inputs, baseline_value=value, target=target
                 )
-                inj_times = []
-                last_resp = None
-                budget_denied = False
-                for _ in range(2):
-                    resp = await self._send(
+                confirmations: list[dict] = []
+                payload_untested = False
+                for round_number in range(1, 3):
+                    before = await self._send(
+                        baseline_url, method, baseline_params, baseline_data,
+                        headers=baseline_headers,
+                        json_body=baseline_json,
+                        test_phase="time_control_before",
+                    )
+                    injected = await self._send(
                         inj_url, method, inj_params, inj_data,
                         headers=inj_headers,
                         json_body=inj_json,
                         test_phase="time_injection", payload=payload,
                     )
-                    # Budget-denied probe has no timing; treat payload as untested.
-                    if resp.not_tested:
-                        budget_denied = True
+                    after = await self._send(
+                        baseline_url, method, baseline_params, baseline_data,
+                        headers=baseline_headers,
+                        json_body=baseline_json,
+                        test_phase="time_control_after",
+                    )
+                    if before.not_tested or injected.not_tested or after.not_tested:
+                        payload_untested = True
                         break
-                    inj_times.append(resp.response_time_ms)
-                    last_resp = resp
+                    controls = [before.response_time_ms, after.response_time_ms]
+                    if max(controls) > 2000:
+                        logger.debug(
+                            "Time payload rejected %s:%s round=%d - adjacent control slow "
+                            "(before=%.0fms after=%.0fms)",
+                            url, parameter, round_number,
+                            before.response_time_ms, after.response_time_ms,
+                        )
+                        break
+                    paired_delta = injected.response_time_ms - max(controls)
+                    threshold_used = max(
+                        expected_ms * threshold_fraction,
+                        expected_ms * 0.60,
+                    )
+                    if paired_delta < threshold_used or injected.response_time_ms < expected_ms * 0.50:
+                        break
+                    confirmations.append({
+                        "round": round_number,
+                        "control_before_ms": round(before.response_time_ms, 1),
+                        "injected_ms": round(injected.response_time_ms, 1),
+                        "control_after_ms": round(after.response_time_ms, 1),
+                        "paired_delta_ms": round(paired_delta, 1),
+                        "request_snippet": injected.request_snippet,
+                        "response_snippet": injected.response_snippet,
+                    })
                     await asyncio.sleep(0.1)
 
-                if budget_denied:
+                if payload_untested or len(confirmations) < 2:
                     continue
 
-                is_significant, timing = ResponseAnalyzer.is_timing_significant(
-                    baseline_times, inj_times,
-                    threshold_ms=expected_ms * threshold_fraction,
-                )
-                if not is_significant:
-                    continue
-
-                diff_ms       = timing.get("diff_ms", 0)
-                injected_mean = timing.get("injected_mean", 0)
-
-                if diff_ms < expected_ms * 0.60:
-                    logger.debug(
-                        "Time diff %.0fms < 60%% of expected %.0fms %s:%s - jitter",
-                        diff_ms, expected_ms, url, parameter,
+                control_times = [
+                    timing
+                    for confirmation in confirmations
+                    for timing in (
+                        confirmation["control_before_ms"],
+                        confirmation["control_after_ms"],
                     )
-                    continue
-
-                if injected_mean < expected_ms * 0.50:
-                    logger.debug(
-                        "Injected mean %.0fms < 50%% of expected %.0fms %s:%s",
-                        injected_mean, expected_ms, url, parameter,
-                    )
-                    continue
-
-                confidence = 75.0
-
-                # Build structured timing evidence for reviewer validation
-                threshold_used = expected_ms * threshold_fraction
+                ]
+                injection_times = [confirmation["injected_ms"] for confirmation in confirmations]
+                baseline_mean = sum(control_times) / len(control_times)
+                injected_mean = sum(injection_times) / len(injection_times)
+                diff_ms = min(confirmation["paired_delta_ms"] for confirmation in confirmations)
+                confidence = 85.0
                 timing_evidence = {
-                    **timing,
-                    "baseline_times_ms": baseline_times,
-                    "injected_times_ms": inj_times,
+                    "paired_confirmations": confirmations,
+                    "baseline_times_ms": control_times,
+                    "injected_times_ms": injection_times,
                     "baseline_mean_ms": round(baseline_mean, 1),
                     "injected_mean_ms": round(injected_mean, 1),
                     "delta_ms": round(diff_ms, 1),
                     "expected_sleep_ms": expected_ms,
-                    "threshold_ms": round(threshold_used, 1),
+                    "threshold_ms": round(max(expected_ms * threshold_fraction, expected_ms * 0.60), 1),
                 }
 
                 finding = self._create_finding(
@@ -1374,8 +1368,8 @@ class SQLiVerifier(BaseVerifier):
                     confidence_score=confidence, detection_method="time_based",
                     method=method, detection_evidence=timing_evidence,
                     reproducible=True, verified=True,
-                    verification_request_snippet=last_resp.request_snippet,
-                    verification_response_snippet=last_resp.response_snippet,
+                    verification_request_snippet=confirmations[-1]["request_snippet"],
+                    verification_response_snippet=confirmations[-1]["response_snippet"],
                 )
                 return VerificationResult(
                     is_vulnerable=True, confidence_score=confidence,
@@ -1386,7 +1380,7 @@ class SQLiVerifier(BaseVerifier):
             return VerificationResult(
                 is_vulnerable=False, confidence_score=0.0,
                 detection_method="time_based", findings=[],
-                evidence={"baseline_times": baseline_times},
+                evidence={"paired_confirmations": []},
             )
 
         except Exception as e:

@@ -34,7 +34,6 @@ verifier only runs against JSON-body parameters (the sole place an operator
 object is parsed as query logic).
 """
 
-import asyncio
 import difflib
 import json
 import logging
@@ -599,94 +598,71 @@ class NoSqliVerifier(BaseVerifier):
         ]
 
         try:
-            baseline_times: list[float] = []
-            if baseline is not None and not baseline.not_tested:
-                baseline_times.append(baseline.response_time_ms)
-            for _ in range(3 - len(baseline_times)):
-                probe = await self._send_operator(
-                    target, str(target.value), test_phase="nosql_time_baseline"
-                )
-                if probe.not_tested:
-                    continue
-                baseline_times.append(probe.response_time_ms)
-                await asyncio.sleep(0.1)
-
-            if not baseline_times:
-                return VerificationResult(
-                    is_vulnerable=False, confidence_score=0.0,
-                    detection_method="nosql_time_based", findings=[],
-                    evidence={"skipped": "not_tested_budget_denied"},
-                )
-
-            baseline_mean = sum(baseline_times) / len(baseline_times)
-            if baseline_mean > 2000:
-                return VerificationResult(
-                    is_vulnerable=False, confidence_score=0.0,
-                    detection_method="nosql_time_based", findings=[],
-                    evidence={"skipped": "baseline_too_slow", "baseline_mean_ms": baseline_mean},
-                )
-
             threshold_fraction = (
                 getattr(self, "blind_timing_threshold", None)
                 or get_settings().blind_injection_timing_threshold
             )
-
+            confirmations: list[dict] = []
             for operator in sleep_operators:
-                inj_times: list[float] = []
-                last_resp: Optional[ResponseData] = None
-                budget_denied = False
-                for _ in range(2):
-                    resp = await self._send_operator(
-                        target, operator, test_phase="nosql_time_injection"
-                    )
-                    if resp.not_tested:
-                        budget_denied = True
-                        break
-                    inj_times.append(resp.response_time_ms)
-                    last_resp = resp
-                    await asyncio.sleep(0.1)
-                if budget_denied or not inj_times:
-                    continue
-
-                is_significant, timing = ResponseAnalyzer.is_timing_significant(
-                    baseline_times, inj_times,
-                    threshold_ms=sleep_ms * threshold_fraction,
+                before = await self._send_operator(
+                    target, str(target.value), test_phase="nosql_time_control_before"
                 )
-                if not is_significant:
+                injected = await self._send_operator(
+                    target, operator, test_phase="nosql_time_injection"
+                )
+                after = await self._send_operator(
+                    target, str(target.value), test_phase="nosql_time_control_after"
+                )
+                if before.not_tested or injected.not_tested or after.not_tested:
                     continue
-
-                diff_ms = timing.get("diff_ms", 0)
-                injected_mean = timing.get("injected_mean", 0)
-                if diff_ms < sleep_ms * 0.60 or injected_mean < sleep_ms * 0.50:
+                control_times = [before.response_time_ms, after.response_time_ms]
+                control_mean = sum(control_times) / len(control_times)
+                # A slow adjacent control proves target-wide contention, not an
+                # operator-specific sleep. Reject the sample instead of letting a
+                # concurrent detector/server queue create a timing false positive.
+                if max(control_times) > 2000:
                     continue
-
-                confidence = 75.0
+                paired_delta = injected.response_time_ms - max(control_times)
+                required_delta = max(
+                    sleep_ms * threshold_fraction,
+                    sleep_ms * 0.60,
+                )
+                if paired_delta < required_delta:
+                    continue
                 payload_text = json.dumps(operator, separators=(",", ":"))
-                timing_evidence = {
-                    **timing,
-                    "baseline_times_ms": baseline_times,
-                    "injected_times_ms": inj_times,
-                    "baseline_mean_ms": round(baseline_mean, 1),
-                    "injected_mean_ms": round(injected_mean, 1),
-                    "delta_ms": round(diff_ms, 1),
+                confirmations.append({
+                    "payload": payload_text,
+                    "control_before_ms": round(before.response_time_ms, 1),
+                    "injected_ms": round(injected.response_time_ms, 1),
+                    "control_after_ms": round(after.response_time_ms, 1),
+                    "paired_delta_ms": round(paired_delta, 1),
+                    "control_mean_ms": round(control_mean, 1),
                     "expected_sleep_ms": sleep_ms,
-                }
+                    "request_snippet": injected.request_snippet,
+                    "response_snippet": injected.response_snippet,
+                })
+                if len(confirmations) < 2:
+                    continue
+
+                confidence = 80.0
+                first, second = confirmations[:2]
+                timing_evidence = {"paired_confirmations": confirmations[:2]}
                 finding = self._create_finding(
                     category=OwaspCategory.a05,
                     vuln_type="NoSQL Injection (Time-Based Blind)",
                     severity=SeverityLevel.high,
-                    url=url, parameter=parameter, payload=payload_text,
+                    url=url, parameter=parameter, payload=first["payload"],
                     evidence=(
-                        f"Response delayed {diff_ms:.0f}ms with a $where sleep operator "
-                        f"(baseline_mean={baseline_mean:.0f}ms, injected_mean={injected_mean:.0f}ms, "
-                        f"expected_sleep={sleep_ms}ms)."
+                        f"Two independent $where operators produced paired delays of "
+                        f"{first['paired_delta_ms']:.0f}ms and {second['paired_delta_ms']:.0f}ms; "
+                        "the benign controls immediately before and after each probe remained fast."
                     ),
                     confidence_score=confidence,
                     detection_method="nosql_time_based",
                     method=method, detection_evidence=timing_evidence,
                     reproducible=True, verified=True,
-                    verification_request_snippet=last_resp.request_snippet if last_resp else None,
-                    verification_response_snippet=last_resp.response_snippet if last_resp else None,
+                    verification_request_snippet=second["request_snippet"],
+                    verification_response_snippet=second["response_snippet"],
                 )
                 return VerificationResult(
                     is_vulnerable=True, confidence_score=confidence,
@@ -697,7 +673,7 @@ class NoSqliVerifier(BaseVerifier):
             return VerificationResult(
                 is_vulnerable=False, confidence_score=0.0,
                 detection_method="nosql_time_based", findings=[],
-                evidence={"baseline_times": baseline_times},
+                evidence={"paired_confirmations": confirmations},
             )
 
         except Exception as e:

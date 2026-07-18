@@ -1108,8 +1108,10 @@ class AuthenticationFailuresDetector(BaseDetector):
                     usernames.append(text)
 
         # --- account side: the scanner's own identity ---
-        settings = get_settings()
-        add_identity(settings.authentication_username, from_response=False)
+        # Sourced from the per-scan submitted account (threaded via crawl_context),
+        # not the environment. When no account was submitted this is None and only
+        # response-observed / replay-payload identities are considered.
+        add_identity(kwargs.get("scanner_identity_username"), from_response=False)
         replay = kwargs.get("auth_replay_state")
         if replay is not None:
             for value in (getattr(replay, "payload", {}) or {}).values():

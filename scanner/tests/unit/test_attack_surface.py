@@ -254,8 +254,40 @@ def test_attack_surface_enriches_query_target_from_exact_observed_request():
     assert prepared.headers == {
         "accept": "application/json",
         "user-agent": "Mozilla/5.0 HeadlessChrome/140",
+        "Cookie": "session=abc",
     }
     assert prepared.cookies == {"session": "abc"}
+
+
+def test_static_form_does_not_inherit_later_browser_cookie_mutation():
+    form = HtmlForm(
+        page_url="http://example.com/tools",
+        action="http://example.com/tools",
+        method="POST",
+        inputs=[
+            FormInput(name="value", input_type="text", value="1"),
+            FormInput(name="submit", input_type="submit", value="submit"),
+        ],
+    )
+    observed = RequestObservation(
+        url="http://example.com/tools",
+        method="POST",
+        post_data="value=1&submit=submit",
+        request_headers={"content-type": "application/x-www-form-urlencoded"},
+        request_cookies={"mode": "mutated"},
+        body_kind="form",
+        replayable=True,
+    )
+
+    target = next(
+        item
+        for item in AttackSurface.build([], [form], requests=[observed])
+        if item.parameter == "value"
+    )
+
+    assert target.source == "form"
+    assert target.cookies == {}
+    assert target.build_request("probe").data == {"value": "probe", "submit": "submit"}
 
 
 def test_attack_target_builds_path_template_request():
@@ -286,6 +318,31 @@ def test_attack_target_builds_form_request_with_sibling_values():
 
     assert request.url == "http://example.com/comment"
     assert request.data == {"comment": "<x>", "csrf": "abc", "Submit": "Save"}
+
+
+def test_attack_target_preserves_multipart_form_encoding():
+    form = HtmlForm(
+        page_url="http://example.com/upload",
+        action="http://example.com/upload",
+        method="POST",
+        inputs=[
+            FormInput("MAX_FILE_SIZE", "hidden", "100000"),
+            FormInput("uploaded", "file", ""),
+            FormInput("Upload", "submit", "Upload"),
+        ],
+        content_type="multipart/form-data",
+    )
+
+    target = next(
+        item for item in AttackSurface.build([], [form])
+        if item.parameter == "MAX_FILE_SIZE"
+    )
+    request = target.build_request("100000' AND SLEEP(3)--")
+
+    assert target.content_type == "multipart/form-data"
+    assert request.data["MAX_FILE_SIZE"] == "100000' AND SLEEP(3)--"
+    assert "uploaded" in request.files
+    assert not request.headers or "Content-Type" not in request.headers
 
 
 def test_attack_target_builds_json_request():
@@ -329,4 +386,21 @@ def test_attack_target_builds_header_and_cookie_requests():
 
     assert header.headers == {"X-Test": "canary"}
     assert cookie.cookies == {"session": "canary"}
+    assert cookie.headers == {"Cookie": "session=canary"}
     assert header_target == []
+
+
+def test_attack_target_replaces_stale_cookie_header_with_observed_cookie_context():
+    from app.core.detectors.attack_surface import AttackTarget
+
+    request = AttackTarget(
+        url="http://example.com/app/search",
+        parameter="q",
+        value="test",
+        location=ParameterLocation.query,
+        headers={"cookie": "security=high; session=old"},
+        cookies={"session": "fresh", "security": "low"},
+    ).build_request("payload")
+
+    assert request.headers == {"Cookie": "session=fresh; security=low"}
+    assert request.cookies == {"session": "fresh", "security": "low"}

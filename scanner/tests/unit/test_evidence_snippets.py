@@ -162,6 +162,70 @@ def test_scanner_omits_html_response_excerpt_for_csrf_findings() -> None:
     )
 
 
+def test_scanner_includes_response_excerpt_for_bola_cross_identity() -> None:
+    # BOLA uses detection_method="authorization_matrix_cross_identity", which
+    # was missing from the include allowlist, so its captured response body was
+    # dropped even though it's an active finding with real proof.
+    finding = Finding(
+        category=OwaspCategory.a01,
+        vuln_type="Broken Object-Level Authorization",
+        severity=SeverityLevel.high,
+        url="http://target.test/rest/user/1",
+        evidence="Object-scoped resource returned the same object to two identities.",
+        confidence_score=90.0,
+        detection_method="authorization_matrix_cross_identity",
+        verified=True,
+        verification_response_snippet='{"status":"success","data":{"id":1,"email":"a@b.c"}}',
+    )
+
+    vulnerability = ScanOrchestrator(DummyRepository())._to_vulnerability(finding)
+
+    assert "RESPONSE EXCERPT:" in vulnerability.evidence.response_snippet
+    assert '"email":"a@b.c"' in vulnerability.evidence.response_snippet
+
+
+def test_scanner_includes_response_excerpt_for_large_active_body() -> None:
+    # An active finding whose captured body exceeds the old 600-char cap must
+    # still show its excerpt; size is not a reason to drop active proof.
+    large_body = "<!DOCTYPE html><title>Swagger UI</title>" + ("A" * 900)
+    finding = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="Exposed API Documentation",
+        severity=SeverityLevel.medium,
+        url="http://target.test/api-docs",
+        evidence="OpenAPI/Swagger documentation content is reachable.",
+        confidence_score=85.0,
+        detection_method="path_content_fingerprint",
+        verified=True,
+        verification_response_snippet=large_body,
+    )
+
+    vulnerability = ScanOrchestrator(DummyRepository())._to_vulnerability(finding)
+
+    assert "RESPONSE EXCERPT:" in vulnerability.evidence.response_snippet
+    assert "Swagger UI" in vulnerability.evidence.response_snippet
+
+
+def test_scanner_caps_oversized_response_excerpt() -> None:
+    finding = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="Exposed API Documentation",
+        severity=SeverityLevel.medium,
+        url="http://target.test/api-docs",
+        evidence="Documentation reachable.",
+        confidence_score=85.0,
+        detection_method="path_content_fingerprint",
+        verified=True,
+        verification_response_snippet="X" * 5000,
+    )
+
+    vulnerability = ScanOrchestrator(DummyRepository())._to_vulnerability(finding)
+
+    assert "RESPONSE EXCERPT:" in vulnerability.evidence.response_snippet
+    assert "[...snip after excerpt...]" in vulnerability.evidence.response_snippet
+    assert len(vulnerability.evidence.response_snippet) < 5000
+
+
 def test_scanner_deduplicates_repeated_verification_evidence() -> None:
     finding = Finding(
         category=OwaspCategory.a07,

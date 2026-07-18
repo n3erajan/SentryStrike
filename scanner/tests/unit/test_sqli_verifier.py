@@ -33,6 +33,7 @@ def test_sqli_detector_excludes_submit_button():
     assert "resetBtn" not in params
     assert "imageBtn" not in params
 
+
 from app.core.verification.response_analyzer import ResponseData
 
 
@@ -90,6 +91,25 @@ async def test_sqli_verifier_union_requires_version_proof():
     
     # Since similarity > 0.85 and no canary was found, it should not be verified or is_vulnerable
     assert not result.is_vulnerable or not any(f.verified for f in result.findings)
+
+
+@pytest.mark.asyncio
+async def test_union_canary_with_literal_query_syntax_is_reflection_not_sqli():
+    verifier = SQLiVerifier()
+    baseline = ResponseData(200, {}, "guestbook", 1.0)
+
+    async def mock_send(url, method, params=None, data=None, **kwargs):
+        payload = kwargs.get("payload", "")
+        body = f"guestbook entry: {payload}" if kwargs.get("test_phase") == "union_canary" else baseline.body
+        return ResponseData(200, {}, body, 1.0, "POST /", body)
+
+    verifier._send = mock_send
+    result = await verifier._verify_union_based(
+        "http://example.com/comments", "message", "POST", "hello",
+        pre_test_baseline=baseline,
+    )
+
+    assert result.is_vulnerable is False
 
 
 @pytest.mark.asyncio
@@ -183,6 +203,75 @@ async def test_sqli_verifier_boolean_requires_confirmation():
     
     # Since confirmation true/false matched but the second pair confirmation failed, it should not be vulnerable
     assert not result.is_vulnerable
+
+
+@pytest.mark.asyncio
+async def test_sqli_boolean_detects_repeatable_small_template_differential():
+    verifier = SQLiVerifier()
+    baseline = ResponseData(200, {}, ("TEMPLATE" * 600) + "ROW:alice", 1.0)
+
+    async def mock_send(url, method, params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase")
+        if phase in {"boolean_true", "boolean_confirm_true"}:
+            body = baseline.body
+        elif phase in {"boolean_false", "boolean_confirm_false"}:
+            body = "TEMPLATE" * 600
+        else:
+            body = baseline.body
+        return ResponseData(200, {}, body, 1.0, request_snippet="GET /", response_snippet=body)
+
+    verifier._send = mock_send
+    result = await verifier._verify_boolean_based(
+        "http://example.com/search?id=1",
+        "id",
+        "GET",
+        "1",
+        pre_test_baseline=baseline,
+        baseline_stability=1.0,
+    )
+
+    assert result.is_vulnerable is True
+    assert result.detection_method == "boolean_differential"
+
+
+@pytest.mark.asyncio
+async def test_sqli_time_based_rejects_target_wide_queue_delay():
+    verifier = SQLiVerifier()
+    baseline = ResponseData(200, {}, "stable", 10.0)
+
+    async def mock_send(url, method, params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase")
+        elapsed = 3000.0 if phase in {"time_injection", "time_control_after"} else 10.0
+        return ResponseData(200, {}, "stable", elapsed, "GET /", "stable")
+
+    verifier._send = mock_send
+    result = await verifier._verify_time_based(
+        "http://example.com/search?id=1", "id", "GET", "1",
+        pre_test_baseline=baseline,
+    )
+
+    assert result.is_vulnerable is False
+    assert result.findings == []
+
+
+@pytest.mark.asyncio
+async def test_sqli_time_based_requires_two_paired_confirmations():
+    verifier = SQLiVerifier()
+    baseline = ResponseData(200, {}, "stable", 10.0)
+
+    async def mock_send(url, method, params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase")
+        elapsed = 3010.0 if phase == "time_injection" else 10.0
+        return ResponseData(200, {}, "stable", elapsed, "GET /", "stable")
+
+    verifier._send = mock_send
+    result = await verifier._verify_time_based(
+        "http://example.com/search?id=1", "id", "GET", "1",
+        pre_test_baseline=baseline,
+    )
+
+    assert result.is_vulnerable is True
+    assert len(result.evidence["paired_confirmations"]) == 2
 
 
 def test_sqli_verifier_prepends_baseline_to_payload():

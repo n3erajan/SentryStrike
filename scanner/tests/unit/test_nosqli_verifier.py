@@ -292,6 +292,47 @@ def test_detector_selects_json_body_and_query_form_targets():
 
 
 @pytest.mark.asyncio
+async def test_time_based_requires_fast_adjacent_controls_and_two_payloads():
+    verifier = NoSqliVerifier()
+    target = _json_body_target()
+
+    async def send_operator(_target, operator, *, test_phase):
+        if test_phase == "nosql_time_injection":
+            return ResponseData(200, {}, "ok", 3050.0, "POST /", "ok")
+        return ResponseData(200, {}, "ok", 10.0, "POST /", "ok")
+
+    verifier._send_operator = send_operator
+    result = await verifier._verify_time_based(
+        target.url, target.parameter, target.method, target, _resp(200, "ok")
+    )
+
+    assert result.is_vulnerable is True
+    assert len(result.evidence["paired_confirmations"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_time_based_rejects_target_wide_contention():
+    verifier = NoSqliVerifier()
+    target = _json_body_target()
+
+    async def send_operator(_target, operator, *, test_phase):
+        if test_phase == "nosql_time_injection":
+            elapsed = 3050.0
+        elif test_phase == "nosql_time_control_after":
+            elapsed = 3000.0
+        else:
+            elapsed = 10.0
+        return ResponseData(200, {}, "ok", elapsed, "POST /", "ok")
+
+    verifier._send_operator = send_operator
+    result = await verifier._verify_time_based(
+        target.url, target.parameter, target.method, target, _resp(200, "ok")
+    )
+
+    assert result.is_vulnerable is False
+
+
+@pytest.mark.asyncio
 async def test_detector_returns_verifier_findings(monkeypatch):
     detector = NoSqlInjectionDetector()
     json_target = _json_body_target()

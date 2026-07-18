@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from html import unescape
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -954,18 +955,27 @@ class FileUploadDetector(BaseDetector):
         Candidate sources (in priority order):
           1. Location response header
           2. JSON body values that look like paths/URLs
-          3. Absolute URLs found via regex in HTML body
-          4. Relative paths found via regex in HTML body
-          5. Well-known upload directory guesses relative to site root
+          3. URL/path references found in the response body
+          4. Well-known upload directory guesses relative to site root
              (NOT relative to the form URL, which is a sub-path and would
              produce wrong results with urljoin for paths like 'uploads/')
         """
         urls: list[str] = []
+        response_url = str(getattr(response, "url", "") or form_url)
+
+        def _add_reference(reference: str) -> None:
+            reference = unescape(str(reference or "")).strip().rstrip(".,;:)]}")
+            if filename not in reference:
+                return
+            # Relative references are defined relative to the response URL. This
+            # preserves application base paths and correctly normalises ../
+            # segments; root-relative and absolute references also retain their
+            # standard urljoin semantics.
+            urls.append(urljoin(response_url, reference))
 
         # 1. Location header
         location = response.headers.get("Location", "")
-        if location and filename in location:
-            urls.append(urljoin(form_url, location))
+        _add_reference(location)
 
         # 2. JSON body
         try:
@@ -979,26 +989,23 @@ class FileUploadDetector(BaseDetector):
                     for v in obj:
                         _walk(v)
                 elif isinstance(obj, str) and filename in obj:
-                    # Resolve relative JSON paths against the site root so that
-                    # a value like "/hackable/uploads/sentry_test.php" becomes
-                    # "http://host/hackable/uploads/sentry_test.php".
-                    urls.append(urljoin(site_root, obj))
+                    _add_reference(obj)
 
             _walk(data)
         except (json.JSONDecodeError, Exception):
             pass
 
-        # 3. Absolute URLs in HTML
-        for match in re.findall(r"https?://[^\"\'\s>]+", response.text or "", re.I):
-            if filename in match:
-                urls.append(match)
+        # 3. References in HTML, JSON-like text, or plain success messages. Keep
+        # the leading ../ or ./ portion: dropping it changes the application base
+        # path for deployments mounted below the origin root.
+        reference_pattern = re.compile(
+            rf"(?:https?://|//|/|\.\.?/)?[^\s\"'<>]*{re.escape(filename)}[^\s\"'<>]*",
+            re.I,
+        )
+        for match in reference_pattern.findall(response.text or ""):
+            _add_reference(match)
 
-        # 4. Relative paths in HTML
-        for match in re.findall(r"/[^\"\'\s>]+", response.text or ""):
-            if filename in match:
-                urls.append(urljoin(site_root, match))
-
-        # 5. Common upload directory guesses - anchored to site root, not form path.
+        # 4. Common upload directory guesses - anchored to site root, not form path.
         #    Using form_url with urljoin for paths like "uploads/" would resolve to
         #    e.g. http://host/dvwa/vulnerabilities/uploads/ (wrong).
         #    urljoin(site_root, "uploads/sentry_test.php") → http://host/uploads/sentry_test.php

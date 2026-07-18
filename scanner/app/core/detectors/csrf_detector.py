@@ -1,5 +1,8 @@
 import asyncio
+import json
 import logging
+import re
+from difflib import SequenceMatcher
 from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
 
 from app.core.crawler.api_extractor import ApiExtractor
@@ -42,7 +45,10 @@ class CSRFDetector(BaseDetector):
 
     csrf_keywords = {"token", "csrf", "xsrf", "user_token", "session_token"}
     state_changing_actions = {"password", "update", "change", "profile", "user", "admin", "delete", "add", "create", "settings", "save"}
-    login_indicators = {"login", "signin", "sign-in", "authenticate", "auth", "session"}
+    login_indicators = {
+        "login", "signin", "sign-in", "authenticate", "auth", "session",
+        "logout", "signout", "sign-out", "logoff",
+    }
 
     @staticmethod
     def _normalize_form(form: object) -> object:
@@ -224,6 +230,92 @@ class CSRFDetector(BaseDetector):
                 return True
         return False
 
+    @staticmethod
+    def _response_rejected(response: object) -> bool:
+        if int(getattr(response, "status_code", 0) or 0) in {400, 401, 403, 409, 419, 422}:
+            return True
+        body = str(getattr(response, "body", "") or "").lower()
+        return any(
+            term in body
+            for term in (
+                "csrf token", "invalid token", "csrf validation failed",
+                "unauthorized request", "token mismatch", "forbidden",
+                "access denied", "request verification", "invalid request",
+                "security token", "form token",
+            )
+        )
+
+    @classmethod
+    def _response_indicates_processing(cls, response: object) -> bool:
+        """Require affirmative mutation evidence; a bare 2xx is never proof."""
+        if cls._response_rejected(response):
+            return False
+        status = int(getattr(response, "status_code", 0) or 0)
+        headers = getattr(response, "headers", {}) or {}
+        if status in {201, 202, 204}:
+            return True
+        if status in {302, 303}:
+            location = str(headers.get("location") or headers.get("Location") or "").strip()
+            return bool(location) and not any(
+                token in urlparse(location).path.lower()
+                for token in ("login", "signin", "error", "denied", "forbidden")
+            )
+        if status != 200:
+            return False
+
+        body = str(getattr(response, "body", "") or "").strip()
+        if not body:
+            return False
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+
+        def _json_success(value: object) -> bool:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    key_lower = str(key).lower()
+                    if key_lower in {"ok", "success", "updated", "saved", "created", "deleted", "changed"} and item is True:
+                        return True
+                    if key_lower == "status" and str(item).lower() in {"ok", "success", "created", "updated", "saved", "deleted"}:
+                        return True
+                    if _json_success(item):
+                        return True
+            elif isinstance(value, list):
+                return any(_json_success(item) for item in value)
+            return False
+
+        if payload is not None and _json_success(payload):
+            return True
+        return bool(
+            re.search(
+                r"\b(?:success(?:ful(?:ly)?)?|updated|saved|deleted|created|changed|completed|processed|uploaded)\b",
+                body,
+                re.I,
+            )
+        )
+
+    @classmethod
+    def _responses_equivalent(cls, control: object, probe: object) -> bool:
+        """True when the probe is accepted like a known-successful control."""
+        if cls._response_rejected(probe):
+            return False
+        control_status = int(getattr(control, "status_code", 0) or 0)
+        probe_status = int(getattr(probe, "status_code", 0) or 0)
+        if control_status != probe_status:
+            return False
+        if control_status in {201, 202, 204}:
+            return True
+        control_headers = getattr(control, "headers", {}) or {}
+        probe_headers = getattr(probe, "headers", {}) or {}
+        if control_status in {302, 303}:
+            control_location = str(control_headers.get("location") or control_headers.get("Location") or "")
+            probe_location = str(probe_headers.get("location") or probe_headers.get("Location") or "")
+            return bool(control_location) and control_location == probe_location
+        control_body = re.sub(r"\s+", " ", str(getattr(control, "body", "") or "")).strip()
+        probe_body = re.sub(r"\s+", " ", str(getattr(probe, "body", "") or "")).strip()
+        return bool(control_body) and SequenceMatcher(None, control_body, probe_body).ratio() >= 0.90
+
     # Content types a cross-origin HTML form can natively produce. Anything else
     # (application/json, application/graphql, …) forces a CORS preflight, so a
     # cross-site page cannot silently forge the request.
@@ -394,6 +486,10 @@ class CSRFDetector(BaseDetector):
                 inp_type = getattr(inp, "input_type", "text").lower()
                 if not inp_name:
                     continue
+                if inp_name.lower() in self.csrf_keywords:
+                    csrf_param = inp_name
+                    inputs_payload[inp_name] = str(getattr(inp, "value", "") or "")
+                    continue
                 # Set dummy/default value for other inputs
                 if inp_type == "password":
                     inputs_payload[inp_name] = "sentry_password123"
@@ -402,58 +498,59 @@ class CSRFDetector(BaseDetector):
                 else:
                     inputs_payload[inp_name] = "sentry_test_val"
 
-                if inp_name.lower() in self.csrf_keywords:
-                    csrf_param = inp_name
+            # Setup/reset actions are destructive scanner targets. Their markup may
+            # still lack a token, but actively replaying them is not an acceptable
+            # way to prove CSRF and can invalidate the rest of the scan.
+            if is_setup_route:
+                return []
 
-            # If no CSRF token is present on a POST form at all, it's heuristically vulnerable,
-            # but we can verify it by submitting the form and looking if it processes (returns 200/302).
-            # If a token IS present, we verify by removing/tampering with it and checking if the server still accepts it!
             async with semaphore:
                 try:
-                    # Build request without the token or with modified token
-                    test_payload = inputs_payload.copy()
-                    if csrf_param:
-                        # Tamper with the token
-                        test_payload[csrf_param] = "invalid_token_xyz"
-                    
-                    json_body = None
-                    request_headers = None
-                    if location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
-                        injected_url = form_url
-                        injected_params = None
-                        injected_data = None
-                        json_body = test_payload
-                        request_headers = {"Content-Type": content_type or "application/json"}
-                    else:
-                        # Submit the form
+                    def _request_parts(payload: dict[str, object]) -> tuple:
+                        if location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
+                            return (
+                                form_url, None, None, payload,
+                                {"Content-Type": content_type or "application/json"},
+                            )
                         injected_url, injected_params, injected_data = URLParameterBuilder.inject_parameter(
                             form_url, csrf_param or "dummy", "tampered", method
                         )
-
-                        # Overwrite injected data with complete form payload
-                        if method in {"POST", "PUT", "PATCH", "DELETE"}:
-                            injected_data = test_payload
+                        if method in _MUTATING_METHODS:
+                            injected_data = payload
                         else:
-                            injected_params = test_payload
+                            injected_params = payload
+                        return injected_url, injected_params, injected_data, None, None
 
-                    response = await verifier.send_request(
-                        injected_url,
-                        method,
-                        injected_params,
-                        injected_data,
-                        headers=request_headers,
-                        json_body=json_body,
-                        test_phase="token_tamper",
-                    )
+                    control_response = None
+                    if csrf_param:
+                        csrf_value = str(inputs_payload.get(csrf_param) or "")
+                        if not csrf_value:
+                            # A token name without its observed value cannot form a
+                            # valid control. Treat it as unverified structure, not an
+                            # exploitable bypass.
+                            return []
+                        control_url, control_params, control_data, control_json, control_headers = _request_parts(inputs_payload)
+                        control_response = await verifier.send_request(
+                            control_url,
+                            method,
+                            control_params,
+                            control_data,
+                            headers=control_headers,
+                            json_body=control_json,
+                            test_phase="valid_token_control",
+                        )
+                        if not self._response_indicates_processing(control_response):
+                            return []
 
-                    # Phase 3: Add optional Origin/Referer bypass test
+                    test_payload = inputs_payload.copy()
+                    if csrf_param:
+                        test_payload[csrf_param] = "invalid_token_xyz"
+                    injected_url, injected_params, injected_data, json_body, request_headers = _request_parts(test_payload)
                     bypass_headers = {
+                        **(request_headers or {}),
                         "Origin": "https://evil.example",
-                        "Referer": "https://evil.example/malicious"
+                        "Referer": "https://evil.example/malicious",
                     }
-                    # Send bypass request if the original request succeeded (to minimize requests), 
-                    # but we can also just send it and check its success.
-                    bypass_headers = {**(request_headers or {}), **bypass_headers}
                     bypass_response = await verifier.send_request(
                         injected_url,
                         method,
@@ -461,13 +558,17 @@ class CSRFDetector(BaseDetector):
                         injected_data,
                         headers=bypass_headers,
                         json_body=json_body,
-                        test_phase="origin_bypass",
+                        test_phase="origin_token_bypass" if csrf_param else "origin_missing_token",
                     )
 
-                    # Criteria for CSRF vulnerability:
-                    # 1. HTTP 200 or 302 redirect (success indicator)
-                    # 2. Response body doesn't contain a clear CSRF/token validation error
-                    response_to_check = bypass_response if bypass_response.status_code in [200, 302, 303] else response
+                    if control_response is not None:
+                        accepted = self._responses_equivalent(control_response, bypass_response)
+                    else:
+                        accepted = self._response_indicates_processing(bypass_response)
+                    if not accepted:
+                        return []
+
+                    response_to_check = bypass_response
 
                     # P0-4: an SPA returns the 200 HTML shell for any client-side
                     # route, so "200 + no error string" is not evidence of a state
@@ -488,68 +589,52 @@ class CSRFDetector(BaseDetector):
                             )
                             return []
 
-                    if response_to_check.status_code in [200, 302, 303]:
-                        body_lower = response_to_check.body.lower()
-                        error_terms = [
-                            "csrf token", "invalid token", "csrf validation failed",
-                            "unauthorized request", "token mismatch", "forbidden",
-                            "access denied", "request verification", "invalid request",
-                            "security token", "form token",
-                        ]
-                        if not any(term in body_lower for term in error_terms):
-                            evidence_msg = "Form submitted successfully with a tampered/missing CSRF token."
-                            if csrf_param:
-                                evidence_msg = f"Form contains CSRF token parameter '{csrf_param}', but successfully accepted submission when it was tampered with."
-                            
-                            # Phase 3: SameSite and Exploitation Context
-                            samesite_attr = None
-                            for resp in [response, bypass_response]:
-                                set_cookie_headers = [v for k, v in resp.headers.items() if k.lower() == "set-cookie"]
-                                for header in set_cookie_headers:
-                                    cookie_parts = [p.strip().lower() for p in header.split(";")]
-                                    cookie_name = cookie_parts[0].split("=")[0] if "=" in cookie_parts[0] else ""
-                                    if cookie_name in session_cookies or any(tok in cookie_name for tok in ["session", "token", "sess"]):
-                                        for p in cookie_parts:
-                                            if p.startswith("samesite"):
-                                                samesite_attr = p.split("=")[1] if "=" in p else "strict"
+                    evidence_msg = "Foreign-Origin submission produced affirmative state-change evidence without a CSRF token."
+                    if csrf_param:
+                        evidence_msg = (
+                            f"A valid-token control processed successfully, and the same action with tampered "
+                            f"CSRF token '{csrf_param}' and foreign Origin/Referer was accepted equivalently."
+                        )
 
-                            severity = SeverityLevel.low # CVSS profile alignment
-                            if samesite_attr == "strict":
-                                evidence_msg += " (Note: SameSite=Strict provides partial mitigation)."
-                            elif samesite_attr == "lax" and method == "GET":
-                                evidence_msg += " (Note: SameSite=Lax provides mitigation for safe HTTP methods)."
-                            elif samesite_attr == "lax" and method == "POST":
-                                severity = SeverityLevel.medium
-                                evidence_msg += " (Note: SameSite=Lax mitigates some cross-site POSTs in modern browsers)."
-                            else:
-                                if bypass_response.status_code in [200, 302, 303] and not is_setup_route:
-                                    severity = SeverityLevel.high
-                                elif is_setup_route:
-                                    evidence_msg += " (Downgraded: Setup/onboarding route)."
-                                    severity = SeverityLevel.low
-                                else:
-                                    severity = SeverityLevel.medium
+                    samesite_attr = None
+                    cookie_responses = [bypass_response]
+                    if control_response is not None:
+                        cookie_responses.append(control_response)
+                    for resp in cookie_responses:
+                        set_cookie_headers = [v for k, v in resp.headers.items() if k.lower() == "set-cookie"]
+                        for header in set_cookie_headers:
+                            cookie_parts = [p.strip().lower() for p in header.split(";")]
+                            cookie_name = cookie_parts[0].split("=")[0] if "=" in cookie_parts[0] else ""
+                            if cookie_name in session_cookies or any(tok in cookie_name for tok in ["session", "token", "sess"]):
+                                for part in cookie_parts:
+                                    if part.startswith("samesite"):
+                                        samesite_attr = part.split("=", 1)[1] if "=" in part else "strict"
 
-                            if bypass_response.status_code in [200, 302, 303]:
-                                evidence_msg += " Exploit succeeded even with foreign Origin/Referer."
+                    severity = SeverityLevel.high
+                    if samesite_attr == "strict":
+                        severity = SeverityLevel.low
+                        evidence_msg += " SameSite=Strict provides substantial browser-side mitigation."
+                    elif samesite_attr == "lax":
+                        severity = SeverityLevel.medium
+                        evidence_msg += " SameSite=Lax mitigates some cross-site submission paths."
 
-                            cand_findings.append(
-                                Finding(
-                                    category=OwaspCategory.a01,
-                                    vuln_type="Cross-Site Request Forgery (CSRF)",
-                                    severity=severity,
-                                    url=form_url,
-                                    parameter=csrf_param or "missing_token",
-                                    method=method,
-                                    evidence=evidence_msg,
-                                    confidence_score=90.0,
-                                    detection_method="token_bypass",
-                                    reproducible=True,
-                                    verified=True,
-                                    verification_request_snippet=response_to_check.request_snippet,
-                                    verification_response_snippet=response_to_check.response_snippet,
-                                )
-                            )
+                    cand_findings.append(
+                        Finding(
+                            category=OwaspCategory.a01,
+                            vuln_type="Cross-Site Request Forgery (CSRF)",
+                            severity=severity,
+                            url=form_url,
+                            parameter=csrf_param or "missing_token",
+                            method=method,
+                            evidence=evidence_msg,
+                            confidence_score=95.0 if csrf_param else 90.0,
+                            detection_method="token_bypass" if csrf_param else "missing_token_state_change",
+                            reproducible=True,
+                            verified=True,
+                            verification_request_snippet=response_to_check.request_snippet,
+                            verification_response_snippet=response_to_check.response_snippet,
+                        )
+                    )
                 except Exception as e:
                     logger.error("CSRF verification failed for %s: %s", form_url, e)
             return cand_findings

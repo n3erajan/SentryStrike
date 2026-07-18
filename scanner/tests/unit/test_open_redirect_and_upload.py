@@ -384,6 +384,50 @@ async def test_file_upload_detector_does_not_verify_plain_200_without_file_evide
     assert findings == []
 
 
+@pytest.mark.parametrize(
+    ("body", "json_body", "expected"),
+    [
+        (
+            "../../hackable/uploads/sentry_test.php successfully uploaded",
+            None,
+            "https://example.test/app/hackable/uploads/sentry_test.php",
+        ),
+        (
+            '<a href="../media/sentry_test.php">uploaded file</a>',
+            None,
+            "https://example.test/app/forms/media/sentry_test.php",
+        ),
+        (
+            '<img src="/shared/uploads/sentry_test.php">',
+            None,
+            "https://example.test/shared/uploads/sentry_test.php",
+        ),
+        (
+            "",
+            {"result": {"path": "../stored/sentry_test.php"}},
+            "https://example.test/app/forms/stored/sentry_test.php",
+        ),
+    ],
+)
+def test_file_upload_candidate_urls_resolve_response_references(body, json_body, expected):
+    detector = FileUploadDetector()
+    request = httpx.Request("POST", "https://example.test/app/forms/upload/")
+    response = (
+        httpx.Response(201, json=json_body, request=request)
+        if json_body is not None
+        else httpx.Response(200, text=body, request=request)
+    )
+
+    urls = detector._extract_candidate_urls(
+        response,
+        str(request.url),
+        detector._site_root(str(request.url)),
+        "sentry_test.php",
+    )
+
+    assert urls[0] == expected
+
+
 def test_file_upload_static_formdata_candidate_extraction():
     detector = FileUploadDetector()
     candidates = detector._api_upload_candidates(

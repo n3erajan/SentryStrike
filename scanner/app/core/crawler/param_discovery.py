@@ -200,6 +200,7 @@ class ParamDiscovery:
             form_url = getattr(form, "action", getattr(form, "page_url", ""))
             form_method = getattr(form, "method", "POST").upper()
             form_inputs = list(getattr(form, "inputs", []))
+            form_content_type = getattr(form, "content_type", None) or getattr(form, "enctype", None)
 
             parsed_form = urlparse(form_url)
             base_form_path = urlunparse((parsed_form.scheme, parsed_form.netloc, parsed_form.path, '', '', ''))
@@ -216,9 +217,27 @@ class ParamDiscovery:
                 has_injectable_input = True
                 inp_value = getattr(inp, "value", "")
                 if form_method == "GET":
-                    _add_candidate(form_url, inp_name, "GET", inp_value, form_inputs, location=ParameterLocation.form, source="form")
+                    _add_candidate(
+                        form_url,
+                        inp_name,
+                        "GET",
+                        inp_value,
+                        form_inputs,
+                        location=ParameterLocation.form,
+                        source="form",
+                        content_type=form_content_type,
+                    )
                 else:
-                    _add_candidate(form_url, inp_name, form_method, inp_value, form_inputs, location=ParameterLocation.form, source="form")
+                    _add_candidate(
+                        form_url,
+                        inp_name,
+                        form_method,
+                        inp_value,
+                        form_inputs,
+                        location=ParameterLocation.form,
+                        source="form",
+                        content_type=form_content_type,
+                    )
 
             if has_injectable_input:
                 paths_with_params.add(base_form_path)
