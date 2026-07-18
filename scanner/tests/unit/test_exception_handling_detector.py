@@ -209,3 +209,57 @@ def test_node_stack_trace_500_is_reported() -> None:
     )
     assert finding is not None
     assert finding.vuln_type == "Verbose Error Handling"
+
+
+def test_observed_evidence_ignores_bare_sql_query_echo() -> None:
+    # A "SELECT ... FROM ... WHERE" echo in a SQLi verifier's OWN response is the
+    # A05 injection proof, already owned by that finding - not independent A10
+    # verbose-error disclosure. When the observed body contains ONLY a query-shape
+    # echo (no engine error, no stack trace), no A10 finding is derived.
+    detector = ExceptionHandlingDetector()
+    source_finding = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="SQL Injection (Error-Based)",
+        severity=SeverityLevel.critical,
+        url="http://target.test/rest/user/login",
+        parameter="email",
+        payload="'",
+        method="POST",
+        evidence="Boolean SQLi confirmed.",
+        detection_method="boolean_differential",
+        verification_response_snippet=(
+            "HTTP/1.1 200 OK\n\n"
+            "SELECT * FROM Users WHERE email = 'x' AND password = 'y'"
+        ),
+        verified=True,
+    )
+
+    findings = detector.findings_from_observed_evidence([source_finding])
+    assert findings == []
+
+
+def test_observed_evidence_line_does_not_fabricate_http_200() -> None:
+    # The source finding carries no HTTP status, so the derived evidence line must
+    # not claim "HTTP 200" (which previously mislabeled 500 error pages).
+    detector = ExceptionHandlingDetector()
+    source_finding = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="SQL Injection (Error-Based)",
+        severity=SeverityLevel.critical,
+        url="http://target.test/api/Feedbacks/",
+        parameter="captchaId",
+        payload="\x00",
+        method="POST",
+        evidence="Engine error triggered.",
+        detection_method="error_based",
+        verification_response_snippet=(
+            "SQLITE_ERROR: unrecognized token\n"
+            "    at /juice-shop/node_modules/sequelize/lib/sequelize.js:315:28"
+        ),
+        verified=True,
+    )
+
+    findings = detector.findings_from_observed_evidence([source_finding])
+    assert len(findings) == 1
+    assert "HTTP 200" not in findings[0].evidence
+    assert "status unrecorded" in findings[0].evidence

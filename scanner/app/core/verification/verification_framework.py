@@ -31,7 +31,12 @@ from app.utils.http_logging import (
     resolve_request_context,
 )
 from app.core import request_governor
-from app.utils.scan_http import build_scan_headers, create_scan_client
+from app.utils.scan_http import (
+    build_httpx_request_snippet,
+    build_observed_request_snippet,
+    build_scan_headers,
+    create_scan_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,23 +155,52 @@ class HttpVerifier:
         import time
         from urllib.parse import urlencode, urlparse
 
-        # Prepare request snippet for evidence
-        parsed = urlparse(url)
-        req_path = parsed.path or "/"
-        if parsed.query:
-            req_path += f"?{parsed.query}"
-        if params:
-            req_path += ("&" if "?" in req_path else "?") + urlencode(params)
-        
+        # Prepare request snippet for evidence. Route through the shared
+        # build_observed_request_snippet renderer so every HTTP-backed finding
+        # (HttpVerifier, observed-request detectors, exception_handler) emits
+        # the same ``{METHOD} {path} HTTP/1.1\nHost: …\n{headers}\n\n{body}``
+        # shape — no per-call inline f-string divergence.
         all_headers = {**self.headers, **(headers or {})}
-        headers_str = "\n".join([f"{k}: {v}" for k, v in all_headers.items()])
         body_str = ""
         if json_body is not None:
             body_str = json.dumps(json_body, separators=(",", ":"), default=str)
         elif data:
             body_str = urlencode(data)
-        
-        request_snippet = f"{method} {req_path} HTTP/1.1\nHost: {parsed.netloc}\n{headers_str}\n\n{body_str}"
+
+        # Reconstruct a URL carrying the (possibly injected) query so the
+        # renderer reproduces the same request line incl. params.
+        snippet_url = url
+        if params:
+            snippet_url += ("&" if urlparse(url).query else "?") + urlencode(params)
+
+        request_snippet = build_observed_request_snippet(
+            url=snippet_url,
+            method=method,
+            headers=all_headers,
+            cookies={**self.cookies, **(cookies or {})},
+            body=body_str,
+        )
+
+        request_kwargs: dict = {"method": method, "url": url}
+        if params:
+            request_kwargs["params"] = params
+        if data:
+            request_kwargs["data"] = data
+        if json_body is not None:
+            request_kwargs["json"] = json_body
+        if headers:
+            request_kwargs["headers"] = headers
+        if cookies:
+            request_kwargs["cookies"] = cookies
+
+        # Build the same effective request httpx will send so evidence includes
+        # transport defaults and client/request cookies even if the network call
+        # later times out. Keep the renderer fallback above for malformed inputs.
+        try:
+            prepared_request = client.build_request(**request_kwargs)
+            request_snippet = build_httpx_request_snippet(prepared_request) or request_snippet
+        except Exception:
+            pass
 
         ctx = resolve_request_context(
             instance_context=self.request_context,
@@ -199,21 +233,6 @@ class HttpVerifier:
         try:
             start_time = time.time() if capture_timing else None
 
-            # httpx treats params={} as "replace query string with nothing",
-            # wiping query params already embedded in *url*. Only pass params/data
-            # when there are actual values to send.
-            request_kwargs: dict = {"method": method, "url": url}
-            if params:
-                request_kwargs["params"] = params
-            if data:
-                request_kwargs["data"] = data
-            if json_body is not None:
-                request_kwargs["json"] = json_body
-            if headers:
-                request_kwargs["headers"] = headers
-            if cookies:
-                request_kwargs["cookies"] = cookies
-
             # NOTE: do NOT acquire get_scan_http_semaphore() here. The scan client
             # returned by create_scan_client already wraps every request in that
             # same process-wide semaphore (scan_http.throttled_request). Acquiring
@@ -222,6 +241,13 @@ class HttpVerifier:
             # concurrency slots fill up (each in-flight request holds one slot while
             # waiting for a second that can never free).
             response = await client.request(**request_kwargs)
+
+            # Redirects may change the effective URL/method. Prefer the request
+            # attached to the final response over the pre-send reconstruction.
+            try:
+                request_snippet = build_httpx_request_snippet(response.request) or request_snippet
+            except Exception:
+                pass
 
             end_time = time.time() if capture_timing else None
             response_time_ms = (end_time - start_time) * 1000 if capture_timing else 0
@@ -551,19 +577,6 @@ class FindingDeduplicator:
         path = "/".join(normalized)
         return f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
 
-    # Vuln types that describe a single application-wide misconfiguration rather
-    # than a per-endpoint bug. Verbose error / stack-trace disclosure comes from
-    # one global framework error handler (e.g. NODE_ENV!=production, Django
-    # DEBUG=True): every endpoint that errors leaks internals the same way, and
-    # the remediation is identical for all of them. Reporting it once per endpoint
-    # over-reports the same defect, so these collapse to a single finding per
-    # origin (affected endpoints preserved in merged evidence).
-    _APP_WIDE_DISCLOSURE_TYPES = frozenset({"verbose error handling"})
-
-    @staticmethod
-    def _is_app_wide_disclosure(vuln_type: str) -> bool:
-        return (vuln_type or "").strip().lower() in FindingDeduplicator._APP_WIDE_DISCLOSURE_TYPES
-
     @staticmethod
     def _dedupe_family(vuln_type: str) -> str:
         vt = (vuln_type or "").lower()
@@ -645,16 +658,16 @@ class FindingDeduplicator:
                 canonical_url, finding.parameter
             )
             canonical_url = FindingDeduplicator._normalize_object_id_path(canonical_url)
-            # App-wide disclosure (verbose errors / stack traces): collapse every
-            # affected endpoint to the origin so the single global-error-handler
-            # misconfiguration is reported once, not once per route that trips it.
-            # Other exception_disclosure-family types (e.g. Debug/Metrics Endpoint
-            # Exposed) keep their real path and are unaffected.
-            if FindingDeduplicator._is_app_wide_disclosure(finding.vuln_type):
-                _p = urlparse(canonical_url)
-                canonical_url = f"{_p.scheme}://{_p.netloc}"
             family = FindingDeduplicator._dedupe_family(finding.vuln_type)
-            key = (canonical_url, family)
+            # Error disclosures are tied to the request handler that produced
+            # them. Different methods on the same route can dispatch unrelated
+            # handlers, so each needs its own reproducible request/response proof.
+            method = (
+                (finding.method or "GET").upper()
+                if (finding.vuln_type or "").strip().lower() == "verbose error handling"
+                else ""
+            )
+            key = (canonical_url, family, method)
             if key not in groups:
                 groups[key] = []
             groups[key].append(finding)

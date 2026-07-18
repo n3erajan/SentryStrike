@@ -175,6 +175,7 @@ class AttackSurface:
         endpoint_templates = cls._endpoint_templates(api_endpoints or [])
         endpoint_form_templates = cls._endpoint_form_templates(api_endpoints or [])
         request_templates = cls._request_templates(requests or [])
+        request_metadata = cls._request_metadata(requests or [])
         targets: list[AttackTarget] = []
         seen: set[tuple[str, str, str, str, str]] = set()
 
@@ -219,11 +220,20 @@ class AttackSurface:
                 continue
             template = None
             form_inputs = candidate.context.get("form_inputs")
-            headers: dict[str, str] = {}
+            metadata_headers, metadata_cookies = request_metadata.get(
+                (candidate.url, candidate.method.upper()),
+                ({}, {}),
+            )
+            headers = {
+                **metadata_headers,
+                **(candidate.context.get("headers") or {}),
+            }
             if candidate.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
-                template, headers = cls._find_template(candidate, endpoint_templates, request_templates)
+                template, template_headers = cls._find_template(candidate, endpoint_templates, request_templates)
+                headers = {**template_headers, **headers}
             elif candidate.location == ParameterLocation.form and form_inputs is None:
-                form_inputs, headers = cls._find_form_template(candidate, endpoint_form_templates)
+                form_inputs, template_headers = cls._find_form_template(candidate, endpoint_form_templates)
+                headers = {**template_headers, **headers}
 
             key = (
                 candidate.url,
@@ -248,7 +258,10 @@ class AttackSurface:
                     source=candidate.source,
                     json_template=template,
                     headers=headers,
-                    cookies=candidate.context.get("cookies") or {},
+                    cookies={
+                        **metadata_cookies,
+                        **(candidate.context.get("cookies") or {}),
+                    },
                     security_relevance=set(candidate.security_relevance),
                     replayable=bool(candidate.context.get("replayable", True)),
                     body_schema=list(candidate.context.get("body_schema") or []),
@@ -265,6 +278,7 @@ class AttackSurface:
                 # an observation). Replaying it only produces 404 noise — the leaf
                 # body params would each be fired against a non-existent object.
                 continue
+            observed_headers, observed_cookies = cls._request_replay_metadata(request)
             content_type = cls._request_content_type(request)
             body = cls._parse_json(request.post_data)
             if not isinstance(body, (dict, list)):
@@ -318,12 +332,8 @@ class AttackSurface:
                             form_inputs=form_inputs,
                             content_type=content_type,
                             source="browser_form_request",
-                            headers={
-                                key: value
-                                for key, value in (request.request_headers or {}).items()
-                                if key.lower() not in {"content-length"}
-                            },
-                            cookies=dict(getattr(request, "request_cookies", {}) or {}),
+                            headers=observed_headers,
+                            cookies=observed_cookies,
                             security_relevance=ApiExtractor.classify_parameter(name),
                             replayable=bool(getattr(request, "replayable", True)),
                             body_schema=list(getattr(request, "body_schema", []) or []),
@@ -335,7 +345,7 @@ class AttackSurface:
                     url=request.url,
                     method=request.method,
                     request_body=body,
-                    headers=request.request_headers,
+                    headers=observed_headers,
                 )
                 for parameter in ApiExtractor.parameters_from_endpoint(endpoint):
                     if filter_fn and not cls._candidate_matches_filter(filter_fn, parameter):
@@ -360,8 +370,8 @@ class AttackSurface:
                             parent_path=parameter.parent_path,
                             source="browser_request",
                             json_template=body,
-                            headers=request.request_headers,
-                            cookies=dict(getattr(request, "request_cookies", {}) or {}),
+                            headers=observed_headers,
+                            cookies=observed_cookies,
                             security_relevance=set(parameter.security_relevance),
                             replayable=bool(getattr(request, "replayable", True)),
                             body_schema=list(getattr(request, "body_schema", []) or []),
@@ -587,12 +597,7 @@ class AttackSurface:
             item_path = parsed.path.rstrip("/") + "/" + created_id
             item_url = urlunparse(parsed._replace(path=item_path))
             content_type = getattr(request, "request_content_type", None) or "application/json"
-            headers = {
-                key: value
-                for key, value in (getattr(request, "request_headers", {}) or {}).items()
-                if key.lower() != "content-length"
-            }
-            cookies = dict(getattr(request, "request_cookies", {}) or {})
+            headers, cookies = cls._request_replay_metadata(request)
             for method in ("PUT", "PATCH"):
                 if (item_url, method) in observed_keys:
                     continue
@@ -1076,8 +1081,34 @@ class AttackSurface:
         for request in requests:
             body = AttackSurface._parse_json(request.post_data)
             if isinstance(body, dict):
-                templates[(request.url, request.method.upper())] = (body, request.request_headers or {})
+                headers, _ = AttackSurface._request_replay_metadata(request)
+                templates[(request.url, request.method.upper())] = (body, headers)
         return templates
+
+    @staticmethod
+    def _request_replay_metadata(
+        request: RequestObservation,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """Return safe, non-duplicated browser metadata for an active replay."""
+        cookies = dict(getattr(request, "request_cookies", {}) or {})
+        headers = {
+            str(key): str(value)
+            for key, value in (getattr(request, "request_headers", {}) or {}).items()
+            if str(key).lower() not in {"content-length", "host"}
+            and not (str(key).lower() == "cookie" and cookies)
+        }
+        return headers, cookies
+
+    @staticmethod
+    def _request_metadata(
+        requests: list[RequestObservation],
+    ) -> dict[tuple[str, str], tuple[dict[str, str], dict[str, str]]]:
+        metadata: dict[tuple[str, str], tuple[dict[str, str], dict[str, str]]] = {}
+        for request in requests:
+            metadata[(request.url, request.method.upper())] = (
+                AttackSurface._request_replay_metadata(request)
+            )
+        return metadata
 
     @staticmethod
     def _find_template(

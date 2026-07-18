@@ -62,6 +62,7 @@ async def test_builds_chat_completions_request(monkeypatch):
         assert body["model"] == "gpt-4o-mini"
         assert body["messages"] == [{"role": "user", "content": "analyse finding"}]
         assert body["stream"] is False
+        assert body["temperature"] == 0.1
         assert body["response_format"] == {"type": "json_object"}
     finally:
         get_settings.cache_clear()

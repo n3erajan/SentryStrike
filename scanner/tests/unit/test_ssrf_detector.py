@@ -8,6 +8,7 @@ from app.core.detectors.ssrf_detector import SSRFDetector
 from shared.verification.oast import OastClient
 from app.core.verification.response_analyzer import ResponseData
 from app.core.verification.verification_framework import HttpVerifier
+from shared.models.vulnerability import OwaspCategory
 
 
 class FakeOast(OastClient):
@@ -60,11 +61,8 @@ async def test_ssrf_detector_reports_blind_oast_callback_for_json_body_target():
 
 
 @pytest.mark.asyncio
-async def test_ssrf_inband_fallback_reports_verified_when_strong_differential():
-    """No OAST configured + internal target behaves strongly differently from
-    the external control (timing delta) -> a VERIFIED in-band finding. The
-    strong timing differential is accepted as verified because the server
-    demonstrably reached the internal target and behaved differently."""
+async def test_ssrf_inband_fallback_reports_probable_when_strong_differential():
+    """A repeated timeout/timing differential is indirect, not callback proof."""
     detector = SSRFDetector()
     parameter = ParameterCandidate(
         name="url",
@@ -89,11 +87,16 @@ async def test_ssrf_inband_fallback_reports_verified_when_strong_differential():
             api_endpoints=[],
         )
 
-    verified = [f for f in findings if f.vuln_type == "Server-Side Request Forgery (SSRF)"]
-    assert verified, "expected a verified in-band SSRF finding (strong timing differential)"
-    assert verified[0].verified is True
-    assert verified[0].detection_method == "ssrf_inband_differential"
-    assert verified[0].confidence_score == 75.0
+    probable = [f for f in findings if f.vuln_type == "Server-Side Request Forgery (SSRF) - Probable"]
+    assert probable, "expected a probable in-band SSRF finding"
+    assert probable[0].verified is False
+    assert probable[0].detection_method == "ssrf_inband_differential"
+    assert probable[0].confidence_score == 60.0
+    assert probable[0].category == OwaspCategory.a01
+    assert "EXTERNAL CONTROL SAMPLES" in probable[0].verification_response_snippet
+    assert "INTERNAL TARGET SAMPLES" in probable[0].verification_response_snippet
+    assert probable[0].detection_evidence["control_samples"]
+    assert probable[0].detection_evidence["internal_samples"]
 
 
 @pytest.mark.asyncio
@@ -168,7 +171,8 @@ async def test_ssrf_inband_runs_as_fallback_when_oast_configured_but_no_callback
 
     inband = [f for f in findings if f.detection_method == "ssrf_inband_differential"]
     assert inband, "in-band fallback should run when OAST didn't confirm"
-    assert inband[0].verified is True
+    assert inband[0].verified is False
+    assert inband[0].detection_evidence["oast_available"] is True
 
 
 @pytest.mark.asyncio
@@ -219,6 +223,14 @@ def test_ssrf_inband_differential_evaluator_truth_cases():
         [(200, 10, 110.0), (200, 10, 108.0)],
         delta,
     ) is None
+
+    timeout_reason = detector._inband_differential(
+        [(200, 10, 100.0), (200, 10, 105.0)],
+        [(0, 0, 3000.0), (0, 0, 3000.0)],
+        delta,
+    )
+    assert timeout_reason is not None
+    assert "transport error/timeout" in timeout_reason
 
 
 def test_oast_client_extracts_interactions_from_common_payload_shapes():

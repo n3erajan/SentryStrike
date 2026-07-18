@@ -1,4 +1,4 @@
-from app.core.crawler.models import ApiEndpoint, ParameterLocation, RequestObservation
+from app.core.crawler.models import ApiEndpoint, ParameterCandidate, ParameterLocation, RequestObservation
 from app.core.crawler.spider import FormInput, HtmlForm
 from app.core.detectors.attack_surface import AttackSurface, build_json_body
 
@@ -218,6 +218,44 @@ def test_attack_target_builds_query_request():
     assert request.url == "http://example.com/search?q=payload"
     assert request.params is None
     assert request.data is None
+
+
+def test_attack_surface_enriches_query_target_from_exact_observed_request():
+    url = "http://example.com/search?q=test"
+    candidate = ParameterCandidate(
+        name="q",
+        location=ParameterLocation.query,
+        url=url,
+        method="GET",
+        baseline_value="test",
+        source="browser_request",
+    )
+    observed = RequestObservation(
+        url=url,
+        method="GET",
+        request_headers={
+            "host": "example.com",
+            "content-length": "99",
+            "cookie": "stale=header",
+            "accept": "application/json",
+            "user-agent": "Mozilla/5.0 HeadlessChrome/140",
+        },
+        request_cookies={"session": "abc"},
+    )
+
+    target = AttackSurface.build(
+        [],
+        [],
+        parameters=[candidate],
+        requests=[observed],
+    )[0]
+    prepared = target.build_request("payload")
+
+    assert prepared.headers == {
+        "accept": "application/json",
+        "user-agent": "Mozilla/5.0 HeadlessChrome/140",
+    }
+    assert prepared.cookies == {"session": "abc"}
 
 
 def test_attack_target_builds_path_template_request():

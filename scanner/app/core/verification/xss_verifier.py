@@ -37,6 +37,7 @@ from app.core.verification.verification_framework import (
     URLParameterBuilder,
     VerificationResult,
 )
+from app.utils.scan_http import build_observed_request_snippet
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 from dataclasses import dataclass, field
 
@@ -1224,6 +1225,7 @@ class XSSVerifier(BaseVerifier):
                         "vector": vector_name,
                         "surface": surface_name,
                         "payload": payload,
+                        "url": probe_url,
                     }
         return {"fired": False, "csp": csp_seen}
 
@@ -1548,7 +1550,12 @@ class XSSVerifier(BaseVerifier):
                                 headers={},
                                 body=f"<stored xss canary={canary} executed in browser>",
                                 response_time_ms=0.0,
-                                request_snippet=f"GET {probe_url}",
+                                request_snippet=build_observed_request_snippet(
+                                    url=probe_url,
+                                    method="GET",
+                                    headers={"User-Agent": "SentryStrikeScanner/1.0"},
+                                    cookies=getattr(self.http_verifier, "cookies", None),
+                                ),
                                 response_snippet=f"browser execution confirmed (canary={canary})",
                             )
                             return True, [0], False, carrier, evidence

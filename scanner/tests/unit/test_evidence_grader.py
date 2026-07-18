@@ -81,6 +81,11 @@ class TestActiveOutputMethods:
         "default_credentials_probe",
         "credential_stuffing_probe",
         "logout_token_reuse_probe",
+        "nosql_boolean_operator",
+        "mass_assignment_privilege_field",
+        "jwt_active_forgery",
+        "poison_null_byte_extension_bypass",
+        "xxe_external_entity_file_read",
     ])
     def test_active_output_method(self, method):
         grade = grader.grade(_vuln("Test Vuln", detection_method=method))
@@ -137,21 +142,34 @@ class TestTimingMethods:
         assert grade.proof_type == "timing_strong"
 
 
-class TestAuthDifferentialMethods:
-    """Access-control methods — 200 OK is not proof — ceiling 1.00 (no cap)."""
+class TestConfirmedAuthMethods:
+    """Cross-identity/role proof is strong and receives a low FP ceiling."""
 
     @pytest.mark.parametrize("method", [
-        "authorization_matrix",
         "authorization_matrix_second_user",
         "authorization_matrix_privileged_baseline",
-        "mass_assignment_privilege_field",
-        "mutating_authz_differential",
+        "authorization_matrix_cross_identity",
         "differential_idor",
         "second_user_idor",
         "vertical_idor",
     ])
-    def test_auth_diff_method(self, method):
+    def test_confirmed_auth_method(self, method):
         grade = grader.grade(_vuln("Insecure Direct Object Reference (IDOR)",
+                                   detection_method=method, category=OwaspCategory.a01))
+        assert grade.proof_type == "auth_confirmed"
+        assert grade.fp_ceiling == 0.15
+        assert grade.grade == "A"
+
+
+class TestAuthDifferentialMethods:
+    """Ambiguous access-control observations retain full AI review latitude."""
+
+    @pytest.mark.parametrize("method", [
+        "authorization_matrix",
+        "mutating_authz_differential",
+    ])
+    def test_auth_diff_method(self, method):
+        grade = grader.grade(_vuln("Unauthenticated API Data Exposure",
                                    detection_method=method, category=OwaspCategory.a01))
         assert grade.proof_type == "auth_differential"
         assert grade.fp_ceiling == 1.0
@@ -178,7 +196,6 @@ class TestPatternMatchMethods:
         "observed_exception_evidence",
         "path_bruteforce",
         "api_response_reflection",
-        "ssrf_inband_differential",
         "content_type_bypass_response_evidence",
         "double_extension_response_evidence",
         "observed_response_content",
@@ -208,6 +225,32 @@ class TestPatternMatchMethods:
         assert grade.fp_ceiling == 1.0
 
 
+def test_ssrf_inband_is_indirect_differential_not_pattern_match() -> None:
+    vulnerability = _vuln(
+        "Server-Side Request Forgery (SSRF) - Probable",
+        detection_method="ssrf_inband_differential",
+        detection_evidence={
+            "control_target": "http://control.invalid/",
+            "internal_target": "http://169.254.169.254/",
+            "differential_reason": "internal target timed out",
+            "signal_strength": "strong",
+            "oast_available": False,
+            "control_samples": [{"status_code": 200, "response_time_ms": 20}],
+            "internal_samples": [{"status_code": 0, "response_time_ms": 3000}],
+        },
+        verified=False,
+        category=OwaspCategory.a01,
+    )
+
+    grade = grader.grade(vulnerability)
+    brief = grader.build_evidence_brief(vulnerability, grade)
+
+    assert grade.proof_type == "ssrf_differential"
+    assert grade.fp_ceiling == 0.49
+    assert "not confirmed" in grade.reason.lower()
+    assert "control_samples" in brief
+    assert "internal_samples" in brief
+
 class TestStructuralVulnTypes:
     """Structural vuln types — observation IS the proof — ceiling 0.10."""
 
@@ -233,6 +276,17 @@ class TestStructuralVulnTypes:
         assert grade.proof_type == "structural"
         assert grade.fp_ceiling == 0.10
         assert grade.grade == "B"
+
+    def test_upload_allowlist_differential_is_structural_proof(self):
+        grade = grader.grade(
+            _vuln(
+                "Missing File Type Validation",
+                detection_method="upload_type_allowlist_bypass_differential",
+            )
+        )
+
+        assert grade.proof_type == "structural"
+        assert grade.fp_ceiling == 0.10
 
 
 class TestHeuristicFallback:
@@ -295,6 +349,69 @@ class TestEvidenceBrief:
         assert "password" in brief
         assert "object_scoped_request: True" in brief
 
+    def test_brief_for_auth_diff_accepts_deduplicated_state_lists(self):
+        """Deduplication list-wraps every evidence value, including states."""
+        vuln = _vuln(
+            "Insecure Direct Object Reference (IDOR)",
+            detection_method="authorization_matrix_second_user",
+            detection_evidence={
+                "serves_public_data": [None],
+                "has_object_reference": [True],
+                "admin_like": [False],
+                "states": [
+                    {
+                        "unauthenticated": {
+                            "status_code": 401,
+                            "json_shape": ["error"],
+                            "identifiers": [],
+                            "secret_fields": [],
+                        },
+                        "low": {
+                            "status_code": 200,
+                            "json_shape": ["data.id", "data.email"],
+                            "identifiers": ["id=42"],
+                            "secret_fields": ["data.email"],
+                        },
+                        "second": {
+                            "status_code": 200,
+                            "json_shape": ["data.id", "data.email"],
+                            "identifiers": ["id=42"],
+                            "secret_fields": ["data.email"],
+                        },
+                    }
+                ],
+            },
+            category=OwaspCategory.a01,
+        )
+
+        grade = grader.grade(vuln)
+        brief = grader.build_evidence_brief(vuln, grade)
+
+        assert grade.proof_type == "auth_confirmed"
+        assert "anonymous_response: HTTP 401" in brief
+        assert "authenticated_response: HTTP 200" in brief
+        assert "second_user_response: HTTP 200" in brief
+        assert "shared_identifiers_low_vs_second: ['id=42']" in brief
+        assert "secret_fields_in_authenticated_responses: ['data.email']" in brief
+        assert "object_scoped_request: True" in brief
+
+    def test_brief_for_deduplicated_idor_includes_top_level_shared_identifiers(self):
+        vuln = _vuln(
+            "Insecure Direct Object Reference (IDOR)",
+            detection_method="second_user_idor",
+            detection_evidence={
+                "parameter_location": ["json_body"],
+                "shared_identifiers": [["userid=25"]],
+            },
+            category=OwaspCategory.a01,
+        )
+
+        grade = grader.grade(vuln)
+        brief = grader.build_evidence_brief(vuln, grade)
+
+        assert "shared_identifiers_low_vs_second: ['userid=25']" in brief
+        assert "secret_fields_in_anonymous_response" not in brief
+
     def test_brief_for_timing_contains_delta(self):
         vuln = _vuln("SQL Injection (Time-Based Blind)", detection_method="time_based",
                      detection_evidence={"baseline_mean_ms": 300, "injected_mean_ms": 5100,
@@ -304,6 +421,27 @@ class TestEvidenceBrief:
         assert "baseline_mean_ms: 300" in brief
         assert "delta_ms: 4800" in brief
         assert "expected_sleep_ms: 5000" in brief
+
+    def test_timing_grade_accepts_deduplicated_scalar_lists(self):
+        vuln = _vuln(
+            "SQL Injection (Time-Based Blind)",
+            detection_method="time_based",
+            detection_evidence={
+                "baseline_mean_ms": [200],
+                "injected_mean_ms": [5000],
+                "delta_ms": [4800],
+                "expected_sleep_ms": [5000],
+                "baseline_times_ms": [[190, 200, 210]],
+            },
+        )
+
+        grade = grader.grade(vuln)
+        brief = grader.build_evidence_brief(vuln, grade)
+
+        assert grade.proof_type == "timing_strong"
+        assert "baseline_mean_ms: 200" in brief
+        assert "delta_ms: 4800" in brief
+        assert "baseline_samples: [190, 200, 210]" in brief
 
     def test_brief_for_pattern_match_detects_reflected_payload(self):
         vuln = _vuln("Verbose Error Handling", detection_method="observed_exception_evidence",
@@ -334,6 +472,52 @@ class TestEvidenceBrief:
         brief = grader.build_evidence_brief(vuln, grade)
         assert "accessible_url" in brief
         assert "canary_executed: True" in brief
+
+    def test_brief_for_nosql_boolean_operator_summarizes_both_controls(self):
+        vuln = _vuln(
+            "NoSQL Injection (Boolean Operator)",
+            detection_method="nosql_boolean_operator",
+            detection_evidence={
+                "first_family": [{
+                    "family": "ne_eq",
+                    "true_status": 200,
+                    "false_status": 500,
+                    "similarity": 0.01,
+                }],
+                "confirm_family": [{
+                    "family": "gt_lt",
+                    "true_status": 200,
+                    "false_status": 200,
+                    "similarity": 0.02,
+                }],
+            },
+        )
+
+        grade = grader.grade(vuln)
+        brief = grader.build_evidence_brief(vuln, grade)
+
+        assert grade.proof_type == "active_output"
+        assert "first_family: family=ne_eq" in brief
+        assert "confirm_family: family=gt_lt" in brief
+
+    def test_brief_for_jwt_forgery_surfaces_acceptance_oracle(self):
+        vuln = _vuln(
+            "JWT alg=none Forgery Accepted",
+            detection_method="jwt_active_forgery",
+            detection_evidence={
+                "forgery": ["alg=none"],
+                "proof_mode": ["identity-reflection"],
+                "forged_status": [200],
+            },
+        )
+
+        grade = grader.grade(vuln)
+        brief = grader.build_evidence_brief(vuln, grade)
+
+        assert grade.proof_type == "active_output"
+        assert "forgery: alg=none" in brief
+        assert "proof_mode: identity-reflection" in brief
+        assert "forged_status: 200" in brief
 
     def test_brief_falls_back_to_response_snippet_when_no_structured_evidence(self):
         """When a detector sets no detection_evidence, the brief still gives

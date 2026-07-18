@@ -21,6 +21,10 @@ def build_httpx_evidence_snippets(
     extra_markers: list[str] | None = None,
     include_response_body: bool = True,
     max_request_body_chars: int = 2000,
+    fallback_url: str | None = None,
+    fallback_method: str | None = None,
+    fallback_headers: Mapping[str, object] | None = None,
+    fallback_body: object = None,
 ) -> tuple[str | None, str | None]:
     """Reconstruct ``(request_snippet, response_snippet)`` evidence from a
     completed ``httpx.Response``.
@@ -36,8 +40,12 @@ def build_httpx_evidence_snippets(
     produces.
 
     Defensive against fake/mock response objects (as used in unit tests)
-    that don't carry a real ``.request``: falls back to a response-only
-    snippet (or ``(None, None)``) rather than raising.
+    that don't carry a real ``.request``: when a caller supplies the
+    ``fallback_*`` parts (the url/method/headers/body it used to build the
+    request), the request snippet is reconstructed from those via
+    :func:`build_observed_request_snippet` so a real probe never loses its
+    request evidence; with no fallback, the request side falls back to
+    ``None`` (and the response side is still returned) rather than raising.
     """
     # Local import: response_analyzer lives in app.core.verification and this
     # module is imported very early by scanner configuration/throttle helpers;
@@ -63,30 +71,152 @@ def build_httpx_evidence_snippets(
         include_headers=True,
     )
 
-    request = getattr(response, "request", None)
+    try:
+        request = response.request
+    except Exception:
+        request = None
     if request is None:
+        # No captured httpx request (mock response, or a response object that
+        # lost its .request). If the caller supplied the request parts it
+        # built the probe from, render the snippet from those so a real HTTP
+        # exchange doesn't vanish from the report. Otherwise the request side
+        # genuinely isn't reconstructable -> None.
+        if fallback_url:
+            fallback_snippet = build_observed_request_snippet(
+                url=fallback_url,
+                method=fallback_method or "GET",
+                headers=fallback_headers,
+                body=fallback_body,
+                max_body_chars=max_request_body_chars,
+            )
+            return fallback_snippet, response_snippet
         return None, response_snippet
 
     try:
-        parsed = urlparse(str(request.url))
+        request_snippet = build_httpx_request_snippet(
+            request,
+            max_body_chars=max_request_body_chars,
+        )
+    except Exception:
+        # Rendering the captured .request failed. Fall back to the caller-
+        # supplied parts (if any) before dropping to None, so a real HTTP
+        # exchange doesn't silently lose its request evidence.
+        if fallback_url:
+            request_snippet = build_observed_request_snippet(
+                url=fallback_url,
+                method=fallback_method or "GET",
+                headers=fallback_headers,
+                body=fallback_body,
+                max_body_chars=max_request_body_chars,
+            )
+        else:
+            request_snippet = None
+
+    return request_snippet, response_snippet
+
+
+def build_httpx_request_snippet(
+    request: object,
+    *,
+    max_body_chars: int = 2000,
+) -> str | None:
+    """Render the effective request prepared/sent by httpx."""
+    content = getattr(request, "content", b"")
+    body = content.decode("utf-8", "replace") if content else ""
+    return build_observed_request_snippet(
+        url=str(request.url),
+        method=str(request.method),
+        headers=dict(request.headers),
+        body=body,
+        max_body_chars=max_body_chars,
+    )
+
+
+def build_observed_request_snippet(
+    *,
+    url: str,
+    method: str = "GET",
+    headers: Mapping[str, object] | None = None,
+    cookies: Mapping[str, object] | None = None,
+    body: object = None,
+    max_body_chars: int = 2000,
+) -> str | None:
+    """Reconstruct a request-snippet from an OBSERVED request's parts.
+
+    Some findings are derived from a request the browser/crawler already sent
+    (an observed XHR, a mined API endpoint, a recorded login recipe) rather than
+    from a live ``httpx.Response`` the detector holds. Those detectors have the
+    url/method/headers/body on hand but historically left
+    ``verification_request_snippet`` empty, so a genuine request-backed finding
+    rendered with no request evidence. This produces the same
+    ``{METHOD} {path} HTTP/1.1`` shape ``HttpVerifier.send_request`` emits, so
+    the report's request evidence is consistent regardless of source.
+
+    Returns ``None`` only when there is no usable URL. Any other render
+    failure (an unparseable body/header shape) still yields at least the
+    request line + Host, so a real observed request never collapses to
+    ``None`` and leaves the report with no request evidence. Secret
+    redaction is applied downstream at report-build time, so raw values
+    may be passed here.
+    """
+    import json as _json
+
+    if not url:
+        return None
+    try:
+        parsed = urlparse(str(url))
         req_path = parsed.path or "/"
         if parsed.query:
             req_path += f"?{parsed.query}"
-
-        headers_str = "\n".join(f"{k}: {v}" for k, v in request.headers.items())
-
-        body = ""
-        content = request.content
-        if content:
-            body = content.decode("utf-8", "replace")
-        if len(body) > max_request_body_chars:
-            body = body[:max_request_body_chars] + "\n[...snip...]"
-
-        request_snippet = f"{request.method} {req_path} HTTP/1.1\nHost: {parsed.netloc}\n{headers_str}\n\n{body}"
+        method_str = (str(method) or "GET").upper()
+        # The request line + Host is the irreducible minimum; always emit it
+        # so the snippet is non-None whenever a URL exists, even if the body
+        # or headers can't be rendered.
+        snippet = f"{method_str} {req_path} HTTP/1.1\nHost: {parsed.netloc}"
     except Exception:
-        request_snippet = None
+        return None
 
-    return request_snippet, response_snippet
+    try:
+        # Header names are case-insensitive.  Collapse differently-cased
+        # duplicates (for example ``Host``/``host`` or two User-Agent values)
+        # before rendering; Host is emitted from the URL exactly once.
+        normalized_headers: dict[str, tuple[str, str]] = {}
+        for key, value in (headers or {}).items():
+            if not key:
+                continue
+            lower_key = str(key).lower()
+            if lower_key == "host":
+                continue
+            normalized_headers[lower_key] = (str(key).title(), str(value))
+
+        if cookies and "cookie" not in normalized_headers:
+            cookie_value = "; ".join(
+                f"{name}={value}" for name, value in cookies.items() if name
+            )
+            if cookie_value:
+                normalized_headers["cookie"] = ("Cookie", cookie_value)
+
+        header_lines = "\n".join(
+            f"{key}: {value}" for key, value in normalized_headers.values()
+        )
+        if header_lines:
+            snippet += f"\n{header_lines}"
+
+        body_str = ""
+        if body is not None and body != "":
+            if isinstance(body, (dict, list)):
+                body_str = _json.dumps(body, separators=(",", ":"), default=str)
+            else:
+                body_str = str(body)
+        if len(body_str) > max_body_chars:
+            body_str = body_str[:max_body_chars] + "\n[...snip...]"
+
+        snippet += f"\n\n{body_str}"
+    except Exception:
+        # Headers/body failed to render, but the request line + Host above
+        # already stand. Keep that rather than dropping the snippet entirely.
+        pass
+    return snippet
 
 
 def build_scan_headers(auth_headers: Mapping[str, object] | None = None) -> dict[str, str]:

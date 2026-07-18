@@ -737,4 +737,12 @@ async def test_ssrf_detector_verifies_blind_via_oast_client():
             parameters=[param],
             oast_client=FakeOast(),
         )
-    assert any("Blind Server-Side Request Forgery" in f.vuln_type and f.verified for f in findings)
+    oast_findings = [
+        finding
+        for finding in findings
+        if "Blind Server-Side Request Forgery" in finding.vuln_type
+    ]
+    assert oast_findings and oast_findings[0].verified
+    assert oast_findings[0].category == OwaspCategory.a01
+    assert "OAST collaborator" in oast_findings[0].verification_response_snippet
+    assert oast_findings[0].detection_evidence["interaction_count"] == 1

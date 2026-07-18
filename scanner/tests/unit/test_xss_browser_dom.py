@@ -188,14 +188,21 @@ def test_sweep_invokes_verify_reflected_dom_and_builds_finding(monkeypatch):
         calls.append((route_url, parameter, location))
         if parameter == "q":
             return {"fired": True, "vector": "svg_onload", "surface": "hash_query",
-                    "payload": "<svg onload=window.sentry_hook('c')>"}
+                    "payload": "<svg onload=window.sentry_hook('c')>",
+                    "url": "http://x/#/search?q=payload"}
         return {"fired": False}
 
     monkeypatch.setattr(XSSVerifier, "_new_reflection_context", fake_new_ctx)
     monkeypatch.setattr(XSSVerifier, "verify_reflected_dom", fake_verify)
 
     findings = asyncio.run(
-        detector._browser_dom_reflection_sweep(targets, [], {}, browser_available=True, existing_findings=[])
+        detector._browser_dom_reflection_sweep(
+            targets,
+            [],
+            {"session": "abc"},
+            browser_available=True,
+            existing_findings=[],
+        )
     )
 
     assert calls == [("http://x/#/search", "q", "both")]
@@ -207,6 +214,14 @@ def test_sweep_invokes_verify_reflected_dom_and_builds_finding(monkeypatch):
     # The winning vector/surface is threaded through to the finding.
     assert finding.detection_evidence.get("winning_vector") == "svg_onload"
     assert finding.detection_evidence.get("winning_surface") == "hash_query"
+    # DOM-XSS is delivered via browser navigation (no httpx send_request). The
+    # snippet represents the actual HTTP navigation: fragments and fake GET
+    # bodies are omitted, while the browser context's known UA is retained.
+    assert finding.verification_request_snippet is not None
+    assert finding.verification_request_snippet.startswith("GET / HTTP/1.1\nHost: x")
+    assert "User-Agent: SentryStrikeScanner/1.0" in finding.verification_request_snippet
+    assert "Cookie: session=abc" in finding.verification_request_snippet
+    assert "<svg onload=window.sentry_hook('c')>" not in finding.verification_request_snippet
 
 
 # --- Task D: multi-vector / multi-surface loop -----------------------------------------
@@ -241,6 +256,7 @@ def test_sweep_vectors_stops_on_first_fire(monkeypatch):
         verifier._sweep_vectors_and_surfaces(object(), "http://x/#/search", "q", "canary")
     )
     assert result["fired"] is True
+    assert result["url"] == probed[-1]
     # Stopped immediately after the firing probe.
     assert len(probed) == 2
 

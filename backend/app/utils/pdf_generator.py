@@ -6,7 +6,9 @@ Converts scan JSON output into a polished, client-ready PDF report.
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -48,10 +50,306 @@ def _fmt_dt(value, fmt="%Y-%m-%d %H:%M:%S") -> str:
         return str(value)[:19]
 
 
+# ─────────────────────── Unicode / emoji rendering ──────────────────────── #
+#
+# The built-in PDF fonts (Helvetica/Courier) only cover Latin-1/WinAnsi, so
+# characters like arrows, em dashes, ellipses, and emoji render as tofu boxes.
+# Rather than flatten them to ASCII, we render them faithfully:
+#
+#   * Latin-1 chars          -> base font (Helvetica/Courier), unchanged.
+#   * Other text codepoints  -> a registered Unicode TrueType font ("Uni"),
+#     drawn as real vector glyphs (arrows, dashes, symbols, non-Latin scripts).
+#   * Color emoji            -> rasterized to inline PNGs (ReportLab can only
+#     draw glyph outlines, not COLR/CBDT color-font tables).
+#   * Truly unrenderable     -> transliterated to ASCII if we have a mapping,
+#     else "?" as a last resort.
+#
+# Everything degrades gracefully: if the Unicode font / Pillow / emoji font are
+# unavailable (e.g. a slim Linux container), we fall back to transliteration so
+# the report always builds.
+
+# Fallback ASCII transliterations, used only when no font can draw the glyph.
+_UNICODE_TRANSLITERATIONS = {
+    "–": "-", "—": "-", "―": "-",
+    "‘": "'", "’": "'", "‚": ",",
+    "“": '"', "”": '"', "„": '"',
+    "…": "...", "→": "->", "←": "<-", "↔": "<->", "⇒": "=>",
+    "•": "*", "·": "*", "−": "-",
+    " ": " ", " ": " ", "​": "",
+    "≤": "<=", "≥": ">=", "≠": "!=", "×": "x",
+    "✓": "[ok]", "✗": "[x]", "✔": "[ok]", "✘": "[x]", "⚠": "[!]",
+}
+
+# Prioritized Unicode text fonts. Each is registered under its own ReportLab
+# name; the first one whose cmap contains a codepoint wins, so a broad-coverage
+# font handles most glyphs and later fonts fill rare gaps (e.g. Syllabics).
+_UNI_FONT_CANDIDATES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Uni0", ("arialuni.ttf",)),                       # Arial Unicode MS
+    ("Uni1", ("seguisym.ttf",)),                       # Segoe UI Symbol
+    ("Uni2", ("DejaVuSans.ttf", "NotoSans-Regular.ttf")),  # Linux fallbacks
+    ("Uni3", ("gadugi.ttf",)),                         # Cherokee/Syllabics gaps
+)
+
+# Populated by _ensure_fonts(); cached for the process lifetime.
+_FONTS: dict[str, Any] = {
+    "ready": False,
+    "uni": False,
+    "uni_fonts": [],           # list of (reportlab_name, cmap frozenset), in priority order
+    "emoji": False,
+    "emoji_font_path": None,
+    "emoji_cmap": frozenset(),
+    "emoji_cache_dir": None,
+}
+
+
+def _font_search_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+    if windir:
+        dirs.append(Path(windir) / "Fonts")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        dirs.append(Path(local) / "Microsoft" / "Windows" / "Fonts")
+    dirs += [
+        Path("/usr/share/fonts"), Path("/usr/local/share/fonts"),
+        Path("/Library/Fonts"), Path("/System/Library/Fonts"),
+        Path.home() / ".fonts",
+    ]
+    return [d for d in dirs if d.is_dir()]
+
+
+def _find_font_file(candidates: tuple[str, ...]) -> Path | None:
+    wanted = {c.lower() for c in candidates}
+    for base in _font_search_dirs():
+        try:
+            for f in base.rglob("*"):
+                if f.name.lower() in wanted:
+                    return f
+        except OSError:
+            continue
+    return None
+
+
+def _load_cmap(path: Path) -> frozenset:
+    try:
+        from fontTools.ttLib import TTFont as _FTFont
+
+        with _FTFont(str(path), fontNumber=0, lazy=True) as ft:
+            return frozenset(ft.getBestCmap().keys())
+    except Exception:
+        return frozenset()
+
+
+def _ensure_fonts() -> None:
+    """Register the Unicode text fonts and locate the color-emoji font once."""
+    if _FONTS["ready"]:
+        return
+    _FONTS["ready"] = True
+
+    uni_fonts: list[tuple[str, frozenset]] = []
+    for rl_name, filenames in _UNI_FONT_CANDIDATES:
+        path = _find_font_file(filenames)
+        if not path:
+            continue
+        cmap = _load_cmap(path)
+        if not cmap:
+            continue
+        try:
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
+
+            pdfmetrics.registerFont(TTFont(rl_name, str(path)))
+            uni_fonts.append((rl_name, cmap))
+        except Exception:
+            continue
+    _FONTS["uni_fonts"] = uni_fonts
+    _FONTS["uni"] = bool(uni_fonts)
+
+    emoji_path = _find_font_file((
+        "seguiemj.ttf",              # Segoe UI Emoji (Windows, color)
+        "NotoColorEmoji.ttf",        # Noto Color Emoji (Linux)
+        "AppleColorEmoji.ttc",       # macOS
+    ))
+    if emoji_path:
+        try:
+            import PIL  # noqa: F401  (presence check)
+
+            _FONTS["emoji_font_path"] = str(emoji_path)
+            _FONTS["emoji_cmap"] = _load_cmap(emoji_path)
+            _FONTS["emoji"] = True
+        except Exception:
+            _FONTS["emoji"] = False
+
+
+def _is_emoji_codepoint(cp: int) -> bool:
+    return (
+        0x1F300 <= cp <= 0x1FAFF
+        or 0x1F000 <= cp <= 0x1F0FF
+        or 0x2600 <= cp <= 0x27BF
+        or 0x2B00 <= cp <= 0x2BFF
+        or 0x1F1E6 <= cp <= 0x1F1FF
+        or cp in (0x203C, 0x2049)
+    )
+
+
+def _uni_font_for(cp: int) -> str | None:
+    """Return the first registered Unicode font whose cmap has this codepoint."""
+    for rl_name, cmap in _FONTS["uni_fonts"]:
+        if cp in cmap:
+            return rl_name
+    return None
+
+
+def _resolve_char(ch: str) -> tuple[str, str]:
+    """Classify a character into a render bucket.
+
+    Returns (kind, payload):
+      * ("keep", ch)   - newline/tab, passed through
+      * ("latin", "\\uXXXX") - other control char (incl. NUL), shown as a
+                         visible escape so evidence is never silently dropped
+      * ("latin", ch)  - base Latin-1 font renders it (payload may be an ASCII
+                         transliteration when no font has the glyph)
+      * ("uni:<name>", ch) - registered Unicode font <name> renders it
+      * ("emoji", ch)  - rasterize to an inline color image
+    """
+    cp = ord(ch)
+    if ch in ("\n", "\t"):
+        return ("keep", ch)
+    if cp < 0x20 or cp == 0x7F:
+        # Non-printable control byte (NUL, DEL, etc.) — surface it visibly
+        # rather than dropping it, so the report reflects the raw response.
+        return ("latin", f"\\u{cp:04x}")
+    if cp <= 0xFF:
+        return ("latin", ch)
+    if _FONTS["emoji"] and _is_emoji_codepoint(cp) and cp in _FONTS["emoji_cmap"]:
+        return ("emoji", ch)
+    uni = _uni_font_for(cp)
+    if uni:
+        return (f"uni:{uni}", ch)
+    if _FONTS["emoji"] and cp in _FONTS["emoji_cmap"]:
+        return ("emoji", ch)
+    return ("latin", _UNICODE_TRANSLITERATIONS.get(ch, "?"))
+
+
+def _emoji_png_path(ch: str) -> str | None:
+    """Rasterize a single emoji to a cached PNG; return its filesystem path."""
+    if not _FONTS["emoji"]:
+        return None
+    cache_dir = _FONTS["emoji_cache_dir"]
+    if cache_dir is None:
+        cache_dir = Path(tempfile.gettempdir()) / "sentrystrike_emoji"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            _FONTS["emoji"] = False
+            return None
+        _FONTS["emoji_cache_dir"] = cache_dir
+
+    key = "-".join(f"{ord(c):x}" for c in ch)
+    out = cache_dir / f"{key}.png"
+    if out.exists():
+        return str(out).replace("\\", "/")
+
+    try:
+        from PIL import Image as _PILImage, ImageDraw, ImageFont
+
+        render_px = 109  # Segoe UI Emoji ships a 109px bitmap strike
+        font = ImageFont.truetype(_FONTS["emoji_font_path"], render_px)
+        img = _PILImage.new("RGBA", (render_px * 2, render_px * 2), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        try:
+            draw.text((render_px // 2, render_px // 4), ch, font=font, embedded_color=True)
+        except TypeError:
+            draw.text((render_px // 2, render_px // 4), ch, font=font)
+        bbox = img.getbbox()
+        if bbox:
+            img = img.crop(bbox)
+        img.save(out)
+        return str(out).replace("\\", "/")
+    except Exception:
+        return None
+
+
+def _sanitize_pdf_text(value: Any) -> str:
+    """ASCII-safe text for canvas draws that use only the base Latin-1 fonts.
+
+    Used for cover-page fields (URLs/dates/scan IDs) drawn directly with
+    Helvetica, where inline font switching isn't available.
+    """
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    out: list[str] = []
+    for ch in text:
+        cp = ord(ch)
+        if ch in ("\n", "\t"):
+            out.append(ch)
+        elif cp < 0x20 or cp == 0x7F:
+            out.append(f"\\u{cp:04x}")
+        elif cp <= 0xFF:
+            out.append(ch)
+        else:
+            out.append(_UNICODE_TRANSLITERATIONS.get(ch, "?"))
+    return "".join(out)
+
+
+def _para_markup(value: Any, *, emoji_px: float = 10.0) -> str:
+    """Build Paragraph markup that renders every character faithfully.
+
+    Latin text stays in the base font; Unicode glyphs are wrapped in the
+    registered Unicode font; emoji become inline <img> tags.
+    """
+    _ensure_fonts()
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+
+    parts: list[str] = []
+    buf: list[str] = []
+    buf_kind: str | None = None   # "latin" or "uni:<font>"
+
+    def flush() -> None:
+        if not buf:
+            return
+        segment = escape("".join(buf)).replace("\n", "<br/>")
+        if buf_kind and buf_kind.startswith("uni:"):
+            parts.append(f'<font name="{buf_kind[4:]}">{segment}</font>')
+        else:
+            parts.append(segment)
+        buf.clear()
+
+    for ch in text:
+        kind, payload = _resolve_char(ch)
+        if kind == "keep":
+            payload = ch
+        elif kind == "drop":
+            continue
+        elif kind == "emoji":
+            png = _emoji_png_path(payload)
+            if png:
+                flush()
+                parts.append(
+                    f'<img src="{png}" width="{emoji_px:.1f}" '
+                    f'height="{emoji_px:.1f}" valign="-1.5"/>'
+                )
+                continue
+            uni = _uni_font_for(ord(payload))
+            if uni:
+                kind = f"uni:{uni}"
+            else:
+                kind, payload = "latin", _UNICODE_TRANSLITERATIONS.get(payload, "?")
+
+        run_kind = kind if kind.startswith("uni:") else "latin"
+        if run_kind != buf_kind:
+            flush()
+            buf_kind = run_kind
+        buf.append(payload)
+
+    flush()
+    return "".join(parts)
+
+
 def _para_escape(value: Any) -> str:
     """Escape dynamic text before passing it to ReportLab Paragraph markup."""
-    text = "N/A" if value is None else str(value)
-    return escape(text).replace("\n", "<br/>")
+    if value is None:
+        return "N/A"
+    return _para_markup(value)
 
 
 def _dedupe_semicolon_text(value: Any) -> str:
@@ -288,15 +586,70 @@ class CodeBlock(Flowable):
 
     @staticmethod
     def _normalize_text(text: str) -> str:
-        cleaned = str(text or "").replace("\t", "    ")
-        cleaned = re.sub(r"</?pre[^>]*>", "", cleaned, flags=re.I)
+        # Keep Unicode and control bytes intact: arrows/dashes/emoji render via
+        # font switching / inline images in draw(), and control chars (NUL, DEL,
+        # etc.) are surfaced as visible \uXXXX escapes by _resolve_char() so
+        # evidence is never silently dropped. Only tabs are expanded here.
+        raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
+        cleaned = re.sub(r"</?pre[^>]*>", "", raw, flags=re.I)
         cleaned = re.sub(r"</?code[^>]*>", "", cleaned, flags=re.I)
         return cleaned
+
+    def _emoji_advance(self) -> float:
+        return self.font_size
+
+    def _segment_runs(self, text: str) -> list[tuple[str, str]]:
+        """Split text into (kind, payload) runs. kind is 'latin', 'uni:<font>',
+        or 'emoji' (payload = PNG path). Adjacent same-font chars are merged."""
+        _ensure_fonts()
+        runs: list[tuple[str, str]] = []
+        cur_kind: str | None = None
+        cur: list[str] = []
+
+        def push() -> None:
+            nonlocal cur_kind
+            if cur:
+                runs.append((cur_kind, "".join(cur)))
+                cur.clear()
+
+        for ch in text:
+            kind, payload = _resolve_char(ch)
+            if kind == "keep":
+                payload = ch
+            elif kind == "drop":
+                continue
+            elif kind == "emoji":
+                png = _emoji_png_path(payload)
+                if png:
+                    push()
+                    runs.append(("emoji", png))
+                    cur_kind = None
+                    continue
+                uni = _uni_font_for(ord(payload))
+                if uni:
+                    kind = f"uni:{uni}"
+                else:
+                    kind, payload = "latin", _UNICODE_TRANSLITERATIONS.get(payload, "?")
+            run_kind = kind if kind.startswith("uni:") else "latin"
+            if run_kind != cur_kind:
+                push()
+                cur_kind = run_kind
+            cur.append(payload)
+        push()
+        return runs
 
     def _string_width(self, text: str) -> float:
         from reportlab.pdfbase.pdfmetrics import stringWidth
 
-        return stringWidth(text, self.font_name, self.font_size)
+        total = 0.0
+        for kind, payload in self._segment_runs(text):
+            if kind == "emoji":
+                total += self._emoji_advance()
+            elif kind.startswith("uni:"):
+                total += stringWidth(payload, kind[4:], self.font_size)
+            else:
+                total += stringWidth(payload, self.font_name, self.font_size)
+        return total
 
     def _wrap_line(self, line: str, max_width: float) -> list[str]:
         if not line:
@@ -354,16 +707,31 @@ class CodeBlock(Flowable):
         return [first, rest]
 
     def draw(self):
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+
         c = self.canv
         c.saveState()
         c.setFillColor(LIGHT_BG)
         c.roundRect(0, 0, self.width, self.height, 2, fill=1, stroke=0)
-        c.setFillColor(BODY_TEXT)
-        c.setFont(self.font_name, self.font_size)
 
         y = self.height - self.pad_y - self.font_size
         for line in self.lines:
-            c.drawString(self.pad_x, y, line)
+            x = self.pad_x
+            for kind, payload in self._segment_runs(line):
+                if kind == "emoji":
+                    size = self._emoji_advance()
+                    try:
+                        c.drawImage(payload, x, y - size * 0.15, width=size,
+                                    height=size, mask="auto")
+                    except Exception:
+                        pass
+                    x += size
+                    continue
+                font = kind[4:] if kind.startswith("uni:") else self.font_name
+                c.setFillColor(BODY_TEXT)
+                c.setFont(font, self.font_size)
+                c.drawString(x, y, payload)
+                x += stringWidth(payload, font, self.font_size)
             y -= self.leading
         c.restoreState()
 
@@ -384,8 +752,9 @@ class CoverPage:
             target = vulns[0].get("location", {}).get("url", target)
             target = "/".join(target.split("/")[:3])
 
+        target = _sanitize_pdf_text(target)
         gen_at = data.get("generated_at", "")
-        date_str = _fmt_dt(gen_at, "%B %d, %Y")
+        date_str = _sanitize_pdf_text(_fmt_dt(gen_at, "%B %d, %Y"))
 
         canvas.saveState()
 
@@ -421,12 +790,12 @@ class CoverPage:
         canvas.setFont("Helvetica", 11)
         canvas.drawString(22*mm, h - 85*mm, f"Target: {target}")
         canvas.drawString(22*mm, h - 92*mm, f"Date:   {date_str}")
-        scan_id_str = f"Scan ID: {data.get('scan_id', 'N/A')}"
+        scan_id_str = _sanitize_pdf_text(f"Scan ID: {data.get('scan_id', 'N/A')}")
         # Clip long scan IDs to fit within page margin
         canvas.setFont("Helvetica", 10)
         max_w = w - 44*mm
         while canvas.stringWidth(scan_id_str, "Helvetica", 10) > max_w and len(scan_id_str) > 20:
-            scan_id_str = scan_id_str[:-4] + "…"
+            scan_id_str = scan_id_str[:-4] + "..."
         canvas.drawString(22*mm, h - 99*mm, scan_id_str)
 
         # ── Risk score pill ──
@@ -1101,6 +1470,18 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
         ]))
         block.append(det_tbl)
         block.append(Spacer(1, 3*mm))
+        # Keep the finding header + details grid together on one page; everything
+        # after this index (description, impact, evidence, …) may flow/break.
+        keep_together_count = len(block)
+
+        # ── What This Is (plain-language description) ──
+        description = ai.get("description")
+        if description:
+            block.append(Spacer(1, 3*mm))
+            block.append(Paragraph("WHAT THIS IS", styles["label"]))
+            block.append(Spacer(1, 1*mm))
+            block.append(Paragraph(_para_escape(description), styles["body_sm"]))
+            block.append(Spacer(1, 3*mm))
 
         # ── Business Impact ──
         block.append(Spacer(1, 3*mm))
@@ -1150,15 +1531,17 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
         # ── False positive info ──
         fp_prob = ai.get("false_positive_probability", 0)
         fp_pct  = int(fp_prob * 100)
+        ai_verdict = _clean_status(ai.get("verdict") or "N/A")
         block.append(Spacer(1, 2*mm))
         block.append(Paragraph(
-            f"<b>False Positive Probability:</b> {fp_pct}%  |  "
+            f"<b>AI False-Positive Estimate (Advisory):</b> {fp_pct}%  |  "
+            f"<b>Verdict:</b> {ai_verdict}  |  "
             f"<b>AI Analysis Status:</b> {_clean_status(ai.get('ai_analysis_status', 'N/A'))}",
             styles["caption"],
         ))
 
-        elems.append(KeepTogether(block[:6]))  # keep header + details together
-        elems.extend(block[6:])
+        elems.append(KeepTogether(block[:keep_together_count]))  # keep header + details together
+        elems.extend(block[keep_together_count:])
         elems.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER,
                                 spaceBefore=4, spaceAfter=2))
 

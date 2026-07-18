@@ -181,6 +181,11 @@ class FileUploadDetector(BaseDetector):
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
             response_evidence = self._has_upload_response_evidence(response, php_name)
             if accessible_url:
+                request_snippet, response_snippet = build_httpx_evidence_snippets(
+                    response, payload=php_name,
+                    fallback_url=candidate.url, fallback_method=candidate.method,
+                    fallback_headers=candidate.headers, fallback_body=php_name,
+                )
                 findings.append(Finding(
                     category=OwaspCategory.a01,
                     vuln_type="Unrestricted File Upload",
@@ -202,6 +207,8 @@ class FileUploadDetector(BaseDetector):
                     },
                     reproducible=True,
                     verified=True,
+                    verification_request_snippet=request_snippet,
+                    verification_response_snippet=response_snippet,
                 ))
                 return  # Most severe finding recorded - stop here.
 
@@ -211,6 +218,11 @@ class FileUploadDetector(BaseDetector):
             php_name, php_content, "image/jpeg",
         )
         if accepted:
+            request_snippet, response_snippet = build_httpx_evidence_snippets(
+                response, payload=php_name,
+                fallback_url=candidate.url, fallback_method=candidate.method,
+                fallback_headers=candidate.headers, fallback_body=php_name,
+            )
             candidate_urls = self._extract_candidate_urls(response, form_url, site_root, php_name)
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
             if accessible_url:
@@ -236,6 +248,8 @@ class FileUploadDetector(BaseDetector):
                     },
                     reproducible=True,
                     verified=True,
+                    verification_request_snippet=request_snippet,
+                    verification_response_snippet=response_snippet,
                 ))
             elif response_evidence:
                 findings.append(Finding(
@@ -259,6 +273,8 @@ class FileUploadDetector(BaseDetector):
                     },
                     reproducible=False,
                     verified=False,
+                    verification_request_snippet=request_snippet,
+                    verification_response_snippet=response_snippet,
                 ))
 
         # --- Test 3: double extension (.php.jpg) ---
@@ -271,6 +287,11 @@ class FileUploadDetector(BaseDetector):
             candidate_urls = self._extract_candidate_urls(response, form_url, site_root, dbl_name)
             accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
             response_evidence = self._has_upload_response_evidence(response, dbl_name)
+            dbl_request_snippet, dbl_response_snippet = build_httpx_evidence_snippets(
+                response, payload=dbl_name,
+                fallback_url=candidate.url, fallback_method=candidate.method,
+                fallback_headers=candidate.headers, fallback_body=dbl_name,
+            )
             if accessible_url:
                 findings.append(Finding(
                     category=OwaspCategory.a01,
@@ -293,6 +314,8 @@ class FileUploadDetector(BaseDetector):
                     },
                     reproducible=True,
                     verified=True,
+                    verification_request_snippet=dbl_request_snippet,
+                    verification_response_snippet=dbl_response_snippet,
                 ))
             elif response_evidence:
                 findings.append(Finding(
@@ -315,6 +338,8 @@ class FileUploadDetector(BaseDetector):
                     },
                     reproducible=False,
                     verified=False,
+                    verification_request_snippet=dbl_request_snippet,
+                    verification_response_snippet=dbl_response_snippet,
                 ))
 
         # --- Test 4: unrestricted type - accepts plain .txt ---
@@ -329,6 +354,8 @@ class FileUploadDetector(BaseDetector):
             if accessible_url or response_evidence:
                 txt_request_snippet, txt_response_snippet = build_httpx_evidence_snippets(
                     response, payload=txt_name,
+                    fallback_url=candidate.url, fallback_method=candidate.method,
+                    fallback_headers=candidate.headers, fallback_body=txt_name,
                 )
                 findings.append(Finding(
                     category=OwaspCategory.a01,
@@ -409,6 +436,8 @@ class FileUploadDetector(BaseDetector):
             ):
                 danger_request_snippet, danger_response_snippet = build_httpx_evidence_snippets(
                     danger_resp, payload=danger_name,
+                    fallback_url=candidate.url, fallback_method=candidate.method,
+                    fallback_headers=candidate.headers, fallback_body=danger_name,
                 )
                 findings.append(Finding(
                     category=OwaspCategory.a01,
@@ -519,6 +548,11 @@ class FileUploadDetector(BaseDetector):
         accessible_url = await self._find_canary(client, candidate_urls, "SENTRY_UPLOAD_TEST_CANARY")
         if not accessible_url:
             return
+        svg_request_snippet, svg_response_snippet = build_httpx_evidence_snippets(
+            response, payload=svg_name,
+            fallback_url=candidate.url, fallback_method=candidate.method,
+            fallback_headers=candidate.headers, fallback_body=svg_name,
+        )
         findings.append(Finding(
             category=OwaspCategory.a01,
             vuln_type="Unrestricted File Upload",
@@ -540,6 +574,8 @@ class FileUploadDetector(BaseDetector):
             },
             reproducible=True,
             verified=True,
+            verification_request_snippet=svg_request_snippet,
+            verification_response_snippet=svg_response_snippet,
         ))
 
     async def _test_xml_parser(
@@ -567,6 +603,11 @@ class FileUploadDetector(BaseDetector):
         if not entity_accepted:
             return
         entity_body = entity_resp.text or ""
+        entity_request_snippet, entity_response_snippet = build_httpx_evidence_snippets(
+            entity_resp, payload="sentry_entity.xml",
+            fallback_url=candidate.url, fallback_method=candidate.method,
+            fallback_headers=candidate.headers, fallback_body="sentry_entity.xml",
+        )
         # Strongest signal: the parser expanded the internal entity and reflected
         # its value (the raw entity name is gone, the canary text is present).
         if self._XML_ENTITY_CANARY in entity_body and "&probe;" not in entity_body:
@@ -588,6 +629,8 @@ class FileUploadDetector(BaseDetector):
                 detection_evidence={"parser_expands_entities": True},
                 reproducible=True,
                 verified=True,
+                verification_request_snippet=entity_request_snippet,
+                verification_response_snippet=entity_response_snippet,
             ))
             return
         # Weaker signal: the entity doc is processed differently from the benign
@@ -614,6 +657,8 @@ class FileUploadDetector(BaseDetector):
                 detection_evidence={"proof_type": "control_differential"},
                 reproducible=False,
                 verified=False,
+                verification_request_snippet=entity_request_snippet,
+                verification_response_snippet=entity_response_snippet,
             ))
 
     async def _test_xxe_external_entity(
@@ -656,6 +701,8 @@ class FileUploadDetector(BaseDetector):
             disclosed = body[match.start(): match.start() + 80]
             xxe_request_snippet, xxe_response_snippet = build_httpx_evidence_snippets(
                 response, payload="sentry_xxe.xml", extra_markers=[disclosed],
+                fallback_url=candidate.url, fallback_method=candidate.method,
+                fallback_headers=candidate.headers, fallback_body="sentry_xxe.xml",
             )
             findings.append(Finding(
                 category=OwaspCategory.a05,
