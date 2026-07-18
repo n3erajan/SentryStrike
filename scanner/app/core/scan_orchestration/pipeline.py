@@ -1,0 +1,667 @@
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+from time import perf_counter
+from urllib.parse import urlparse
+
+from app.config import get_settings
+from app.core.detectors.attack_planner import AttackPlanner
+from app.core.detectors.auth_detector import AuthenticationFailuresDetector
+from app.core.detectors.base_detector import Finding
+from app.core.detectors.crypto_failures import CryptoFailuresDetector
+from app.core.detectors.exception_handler import ExceptionHandlingDetector
+from app.core.detectors.security_headers import SecurityHeadersDetector
+from app.core.detectors.sensitive_paths import SensitivePathsDetector
+from app.core.scan_orchestration.progress import AI_PRIOR_PER_FINDING_S, _EtaState
+from app.core.verification.verification_framework import FindingDeduplicator, TestPollutionFilter
+from app.utils.cvss_calculator import CvssCalculator
+from app.utils.scan_metrics import begin_request_counting, end_request_counting, snapshot_request_counts
+from app.core.request_governor import begin_governor, end_governor, denied_snapshot
+from shared.models.scan import CrawlMode, DetectorCoverageMetric, ScanPhase, ScanStatus
+from shared.models.vulnerability import OwaspCategory, SeverityLevel
+from shared.schemas.scan_schema import ScanConfig
+from shared.verification.oast import OastClient
+
+logger = logging.getLogger("app.core.scanner")
+
+
+class PipelineMixin:
+    async def _run_scan_pipeline(
+        self,
+        scan_id: str,
+        *,
+        auth_accounts: list | None = None,
+        scan_config: ScanConfig | None = None,
+    ) -> None:
+        scan = await self.repository.get_by_id(scan_id)
+        if scan is None:
+            logger.error("scan %s not found", scan_id)
+            return
+
+        # Isolate mutable crawl/detector state for every production scan so
+        # concurrent scans cannot share cookies/auth/HTTP clients/verifier state
+        # (Issue 1). Injected fakes (tests/embedders) are preserved: only the
+        # default self-built instances are swapped for fresh per-scan ones.
+        runtime = self._build_scan_runtime()
+        scan_spider = runtime.spider
+        scan_detectors = runtime.detectors
+        scan_supply_chain = runtime.supply_chain_detector
+
+        try:
+            self._eta_state = _EtaState()
+            await self._set_phase_progress(scan, ScanPhase.initializing, 1.0, "Starting scan")
+            await self._check_cancelled(scan_id)
+
+            # The worker received these accounts in the Redis job payload. BLPOP
+            # removed that payload before this method started, so they now live
+            # only in this worker's memory.
+            submitted_accounts = auth_accounts or []
+            auth_accounts_by_role = {account.role.value: account for account in submitted_accounts}
+            main_account = auth_accounts_by_role.get("main")
+
+            await self._set_phase_progress(scan, ScanPhase.crawling, 0.0, "Crawling target and discovering attack surface")
+            if scan.crawl_mode == CrawlMode.single:
+                logger.info("single-path scan: skipping spider discovery for %s", scan.target_url)
+                crawl_result = await scan_spider.fetch_single(scan.target_url)
+            else:
+                crawl_result = await scan_spider.crawl(scan.target_url, auth_override=main_account, scan_config=scan_config)
+
+            # Filter all crawl results to strictly enforce same-origin target isolation (Issue 2)
+            target_url = scan.target_url
+            
+            def is_same_origin(url_a: str, url_b: str) -> bool:
+                try:
+                    p_a = urlparse(url_a)
+                    p_b = urlparse(url_b)
+                    port_a = p_a.port or (80 if p_a.scheme == "http" else 443 if p_a.scheme == "https" else None)
+                    port_b = p_b.port or (80 if p_b.scheme == "http" else 443 if p_b.scheme == "https" else None)
+                    return (p_a.scheme == p_b.scheme and p_a.hostname == p_b.hostname and port_a == port_b)
+                except Exception:
+                    return False
+
+            crawl_result.urls = [u for u in crawl_result.urls if is_same_origin(target_url, u)]
+            crawl_result.routes = [r for r in crawl_result.routes if is_same_origin(target_url, getattr(r, "url", "")) and not getattr(r, "is_dead", False)]
+            crawl_result.api_endpoints = [e for e in crawl_result.api_endpoints if is_same_origin(target_url, getattr(e, "url", ""))]
+            crawl_result.requests = [req for req in crawl_result.requests if is_same_origin(target_url, getattr(req, "url", ""))]
+            if hasattr(crawl_result, "request_audit"):
+                crawl_result.request_audit = [
+                    req for req in crawl_result.request_audit
+                    if is_same_origin(target_url, getattr(req, "url", ""))
+                ]
+            crawl_result.parameters = [p for p in crawl_result.parameters if is_same_origin(target_url, getattr(p, "url", ""))]
+            # A form is in scope only when its RESOLVED submission target is same-origin.
+            # page_url is used only to resolve a relative/empty action — never as scope
+            # proof on its own, or a same-origin page carrying an off-origin form action
+            # would let active payloads and credentials reach a third party (Issue 2).
+            crawl_result.forms = self._scope_forms_to_origin(target_url, crawl_result.forms, is_same_origin)
+
+            scan.statistics.total_urls_crawled = self._count_discovered_surface(crawl_result)
+            await self._set_phase_progress(scan, ScanPhase.crawling, 1.0, f"Crawl complete: {scan.statistics.total_urls_crawled} URL(s) discovered")
+            await self._check_cancelled(scan_id)
+
+            await self._set_phase_progress(scan, ScanPhase.technology_detection, 0.0, "Detecting technology stack and known CVEs")
+            technologies = await self.technology_detector.detect(
+                scan.target_url,
+                crawl_result=crawl_result,
+                browser_available=getattr(crawl_result, "browser_available", False),
+                storage_state=getattr(crawl_result, "auth_storage_state", None),
+                session_cookies=getattr(crawl_result, "session_cookies", {}),
+            )
+            scan.technology_stack = await self.cve_service.enrich_components(technologies)
+            # Back-fill component versions from ecosystem-standard manifests and
+            # version-bearing headers so the supply-chain gate can emit true A03
+            # findings. Best-effort: never fail the scan over version enrichment.
+            try:
+                await self._enrich_tech_from_manifests(scan, crawl_result)
+            except Exception as exc:
+                logger.debug("manifest/header version enrichment failed: %s", exc)
+            await self._set_phase_progress(scan, ScanPhase.technology_detection, 1.0, f"Technology analysis complete: {len(scan.technology_stack)} component(s) identified")
+            await self._check_cancelled(scan_id)
+
+            await self._set_phase_progress(scan, ScanPhase.tls_analysis, 0.0, "Analyzing TLS and transport security")
+            ssl_result = await self.ssl_analyzer.analyze(scan.target_url)
+            findings: list[Finding] = []
+            if not ssl_result.get("valid", True):
+                issues = ssl_result.get("issues", [])
+                no_tls = any("does not support HTTPS" in i for i in issues)
+                findings.append(
+                    Finding(
+                        category=OwaspCategory.a02 if no_tls else OwaspCategory.a04,
+                        vuln_type="No TLS Configuration" if no_tls else "Weak TLS/SSL Configuration",
+                        severity=SeverityLevel.high if no_tls else SeverityLevel.medium,
+                        url=scan.target_url,
+                        evidence="; ".join(issues) or "TLS issues detected",
+                        verified=True,
+                        reproducible=True,
+                    )
+                )
+            await self._set_phase_progress(scan, ScanPhase.tls_analysis, 1.0, "TLS analysis complete")
+
+            skip_in_single_path = (SensitivePathsDetector,)
+            active_detectors = [
+                detector
+                for detector in scan_detectors
+                if not isinstance(detector, (CryptoFailuresDetector, SecurityHeadersDetector))
+                and not (scan.crawl_mode == CrawlMode.single and isinstance(detector, skip_in_single_path))
+            ]
+            effective_concurrency = scan_config.get_val("scanner_concurrency", get_settings().scanner_concurrency) if scan_config else get_settings().scanner_concurrency
+            detector_parallelism = max(2, effective_concurrency // 3)
+            detector_semaphore = asyncio.Semaphore(detector_parallelism)
+            session_cookies = getattr(crawl_result, "session_cookies", {})
+            oast_settings = get_settings()
+            crawl_context = {
+                "root_url": scan.target_url,
+                "session_cookies": session_cookies,
+                "auth_headers": getattr(crawl_result, "auth_headers", {}),
+                "auth_storage_state": getattr(crawl_result, "auth_storage_state", None),
+                "auth_state": getattr(crawl_result, "auth_state", "unauthenticated"),
+                "is_spa": getattr(crawl_result, "is_spa", False),
+                "spa_root_html": getattr(crawl_result, "spa_root_html", ""),
+                "api_endpoints": getattr(crawl_result, "api_endpoints", []),
+                "parameters": getattr(crawl_result, "parameters", []),
+                "requests": getattr(crawl_result, "requests", []),
+                "request_audit": getattr(crawl_result, "request_audit", []),
+                "request_audit_summary": getattr(crawl_result, "request_audit_summary", {}),
+                "routes": getattr(crawl_result, "routes", []),
+                "assets": getattr(crawl_result, "assets", []),
+                "dead_routes": getattr(crawl_result, "dead_routes", []),
+                "browser_available": getattr(crawl_result, "browser_available", None),
+                "browser_error": getattr(crawl_result, "browser_error", None),
+                "browser_forms": getattr(crawl_result, "browser_forms", []),
+                "oast_client": OastClient(
+                    (scan_config.oast_callback_base_url if scan_config else None) or oast_settings.oast_callback_base_url,
+                    (scan_config.oast_poll_url if scan_config else None) or oast_settings.oast_poll_url,
+                    timeout_seconds=oast_settings.request_timeout_seconds,
+                ),
+                "scan_config": scan_config,
+            }
+            # Reuse the winning login path from the main account so second/admin
+            # logins don't restart the strategy cascade from scratch.
+            main_replay = getattr(crawl_result, "auth_replay_state", None)
+            # Expose the winning login recipe to detectors (the auth detector uses it
+            # as a reliable login-flow record for default/weak-credential probing).
+            crawl_context["auth_replay_state"] = main_replay
+            # The scanner's OWN login identity for this scan (from the submitted
+            # main account, if any). The auth detector uses it to avoid flagging
+            # its own credentials as an exposed app identity. No env fallback.
+            crawl_context["scanner_identity_username"] = (
+                main_account.username if main_account else None
+            )
+            main_credentials = (
+                (main_account.username, main_account.password) if main_account else None
+            )
+            await self._apply_submitted_account_sessions(
+                scan,
+                auth_accounts_by_role,
+                crawl_context,
+                scan_config=scan_config,
+                preferred_replay=main_replay,
+                primary_credentials=main_credentials,
+            )
+            attack_planner = AttackPlanner.from_context(
+                urls=crawl_result.urls,
+                forms=crawl_result.forms,
+                parameters=getattr(crawl_result, "parameters", []),
+                api_endpoints=getattr(crawl_result, "api_endpoints", []),
+                requests=getattr(crawl_result, "requests", []),
+            )
+            crawl_context["attack_planner"] = attack_planner
+            crawl_context["attack_targets"] = attack_planner.targets
+            coverage_context = {
+                **crawl_context,
+                "urls": crawl_result.urls,
+                "forms": crawl_result.forms,
+            }
+            self._update_crawl_metadata(scan, crawl_result, crawl_context)
+
+            self._eta_state.measured_latency_ms = await self._measure_target_latency_ms(scan.target_url)
+            work_units, detector_prior_s = self._estimate_detector_work(
+                attack_planner,
+                active_detectors,
+                latency_ms=self._eta_state.measured_latency_ms,
+                parallelism=detector_parallelism,
+                per_detector_cap=(
+                    scan_config.get_val(
+                        "scanner_per_detector_request_cap",
+                        get_settings().scanner_per_detector_request_cap,
+                    )
+                    if scan_config
+                    else get_settings().scanner_per_detector_request_cap
+                ),
+            )
+            self._eta_state.detector_work_units = work_units
+            self._eta_state.detector_total_work = sum(work_units.values())
+            self._eta_state.detector_completed_work = 0.0
+            self._eta_state.detector_total_s = detector_prior_s
+            self._eta_state.detector_fraction = 0.0
+            self._eta_state.detector_phase_started = perf_counter()
+            logger.info(
+                "detector ETA model: ~%.0fs prior (%d detectors, %.0f work-units, "
+                "latency=%.0fms, parallelism=%d)",
+                self._eta_state.detector_total_s,
+                len(active_detectors),
+                self._eta_state.detector_total_work,
+                self._eta_state.measured_latency_ms,
+                detector_parallelism,
+            )
+
+            await self._set_phase_progress(scan, ScanPhase.vulnerability_detection, 0.0, f"Running {len(active_detectors)} active detector(s)")
+            detector_metrics: list[DetectorCoverageMetric] = []
+            metric_by_detector: dict[str, DetectorCoverageMetric] = {}
+
+            def record_metric(metric: DetectorCoverageMetric) -> DetectorCoverageMetric:
+                detector_metrics.append(metric)
+                metric_by_detector[metric.detector] = metric
+                return metric
+
+            async def run_detector(detector) -> tuple[object, list[Finding], DetectorCoverageMetric]:
+                detector_name = self._detector_name(detector)
+                async with detector_semaphore:
+                    try:
+                        result = await detector.detect(
+                            crawl_result.urls,
+                            crawl_result.forms,
+                            **crawl_context,
+                            technology_stack=scan.technology_stack,
+                        )
+                    except Exception as exc:
+                        logger.warning("detector failure: %s", exc)
+                        return detector, [], DetectorCoverageMetric(
+                            detector=detector_name,
+                            skipped_reasons={"detector_exception": 1},
+                        )
+                self._tag_detector_findings(result, detector_name)
+                return detector, result, self._detector_metric_for_findings(
+                    detector,
+                    result,
+                    coverage_context,
+                    technology_stack=scan.technology_stack,
+                )
+
+            detector_request_counts: dict[str, int] = {}
+            detector_denied_counts: dict[str, int] = {}
+            begin_request_counting()
+            # P1-1: activate the request-budget governor for the detector phase so
+            # per-detector / per-parameter ceilings bound each detector's traffic.
+            _governor_settings = get_settings()
+            begin_governor(
+                _governor_settings.scanner_per_detector_request_cap,
+                _governor_settings.scanner_per_parameter_request_cap,
+            )
+            try:
+                # Run detectors concurrently but consume them as they finish so
+                # progress ticks on work completed (not detector headcount).
+                detector_total = max(1, len(active_detectors))
+                detector_done = 0
+                for coro in asyncio.as_completed(
+                    [run_detector(detector) for detector in active_detectors]
+                ):
+                    result = await coro
+                    detector_done += 1
+                    finished_name = "unknown"
+                    if isinstance(result, Exception):
+                        logger.warning("detector failure: %s", result)
+                        record_metric(
+                            DetectorCoverageMetric(
+                                detector="unknown",
+                                skipped_reasons={"detector_exception": 1},
+                            )
+                        )
+                    else:
+                        finished_detector, result_findings, metric = result
+                        finished_name = metric.detector or self._detector_name(finished_detector)
+                        record_metric(metric)
+                        findings.extend(result_findings)
+                    work = self._eta_state.detector_work_units.get(finished_name, 0.0)
+                    if work <= 0 and self._eta_state.detector_total_work > 0:
+                        # Unknown/exception: spread remaining average so progress moves.
+                        remaining_detectors = max(1, detector_total - detector_done + 1)
+                        remaining_work = max(
+                            0.0,
+                            self._eta_state.detector_total_work - self._eta_state.detector_completed_work,
+                        )
+                        work = remaining_work / remaining_detectors
+                    self._eta_state.detector_completed_work = min(
+                        self._eta_state.detector_total_work,
+                        self._eta_state.detector_completed_work + work,
+                    )
+                    self._eta_state.findings_count = len(findings)
+                    total_work = max(self._eta_state.detector_total_work, 1e-9)
+                    self._eta_state.detector_fraction = (
+                        self._eta_state.detector_completed_work / total_work
+                    )
+                    await self._set_phase_progress(
+                        scan,
+                        ScanPhase.vulnerability_detection,
+                        self._eta_state.detector_fraction,
+                        f"Detectors {detector_done}/{detector_total} complete: {len(findings)} raw finding(s)",
+                    )
+
+                exception_detector = next((detector for detector in scan_detectors if isinstance(detector, ExceptionHandlingDetector)), None)
+                if exception_detector is not None:
+                    observed_exception_findings = exception_detector.findings_from_observed_evidence(findings, target_url=scan.target_url)
+                    self._tag_detector_findings(observed_exception_findings, self._detector_name(exception_detector))
+                    if observed_exception_findings:
+                        logger.info(
+                            "derived %d exception-handling finding(s) from observed active-verification evidence",
+                            len(observed_exception_findings),
+                        )
+                        metric = metric_by_detector.get(self._detector_name(exception_detector))
+                        if metric is None:
+                            metric = record_metric(self._detector_metric_for_findings(exception_detector, [], coverage_context))
+                        self._add_findings_to_metric(metric, observed_exception_findings)
+                        findings.extend(observed_exception_findings)
+
+                auth_detector_obj = next((detector for detector in scan_detectors if isinstance(detector, AuthenticationFailuresDetector)), None)
+                if auth_detector_obj is not None:
+                    observed_credential_findings = auth_detector_obj.findings_from_observed_evidence(findings)
+                    self._tag_detector_findings(observed_credential_findings, self._detector_name(auth_detector_obj))
+                    if observed_credential_findings:
+                        logger.info(
+                            "derived %d credential-disclosure finding(s) from observed evidence",
+                            len(observed_credential_findings),
+                        )
+                        metric = metric_by_detector.get(self._detector_name(auth_detector_obj))
+                        if metric is None:
+                            metric = record_metric(self._detector_metric_for_findings(auth_detector_obj, [], coverage_context))
+                        self._add_findings_to_metric(metric, observed_credential_findings)
+                        findings.extend(observed_credential_findings)
+
+                # A10/A07 derived-evidence cross-guard: when the same source finding
+                # yields both a verbose-error (A10) and a credential disclosure
+                # (A07) derivation, fold the verbose-error finding into the
+                # credential finding so one response body isn't counted twice.
+                # Only same-source derived findings merge; independent findings stay.
+                self._merge_same_source_derived_findings(findings)
+
+                # Provide the scan root URL so site-wide detectors can avoid duplicate page-level findings.
+                crypto_detector = next((detector for detector in scan_detectors if isinstance(detector, CryptoFailuresDetector)), None)
+                if crypto_detector is not None:
+                    crypto_findings = await crypto_detector.detect(crawl_result.urls, crawl_result.forms, **crawl_context)
+                    self._tag_detector_findings(crypto_findings, self._detector_name(crypto_detector))
+                    record_metric(
+                        self._detector_metric_for_findings(
+                            crypto_detector,
+                            crypto_findings,
+                            coverage_context,
+                            technology_stack=scan.technology_stack,
+                        )
+                    )
+                    findings.extend(crypto_findings)
+
+                header_detector = next((detector for detector in scan_detectors if isinstance(detector, SecurityHeadersDetector)), None)
+                if header_detector is not None:
+                    header_findings = await header_detector.detect(crawl_result.urls, crawl_result.forms, **crawl_context)
+                    self._tag_detector_findings(header_findings, self._detector_name(header_detector))
+                    record_metric(
+                        self._detector_metric_for_findings(
+                            header_detector,
+                            header_findings,
+                            coverage_context,
+                            technology_stack=scan.technology_stack,
+                        )
+                    )
+                    findings.extend(header_findings)
+
+                supply_chain_findings = await scan_supply_chain.detect(
+                    crawl_result.urls,
+                    crawl_result.forms,
+                    technologies=scan.technology_stack,
+                    **crawl_context,
+                )
+                self._tag_detector_findings(supply_chain_findings, self._detector_name(scan_supply_chain))
+                record_metric(
+                    self._detector_metric_for_findings(
+                        scan_supply_chain,
+                        supply_chain_findings,
+                        coverage_context,
+                        technology_stack=scan.technology_stack,
+                    )
+                )
+                findings.extend(supply_chain_findings)
+                detector_request_counts = snapshot_request_counts()
+                detector_denied_counts = denied_snapshot()
+            finally:
+                end_request_counting()
+                end_governor()
+            self._apply_detector_request_counts(
+                detector_metrics,
+                detector_request_counts,
+                detector_denied_counts,
+                coverage_context.get("attack_planner"),
+            )
+
+            await self._set_phase_progress(
+                scan,
+                ScanPhase.vulnerability_detection,
+                1.0,
+                f"Detector phase complete: {len(findings)} raw finding(s)",
+            )
+            await self._check_cancelled(scan_id)
+
+            # Enrich the technology stack from error responses the detectors just
+            # triggered. Stack traces / DB errors leak the framework, ORM, DB
+            # engine and language (often with versions) that header/HTML/runtime
+            # fingerprinting at scan start could not see. Best-effort: never fail
+            # the scan over fingerprint enrichment.
+            try:
+                await self._enrich_tech_from_errors(scan, findings)
+            except Exception as exc:
+                logger.debug("error-based technology enrichment failed: %s", exc)
+
+            # DEDUPLICATION PHASE: merge repeated proof for the same normalized
+            # route and vulnerability family. Verbose errors additionally retain
+            # the HTTP method because it identifies the request handler/reproducer.
+            await self._set_phase_progress(scan, ScanPhase.deduplication, 0.0, "Deduplicating and filtering findings")
+            findings = FindingDeduplicator.deduplicate(findings)
+            logger.info("deduplication complete: %d findings after merging", len(findings))
+
+            findings = TestPollutionFilter.filter_cross_module_contamination(findings)
+            logger.info(
+                "test pollution filter complete: %d findings after contamination review",
+                len(findings),
+            )
+
+            # CSRF finding deduplication:
+            # If token_bypass verified CSRF exists for a URL, suppress weaker heuristics
+            # like "Authentication Form Lacks CSRF Protection" to reduce duplicate noise.
+            _csrf_confirmed_urls: set[str] = set()
+            for f in findings:
+                if not f.vuln_type:
+                    continue
+                if "csrf" not in f.vuln_type.lower():
+                    continue
+                if getattr(f, "detection_method", "") == "token_bypass" or getattr(f, "verified", False):
+                    _csrf_confirmed_urls.add(f.url.split("?")[0])
+
+            if _csrf_confirmed_urls:
+                filtered: list[Finding] = []
+                for f in findings:
+                    url_key = (f.url or "").split("?")[0]
+                    vt_lower = (f.vuln_type or "").lower()
+                    if url_key in _csrf_confirmed_urls and "authentication form" in vt_lower and "lacks csrf" in vt_lower:
+                        continue
+                    if url_key in _csrf_confirmed_urls and "authentication form" in vt_lower and "may lack csrf" in vt_lower:
+                        continue
+                    filtered.append(f)
+                findings = filtered
+
+            # scan_mode filtering: If verified, keep only verified findings.
+            #
+            # IMPORTANT - heuristic passthrough:
+            # Some vulnerability classes are confirmed by *observing* the HTTP response (e.g.
+            # "credentials sent in a GET query string", "no CSRF token in form", "phpMyAdmin
+            # is reachable").  These findings are structurally true the moment the detector
+            # inspects the response - there is no active exploit payload that could flip
+            # `verified=True`.  Dropping them silently would cause the scanner to miss
+            # critical, real issues on targets like DVWA.
+            #
+            # For these classes we keep the finding but note it is heuristic-only so the
+            # AI analysis phase can apply its own confidence weighting.
+            HEURISTIC_PASSTHROUGH_TYPES: tuple[str, ...] = (
+                # Credential / transport exposure - observable from request inspection alone
+                "credentials transmitted via http get",
+                "credentials via get",
+                "password in get",
+                # CSRF structural absence - observable from form HTML
+                "authentication form may lack csrf",
+                "csrf protection",
+                "csrf token",
+                # Exposed admin / sensitive paths require content or access-control proof.
+                "phpmyadmin",
+                # Security-header absence - confirmed from response headers
+                "missing security header",
+                "security header",
+                # Session / cookie attribute issues - confirmed from Set-Cookie header
+                "insecure session cookie",
+                "cookie attribute",
+                # Information disclosure - confirmed from response body
+                "information disclosure",
+                "server banner",
+                "stack trace",
+                "debug page",
+                # TLS / transport issues already handled by sslyze (always verified=True)
+                "weak tls",
+                "ssl configuration",
+            )
+
+            settings = get_settings()
+            scan_mode = scan_config.get_val("scan_mode", getattr(settings, "scan_mode", "verified")) if scan_config else getattr(settings, "scan_mode", "verified")
+            if scan_mode == "verified":
+                dropped_by_detector: dict[str, int] = {}
+                kept, dropped = [], []
+                for f in findings:
+                    vuln_lower = f.vuln_type.lower()
+                    is_verified = getattr(f, "verified", False)
+                    is_low_severity = f.severity == SeverityLevel.low
+                    is_heuristic_passthrough = any(
+                        keyword in vuln_lower for keyword in HEURISTIC_PASSTHROUGH_TYPES
+                    ) and getattr(f, "detection_method", "heuristic") == "heuristic"
+
+                    if is_verified or is_low_severity or is_heuristic_passthrough:
+                        if is_heuristic_passthrough and not is_verified:
+                            # Boost confidence slightly so AI phase doesn't ignore it, but
+                            # leave verified=False so the risk-score weighting in _to_vulnerability
+                            # still applies a 30 % penalty - honest representation.
+                            f.confidence_score = max(f.confidence_score, 0.6)
+                            logger.info(
+                                "verified scan mode KEPT heuristic finding (passthrough): "
+                                "vuln_type=%r severity=%s url=%s",
+                                f.vuln_type,
+                                f.severity.value if hasattr(f.severity, "value") else f.severity,
+                                f.url,
+                            )
+                        kept.append(f)
+                    else:
+                        dropped.append(f)
+                        detector_name = str(getattr(f, "detector_name", "verified_mode_filter") or "verified_mode_filter")
+                        dropped_by_detector[detector_name] = dropped_by_detector.get(detector_name, 0) + 1
+                        logger.warning(
+                            "verified scan mode DROPPED finding: vuln_type=%r severity=%s verified=%s "
+                            "url=%s parameter=%s detection_method=%s confidence=%.1f",
+                            f.vuln_type,
+                            f.severity.value if hasattr(f.severity, "value") else f.severity,
+                            getattr(f, "verified", False),
+                            f.url,
+                            f.parameter,
+                            getattr(f, "detection_method", "unknown"),
+                            getattr(f, "confidence_score", 0.0),
+                        )
+                findings = kept
+                for detector_name, drop_count in dropped_by_detector.items():
+                    metric = metric_by_detector.get(detector_name)
+                    if metric is None:
+                        metric = record_metric(DetectorCoverageMetric(detector=detector_name))
+                    metric.dropped_findings_verified_mode += drop_count
+                    metric.skipped_reasons["dropped_unverified_in_verified_mode"] = (
+                        metric.skipped_reasons.get("dropped_unverified_in_verified_mode", 0) + drop_count
+                    )
+                logger.info("filtered findings for verified scan mode: %d findings remaining", len(findings))
+
+            scan.report_metadata.detector_coverage = detector_metrics
+            self._log_detector_coverage(detector_metrics)
+            scan.report_metadata.coverage_warnings.extend(
+                self._detector_coverage_warnings(detector_metrics)
+            )
+
+            # PHASE 1: Detect all vulnerabilities
+            redaction_secrets = self._collect_redaction_secrets(submitted_accounts)
+            vulnerabilities = [
+                self._to_vulnerability(f, extra_secrets=redaction_secrets) for f in findings
+            ]
+            logger.info("phase 1 complete: detected %d vulnerabilities", len(vulnerabilities))
+            await self._set_phase_progress(scan, ScanPhase.deduplication, 1.0, f"Deduplication complete: {len(vulnerabilities)} finding(s)")
+
+            # PHASE 2: Analyze all findings with AI
+            logger.info("phase 2 starting: analyzing %d findings", len(vulnerabilities))
+            self._eta_state.findings_count = len(vulnerabilities)
+            self._eta_state.ai_fraction = 0.0
+            self._eta_state.ai_remaining_s = None
+            if vulnerabilities and get_settings().ai_analysis_enabled:
+                self._eta_state.ai_total_s = len(vulnerabilities) * AI_PRIOR_PER_FINDING_S
+            else:
+                self._eta_state.ai_total_s = 1.0
+            await self._set_phase_progress(scan, ScanPhase.ai_analysis, 0.0, f"Analyzing {len(vulnerabilities)} finding(s)")
+            vulnerabilities = await self._analyze_all_findings(vulnerabilities, scan)
+
+            # Phase 2.1: Sync severity from the deterministic CVSS score.
+            for v in vulnerabilities:
+                severity_str = CvssCalculator.get_severity(v.cvss_score)
+                v.severity = SeverityLevel(severity_str)
+
+            # Phase 2.2: Apply advisory review labels. AI never changes CVSS,
+            # severity, suppression, or aggregate-risk membership.
+            self._apply_ai_review_statuses(vulnerabilities)
+
+            vulnerabilities = self._compute_priority_ranks(vulnerabilities)
+            vulnerabilities.sort(key=lambda v: v.cvss_score, reverse=True)
+            logger.info("phase 2 complete: analyzed %d findings", len(vulnerabilities))
+
+            scan.vulnerabilities = vulnerabilities
+            
+            # Phase 4.4 Attack chain synthesis
+            await self._set_phase_progress(scan, ScanPhase.risk_scoring, 0.0, "Calculating severity, evidence strength, and risk score")
+            scan.report_metadata.attack_chains = self._synthesize_attack_chains(vulnerabilities)
+            scan.report_metadata.evidence_strength_breakdown = self._evidence_strength_breakdown(vulnerabilities)
+            scan.statistics.total_vulnerabilities = len(vulnerabilities)
+            scan.statistics.severity_breakdown.critical = len([v for v in vulnerabilities if v.severity.value == "Critical"])
+            scan.statistics.severity_breakdown.high = len([v for v in vulnerabilities if v.severity.value == "High"])
+            scan.statistics.severity_breakdown.medium = len([v for v in vulnerabilities if v.severity.value == "Medium"])
+            scan.statistics.severity_breakdown.low = len([v for v in vulnerabilities if v.severity.value == "Low"])
+            scan.statistics.severity_breakdown.info = len([v for v in vulnerabilities if v.severity.value == "Info"])
+
+            scan.overall_risk_score, scan.overall_risk_level = self._calculate_aggregate_risk(
+                vulnerabilities
+            )
+            await self._set_phase_progress(scan, ScanPhase.risk_scoring, 1.0, "Risk scoring complete")
+
+            # PHASE 3: Generate final report from analyzed findings
+            logger.info("phase 3 starting: generating report")
+            await self._set_phase_progress(scan, ScanPhase.report_generation, 0.0, "Generating final report summary")
+            report = await self.ai_report.generate(scan)
+            scan.report_metadata.generated_at = datetime.now(timezone.utc)
+            _ai_settings = get_settings()
+            scan.report_metadata.ai_model = (
+                _ai_settings.ai_model if _ai_settings.ai_analysis_enabled else None
+            )
+            
+            # Extract summary: handle if AI returns dict instead of string
+            executive_summary = report.get("executive_summary", "")
+            if isinstance(executive_summary, dict):
+                # If dict, try to get 'summary' key or convert to JSON string
+                executive_summary = executive_summary.get("summary", json.dumps(executive_summary))
+            scan.report_metadata.summary = str(executive_summary) if executive_summary else "Report generated successfully."
+            
+            scan.completed_at = datetime.now(timezone.utc)
+            await self._set_progress(scan, 100, ScanPhase.completed, "Scan completed", status=ScanStatus.completed)
+            logger.info("phase 3 complete: scan %s finished", scan_id)
+        except asyncio.CancelledError:
+            scan.completed_at = datetime.now(timezone.utc)
+            scan.error_message = "Scan cancelled by user"
+            await self._set_progress(scan, scan.progress, ScanPhase.cancelled, "Scan cancelled by user", status=ScanStatus.cancelled)
+        except Exception as exc:
+            logger.exception("scan %s failed", scan_id)
+            scan.error_message = str(exc)
+            scan.completed_at = datetime.now(timezone.utc)
+            await self._set_progress(scan, scan.progress, ScanPhase.failed, f"Scan failed: {exc}", status=ScanStatus.failed)
