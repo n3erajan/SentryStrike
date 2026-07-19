@@ -40,10 +40,10 @@ class PipelineMixin:
             logger.error("scan %s not found", scan_id)
             return
 
-        # Isolate mutable crawl/detector state for every production scan so
-        # concurrent scans cannot share cookies/auth/HTTP clients/verifier state
-        # (Issue 1). Injected fakes (tests/embedders) are preserved: only the
-        # default self-built instances are swapped for fresh per-scan ones.
+        # Isolate mutable crawl/detector state per production scan so concurrent
+        # runs cannot share cookies, auth, HTTP clients, or verifier state.
+        # Injected fakes (tests/embedders) are preserved; only the default
+        # self-built instances are replaced with fresh per-scan ones.
         runtime = self._build_scan_runtime()
         scan_spider = runtime.spider
         scan_detectors = runtime.detectors
@@ -68,7 +68,7 @@ class PipelineMixin:
             else:
                 crawl_result = await scan_spider.crawl(scan.target_url, auth_override=main_account, scan_config=scan_config)
 
-            # Filter all crawl results to strictly enforce same-origin target isolation (Issue 2)
+            # Keep crawl results same-origin so active probes never leave the scan target.
             target_url = scan.target_url
             
             def is_same_origin(url_a: str, url_b: str) -> bool:
@@ -91,10 +91,10 @@ class PipelineMixin:
                     if is_same_origin(target_url, getattr(req, "url", ""))
                 ]
             crawl_result.parameters = [p for p in crawl_result.parameters if is_same_origin(target_url, getattr(p, "url", ""))]
-            # A form is in scope only when its RESOLVED submission target is same-origin.
-            # page_url is used only to resolve a relative/empty action — never as scope
-            # proof on its own, or a same-origin page carrying an off-origin form action
-            # would let active payloads and credentials reach a third party (Issue 2).
+            # A form is in scope only when its resolved submission target is same-origin.
+            # page_url resolves relative/empty actions but is not scope proof on its
+            # own — otherwise a same-origin page with an off-origin action could
+            # send active payloads and credentials to a third party.
             crawl_result.forms = self._scope_forms_to_origin(target_url, crawl_result.forms, is_same_origin)
 
             scan.statistics.total_urls_crawled = self._count_discovered_surface(crawl_result)
@@ -289,8 +289,8 @@ class PipelineMixin:
             detector_request_counts: dict[str, int] = {}
             detector_denied_counts: dict[str, int] = {}
             begin_request_counting()
-            # P1-1: activate the request-budget governor for the detector phase so
-            # per-detector / per-parameter ceilings bound each detector's traffic.
+            # Activate the request-budget governor so per-detector and per-parameter
+            # ceilings bound traffic during vulnerability detection.
             _governor_settings = get_settings()
             begin_governor(
                 _governor_settings.scanner_per_detector_request_cap,
@@ -457,9 +457,9 @@ class PipelineMixin:
             except Exception as exc:
                 logger.debug("error-based technology enrichment failed: %s", exc)
 
-            # DEDUPLICATION PHASE: merge repeated proof for the same normalized
-            # route and vulnerability family. Verbose errors additionally retain
-            # the HTTP method because it identifies the request handler/reproducer.
+            # Merge repeated proof for the same normalized route and vulnerability
+            # family. Verbose-error findings also keep the HTTP method so the
+            # request handler and reproducer stay distinct.
             await self._set_phase_progress(scan, ScanPhase.deduplication, 0.0, "Deduplicating and filtering findings")
             findings = FindingDeduplicator.deduplicate(findings)
             logger.info("deduplication complete: %d findings after merging", len(findings))
@@ -470,9 +470,8 @@ class PipelineMixin:
                 len(findings),
             )
 
-            # CSRF finding deduplication:
-            # If token_bypass verified CSRF exists for a URL, suppress weaker heuristics
-            # like "Authentication Form Lacks CSRF Protection" to reduce duplicate noise.
+            # When a URL already has token-bypass-verified CSRF, drop weaker form-level
+            # heuristics (e.g. missing CSRF on an auth form) that only restate it.
             _csrf_confirmed_urls: set[str] = set()
             for f in findings:
                 if not f.vuln_type:
@@ -494,41 +493,35 @@ class PipelineMixin:
                     filtered.append(f)
                 findings = filtered
 
-            # scan_mode filtering: If verified, keep only verified findings.
-            #
-            # IMPORTANT - heuristic passthrough:
-            # Some vulnerability classes are confirmed by *observing* the HTTP response (e.g.
-            # "credentials sent in a GET query string", "no CSRF token in form", "phpMyAdmin
-            # is reachable").  These findings are structurally true the moment the detector
-            # inspects the response - there is no active exploit payload that could flip
-            # `verified=True`.  Dropping them silently would cause the scanner to miss
-            # critical, real issues on targets like DVWA.
-            #
-            # For these classes we keep the finding but note it is heuristic-only so the
-            # AI analysis phase can apply its own confidence weighting.
+            # In verified scan mode, keep confirmed findings and a small set of
+            # observation-only classes that cannot produce active exploit proof.
+            # Examples: credentials in a GET query, CSRF token absence in form HTML,
+            # missing security headers, cookie-attribute issues, and stack traces.
+            # These are structurally true from inspection alone; dropping them would
+            # hide real issues. They stay unverified so AI analysis can weight them.
             HEURISTIC_PASSTHROUGH_TYPES: tuple[str, ...] = (
-                # Credential / transport exposure - observable from request inspection alone
+                # Credential / transport exposure (request inspection)
                 "credentials transmitted via http get",
                 "credentials via get",
                 "password in get",
-                # CSRF structural absence - observable from form HTML
+                # CSRF structural absence (form HTML)
                 "authentication form may lack csrf",
                 "csrf protection",
                 "csrf token",
-                # Exposed admin / sensitive paths require content or access-control proof.
+                # Exposed admin / sensitive paths (content or access-control proof)
                 "phpmyadmin",
-                # Security-header absence - confirmed from response headers
+                # Security-header absence (response headers)
                 "missing security header",
                 "security header",
-                # Session / cookie attribute issues - confirmed from Set-Cookie header
+                # Session / cookie attribute issues (Set-Cookie)
                 "insecure session cookie",
                 "cookie attribute",
-                # Information disclosure - confirmed from response body
+                # Information disclosure (response body)
                 "information disclosure",
                 "server banner",
                 "stack trace",
                 "debug page",
-                # TLS / transport issues already handled by sslyze (always verified=True)
+                # TLS / transport (sslyze; always verified)
                 "weak tls",
                 "ssl configuration",
             )
@@ -591,15 +584,14 @@ class PipelineMixin:
                 self._detector_coverage_warnings(detector_metrics)
             )
 
-            # PHASE 1: Detect all vulnerabilities
+            # Convert raw findings to Vulnerability models, with secrets redacted.
             redaction_secrets = self._collect_redaction_secrets(submitted_accounts)
             vulnerabilities = [
                 self._to_vulnerability(f, extra_secrets=redaction_secrets) for f in findings
             ]
-            logger.info("phase 1 complete: detected %d vulnerabilities", len(vulnerabilities))
             await self._set_phase_progress(scan, ScanPhase.deduplication, 1.0, f"Deduplication complete: {len(vulnerabilities)} finding(s)")
 
-            # PHASE 2: Analyze all findings with AI
+            # Run AI analysis across all findings.
             logger.info("phase 2 starting: analyzing %d findings", len(vulnerabilities))
             self._eta_state.findings_count = len(vulnerabilities)
             self._eta_state.ai_fraction = 0.0
@@ -611,13 +603,14 @@ class PipelineMixin:
             await self._set_phase_progress(scan, ScanPhase.ai_analysis, 0.0, f"Analyzing {len(vulnerabilities)} finding(s)")
             vulnerabilities = await self._analyze_all_findings(vulnerabilities, scan)
 
-            # Phase 2.1: Sync severity from the deterministic CVSS score.
+            # Sync severity labels from the deterministic CVSS score.
             for v in vulnerabilities:
                 severity_str = CvssCalculator.get_severity(v.cvss_score)
                 v.severity = SeverityLevel(severity_str)
 
-            # Phase 2.2: Apply advisory review labels. AI never changes CVSS,
-            # severity, suppression, or aggregate-risk membership.
+            # Apply advisory review labels from AI analysis. The AI may annotate
+            # findings as likely false positives or uncertain, but never changes
+            # the deterministic CVSS score, severity, or aggregate-risk membership.
             self._apply_ai_review_statuses(vulnerabilities)
 
             vulnerabilities = self._compute_priority_ranks(vulnerabilities)
@@ -626,7 +619,7 @@ class PipelineMixin:
 
             scan.vulnerabilities = vulnerabilities
             
-            # Phase 4.4 Attack chain synthesis
+            # Synthesise multi-step attack chains from individual findings.
             await self._set_phase_progress(scan, ScanPhase.risk_scoring, 0.0, "Calculating severity, evidence strength, and risk score")
             scan.report_metadata.attack_chains = self._synthesize_attack_chains(vulnerabilities)
             scan.report_metadata.evidence_strength_breakdown = self._evidence_strength_breakdown(vulnerabilities)
@@ -642,7 +635,7 @@ class PipelineMixin:
             )
             await self._set_phase_progress(scan, ScanPhase.risk_scoring, 1.0, "Risk scoring complete")
 
-            # PHASE 3: Generate final report from analyzed findings
+            # Generate the narrative report from analysed findings.
             logger.info("phase 3 starting: generating report")
             await self._set_phase_progress(scan, ScanPhase.report_generation, 0.0, "Generating final report summary")
             report = await self.ai_report.generate(scan)

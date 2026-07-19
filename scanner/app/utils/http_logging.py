@@ -15,6 +15,13 @@ http_logger = logging.getLogger("sentry.http")
 
 @dataclass(frozen=True)
 class ScanRequestContext:
+    """Carries the scan-state context for structured HTTP log lines.
+
+    ``module`` identifies the detector (e.g. ``"sqli"``, ``"xss"``),
+    ``parameter`` names the injection point, and ``test_phase`` labels
+    the verification stage (e.g. ``"recon"``, ``"probe"``, ``"verify"``).
+    """
+
     module: str = ""
     parameter: str = ""
     test_phase: str = ""

@@ -1566,7 +1566,7 @@ class BrowserDiscoveryEngine:
                     # Post-auth liveness re-check (generic). On the root a
                     # logged-out shell means the seeded storage_state never
                     # persisted (RC-A); on other routes it means interaction
-                    # dropped the session mid-crawl (P1-3). Re-seed cookies
+                    # dropped the session mid-crawl. Re-seed cookies
                     # when we have them rather than crawl unauthenticated.
                     is_root = self._normalize_for_seen(target_url) == self._normalize_for_seen(root_url)
                     if (storage_state or auth_cookie_entries) and await self._looks_logged_out(page):
@@ -1761,7 +1761,7 @@ class BrowserDiscoveryEngine:
                                 submitted_form_keys.add(key)
                                 submitted_form_keys.add(sig)
                                 new_forms.append(form)
-                        # Active form submission (Task B): fire the app's real
+                        # Active form submission: fire the app's real
                         # POST/PUT/PATCH XHR so on_request captures a replayable
                         # observation. Skips destructive forms.
                         wstate.browser_forms_submitted += await self._submit_discovered_forms(
@@ -2536,7 +2536,7 @@ class BrowserDiscoveryEngine:
         return any(not bool(form.get("all_named", True)) for form in forms or [])
 
     def _effective_deadline(self, deadline: float | None, loop: Any, route_count: int) -> float | None:
-        """Scale the browser budget to the number of routes to visit (Task B).
+        """Scale the browser budget to the number of routes to visit.
 
         ``base + per_route * min(routes, cap)`` clamped by the configured overall
         budget, so small apps finish fast and large apps get proportionally more.
@@ -4314,7 +4314,7 @@ class BrowserDiscoveryEngine:
             hash_routed = self._looks_hash_routed(root_url, routes)
         targets = [root_url]
         seen = {self._normalize_for_seen(root_url)}
-        # Seed all known static routes up to the route cap (Task B): high-value
+        # Seed all known static routes up to the route cap: high-value
         # auth/form/API routes must be enqueued with their score before the
         # crawl starts so even a short budget reaches them. Bounding the seed set
         # by the per-run route cap (not the per-page interaction budget) keeps

@@ -169,7 +169,7 @@ class SensitivePathsDetector(BaseDetector):
         re.compile(r'<a href="\?C=[NMSD];O=[AD]"', re.IGNORECASE), # Apache column-sort links
     ]
 
-    # Backup/temp permutations appended to discovered files (Task 9).
+    # Backup/temp permutations appended to discovered files.
     _BACKUP_SUFFIXES: tuple[str, ...] = (".bak", ".old", ".orig", "~", ".swp", ".save", ".zip", ".tar.gz")
 
     def _looks_like_autoindex(self, body: str, content_type: str = "") -> bool:

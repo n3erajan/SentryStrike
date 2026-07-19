@@ -61,7 +61,7 @@ class CSRFDetector(BaseDetector):
 
         Static crawler forms (``HtmlForm``/``FormInput``) already expose the
         ``action``/``method``/``inputs`` attributes the detector reads, so they
-        pass through untouched. Browser forms (Task 2) arrive as plain dicts.
+        pass through untouched. Browser forms arrive as plain dicts.
         """
         if not isinstance(form, dict):
             return form
@@ -130,7 +130,8 @@ class CSRFDetector(BaseDetector):
             ):
                 continue
 
-            # Phase 3: Setup routes
+            # Filter out setup/install/onboarding routes — one-shot operations
+            # that do not carry real CSRF risk beyond the initial configuration.
             setup_tokens = {"setup", "install", "wizard", "onboarding"}
             is_setup_route = any(tok in url_path_lower for tok in setup_tokens)
 
@@ -437,7 +438,7 @@ class CSRFDetector(BaseDetector):
         api_endpoints = kwargs.get("api_endpoints") or []
         is_spa = bool(kwargs.get("is_spa", False))
 
-        # P0-4: only genuine mutating APIs (observed non-GET XHR or a spec/JS
+        # Only genuine mutating APIs (observed non-GET XHR or a spec/JS
         # endpoint with a mutating method) are CSRF-testable. A browser-discovered
         # SPA "form" is an input cluster keyed to a *client-side route* whose
         # ``action`` is the route URL — submitting to it returns the 200 HTML
@@ -489,7 +490,7 @@ class CSRFDetector(BaseDetector):
             if not spa_detector.root_looks_like_spa():
                 spa_detector = None
 
-        # Auth-model-aware branching (Task 8): cookie-auth keeps the active
+        # Auth-model-aware branching: cookie-auth keeps the active
         # token-tamper / Origin-bypass verification below; header/bearer-token
         # auth is not exposed to ambient-cookie CSRF, so we only emit an
         # informational posture note and never fabricate a finding.
@@ -602,7 +603,7 @@ class CSRFDetector(BaseDetector):
 
                     response_to_check = bypass_response
 
-                    # P0-4: an SPA returns the 200 HTML shell for any client-side
+                    # An SPA returns the 200 HTML shell for any client-side
                     # route, so "200 + no error string" is not evidence of a state
                     # change. If the response is the SPA shell, no mutation
                     # occurred — never emit a finding.

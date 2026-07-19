@@ -230,8 +230,8 @@ class AttackSurface:
                     # detector. The real endpoint is captured separately as the
                     # form's observed XHR (an ``/api/…`` request). This mirrors
                     # ``_synthesize_form_cluster_targets`` (which skips the same
-                    # clusters): "Phase 3 translates discovered route URLs, not
-                    # synthetic form submissions."
+                    # clusters): translation targets discovered route URLs, not
+                    # synthetic form submissions.
                     continue
                 # Read-style candidates (query/path in the URL) may map to a real
                 # served resource (``/#/ftp/legal.md?file=`` -> ``/ftp/legal.md``),
@@ -712,8 +712,8 @@ class AttackSurface:
                 continue
             if cls._has_unresolved_path_placeholder(endpoint.url):
                 continue
-            # Task C (RC-C): only synthesize bodies for genuine API/JSON/form
-            # endpoints. SPA HTML navigation routes (e.g. a POST /login route
+            # Only synthesize bodies for genuine API/JSON/form endpoints. SPA
+            # HTML navigation routes (e.g. a POST /login route
             # returning the 200 HTML shell) exercise no vulnerable code, so
             # placeholder bodies aimed at them waste the injection budget.
             # Observed bodies always win (deduped out above), so this gate only
@@ -814,7 +814,7 @@ class AttackSurface:
         XHR), the captured field names/types are still known — so synthesize a
         skeleton JSON body and emit one low-confidence ``json_body`` target per
         field (``replayable=False``, ``source_confidence="form_synth"``). This
-        decouples injection coverage from the fragile runtime submit (Phase 4).
+        decouples injection coverage from the fragile runtime submit.
 
         Observed request bodies and higher-confidence targets always win: any leaf
         already emitted under the same ``(url, method, name, location, parent_path)``
@@ -830,9 +830,9 @@ class AttackSurface:
                 # SPA clusters have no real ``action`` so this falls back to the
                 # route URL (``/#/address/create``). That fragment is stripped on
                 # the wire, so a POST here only hits the shell — the synthesized
-                # body tests nothing. Keep form-cluster robustness for Phase 9;
-                # Phase 3 translates discovered route URLs, not synthetic form
-                # submissions.
+                # body tests nothing. Form-cluster robustness tracks separately;
+                # route URL translation targets discovered routes, not synthetic
+                # form submissions.
                 continue
             # A cluster submitted from an SPA is a mutation (login, register,
             # create). The DOM method defaults to GET on orphan clusters that have

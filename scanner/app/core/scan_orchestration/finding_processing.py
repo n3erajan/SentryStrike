@@ -44,7 +44,9 @@ class FindingProcessingMixin:
         vuln_type_lower = vuln.vuln_type.lower()
         severity = vuln.severity
 
-        # Phase 4.3: Preserve AI reasoning; only override on unambiguous proof
+        # Preserve AI reasoning for exploitability; only override when the
+        # evidence contains unambiguous proof (e.g. command output in a
+        # critical injection finding).
         if severity == SeverityLevel.critical and any(
             tok in vuln_type_lower
             for tok in ["command injection", "sql injection", "file inclusion", "file upload"]

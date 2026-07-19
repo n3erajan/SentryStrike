@@ -77,7 +77,8 @@ class SQLInjectionDetector(BaseDetector):
             scan_config.get_val("blind_injection_timing_threshold", settings.blind_injection_timing_threshold)
             if scan_config else settings.blind_injection_timing_threshold
         )
-        # Phase 1: Reconnaissance - Extract candidates
+        # Extract candidates from all available sources (URLs, forms, API
+        # endpoints, observed requests, and the attack planner).
         candidates = self._extract_candidates(
             urls,
             forms,
@@ -88,12 +89,11 @@ class SQLInjectionDetector(BaseDetector):
         )
         logger.info(f"Found {len(candidates)} SQL injection candidates")
 
-        # Phase 2: Active Testing - Verify each candidate
+        # Verify each candidate through active testing.
         verification_results = await self._verify_candidates(candidates)
         findings.extend(verification_results)
 
-        # Phase 3: Filtering & Deduplication
-        # Filter by confidence threshold
+        # Filter by confidence threshold and deduplicate.
         findings = FindingDeduplicator.filter_by_confidence(findings, min_confidence=50.0)
 
         # Deduplicate (same url+param+type = merge evidence)
@@ -113,7 +113,7 @@ class SQLInjectionDetector(BaseDetector):
         attack_planner: object | None = None,
     ) -> list[AttackTarget]:
         """
-        Phase 1 & 2: Reconnaissance - Extract candidates using ParamDiscovery.
+        Reconnaissance - Extract candidates using ParamDiscovery.
         """
         if attack_planner is not None and hasattr(attack_planner, "targets_for"):
             return [
@@ -169,7 +169,7 @@ class SQLInjectionDetector(BaseDetector):
         candidates: list[AttackTarget],
     ) -> list[Finding]:
         """
-        Phase 2: Active Testing - Verify each candidate.
+        Active Testing - Verify each candidate.
 
         Returns findings from successful verifications.
         Handles both 4-tuple (GET/URL) and 5-tuple (POST form) candidates.

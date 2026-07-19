@@ -307,7 +307,8 @@ class FileInclusionDetector(BaseDetector):
 
     @staticmethod
     def _is_valid_src_code_delivery(text_content: str) -> bool:
-        # FIX: Switched from unstable regex searching to reliable, fast substring checks
+        # Use substring checks rather than regex — faster and avoids regex
+        # edge cases that produced false negatives on previously tested targets.
         text_lower = text_content.lower()
         indicators = ["<?php", "html", "doctype", "require_once", "include(", "$_get", "$_post"]
         return any(ind in text_lower for ind in indicators)
@@ -527,7 +528,10 @@ class FileInclusionDetector(BaseDetector):
                                     if not re.search(verify_rule, stripped_body, re.I):
                                         continue
 
-                                # FIX: Lowered threshold from 50 to 10 to protect slim system/docker responses
+                                # Lower threshold to 10 bytes — slim system/docker
+                                # responses would previously fall below the
+                                # 50-byte minimum and be incorrectly marked as
+                                # non-differential.
                                 if "../" in payload or "..\\" in payload:
                                     injected_len = len(injected.body)
                                     delta = abs(injected_len - control_len)
@@ -751,7 +755,7 @@ class FileInclusionDetector(BaseDetector):
                             and not blocked_in_baseline
                             and not network_hit_in_control
                         ):
-                            # Step 2: send example.com and require its known content to
+                            # Send example.com and require its known content to
                             # appear in the response.  A network error alone is never
                             # enough to report — we need the actual remote body reflected.
                             confirm_url, confirm_params, confirm_data, confirm_json, confirm_headers, confirm_cookies = (

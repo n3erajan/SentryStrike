@@ -94,7 +94,7 @@ class CoverageMixin:
         browser_error = getattr(crawl_result, "browser_error", None)
         static_spa_only = is_spa and len(requests) == 0
 
-        # Dynamic-discovery health classification (Task 11): never present a
+        # Dynamic-discovery health classification: never present a
         # dynamically-degraded SPA scan as a clean full scan.
         dynamic_status = self._classify_dynamic_status(
             is_spa=is_spa,

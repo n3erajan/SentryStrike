@@ -11,6 +11,11 @@ _POLL_LIMIT = 50
 
 @router.get("/poll")
 async def poll(id: str = "") -> list[dict]:
+    """Return stored OAST callbacks for a given interaction id.
+
+    Used by scanner workers to poll for out-of-band callbacks that confirm
+    blind vulnerabilities like SSRF and blind SQLi.
+    """
     if not OastClient.is_valid_interaction_id(id):
         return []
     docs = (

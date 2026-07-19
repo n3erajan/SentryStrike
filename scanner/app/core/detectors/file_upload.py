@@ -746,9 +746,8 @@ class FileUploadDetector(BaseDetector):
             data.update(self._build_form_payload(candidate.raw_inputs, candidate.file_field))
         files = {candidate.file_field: (filename, content, content_type)}
 
-        # BUG FIX: original code had inverted ternary:
-        #   method="POST" if method != "POST" else method
-        # which always resolves to "POST" but was clearly intended to
+        # The original ternary ``method="POST" if method != "POST" else method``
+        # was inverted — it always resolved to "POST". The corrected form below
         # normalise the value - just pass method directly.
         response = await client.request(
             method=candidate.method,

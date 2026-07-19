@@ -6,6 +6,13 @@ from shared.models.scan import CrawlMode, Scan, ScanAuthRole, ScanPhase, ScanSta
 
 
 class ScanRepository:
+    """Persistence layer for Scan documents.
+
+    Centralizes all database access for scans so that both the API and the
+    worker operate on the same query logic (ownership checks, lifecycle
+    timestamps, status transitions) rather than duplicating it per service.
+    """
+
     async def create(
         self,
         target_url: str,
@@ -33,6 +40,7 @@ class ScanRepository:
         return scan
 
     async def get_by_id(self, scan_id: str) -> Scan | None:
+        """Fetch a scan by its string id, returning None for malformed ids."""
         try:
             oid = PydanticObjectId(scan_id)
         except Exception:
@@ -40,6 +48,11 @@ class ScanRepository:
         return await Scan.get(oid)
 
     async def get_owned_by_id(self, scan_id: str, owner_user_id: str) -> Scan | None:
+        """Fetch a scan only if it belongs to the given user.
+
+        Returns None when the scan does not exist or is owned by someone
+        else, so callers cannot distinguish between the two cases.
+        """
         scan = await self.get_by_id(scan_id)
         if scan is None or scan.owner_user_id != owner_user_id:
             return None
@@ -65,6 +78,13 @@ class ScanRepository:
         phase_message: str | None = None,
         error_message: str | None = None,
     ) -> Scan:
+        """Transition a scan to a new status and stamp lifecycle timestamps.
+
+        ``started_at`` is recorded the first time a scan enters ``running``;
+        ``completed_at`` is recorded on any terminal state (completed, failed,
+        or cancelled). Optional fields are only overwritten when provided, so
+        callers can update a single attribute without clobbering the rest.
+        """
         scan.status = status
         if progress is not None:
             scan.progress = progress

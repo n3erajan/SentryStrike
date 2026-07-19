@@ -88,7 +88,7 @@ async def test_empty_account_is_unusable(monkeypatch):
     assert session.headers == {}
 
 
-# --- P1-2: reuse the main account's winning login path ---------------------------------
+# --- Reuse the main account's winning login path ---------------------------------
 
 
 def test_substitute_replay_credentials_swaps_by_value():

@@ -2,11 +2,19 @@ from collections import defaultdict
 
 
 class PayloadManager:
+    """Central repository for attack payloads used across all detectors.
+
+    Each detector requests payloads by category (e.g. ``"sqli"``, ``"xss"``)
+    and the manager returns the pre-built list. Custom payloads can be added
+    at runtime for special-case injection points.
+    """
+
     def __init__(self) -> None:
         self._payloads: dict[str, list[str]] = defaultdict(list)
         self._seed_defaults()
 
     def _seed_defaults(self) -> None:
+        """Populate the initial payload set for each vulnerability category."""
         self._payloads["sqli"] = [
             "' OR '1'='1",
             "' OR 1=1--",

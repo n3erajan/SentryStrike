@@ -38,10 +38,18 @@ from shared.schemas.scan_schema import ScanConfig
 
 
 async def _never_cancelled(_: str) -> bool:
+    """Default cancellation checker used when no queue cancellation support exists."""
     return False
 
 
 class ScanOrchestrator(
+    """Top-level scan pipeline orchestrator.
+
+    Composes all pipeline stages (crawl, detect, verify, analyze, score, report)
+    via multiple mixins, each owning one phase of the scan lifecycle. A single
+    ``run_scan`` call sequences these stages with progress reporting, ETA
+    estimation, and cancellation support.
+    """
     PipelineMixin,
     RuntimeMixin,
     DetectorExecutionMixin,

@@ -238,7 +238,7 @@ class _ShellVerifier(_FakeVerifier):
 
 @pytest.mark.asyncio
 async def test_csrf_no_finding_on_spa_client_routes(monkeypatch):
-    """P0-4: browser-discovered SPA "forms" are client-side routes whose action
+    """Browser-discovered SPA "forms" are client-side routes whose action
     returns the 200 HTML shell. With no observed mutating API backing them, they
     must not be tested at all — no CSRF findings on navigation routes."""
     monkeypatch.setattr(csrf_module, "HttpVerifier", _ShellVerifier)
@@ -267,7 +267,7 @@ async def test_csrf_no_finding_on_spa_client_routes(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_csrf_shell_guard_suppresses_finding_for_shell_response(monkeypatch):
-    """P0-4: even a confirmed mutating-API candidate must not produce a finding
+    """Even a confirmed mutating-API candidate must not produce a finding
     when the verification response is the SPA shell (no state change occurred)."""
     from app.core.crawler.models import RequestObservation
 
@@ -302,7 +302,7 @@ async def test_csrf_shell_guard_suppresses_finding_for_shell_response(monkeypatc
 
 @pytest.mark.asyncio
 async def test_csrf_finding_on_real_mutating_api(monkeypatch):
-    """P0-4: an observed mutating XHR (real API) that accepts a tampered,
+    """An observed mutating XHR (real API) that accepts a tampered,
     foreign-Origin submission with a non-shell response is a genuine CSRF finding.
 
     The observed request is form-encoded, so it is genuinely cross-site

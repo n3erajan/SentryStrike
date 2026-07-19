@@ -502,8 +502,9 @@ class AiAnalysisMixin:
     def _build_prompt(self, tech_stack_str: str, vuln_descriptions: list[str], is_batch: bool) -> str:
         """Constructs an evaluation prompt optimised for Qwen3 8B / local 8B models."""
 
-        # KEY CHANGE 1: Role framing with explicit task decomposition
-        # Small models respond better to "think step by step" with explicit phases
+        # Role framing with explicit task decomposition. Smaller local models
+        # (e.g. Qwen3 8B) produce more reliable output when asked to "think
+        # step by step" with named stages.
         role_and_task = (
             "You are a senior penetration tester writing a verified security report. "
             "For each finding, perform these steps IN ORDER before writing JSON:\n"
@@ -523,8 +524,8 @@ class AiAnalysisMixin:
             "Output ONLY the JSON. No preamble, no explanation outside the JSON.\n\n"
         )
 
-        # KEY CHANGE 2: Provide concrete examples of good vs bad output
-        # Small models learn format from examples far better than from instructions
+        # Provide concrete examples of good vs bad output — smaller models
+        # learn format from examples far better than from abstract instructions.
         output_examples = (
             "OUTPUT QUALITY RULES WITH EXAMPLES:\n"
 
@@ -612,7 +613,7 @@ class AiAnalysisMixin:
             "contradiction proving the detector's interpretation wrong.\n\n"
         )
 
-        # KEY CHANGE 3: Explicit schema with value constraints + anchoring to evidence
+        # Explicit schema with value constraints anchored to the evidence block.
         schema_keys = (
             "Return a flat JSON object with EXACTLY these keys (no extras, no nesting):\n"
             "{\n"
@@ -634,8 +635,8 @@ class AiAnalysisMixin:
             "example when applicable.\n\n"
         )
 
-        # KEY CHANGE 4: Pass application context to anchor business_impact
-        # (url path hints at app type; parameter hints at data sensitivity)
+        # Pass application context so the model can gauge realistic business
+        # impact from the URL path and parameter names.
         context_note = (
             f"Target Technology Stack: {tech_stack_str}\n"
             "Note: Treat the application as a real production target. "
@@ -673,7 +674,7 @@ class AiAnalysisMixin:
                 remediation = value
                 break
                 
-        # Phase 4.2 Framework-specific remediation
+        # Framework-specific remediation overrides based on detected technology stack.
         stack_names = [t.name.lower() for t in (tech_stack or [])]
         if "sql injection" in vuln_type.lower():
             if "php" in stack_names:

@@ -1,4 +1,4 @@
-"""Task B: generic route surface scoring truth tables.
+"""Generic route surface scoring truth tables.
 
 Every assertion keys on generic structure/token families only — no full path,
 app name, parameter, or credential is special-cased.

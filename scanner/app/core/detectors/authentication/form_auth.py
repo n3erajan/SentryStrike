@@ -112,11 +112,11 @@ class FormAuthProbeMixin:
             # The redesign uses ONE sequential request list that serves all three
             # purposes simultaneously:
             #
-            #   Phase A - default pairs (varied username + password)
+            #   Default pairs (varied username + password)
             #             → detects Default Credentials Accepted (critical)
             #             → each failed attempt contributes to the lockout counter
             #
-            #   Phase B - stuffing passwords (fixed bogus username, varied password)
+            #   Password stuffing (fixed bogus username, varied password)
             #             → detects No Lockout / Credential-Stuffing weakness (high)
             #             → extends the attempt count for the brute-force check
             #
@@ -145,9 +145,9 @@ class FormAuthProbeMixin:
             }
 
             # --- Build the combined sequence -----------------------------------
-            # Phase A: default pairs (varied username).
-            # The very first pair uses the known-bogus username so its response
-            # becomes the baseline body length / status for success detection.
+            # Default pairs (varied username). The very first pair uses the
+            # known-bogus username so its response becomes the baseline body
+            # length / status for success detection.
             #
             # When the login identifier is an e-mail (the common case for both SPAs
             # and traditional apps), a bare "admin" never authenticates — the
@@ -194,9 +194,9 @@ class FormAuthProbeMixin:
                     ("manager",       "manager"),
                 ]
 
-            # Phase B: stuffing passwords for the fixed bogus username.
+            # Password-stuffing phase: fixed bogus username with varied passwords.
             # These extend the sequential attempt count without re-testing default
-            # usernames, covering the pure password-spray / stuffing scenario.
+            # usernames, covering the pure password-spray / credential-stuffing scenario.
             _stuffing_passwords = [
                 "password", "password1", "password123", "123456",
                 "letmein", "welcome", "monkey", "dragon",
@@ -207,7 +207,7 @@ class FormAuthProbeMixin:
             ]
 
             _combined_pairs = _default_pairs + _stuffing_pairs
-            # Index past which attempts use the fixed bogus username (stuffing phase)
+            # Attempts beyond this index use the fixed bogus username (stuffing).
             _stuffing_start = len(_default_pairs)
 
             try:

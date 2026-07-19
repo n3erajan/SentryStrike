@@ -11,7 +11,9 @@ from shared.models.scan import Scan, ScanPhase, ScanStatus
 logger = logging.getLogger("app.core.scanner")
 
 
-# Phase weights - rough share of total scan time, tuned from real scans.
+# Pipeline-stage weights as a percentage of total scan time, calibrated from
+# real scan durations. The sum approximates 100 %; each weight drives the
+# per-stage progress bar the frontend displays.
 PHASE_WEIGHTS = {
     ScanPhase.initializing: 2,
     ScanPhase.crawling: 25,

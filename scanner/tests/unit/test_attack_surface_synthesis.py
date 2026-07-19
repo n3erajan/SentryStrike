@@ -6,7 +6,7 @@ from app.core.crawler.spider import FormInput, HtmlForm
 from app.core.detectors.attack_surface import AttackSurface, build_json_body
 
 
-# --- Task C: is_api_endpoint predicate (generic) ---------------------------------------
+# --- is_api_endpoint predicate (generic) ---------------------------------------
 
 
 def test_is_api_endpoint_true_on_body_schema():
@@ -178,7 +178,7 @@ def test_build_synthesizes_form_targets_for_form_content_type():
     assert prepared.data["email"] == "' OR 1=1--"
 
 
-# --- Task C: synthesis targets real API endpoints only ---------------------------------
+# --- synthesis targets real API endpoints only ---------------------------------
 
 
 def test_build_synthesis_excludes_html_navigation_route():
@@ -340,7 +340,7 @@ def test_build_skips_parameter_candidates_with_unresolved_path_placeholders():
     assert targets == []
 
 
-# --- Phase 4: synthetic body fallback for captured-but-unsubmittable forms -------------
+# --- Synthetic body fallback for captured-but-unsubmittable forms -------------
 
 
 def _browser_cluster_form(action, inputs, method="GET"):

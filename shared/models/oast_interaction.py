@@ -8,6 +8,14 @@ from shared.config import get_infrastructure_settings
 
 
 class OastInteractionRecord(Document):
+    """A single out-of-band callback received from a scanned target.
+
+    Written by the OAST callback endpoint when a target server makes a
+    request to a scanner-minted callback URL — the definitive confirmation
+    for blind vulnerabilities such as SSRF. Records expire automatically via
+    a MongoDB TTL index so stale interactions do not accumulate.
+    """
+
     interaction_id: Indexed(str)
     source_ip: str | None = None
     path: str = ""

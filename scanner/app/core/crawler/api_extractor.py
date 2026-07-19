@@ -923,7 +923,7 @@ class ApiExtractor:
     def is_api_endpoint(cls, endpoint: ApiEndpoint) -> bool:
         """Return True when ``endpoint`` is a genuine API/JSON/form endpoint.
 
-        Task C (RC-C): body-injection synthesis must target real API endpoints,
+        Body-injection synthesis must target real API endpoints,
         never SPA HTML navigation routes (a ``POST /login`` Angular *route* that
         returns the 200 HTML shell exercises no vulnerable code). An endpoint is
         API-like when **any** generic signal holds — all key on structure/token

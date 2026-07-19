@@ -216,7 +216,7 @@ class DetectorExecutionMixin:
                 if getattr(request, "post_data", None)
             ]
         )
-        # Static body synthesis (Task 4) makes bodies testable even without an
+        # Static body synthesis makes bodies testable even without an
         # observed request body, so only report the coverage gap when nothing —
         # observed or synthesizable — could feed a body-injection detector.
         synthesizable_body_endpoints = 0

@@ -28,6 +28,11 @@ async def process_scan_job(
     repository: ScanRepository,
     orchestrator: ScanOrchestrator,
 ) -> None:
+    """Claim a scan job from the queue and run it through the orchestrator.
+
+    Skips jobs whose scan document no longer exists or has already reached a
+    terminal state. Cancelled jobs are marked and cleaned up without running.
+    """
     scan = await repository.get_by_id(job.scan_id)
     if scan is None:
         await queue.clear_cancel(job.scan_id)
@@ -69,6 +74,12 @@ async def process_scan_job(
 
 
 async def _heartbeat_loop(queue: RedisScanQueue, worker_id: str) -> None:
+    """Periodically refresh the worker heartbeat key in Redis.
+
+    Runs at half the TTL interval so a single missed beat does not
+    immediately mark the worker as dead. The heartbeat allows the backend
+    health endpoint to report the number of active workers.
+    """
     interval = max(1, queue.heartbeat_ttl_seconds // 2)
     while True:
         try:
@@ -79,6 +90,7 @@ async def _heartbeat_loop(queue: RedisScanQueue, worker_id: str) -> None:
 
 
 async def run_worker() -> None:
+    """Main worker loop: initialise services, then dequeue and process scan jobs forever."""
     configure_logging()
     await init_db()
 

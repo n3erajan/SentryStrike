@@ -1,4 +1,4 @@
-"""Command-injection candidate selection (Phase 2, value-aware).
+"""Command-injection candidate selection (value-aware).
 
 Locks in the fix for the audit's "command_injection sent 0 of 378 built
 candidates": selection is now name-OR-value-OR-context, with a replayable

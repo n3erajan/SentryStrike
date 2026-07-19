@@ -439,7 +439,7 @@ async def test_crawl_into_filters_off_origin_runtime_requests(monkeypatch):
 
 
 def test_browser_targets_visit_same_origin_routes_only():
-    # Seed set is bounded by the route cap (Task B), not the per-page interaction
+    # Seed set is bounded by the route cap, not the per-page interaction
     # budget, so all same-origin routes are enqueued regardless of max_interactions.
     engine = BrowserDiscoveryEngine(max_interactions=3)
 
@@ -558,7 +558,7 @@ def test_browser_json_observation_metadata_preserves_body_and_replay_headers():
     ],
 )
 def test_browser_json_body_replayable_even_when_schema_empty(raw_body):
-    """P0-1: an observed JSON body must be replayable whenever it parses as
+    """An observed JSON body must be replayable whenever it parses as
     JSON, not only when schema inference produced a non-empty field list. Empty
     objects, top-level arrays, and primitive JSON bodies were being dropped,
     collapsing ``replayable_json_bodies`` to 0 on real SPA traffic."""
@@ -596,7 +596,7 @@ async def test_build_observation_marks_large_body_truncated_and_not_replayable()
 
 
 def test_auth_cookie_entries_targets_origin():
-    """P1-3: auth cookies are turned into origin-scoped Playwright cookie dicts."""
+    """Auth cookies are turned into origin-scoped Playwright cookie dicts."""
     engine = BrowserDiscoveryEngine()
     entries = engine._auth_cookie_entries("http://target.test:8080/app", {"session": "abc", "csrf": "d"})
     assert {e["name"] for e in entries} == {"session", "csrf"}
@@ -608,7 +608,7 @@ def test_auth_cookie_entries_targets_origin():
 
 @pytest.mark.asyncio
 async def test_reseed_session_readds_cookies_and_is_failsafe():
-    """P1-3: mid-crawl session recovery re-applies auth cookies, never raising."""
+    """Mid-crawl session recovery re-applies auth cookies, never raising."""
     engine = BrowserDiscoveryEngine()
 
     class _Ctx:
@@ -879,7 +879,7 @@ async def test_exercise_page_stops_at_time_budget(monkeypatch):
     assert interactions["n"] == 50
 
 
-# --- Task 2: SPA interaction & navigation --------------------------------
+# --- SPA interaction & navigation --------------------------------
 
 
 @pytest.mark.asyncio
@@ -1218,7 +1218,7 @@ async def test_crawl_into_discovers_and_visits_client_side_routes(monkeypatch):
     assert ws[0].replayable is False
 
 
-# --- Task A: full authenticated storage_state propagation -------------------
+# --- full authenticated storage_state propagation -------------------
 
 
 @pytest.mark.asyncio
@@ -1254,7 +1254,7 @@ async def test_crawl_into_seeds_context_from_storage_state(monkeypatch):
 @pytest.mark.asyncio
 async def test_crawl_into_falls_back_to_bare_context_without_storage_state(monkeypatch):
     """No storage_state → plain ``new_context()`` (cookie/header injection path),
-    preserving the pre-Task-A behavior for cookie-auth and static-auth apps."""
+    preserving the pre-context behavior for cookie-auth and static-auth apps."""
     page = _FakePage(goto_sleep=0.0)
     _install_fake_playwright(monkeypatch, page)
 
@@ -1384,7 +1384,7 @@ async def test_crawl_into_launches_chromium_exactly_once(monkeypatch):
     assert launches["n"] == 1
 
 
-# --- Task B: value-ordered, submission-driven crawl -------------------------
+# --- value-ordered, submission-driven crawl -------------------------
 
 
 def test_effective_deadline_scales_with_route_count_and_is_capped():

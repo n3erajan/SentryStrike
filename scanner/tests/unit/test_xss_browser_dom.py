@@ -605,7 +605,7 @@ def test_browser_execution_keeps_hook_after_navigation_timeout(monkeypatch):
     assert fired is True
 
 
-# --- Task D: multi-vector / multi-surface loop -----------------------------------------
+# --- multi-vector / multi-surface loop -----------------------------------------
 
 
 def test_dom_xss_vectors_are_ordered_and_hook_bound():
@@ -676,7 +676,7 @@ def test_detect_runs_http_only_when_browser_unavailable(monkeypatch):
     assert isinstance(findings, list)
 
 
-# --- Phase 5: API↔SPA route cross-referencing ------------------------------------------
+# --- API↔SPA route cross-referencing ------------------------------------------
 
 
 def test_select_dom_reflection_jobs_projects_api_param_onto_spa_route():
@@ -756,7 +756,7 @@ def test_select_dom_reflection_jobs_path_router_api_needs_no_projection():
     assert q_jobs[0][0] == "http://x/search"
 
 
-# --- Phase 5: browser-aware stored oracle ---------------------------------------------
+# --- Browser-aware stored oracle ---------------------------------------------
 
 
 def _stub_playwright(monkeypatch, *, fired: bool):

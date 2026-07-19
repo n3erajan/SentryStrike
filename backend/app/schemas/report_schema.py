@@ -4,6 +4,8 @@ from pydantic import BaseModel, Field
 
 
 class ReportResponse(BaseModel):
+    """Data-carrier for the report content returned to the frontend."""
+
     scan_id: str
     generated_at: datetime | None = None
     executive_summary: str | None = None
@@ -13,5 +15,7 @@ class ReportResponse(BaseModel):
 
 
 class GenerateReportResponse(BaseModel):
+    """Envelope wrapping a generated report response."""
+
     message: str
     report: ReportResponse

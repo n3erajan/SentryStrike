@@ -105,7 +105,7 @@ class ScannerSettings(InfrastructureSettings):
     )
 
     scan_mode: str = Field(default="verified", alias="SCAN_MODE")
-    # NOTE: Scan credentials (username/password, raw cookies/headers, and the
+    # Scan credentials (username/password, raw cookies/headers, and the
     # second/privileged test-account material) are NOT read from the environment.
     # They are supplied per-scan with the submission request (``ScanAuthAccount``)
     # and reach the worker via the Redis job payload. Environment-based scan

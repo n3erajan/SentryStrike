@@ -1562,13 +1562,8 @@ def build_remediation_roadmap(data: dict, styles: dict) -> list:
     ))
     elems.append(Spacer(1, 3*mm))
 
-    # Roadmap phase is driven by SEVERITY first (the report's headline risk
-    # measure), with exploitability only breaking ties for ordering within a
-    # phase. Critical and High are the two urgent tiers; Medium is planned work;
-    # Low/Info are backlog. A previous version had no branch for High severity
-    # unless exploitability was "Easy", so a High finding with Medium/Hard
-    # exploitability (e.g. a confirmed SQL injection) fell through to the
-    # "Long-Term (Low)" catch-all — burying the most serious issues.
+    # Bucket findings by severity. Exploitability breaks ties within each
+    # bucket so that the fastest wins surface first.
     phases = {
         "Immediate (Critical)": [],
         "Urgent (High)": [],
@@ -1587,8 +1582,8 @@ def build_remediation_roadmap(data: dict, styles: dict) -> list:
         else:
             phases["Backlog (Low / Informational)"].append(v)
 
-    # Within each phase, surface the easiest-to-exploit items first — they are
-    # the fastest wins and the highest immediate risk at a given severity.
+    # Sort each severity bucket by exploitability so the easiest-to-exploit
+    # items appear first — the fastest remediation wins at every level.
     for items in phases.values():
         items.sort(key=lambda v: _exploit_order.get(
             _clean_enum(v.get("ai_analysis", {}).get("exploitability", "Medium")), 1

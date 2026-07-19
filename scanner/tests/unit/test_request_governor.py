@@ -1,4 +1,4 @@
-"""P1-1: request-budget governor — per-detector / per-parameter ceilings."""
+"""Request-budget governor — per-detector / per-parameter ceilings."""
 from __future__ import annotations
 
 import pytest
@@ -85,7 +85,7 @@ async def test_send_request_short_circuits_when_over_budget():
 
 @pytest.mark.asyncio
 async def test_denied_probe_does_not_produce_negative_sqli_verdict():
-    """P1-1: a governor-denied boolean probe must be untested, not a negative.
+    """A governor-denied boolean probe must be untested, not a negative.
 
     With the per-detector cap set to 1, the baseline consumes the budget and the
     boolean true/false probes are denied (status -1). The verifier must skip them

@@ -225,7 +225,7 @@ class HttpVerifier:
             ctx.parameter, url, params, data
         )
 
-        # P1-1: consult the request-budget governor. When a detector or parameter
+        # Consult the request-budget governor. When a detector or parameter
         # has exhausted its ceiling, skip the network call and return an explicit
         # "not tested" sentinel (status_code == -1) rather than a benign 0. A real
         # 0 means connection error/timeout ("nothing there"); -1 means the probe
@@ -245,11 +245,11 @@ class HttpVerifier:
         try:
             start_time = time.time() if capture_timing else None
 
-            # NOTE: do NOT acquire get_scan_http_semaphore() here. The scan client
-            # returned by create_scan_client already wraps every request in that
-            # same process-wide semaphore (scan_http.throttled_request). Acquiring
-            # it a second time around client.request() double-acquires a
-            # non-reentrant asyncio.Semaphore and deadlocks the whole scan once the
+            # Do NOT acquire ``get_scan_http_semaphore()`` here. The scan client
+            # returned by ``create_scan_client`` already wraps every request in that
+            # same process-wide semaphore. Acquiring it again around
+            # ``client.request()`` double-acquires a non-reentrant
+            # ``asyncio.Semaphore`` and deadlocks the entire scan once the
             # concurrency slots fill up (each in-flight request holds one slot while
             # waiting for a second that can never free).
             response = await client.request(**request_kwargs)

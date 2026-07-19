@@ -1,4 +1,4 @@
-"""Task 7 — cross-identity BOLA/IDOR + path-id extraction."""
+"""Cross-identity BOLA/IDOR + path-id extraction."""
 
 import json
 
@@ -467,7 +467,7 @@ def test_admin_like_url_alone_is_not_data_exposure():
 
 
 # ---------------------------------------------------------------------------
-# Cross-identity broken object-level authorization (Phase 4, mass exposure)
+# Cross-identity broken object-level authorization (mass exposure)
 #
 # An object-scoped request (an id names ONE record) that is denied to anonymous
 # callers but returns the SAME substantive record to two DISTINCT authenticated

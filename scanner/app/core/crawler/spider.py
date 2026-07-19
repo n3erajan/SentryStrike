@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FormInput:
+    """A single input field within an HTML form."""
+
     name: str
     input_type: str = "text"
     value: str = ""
@@ -51,6 +53,7 @@ class FormInput:
 
 @dataclass
 class HtmlForm:
+    """Discovered HTML form with its action, method, and parsed inputs."""
     page_url: str
     action: str
     method: str
@@ -66,6 +69,8 @@ class HtmlForm:
 
 @dataclass
 class CrawlResult:
+    """Aggregated output of a crawl pass: discovered URLs, forms, API endpoints, and auth state."""
+
     urls: list[str] = field(default_factory=list)
     forms: list[HtmlForm] = field(default_factory=list)
     session_cookies: dict[str, str] = field(default_factory=dict)
@@ -101,6 +106,13 @@ class CrawlResult:
 
 
 class WebSpider:
+    """HTTP-based web crawler that discovers URLs, forms, and API endpoints.
+
+    Performs recursive crawling from the target root, respecting robots.txt,
+    depth limits, and URL caps. Returns discovered surface as a ``CrawlResult``
+    for downstream detector and verification pipeline stages.
+    """
+
     def __init__(self) -> None:
         self.settings = get_settings()
         self.session_cookies = {}
@@ -475,7 +487,7 @@ class WebSpider:
                 ]
                 await self._run_browser_discovery(crawl_state, root_url, browser_routes)
 
-        # P4: browser routes reconstructed from a dead hash route hold a real
+        # Browser routes reconstructed from a dead hash route hold a real
         # server URL the HTTP worker never saw — a query-bearing endpoint
         # (/redirect?to=https://...) or a served file (/ftp/legal.md). Extend
         # discovered_urls so ParamDiscovery + all detectors (open_redirect,

@@ -11,7 +11,7 @@ from app.core.crawler.models import ApiEndpoint
 
 
 def test_auth_result_carries_full_storage_state():
-    """Task A: AuthResult exposes an optional storage_state blob captured whole
+    """AuthResult exposes an optional storage_state blob captured whole
     from the Playwright context (opaque; never key-inspected)."""
     blob = {
         "cookies": [{"name": "sid", "value": "abc"}],

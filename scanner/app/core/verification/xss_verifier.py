@@ -149,7 +149,7 @@ class XSSVerifier(BaseVerifier):
     )
 
     _STORED_PROBE_URL_CAP = 25
-    # P0-3: hard ceiling on how many header-sink URLs a single header × payload
+    # Hard ceiling on how many header-sink URLs a single header × payload
     # combination re-probes. Bounds the header-stored GET-replay fan-out that
     # otherwise multiplies headers × payloads × every sink-like URL.
     _STORED_HEADER_SINK_CAP = 8
@@ -506,9 +506,9 @@ class XSSVerifier(BaseVerifier):
                     if job:
                         pending_jobs.append(job)
 
-            # The detector owns the phase boundary so all HTTP workers finish
-            # before any browser is launched. Keep the singular key for callers
-            # that predate batched payload handoff.
+            # Browser verification is deferred until after all HTTP probes complete,
+            # ensuring no race between concurrent HTTP workers and Playwright.
+            # Keep the singular key for callers that predate batched payload handoff.
             if pending_jobs:
                 best = max(findings, key=lambda finding: finding.confidence_score, default=None)
                 return VerificationResult(
@@ -799,7 +799,7 @@ class XSSVerifier(BaseVerifier):
                     injected_payload, injected.body, baseline_body=pre_test_baseline.body, canary=canary,
                 )
 
-            # P0-3: the header-stored GET-replay oracle is structurally incapable
+            # The header-stored GET-replay oracle is structurally incapable
             # of confirming reflection on an SPA (the injected header value is
             # rendered client-side from an API response and never appears in the
             # raw HTML shell that this raw-string oracle matches against). On SPA
@@ -1198,7 +1198,7 @@ class XSSVerifier(BaseVerifier):
 
         return False
 
-    # Task D: an ordered, generic set of hook-executing DOM XSS vectors. Each is
+    # An ordered, generic set of hook-executing DOM XSS vectors. Each is
     # parameterised by the per-probe canary via ``window.sentry_hook``; framework
     # sinks sanitise some vectors but execute others, so a single-vector sweep
     # yields incomplete negatives. Ordered cheap → specific. No app-specific payload.
@@ -1211,7 +1211,7 @@ class XSSVerifier(BaseVerifier):
     )
     # Hard cap on navigations per candidate so the vector × surface loop stays
     # inside a single job's timeout rather than multiplying the job count.
-    # P0-3: raised from 12 — the browser-DOM sweep is the genuinely effective SPA
+    # Raised from 12 — the browser-DOM sweep is the genuinely effective SPA
     # confirmer, so budget follows yield now that the header-stored HTTP fan-out
     # is disabled on SPAs.
     _DOM_MAX_ATTEMPTS_PER_CANDIDATE = 18
@@ -1232,7 +1232,7 @@ class XSSVerifier(BaseVerifier):
     ) -> dict:
         """Navigate an SPA route with executing canaries and assert on DOM execution.
 
-        Tries a small ordered set of generic execution vectors (Task D) across
+        Tries a small ordered set of generic execution vectors across
         the query, hash-route query, and fragment surfaces — SPAs read user input
         from both ``location.search`` and ``location.hash`` — stopping at the
         first vector/surface that fires the hooked canary. Independent of any
@@ -1352,7 +1352,7 @@ class XSSVerifier(BaseVerifier):
         return out
 
     async def _new_reflection_context(self, browser, route_url: str, storage_state: dict | None = None):
-        # Seed from the full authenticated storage_state when available (Task A)
+        # Seed from the full authenticated storage_state when available
         # so authenticated-only SPA routes render during DOM confirmation. Falls
         # back to cookie injection when absent. Opaque per-origin blob — generic.
         context = None
@@ -1476,7 +1476,7 @@ class XSSVerifier(BaseVerifier):
             all_urls.append(bare)
 
         if is_header_injection:
-            # P0-3: cap the header-sink fan-out. Even on non-SPA server-rendered
+            # Cap the header-sink fan-out. Even on non-SPA server-rendered
             # apps, probing every sink-like URL for every header × every payload
             # is the dominant traffic sink for near-zero yield; the highest-value
             # log/admin/audit views cluster in the first few matches.

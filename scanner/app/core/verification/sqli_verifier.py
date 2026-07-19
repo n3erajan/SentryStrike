@@ -113,8 +113,10 @@ _UNION_MIN_SIGNIFICANT_PAYLOADS = 3   # raised from 2
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# FIX 1: Replace the two "risky" bare function-name markers with their 
-#         actual error-message forms. These are what MySQL actually outputs.
+# Replace bare function-name markers with their actual MySQL error-message
+# forms. Function names (e.g. "extractvalue") get reflected verbatim by XSS
+# endpoints, causing false positives; only real XPATH syntax errors that
+# appear on actual injection are included here.
 # ---------------------------------------------------------------------------
 
 _SQL_SPECIFIC_MARKERS = frozenset({
@@ -136,9 +138,9 @@ _SQL_SPECIFIC_MARKERS = frozenset({
     "sqlstate",
     "sqlexception",
     "division by zero in",
-    # FIX: was "extractvalue(" and "updatexml(" - these are function NAMES that
-    # get reflected verbatim by XSS endpoints. Replace with the actual MySQL
-    # XPATH error messages that only appear on real injection.
+    # Function names like "extractvalue(" and "updatexml(" get reflected
+    # verbatim by XSS endpoints, causing false positives. The actual MySQL
+    # XPATH error messages that follow are only present on real injection.
     "xpath syntax error",                        # MySQL extractvalue/updatexml error
     "invalid xml",                               # alternate XPATH error form
     "invalid column name",
@@ -211,8 +213,9 @@ def _has_sql_specific_error(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# FIX 2: Strip the FULL composed injection value (baseline + payload),
-#         not just the payload suffix. Also strip %28/%29 hex-encoded parens.
+# Strip the FULL composed injection value (baseline value + payload), not
+# just the payload suffix, to prevent false positives from the baseline
+# portion reappearing. Also strip %28/%29 hex-encoded parentheses.
 # ---------------------------------------------------------------------------
 
 def _new_sql_errors(
@@ -776,7 +779,9 @@ class SQLiVerifier(BaseVerifier):
                     continue
                 inj_body = inj_resp.body or ""
 
-                # FIX: Replaced self._baseline_value with the local variable 'value'
+                # Pass the local variable ``value`` as the baseline rather than
+                # a stale instance attribute, ensuring error detection uses the
+                # correct parameter baseline for this specific probe.
                 errors = _new_sql_errors(baseline_body, inj_body, payload, value or "")
                 if not errors:
                     continue
@@ -1233,7 +1238,7 @@ class SQLiVerifier(BaseVerifier):
         which otherwise look exactly like a database sleep when detectors overlap.
         """
         sleep_payloads = [
-            # Standard - needs baseline_value prefix (now fixed by Fix 1)
+            # Standard — uses baseline_value as the prefix
             ("' AND SLEEP(3)--",                     3000),
             ("' AND SLEEP(3)#",                      3000),
             (" AND SLEEP(3)--",                      3000),
