@@ -44,6 +44,7 @@ def _build_report_payload(scan, scan_id: str) -> dict:
         "risk_level": getattr(scan, "overall_risk_level", None),
         "technology_stack": [tech.model_dump(mode="json") for tech in scan.technology_stack],
         "vulnerabilities": [v.model_dump(mode="json") for v in scan.vulnerabilities],
+        "site_title": getattr(scan, "site_title", ""),
         "report_metadata": report_metadata,
         "evidence_strength_breakdown": report_metadata.get("evidence_strength_breakdown", {}),
         "spa_api_coverage": report_metadata.get("spa_api_coverage", {}),

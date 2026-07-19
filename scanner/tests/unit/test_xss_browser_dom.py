@@ -215,11 +215,16 @@ def test_sweep_invokes_verify_reflected_dom_and_builds_finding(monkeypatch):
     # The winning vector/surface is threaded through to the finding.
     assert finding.detection_evidence.get("winning_vector") == "svg_onload"
     assert finding.detection_evidence.get("winning_surface") == "hash_query"
-    # DOM-XSS is delivered via browser navigation (no httpx send_request). The
-    # snippet represents the actual HTTP navigation: fragments and fake GET
-    # bodies are omitted, while the browser context's known UA is retained.
+    # DOM-XSS is delivered via browser navigation (no httpx send_request). Keep
+    # the full client-side URL for reproduction while separately showing the
+    # fragment-free network request that fetched the SPA shell.
     assert finding.verification_request_snippet is not None
-    assert finding.verification_request_snippet.startswith("GET / HTTP/1.1\nHost: x")
+    assert finding.verification_request_snippet.startswith(
+        "BROWSER NAVIGATION\n"
+        "URL: http://x/#/search?q=payload\n\n"
+        "NETWORK REQUEST\n"
+        "GET / HTTP/1.1\nHost: x"
+    )
     assert "User-Agent: SentryStrikeScanner/1.0" in finding.verification_request_snippet
     assert "Cookie: session=abc" in finding.verification_request_snippet
     assert "<svg onload=window.sentry_hook('c')>" not in finding.verification_request_snippet

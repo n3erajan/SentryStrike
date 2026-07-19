@@ -721,6 +721,23 @@ class ExceptionHandlingDetector(BaseDetector):
         # Apply reflection guard: if the matched pattern only appears because the
         # fuzz payload is echoed back in the response body, discard the match.
         matched = _reflection_guard(body, payload, matched)
+
+        # Query-shape echoes ("SELECT ... FROM ... WHERE", "INSERT INTO ...
+        # VALUES") are low-specificity: they match ordinary page prose and HTML
+        # ("select a language from the menu where ...") as readily as a real DB
+        # error. Standing ALONE on a non-error (2xx/3xx/4xx) response they are
+        # benign page content, not verbose-error proof — this is the false
+        # positive that fired on a 200 guestbook page. Keep them only when the
+        # response is a genuine server error (5xx) or a real engine-error/stack-
+        # trace pattern corroborates; then a SELECT...WHERE echo inside an actual
+        # error is still reported, while benign page content is dropped. (When a
+        # query echo appears alongside a specific engine-error pattern, ``matched``
+        # is not all-query-echo, so the finding is retained unconditionally.)
+        if matched and all(p in _QUERY_ECHO_PATTERNS for p in matched):
+            is_server_error = status is not None and 500 <= status < 600
+            has_corroboration = any(pat.search(body) for pat in _STACK_TRACE_CORROBORATORS)
+            if not (is_server_error or has_corroboration):
+                matched = []
         severity = _reclassify_severity(matched)
 
         sensitive_hdrs = _sensitive_headers_present(headers, http_status=status)

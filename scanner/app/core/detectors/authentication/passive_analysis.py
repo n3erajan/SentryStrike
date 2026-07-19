@@ -28,23 +28,10 @@ class PassiveAuthAnalysisMixin:
             form_url    = getattr(form, "action", getattr(form, "page_url", ""))
             form_method = getattr(form, "method", "POST").upper()
 
-            # A form whose action is a client-side (hash) route posts to the SPA
-            # shell, not a server endpoint: the "#/login" fragment never leaves the
-            # browser, so there is no server-side form handler and no place for a
-            # CSRF hidden token to live (SPAs authenticate with bearer tokens the
-            # browser does not attach cross-site). Detect this precisely so a normal
-            # multi-page-app login form is NOT affected: only skip when the action's
-            # real (pre-fragment) path is the app shell ("" or "/") AND it carries a
-            # fragment route. "/login" or "/login#anchor" keep a real path → not a
-            # shell form → still checked.
-            _parsed_action = urlparse(form_url or "")
-            posts_to_spa_shell = bool(_parsed_action.fragment) and (_parsed_action.path or "") in ("", "/")
-
             has_password = bool(input_names.intersection({"password", "passwd", "pass", "pwd", "passphrase", "secret"})
                                 or "password" in input_types)
             has_username = bool(input_names.intersection({"username", "user", "email", "mail", "login",
                                                            "uname", "phone", "mobile", "account"}))
-            has_hidden   = "hidden" in input_types
 
             # 1. Login form discovered → run active auth tests.
             if has_username and has_password:
@@ -62,13 +49,16 @@ class PassiveAuthAnalysisMixin:
                     )
                     findings.extend(active_findings)
 
-            # 2. Login form submitted over GET
+            # A password form submitted via GET necessarily exposes credentials in
+            # the URL. The structural observation is the verification evidence.
             if has_password and form_method == "GET":
                 findings.append(self._finding(
                     vuln_type="Credentials Transmitted via HTTP GET",
                     url=form_url,
                     method=form_method,
                     severity=SeverityLevel.critical,
+                    verified=True,
+                    confidence_score=90.0,
                     evidence=(
                         "Password field found in a form that submits via GET. "
                         "Credentials will appear in the URL, server logs, browser history, "
@@ -76,30 +66,8 @@ class PassiveAuthAnalysisMixin:
                     ),
                 ))
 
-            # 7. Hidden inputs on auth forms → CSRF token presence / absence check.
-            # Skip SPA-shell forms (see posts_to_spa_shell): a hash-route action has
-            # no server-side form handler, so "no hidden CSRF field" is meaningless
-            # (and misleading) there. A normal MPA login form is unaffected.
-            #
-            # Require an actual credential field (has_password). An identity field
-            # alone (email/user) does NOT make a form an authentication form — a
-            # contact, feedback, newsletter, data-erasure, or password-reset form
-            # all carry `email` without being login forms, and mislabelling them
-            # as "Authentication Form ... Lacks CSRF" is a false positive. Real
-            # (non-login) CSRF on those endpoints is still covered by the CSRF
-            # detector's active token-bypass verification.
-            if has_password and not has_hidden and not posts_to_spa_shell:
-                findings.append(self._finding(
-                    vuln_type="Authentication Form May Lack CSRF Protection",
-                    url=form_url,
-                    method=form_method,
-                    severity=SeverityLevel.high,
-                    category=OwaspCategory.a01,
-                    evidence=(
-                        "Authentication form has no hidden input fields detected. "
-                        "This may indicate missing CSRF token; verify server-side enforcement."
-                    ),
-                ))
+            # CSRF assessment belongs to CSRFDetector, which verifies whether a
+            # cross-origin submission is accepted.
 
             # 8. Password-change form - requires old password check
             change_hits = input_names.intersection({"current_password", "old_password", "existing_password"})

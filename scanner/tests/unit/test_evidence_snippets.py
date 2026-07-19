@@ -1,6 +1,7 @@
 from app.core.detectors.base_detector import Finding
 from app.core.scanner import ScanOrchestrator
 from app.core.verification.response_analyzer import ResponseAnalyzer
+from app.core.verification.verification_framework import FindingDeduplicator
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 
 
@@ -246,3 +247,34 @@ def test_scanner_deduplicates_repeated_verification_evidence() -> None:
     vulnerability = ScanOrchestrator(DummyRepository())._to_vulnerability(finding)
 
     assert vulnerability.evidence.response_snippet.count("Form submitted successfully") == 1
+
+
+def test_deduplicated_bypass_evidence_keeps_each_url_on_its_own_line() -> None:
+    urls = [
+        "http://target.test/ftp/package.json.bak",
+        "http://target.test/ftp/encrypt.pyc",
+    ]
+    findings = [
+        Finding(
+            category=OwaspCategory.a05,
+            vuln_type="Path Traversal / Arbitrary File Read (poison null byte)",
+            severity=SeverityLevel.high,
+            url=url,
+            parameter=url.rsplit("/", 1)[-1],
+            evidence=f"Extension-filter bypass: {url} is forbidden directly.",
+            confidence_score=95.0,
+            detection_method="poison_null_byte_extension_bypass",
+            verified=True,
+            verification_response_snippet="confirmed file contents",
+        )
+        for url in urls
+    ]
+
+    [deduplicated] = FindingDeduplicator.deduplicate(findings)
+    vulnerability = ScanOrchestrator(DummyRepository())._to_vulnerability(deduplicated)
+    response_lines = (vulnerability.evidence.response_snippet or "").splitlines()
+
+    evidence_lines = [line for line in response_lines if line.startswith("Extension-filter bypass:")]
+    assert evidence_lines == [
+        f"Extension-filter bypass: {url} is forbidden directly." for url in urls
+    ]

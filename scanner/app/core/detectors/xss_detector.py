@@ -531,11 +531,18 @@ class XSSDetector(BaseDetector):
                         },
                         reproducible=True,
                         verified=True,
-                        verification_request_snippet=build_observed_request_snippet(
-                            url=winning_url,
-                            method="GET",
-                            headers={"User-Agent": "SentryStrikeScanner/1.0"},
-                            cookies=session_cookies,
+                        verification_request_snippet=(
+                            f"BROWSER NAVIGATION\nURL: {winning_url}\n\n"
+                            "NETWORK REQUEST\n"
+                            + (
+                                build_observed_request_snippet(
+                                    url=winning_url,
+                                    method="GET",
+                                    headers={"User-Agent": "SentryStrikeScanner/1.0"},
+                                    cookies=session_cookies,
+                                )
+                                or ""
+                            )
                         ),
                     )
                 )

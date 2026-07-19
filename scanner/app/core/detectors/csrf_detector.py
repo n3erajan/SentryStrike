@@ -44,6 +44,11 @@ class CSRFDetector(BaseDetector):
     name = "csrf"
 
     csrf_keywords = {"token", "csrf", "xsrf", "user_token", "session_token"}
+    identity_fields = {
+        "username", "user", "email", "mail", "login", "uname",
+        "phone", "mobile", "account",
+    }
+    login_secret_fields = {"password", "passwd", "pass", "pwd", "passphrase", "secret"}
     state_changing_actions = {"password", "update", "change", "profile", "user", "admin", "delete", "add", "create", "settings", "save"}
     login_indicators = {
         "login", "signin", "sign-in", "authenticate", "auth", "session",
@@ -78,23 +83,50 @@ class CSRFDetector(BaseDetector):
         return _FormView(action=action, page_url=page_url, method=method, inputs=inputs)
 
     def _select_candidate_forms(self, forms: list[object]) -> list[tuple]:
-        """Return state-changing, non-login form candidates for CSRF assessment."""
+        """Return state-changing, non-login form candidates for CSRF assessment.
+
+        A form is a CSRF candidate when it is state-changing. The signal can
+        come from three places:
+
+          1. A mutating method (POST/PUT/PATCH/DELETE).
+          2. A state-changing keyword in the URL path (update/change/delete/...).
+          3. The form's fields: a password field, or a field the developer
+             named like an anti-CSRF token (``token``/``csrf``/``user_token``).
+             These mark a protected/mutating action even when the form submits
+             via GET and its path carries no keyword.
+
+        GET state-changing forms are actively verified here instead of producing
+        a passive hint from the authentication detector.
+        """
         form_candidates: list[tuple] = []
         for form in forms:
             form_url = getattr(form, "action", "") or getattr(form, "page_url", "")
             form_method = (getattr(form, "method", "POST") or "POST").upper()
             raw_inputs = list(getattr(form, "inputs", []))
             input_names_lower = {getattr(inp, "name", "").lower() for inp in raw_inputs}
+            input_types_lower = {
+                str(getattr(inp, "input_type", "") or "").lower() for inp in raw_inputs
+            }
 
             # Check if form controls state-changing action
             url_path_lower = urlparse(form_url).path.lower()
             is_state_changing = any(kw in url_path_lower for kw in self.state_changing_actions)
 
+            # Password and anti-CSRF fields can reveal mutating intent even when
+            # the method and URL do not.
+            has_password_field = "password" in input_types_lower or any(
+                tok in name for name in input_names_lower
+                for tok in ("password", "passwd", "pwd", "passphrase")
+            )
+            has_token_field = any(kw in name for name in input_names_lower for kw in self.csrf_keywords)
+            has_state_changing_field = has_password_field or has_token_field
+
             # Skip login/auth forms (handled by auth detector)
             if any(tok in url_path_lower for tok in self.login_indicators):
                 continue
-            if "password" in input_names_lower and (
-                "username" in input_names_lower or "email" in input_names_lower
+            if (
+                input_names_lower.intersection(self.identity_fields)
+                and input_names_lower.intersection(self.login_secret_fields)
             ):
                 continue
 
@@ -102,7 +134,7 @@ class CSRFDetector(BaseDetector):
             setup_tokens = {"setup", "install", "wizard", "onboarding"}
             is_setup_route = any(tok in url_path_lower for tok in setup_tokens)
 
-            if form_method == "POST" or is_state_changing:
+            if form_method in _MUTATING_METHODS or is_state_changing or has_state_changing_field:
                 form_candidates.append((form_url, form_method, raw_inputs, is_setup_route))
         return form_candidates
 

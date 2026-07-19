@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+from types import SimpleNamespace
 
 from app.core.detectors import csrf_detector as csrf_module
 from app.core.detectors.csrf_detector import CSRFDetector
@@ -133,6 +134,89 @@ async def test_csrf_cookie_auth_consumes_browser_discovered_forms(monkeypatch):
     assert finding.verified is True
     # Token-less form with no SameSite protection accepted a foreign-Origin POST.
     assert finding.severity in {SeverityLevel.high, SeverityLevel.medium}
+
+
+@pytest.mark.asyncio
+async def test_csrf_actively_verifies_get_password_change_form(monkeypatch):
+    """A GET password-change form is actively verified by CSRFDetector."""
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
+
+    detector = CSRFDetector()
+    action_url = "http://target.test/form-handler"
+    form = SimpleNamespace(
+        action=action_url,
+        page_url="http://target.test/account",
+        method="GET",
+        inputs=[
+            SimpleNamespace(name="password_new", input_type="password", value=""),
+            SimpleNamespace(name="password_conf", input_type="password", value=""),
+            SimpleNamespace(name="Change", input_type="submit", value="Change"),
+        ],
+    )
+
+    findings = await detector.detect(
+        [action_url],
+        [form],
+        session_cookies={"session": "abc123"},
+        auth_headers={},
+        browser_forms=[],
+    )
+
+    assert findings, "expected the CSRF detector to actively verify the GET form"
+    finding = findings[0]
+    assert "Cross-Site Request Forgery" in finding.vuln_type
+    assert finding.verified is True
+    assert finding.detection_method == "missing_token_state_change"
+
+
+@pytest.mark.asyncio
+async def test_csrf_ignores_generic_login_form_with_field_aliases(monkeypatch):
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
+
+    detector = CSRFDetector()
+    form = SimpleNamespace(
+        action="http://target.test/submit",
+        page_url="http://target.test/",
+        method="GET",
+        inputs=[
+            SimpleNamespace(name="user", input_type="text", value=""),
+            SimpleNamespace(name="passwd", input_type="password", value=""),
+        ],
+    )
+
+    findings = await detector.detect(
+        ["http://target.test/submit"],
+        [form],
+        session_cookies={"session": "abc123"},
+        auth_headers={},
+        browser_forms=[],
+    )
+
+    assert findings == []
+
+
+@pytest.mark.asyncio
+async def test_csrf_ignores_benign_get_search_form(monkeypatch):
+    """A plain GET search form is not a CSRF candidate."""
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
+
+    detector = CSRFDetector()
+    form = SimpleNamespace(
+        action="http://target.test/search",
+        page_url="http://target.test/search",
+        method="GET",
+        inputs=[SimpleNamespace(name="q", input_type="text", value="")],
+    )
+
+    findings = await detector.detect(
+        ["http://target.test/search"],
+        [form],
+        session_cookies={"session": "abc123"},
+        auth_headers={},
+        browser_forms=[],
+    )
+
+    assert findings == []
 
 
 _SPA_SHELL = (

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from time import perf_counter
 from urllib.parse import urlparse
@@ -98,6 +99,12 @@ class PipelineMixin:
 
             scan.statistics.total_urls_crawled = self._count_discovered_surface(crawl_result)
             await self._set_phase_progress(scan, ScanPhase.crawling, 1.0, f"Crawl complete: {scan.statistics.total_urls_crawled} URL(s) discovered")
+
+            root_html = getattr(crawl_result, "spa_root_html", "")
+            if root_html:
+                match = re.search(r"<title[^>]*>(.*?)</title>", root_html, re.I | re.S)
+                scan.site_title = re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+
             await self._check_cancelled(scan_id)
 
             await self._set_phase_progress(scan, ScanPhase.technology_detection, 0.0, "Detecting technology stack and known CVEs")
@@ -541,10 +548,9 @@ class PipelineMixin:
 
                     if is_verified or is_low_severity or is_heuristic_passthrough:
                         if is_heuristic_passthrough and not is_verified:
-                            # Boost confidence slightly so AI phase doesn't ignore it, but
-                            # leave verified=False so the risk-score weighting in _to_vulnerability
-                            # still applies a 30 % penalty - honest representation.
-                            f.confidence_score = max(f.confidence_score, 0.6)
+                            # Confidence uses a 0-100 scale. Keep the finding
+                            # unverified so downstream evidence weighting still applies.
+                            f.confidence_score = max(f.confidence_score, 60.0)
                             logger.info(
                                 "verified scan mode KEPT heuristic finding (passthrough): "
                                 "vuln_type=%r severity=%s url=%s",

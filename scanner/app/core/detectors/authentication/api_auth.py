@@ -161,11 +161,16 @@ class AuthApiProbeMixin:
                 getattr(endpoint, "headers", {}) or {},
                 "api_endpoint",
             )
-        # The scanner's own winning login recipe: a guaranteed-correct login-flow
-        # record (real API URL, method, JSON body, field names) even when the
-        # login XHR was never captured as a browser request or mined from JS.
+        # The scanner's own winning JSON login recipe can seed API probes even
+        # when the login XHR was not captured or mined from JavaScript. HTML-form
+        # replays are intentionally excluded: their payload must not be rewritten
+        # as JSON and sent to an API-only probe.
         replay = kwargs.get("auth_replay_state")
-        if replay is not None and getattr(replay, "payload", None):
+        if (
+            replay is not None
+            and getattr(replay, "is_json", False)
+            and getattr(replay, "payload", None)
+        ):
             add(
                 str(getattr(replay, "action", "") or getattr(replay, "login_url", "") or ""),
                 str(getattr(replay, "method", "POST") or "POST"),

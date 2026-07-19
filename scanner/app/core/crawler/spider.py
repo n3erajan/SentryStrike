@@ -142,6 +142,15 @@ class WebSpider:
                 redacted[key] = f"{scheme} {redact_secret(token)}" if token else redact_secret(value)
         return redacted
 
+    @staticmethod
+    def _redact_cookies(cookies: dict[str, str]) -> dict[str, str]:
+        redacted = dict(cookies)
+        sensitive_keys = {"token", "session", "auth", "jwt", "refresh", "access", "id_token", "sid"}
+        for key, value in list(redacted.items()):
+            if key.lower() in sensitive_keys:
+                redacted[key] = redact_secret(value)
+        return redacted
+
     async def crawl(self, root_url: str, max_depth: int | None = None, auth_override=None, scan_config: ScanConfig | None = None) -> CrawlResult:
         self._reset_scan_auth_state()
         self._auth_override = auth_override
@@ -1145,7 +1154,7 @@ class WebSpider:
                     self._auth_verification_evidence = result.verification_evidence
                     logger.info(
                         "Session authenticated successfully. Cookies: %s, Headers: %s",
-                        self.session_cookies,
+                        self._redact_cookies(self.session_cookies),
                         self._redact_headers(self._auth_headers),
                     )
                 else:

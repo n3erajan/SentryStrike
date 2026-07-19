@@ -193,6 +193,7 @@ class Scan(Document):
     overall_risk_level: str = Field(default="Info")
     technology_stack: list[TechnologyComponent] = Field(default_factory=list)
     vulnerabilities: list[Vulnerability] = Field(default_factory=list)
+    site_title: str = ""
     report_metadata: ReportMetadata = Field(default_factory=ReportMetadata)
     error_message: str | None = None
 

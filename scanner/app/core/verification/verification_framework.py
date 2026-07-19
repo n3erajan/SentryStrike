@@ -120,6 +120,7 @@ class HttpVerifier:
             await self._client.aclose()
             self._client = None
 
+
     async def send_request(
         self,
         url: str,

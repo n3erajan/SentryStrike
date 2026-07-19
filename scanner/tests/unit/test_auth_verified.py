@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.config import get_settings
+from app.core.crawler.auth_manager import AuthReplayState
 from app.core.crawler.models import ApiEndpoint, RequestObservation
 from app.core.detectors.auth_detector import AuthenticationFailuresDetector
 from app.core.detectors.base_detector import Finding
@@ -26,6 +27,57 @@ def test_auth_bruteforce_verified():
     )
     
     assert finding.verified is True
+
+
+def test_api_records_exclude_html_form_replay_but_keep_json_replay():
+    detector = AuthenticationFailuresDetector()
+    common = {
+        "login_url": "http://example.test/login",
+        "action": "http://example.test/login",
+        "method": "POST",
+        "payload": {"username": "alice", "password": "secret"},
+    }
+
+    html_replay = AuthReplayState(**common, is_json=False)
+    assert not any(
+        record["source"] == "auth_replay"
+        for record in detector._api_records({"auth_replay_state": html_replay})
+    )
+
+    json_replay = AuthReplayState(**common, is_json=True)
+    records = detector._api_records({"auth_replay_state": json_replay})
+    assert any(record["source"] == "auth_replay" for record in records)
+
+
+@pytest.mark.asyncio
+async def test_credentials_via_get_is_verified_confirmed_observation():
+    """A GET password form is directly observed structural evidence."""
+    detector = AuthenticationFailuresDetector()
+    form = SimpleNamespace(
+        action="http://example.test/login",
+        page_url="http://example.test/login",
+        method="GET",
+        inputs=[
+            SimpleNamespace(name="username", input_type="text"),
+            SimpleNamespace(name="password", input_type="password"),
+        ],
+    )
+
+    findings = await detector.detect(urls=[], forms=[form])
+
+    get_cred = [f for f in findings if f.vuln_type == "Credentials Transmitted via HTTP GET"]
+    assert len(get_cred) == 1
+    finding = get_cred[0]
+    assert finding.verified is True
+    assert finding.confidence_score >= 70.0
+
+    from app.core.scan_orchestration.finding_processing import FindingProcessingMixin
+    from shared.models.vulnerability import EvidenceStrength
+
+    strength = FindingProcessingMixin._classify_evidence_strength(
+        FindingProcessingMixin(), finding
+    )
+    assert strength == EvidenceStrength.confirmed_observation
 
 
 def test_sensitive_query_params_do_not_flag_non_secret_csrf_values():
@@ -966,74 +1018,7 @@ async def test_active_auth_skipped_for_spa_shell_hash_route_form():
 
 
 @pytest.mark.asyncio
-async def test_csrf_token_check_skipped_for_spa_shell_hash_route_form():
-    # A login form whose action is a client-side hash route (#/login) posts to the
-    # SPA shell: there is no server-side form handler, so "no hidden CSRF field" is
-    # meaningless. The detector must NOT emit the auth-form CSRF finding there.
-    detector = AuthenticationFailuresDetector()
-
-    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
-        return ResponseData(200, {"content-type": "text/html"}, "<html>app shell</html>", 5.0,
-                            request_snippet="", response_snippet="")
-
-    form = _login_form("https://spa.test/#/login")  # hash route → SPA shell
-    with patch.object(HttpVerifier, "send_request", send_request):
-        findings = await detector.detect(urls=[], forms=[form], is_spa=True)
-
-    assert not any(
-        f.vuln_type == "Authentication Form May Lack CSRF Protection" for f in findings
-    )
-
-
-@pytest.mark.asyncio
-async def test_csrf_token_check_still_fires_for_normal_mpa_login_form():
-    # Guard against over-correction: a traditional (non-SPA) login form with a REAL
-    # server action path and no hidden CSRF field must STILL be flagged.
-    detector = AuthenticationFailuresDetector()
-
-    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
-        return ResponseData(401, {"content-type": "text/html"},
-                            "<html>Invalid</html>", 5.0,
-                            request_snippet="", response_snippet="401")
-
-    form = _login_form("https://shop.test/login")  # real server path, not a hash route
-    with patch.object(HttpVerifier, "send_request", send_request):
-        findings = await detector.detect(urls=[], forms=[form], is_spa=False)
-
-    assert any(
-        f.vuln_type == "Authentication Form May Lack CSRF Protection" for f in findings
-    )
-
-
-@pytest.mark.asyncio
-async def test_csrf_token_check_not_fired_for_non_login_email_form():
-    # Regression: a non-authentication form that merely carries an `email` field
-    # (data-erasure, contact, newsletter, password-reset) must NOT be labelled an
-    # "Authentication Form ... Lacks CSRF" — that requires an actual credential
-    # (password) field. Real CSRF on such endpoints is still covered by the CSRF
-    # detector's active token-bypass verification, not this heuristic.
-    detector = AuthenticationFailuresDetector()
-
-    async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
-        return ResponseData(200, {"content-type": "text/html"},
-                            "<html>erasure</html>", 5.0,
-                            request_snippet="", response_snippet="200")
-
-    erasure_form = SimpleNamespace(
-        action="https://shop.test/dataerasure",  # real server path, no password field
-        method="POST",
-        page_url="https://shop.test/dataerasure",
-        inputs=[
-            SimpleNamespace(name="email", input_type="text", value=""),
-            SimpleNamespace(name="securityAnswer", input_type="text", value=""),
-        ],
-    )
-    with patch.object(HttpVerifier, "send_request", send_request):
-        findings = await detector.detect(urls=[], forms=[erasure_form], is_spa=False)
-
-    assert not any(
-        f.vuln_type == "Authentication Form May Lack CSRF Protection" for f in findings
-    )
+async def test_default_credentials_detected_on_email_login_form():
     # A traditional (non-SPA) HTML form login authenticating by e-mail: the weak
     # admin credential is detected using the app domain harvested from an observed
     # response, exactly as for the JSON API path.
