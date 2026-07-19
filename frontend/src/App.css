@@ -12,6 +12,21 @@
   --good: oklch(55% 0.14 150);
   --warn: oklch(70% 0.15 72);
   --bad: oklch(60% 0.2 28);
+
+  /* Severity palette — single source of truth for critical/high/medium/low/info.
+     Every severity tag, dot, text utility, and breakdown cell reads these so a
+     given severity is the same color everywhere. Each level has a foreground
+     color (readable on light backgrounds) and a soft tint for pill backgrounds. */
+  --sev-critical: oklch(47% 0.21 18);
+  --sev-critical-bg: oklch(93% 0.05 18);
+  --sev-high: oklch(58% 0.2 28);
+  --sev-high-bg: oklch(96% 0.03 28);
+  --sev-medium: oklch(55% 0.16 68);
+  --sev-medium-bg: oklch(95% 0.07 78);
+  --sev-low: oklch(52% 0.14 150);
+  --sev-low-bg: oklch(94% 0.06 150);
+  --sev-info: oklch(52% 0.02 255);
+  --sev-info-bg: oklch(94% 0.012 255);
   --dark: oklch(17% 0.035 255);
   --dark2: oklch(22% 0.04 255);
   --light: oklch(94% 0.01 255);
@@ -1222,14 +1237,20 @@ footer.public-footer {
   margin-top: 15px;
   font-size: 0.67rem;
 }
+.critical {
+  color: var(--sev-critical);
+}
 .high {
-  color: var(--bad);
+  color: var(--sev-high);
 }
 .medium {
-  color: oklch(55% 0.16 72);
+  color: var(--sev-medium);
 }
 .low {
-  color: var(--good);
+  color: var(--sev-low);
+}
+.info {
+  color: var(--sev-info);
 }
 
 .formsection h3 {
@@ -1588,17 +1609,25 @@ footer.public-footer {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+.sev-tag.critical {
+  background: var(--sev-critical-bg);
+  color: var(--sev-critical);
+}
 .sev-tag.high {
-  background: oklch(96% 0.03 28);
-  color: var(--bad);
+  background: var(--sev-high-bg);
+  color: var(--sev-high);
 }
 .sev-tag.medium {
-  background: oklch(96% 0.06 75);
-  color: var(--warn);
+  background: var(--sev-medium-bg);
+  color: var(--sev-medium);
 }
 .sev-tag.low {
-  background: oklch(94% 0.06 150);
-  color: var(--good);
+  background: var(--sev-low-bg);
+  color: var(--sev-low);
+}
+.sev-tag.info {
+  background: var(--sev-info-bg);
+  color: var(--sev-info);
 }
 .reports-row .rowactions {
   gap: 6px;
@@ -1907,14 +1936,20 @@ footer.public-footer {
   border-radius: 999px;
   background: var(--muted);
 }
+.sev-dot.critical {
+  background: var(--sev-critical);
+}
 .sev-dot.high {
-  background: var(--bad);
+  background: var(--sev-high);
 }
 .sev-dot.medium {
-  background: var(--warn);
+  background: var(--sev-medium);
 }
 .sev-dot.low {
-  background: var(--good);
+  background: var(--sev-low);
+}
+.sev-dot.info {
+  background: var(--sev-info);
 }
 .finding-title {
   min-width: 0;

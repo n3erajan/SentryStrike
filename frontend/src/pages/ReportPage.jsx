@@ -3,7 +3,7 @@ import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { ChevronDown, Download, FileText } from "lucide-react";
 import { downloadReportPdf, getReport } from "../services/reports.js";
 import { downloadFile, saveBlob } from "../utils/helpers.js";
-import { SEVERITIES, SEVERITY_META } from "../data/constants.js";
+import { SEVERITIES, SEVERITY_META, severityClass } from "../data/constants.js";
 import { useToast } from "../components/Toast.jsx";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
@@ -57,13 +57,6 @@ function severityBand(score) {
   return "Low";
 }
 
-function sevTagClass(severity) {
-  const s = sevKey(severity);
-  if (s === "medium") return "medium";
-  if (s === "low") return "low";
-  return "high";
-}
-
 function titleCase(value) {
   const s = (value || "").toString().replace(/[_-]+/g, " ").trim();
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : "—";
@@ -99,13 +92,13 @@ function Finding({ v }) {
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
       >
-        <span className={`sev-dot ${sevTagClass(v.severity)}`} />
+        <span className={`sev-dot ${severityClass(v.severity)}`} />
         <div className='finding-title'>
           <div className='rowtitle'>{titleCase(v.vuln_type)}</div>
           <div className='small mono'>{url}</div>
         </div>
         <span className='finding-cat small'>{v.category}</span>
-        <span className={`sev-tag ${sevTagClass(v.severity)}`}>
+        <span className={`sev-tag ${severityClass(v.severity)}`}>
           {SEVERITY_META[sevKey(v.severity)]?.label || v.severity}
         </span>
         <span className='finding-cvss mono'>{cvss}</span>
@@ -368,7 +361,7 @@ function ReportPage() {
           </p>
           <div className='severity'>
             <div>
-              <strong className='high'>{breakdown.critical ?? 0}</strong>
+              <strong className='critical'>{breakdown.critical ?? 0}</strong>
               <span>Critical</span>
             </div>
             <div>
@@ -384,7 +377,7 @@ function ReportPage() {
               <span>Low</span>
             </div>
             <div>
-              <strong>{breakdown.info ?? 0}</strong>
+              <strong className='info'>{breakdown.info ?? 0}</strong>
               <span>Info</span>
             </div>
           </div>
@@ -497,15 +490,7 @@ function ReportPage() {
           <div className='panel-b'>
             {chains.map((c) => (
               <div key={c.id} className='chain-item'>
-                <span
-                  className={`sev-tag ${
-                    sevKey(c.severity) === "medium"
-                      ? "medium"
-                      : sevKey(c.severity) === "low"
-                        ? "low"
-                        : "high"
-                  }`}
-                >
+                <span className={`sev-tag ${severityClass(c.severity)}`}>
                   {c.severity}
                 </span>
                 <p>{c.description}</p>

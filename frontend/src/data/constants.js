@@ -10,12 +10,12 @@ import {
 
 const NAV_ITEMS = [
   { to: "/home", label: "Home", Icon: Home, end: true },
-  { to: "/apps", label: "Web applications", Icon: Boxes },
+  // { to: "/apps", label: "Web applications", Icon: Boxes },
   { to: "/scan", label: "New Scan", Icon: ShieldPlus },
   { to: "/active", label: "Active scans", Icon: Activity, badge: "active" },
   { to: "/reports", label: "Reports", Icon: FileBarChart },
-  { to: "/team", label: "Team", Icon: Users },
-  { to: "/settings", label: "Settings", Icon: Settings },
+  // { to: "/team", label: "Team", Icon: Users },
+  // { to: "/settings", label: "Settings", Icon: Settings },
 ];
 
 const MOBILE_NAV = [
@@ -39,13 +39,26 @@ const ROUTE_NAMES = {
 const SEVERITIES = ["critical", "high", "medium", "low", "info"];
 
 const SEVERITY_META = {
-  critical: { color: "var(--bad)", label: "CRITICAL" },
-  high: { color: "var(--bad)", label: "HIGH" },
-  medium: { color: "var(--warn)", label: "MEDIUM" },
-  low: { color: "var(--good)", label: "LOW" },
-  info: { color: "var(--muted)", label: "INFO" },
-  safe: { color: "var(--good)", label: "SAFE" },
+  critical: { color: "var(--sev-critical)", label: "CRITICAL" },
+  high: { color: "var(--sev-high)", label: "HIGH" },
+  medium: { color: "var(--sev-medium)", label: "MEDIUM" },
+  low: { color: "var(--sev-low)", label: "LOW" },
+  info: { color: "var(--sev-info)", label: "INFO" },
+  safe: { color: "var(--sev-low)", label: "SAFE" },
 };
+
+// Single source of truth for mapping a severity value to its CSS color class
+// (.critical/.high/.medium/.low/.info). Use everywhere instead of ad-hoc
+// ternaries so every severity keeps one consistent color across the app.
+const SEVERITY_CLASSES = new Set(["critical", "high", "medium", "low", "info"]);
+
+function severityClass(severity) {
+  const s = (severity || "").toString().toLowerCase();
+  if (SEVERITY_CLASSES.has(s)) return s;
+  if (s === "safe") return "low";
+  // Unknown/empty severities are treated as informational, never as high.
+  return "info";
+}
 
 const SCAN_PHASES = [
   { key: "queued", label: "Queued" },
@@ -314,6 +327,7 @@ export {
   ROUTE_NAMES,
   SEVERITIES,
   SEVERITY_META,
+  severityClass,
   SCAN_PHASES,
   SCAN_MODES,
   CONFIG_GROUPS,

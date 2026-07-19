@@ -5,6 +5,7 @@ import { listScans } from "../services/scan.js";
 import { downloadReportPdf } from "../services/reports.js";
 import { saveBlob } from "../utils/helpers.js";
 import { useToast } from "../components/Toast.jsx";
+import { severityClass } from "../data/constants.js";
 
 function severityBand(level, score) {
   const lvl = (level || "").toString().toLowerCase();
@@ -17,14 +18,6 @@ function severityBand(level, score) {
 
 function crawlLabel(mode) {
   return mode === "single" ? "Single page" : "Full site";
-}
-
-// Maps a severity band to the existing color utility classes (.high/.medium/.low).
-function sevClass(band) {
-  const b = (band || "").toLowerCase();
-  if (b === "critical" || b === "high") return "high";
-  if (b === "medium") return "medium";
-  return "low";
 }
 
 function formatDate(iso) {
@@ -156,8 +149,10 @@ function ReportsPage() {
               </div>
               <span>{r.date}</span>
               <span className='rep-score'>
-                <b className={sevClass(r.band)}>{r.score}/100</b>
-                <span className={`sev-tag ${sevClass(r.band)}`}>{r.band}</span>
+                <b className={severityClass(r.band)}>{r.score}/100</b>
+                <span className={`sev-tag ${severityClass(r.band)}`}>
+                  {r.band}
+                </span>
               </span>
               <span>{r.count} findings</span>
               <span className='rowactions'>
