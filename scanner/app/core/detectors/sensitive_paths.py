@@ -34,6 +34,7 @@ class SensitivePathsDetector(BaseDetector):
         "/.env.backup",
         "/.svn/entries",
         "/.hg/requires",
+        "/.htaccess",
         "/.DS_Store",
         "/phpinfo.php",
         "/info.php",
@@ -168,7 +169,7 @@ class SensitivePathsDetector(BaseDetector):
         re.compile(r'<a href="\?C=[NMSD];O=[AD]"', re.IGNORECASE), # Apache column-sort links
     ]
 
-    # Backup/temp permutations appended to discovered files (Task 9).
+    # Backup/temp permutations appended to discovered files.
     _BACKUP_SUFFIXES: tuple[str, ...] = (".bak", ".old", ".orig", "~", ".swp", ".save", ".zip", ".tar.gz")
 
     def _looks_like_autoindex(self, body: str, content_type: str = "") -> bool:
@@ -192,6 +193,13 @@ class SensitivePathsDetector(BaseDetector):
             return True, "Directory Listing Exposed", "Directory listing/autoindex response exposes sibling file and directory names.", SeverityLevel.medium
         if ".git/config" in path_lower and "[core]" in body_lower:
             return True, "Sensitive File Exposure", "Git configuration file exposed.", SeverityLevel.high
+        if ".htaccess" in path_lower and any(
+            directive in body_lower
+            for directive in ("rewriteengine", "rewriterule", "authtype", "require ",
+                              "order ", "deny from", "allow from", "options ",
+                              "<files", "<directory", "addhandler", "sethandler")
+        ):
+            return True, "Sensitive File Exposure", "Apache .htaccess configuration file exposed.", SeverityLevel.medium
         if ".env" in path_lower and (
             any(pattern.search(body) for pattern in self._SECRET_PATTERNS)
             or re.search(r"\b(?:db_password|database_password|app_key|secret)\b\s*=", body, re.I)

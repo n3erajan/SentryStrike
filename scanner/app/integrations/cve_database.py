@@ -8,10 +8,18 @@ logger = logging.getLogger(__name__)
 
 
 class CveDatabaseService:
+    """Enrich technology components with known CVEs from the NVD database.
+
+    Each component is queried via ``NvdClient``, its CVEs are attached to the
+    component record, and the results are cached in the ``CveRecord`` collection
+    for reuse across scans.
+    """
+
     def __init__(self) -> None:
         self.nvd_client = NvdClient()
 
     async def enrich_components(self, components: list[TechnologyComponent]) -> list[TechnologyComponent]:
+        """Look up CVEs for each component and persist new records to the database."""
         enriched: list[TechnologyComponent] = []
         for component in components:
             try:

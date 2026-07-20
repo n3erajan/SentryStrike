@@ -6,6 +6,13 @@ from shared.models.scan import AuthCoverage, DetectorCoverageMetric, EvidenceStr
 
 
 class AiReportGenerator:
+    """Generates narrative report content (summary, recommendations, etc.).
+
+    Uses the LLM client when AI analysis is enabled and falls back to a
+    deterministic template when it is not — ensuring scans always produce
+    a report regardless of model availability.
+    """
+
     def __init__(self) -> None:
         self.client = AIClient()
 

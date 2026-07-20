@@ -10,6 +10,13 @@ logger = logging.getLogger(__name__)
 
 
 class NvdClient:
+    """Client for the NIST National Vulnerability Database (NVD) API.
+
+    Caches lookups by component name and version to avoid redundant queries
+    when the same technology appears across multiple scans. The in-memory
+    cache respects a configurable TTL so fresh CVEs are not missed.
+    """
+
     def __init__(self) -> None:
         self.settings = get_settings()
         self._cache: dict[str, tuple[datetime, list[dict]]] = {}
@@ -36,6 +43,7 @@ class NvdClient:
         return resp.json().get("vulnerabilities", [])
 
     async def lookup_cves(self, component_name: str, version: str | None = None) -> list[dict]:
+        """Return known CVEs for a component/version pair, using cached results when fresh."""
         key = f"{component_name.lower()}:{version or ''}"
         now = datetime.now(timezone.utc)
         cached = self._cache.get(key)

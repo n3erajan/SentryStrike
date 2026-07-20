@@ -120,6 +120,7 @@ class HttpVerifier:
             await self._client.aclose()
             self._client = None
 
+
     async def send_request(
         self,
         url: str,
@@ -161,6 +162,9 @@ class HttpVerifier:
         # the same ``{METHOD} {path} HTTP/1.1\nHost: …\n{headers}\n\n{body}``
         # shape — no per-call inline f-string divergence.
         all_headers = {**self.headers, **(headers or {})}
+        has_explicit_cookie_header = any(
+            str(name).lower() == "cookie" for name in all_headers
+        )
         body_str = ""
         if json_body is not None:
             body_str = json.dumps(json_body, separators=(",", ":"), default=str)
@@ -177,7 +181,11 @@ class HttpVerifier:
             url=snippet_url,
             method=method,
             headers=all_headers,
-            cookies={**self.cookies, **(cookies or {})},
+            cookies=(
+                {}
+                if has_explicit_cookie_header
+                else {**self.cookies, **(cookies or {})}
+            ),
             body=body_str,
         )
 
@@ -190,7 +198,11 @@ class HttpVerifier:
             request_kwargs["json"] = json_body
         if headers:
             request_kwargs["headers"] = headers
-        if cookies:
+        # An explicit request-level Cookie header must replace the client's cookie
+        # jar, not be combined with it.  Combining both is how duplicate path-scoped
+        # names (for example two different security/session values) reached the
+        # server and changed the application context between baseline and payload.
+        if cookies and not has_explicit_cookie_header:
             request_kwargs["cookies"] = cookies
 
         # Build the same effective request httpx will send so evidence includes
@@ -213,7 +225,7 @@ class HttpVerifier:
             ctx.parameter, url, params, data
         )
 
-        # P1-1: consult the request-budget governor. When a detector or parameter
+        # Consult the request-budget governor. When a detector or parameter
         # has exhausted its ceiling, skip the network call and return an explicit
         # "not tested" sentinel (status_code == -1) rather than a benign 0. A real
         # 0 means connection error/timeout ("nothing there"); -1 means the probe
@@ -233,11 +245,11 @@ class HttpVerifier:
         try:
             start_time = time.time() if capture_timing else None
 
-            # NOTE: do NOT acquire get_scan_http_semaphore() here. The scan client
-            # returned by create_scan_client already wraps every request in that
-            # same process-wide semaphore (scan_http.throttled_request). Acquiring
-            # it a second time around client.request() double-acquires a
-            # non-reentrant asyncio.Semaphore and deadlocks the whole scan once the
+            # Do NOT acquire ``get_scan_http_semaphore()`` here. The scan client
+            # returned by ``create_scan_client`` already wraps every request in that
+            # same process-wide semaphore. Acquiring it again around
+            # ``client.request()`` double-acquires a non-reentrant
+            # ``asyncio.Semaphore`` and deadlocks the entire scan once the
             # concurrency slots fill up (each in-flight request holds one slot while
             # waiting for a second that can never free).
             response = await client.request(**request_kwargs)

@@ -1,4 +1,4 @@
-"""Tests for the generic manifest / header version probe (Phase 1).
+"""Tests for the generic manifest / header version probe.
 
 Locks in the requirement that *actual* component versions a target reveals
 (package manifests, lockfiles, version-bearing headers) are captured so the

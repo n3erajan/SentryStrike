@@ -9,15 +9,28 @@ from shared.schemas.scan_schema import CreateScanRequest, ScanCredentials
 
 router = APIRouter(prefix="/scans", tags=["scans"])
 
+# Module-level scan queue reference, wired at startup via set_scan_queue().
+# A global is used because FastAPI lifespan context cannot be passed directly
+# into route functions without per-request lookups.
 scan_queue: ScanQueue | None = None
 
 
 def set_scan_queue(instance: ScanQueue) -> None:
+    """Wire the scan queue instance for use by route handlers.
+
+    Called once during application startup in the lifespan hook.
+    """
     global scan_queue
     scan_queue = instance
 
 
 def _auth_accounts_from_payload(credentials: ScanCredentials | None) -> list[ScanAuthAccount]:
+    """Convert optional ScanCredentials into a flat list of ScanAuthAccount DTOs.
+
+    Each populated credential slot (main, second, admin) becomes a single
+    ScanAuthAccount tagged with its role, ready for the Redis job payload.
+    Unpopulated slots are omitted rather than sent as null-bearing entries.
+    """
     if credentials is None:
         return []
     accounts: list[ScanAuthAccount] = []
@@ -48,6 +61,7 @@ def _auth_accounts_from_payload(credentials: ScanCredentials | None) -> list[Sca
 
 
 def _scan_summary(scan) -> dict:
+    """Project a Scan document to its list-view representation."""
     return {
         "id": str(scan.id),
         "target_url": scan.target_url,
@@ -78,7 +92,9 @@ async def create_scan(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    # Credentials are serialized into the Redis job as plaintext and removed
+    """Submit a new scan target and enqueue the job for processing.
+
+    Credentials are serialized into the Redis job as plaintext and removed
     # atomically when a worker claims the job. MongoDB persists only role names.
     auth_accounts = _auth_accounts_from_payload(payload.credentials)
     scan = await repo.create(
@@ -135,6 +151,7 @@ async def list_scans(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
+    """Return a paginated list of scans owned by the authenticated user."""
     scans = await repo.list(skip=skip, limit=limit, owner_user_id=str(current_user.id))
     payload = [_scan_summary(scan) for scan in scans]
     return json_response({"items": payload, "total": len(payload)})
@@ -146,6 +163,7 @@ async def get_scan_details(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
+    """Return full scan details including all vulnerabilities and metadata."""
     scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
@@ -161,6 +179,7 @@ async def get_scan_status(
     scan_id: str,
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
+
 ) -> dict:
     scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
@@ -184,6 +203,7 @@ async def cancel_scan(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
+    """Request cancellation of a running or queued scan."""
     scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")

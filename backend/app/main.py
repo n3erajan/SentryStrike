@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Initialize infrastructure on startup and tear it down on shutdown."""
     configure_logging()
     await init_db()
 
@@ -32,6 +33,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    """Build, wire, and return the FastAPI application instance."""
     settings = get_settings()
     app = FastAPI(
         title=settings.app_name,

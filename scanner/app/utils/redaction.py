@@ -32,28 +32,61 @@ _SENSITIVE_HEADER_RE = re.compile(
 # Cookie / Set-Cookie lines: mask only the crumbs whose name looks like a
 # session/credential token, leaving benign crumbs (e.g. ``language=en``) intact.
 _COOKIE_HEADER_RE = re.compile(r"(?im)^([ \t]*(?:set-)?cookie[ \t]*:[ \t]*)(.+)$")
+# Session/credential cookie names, matched as SUBSTRINGS (no word boundaries).
+# Real-world session cookies concatenate the marker into a single identifier
+# (``PHPSESSID``, ``JSESSIONID``, ``ASPSESSIONID``, ``laravel_session``,
+# ``ci_session``, ``CFTOKEN``), so a ``\b``-anchored match silently misses them —
+# ``sess``/``sid`` inside ``PHPSESSID`` have no word boundary and leak the value
+# verbatim. Substring matching redacts these across any framework. The tokens are
+# chosen so benign crumbs (``language=en``, ``theme=dark``) still pass through
+# untouched; when in doubt we favour masking a cookie value over leaking a live
+# session token.
 _SENSITIVE_COOKIE_NAME_RE = re.compile(
-    r"(?i)\b(token|session|sess|jwt|auth|sid|csrf|xsrf|access|refresh|bearer|"
-    r"secret|api[_-]?key|connect\.sid|remember)\b"
+    r"(?i)("
+    # framework session cookies (explicit for readability; also covered below)
+    r"phpsessid|jsessionid|aspsessionid|asp\.net[_-]?sessionid|"
+    r"laravel_session|ci_session|symfony|connect\.sid|sails\.sid|"
+    r"cfid|cftoken|cfglobals|"
+    # generic session identifiers
+    r"session|sessid|sess|sid|"
+    # auth / bearer / jwt / oauth
+    r"token|jwt|bearer|oauth|auth|access|refresh|"
+    # csrf / xsrf
+    r"csrf|xsrf|"
+    # secrets, api keys, passwords, remember-me, credentials
+    r"secret|apikey|api[_-]?key|password|passwd|pwd|remember|credential"
+    r")"
 )
 
 # JWT: three base64url segments. The JOSE header is base64 of ``{"...`` so real
 # JWTs begin with ``eyJ`` — precise enough to avoid masking ordinary dotted text.
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]+")
 
-# Credential-labeled fields in JSON / form / query bodies. Framework-agnostic:
-# keys are the near-universal credential field names, not any app's schema. Only
-# scalar-valued keys are listed (never ``auth``/``credentials`` which commonly
-# hold nested objects) so a match is always a leaf value. The key and its quoting
-# are preserved; only the value is replaced.
+# Credential-labeled fields in JSON / form / query bodies. Colon-delimited keys
+# must have field structure (quoted JSON/object key or an unquoted key at the
+# start of a line/object member). This prevents prose such as ``bypass: URL`` or
+# ``unrecognized token: value`` from being mistaken for credential fields.
+# Equals-delimited form/query fields retain a looser identifier boundary.
 _CRED_FIELD_RE = re.compile(
-    r"""(?ix)
+    r"""(?ixm)
     (                                   # group 1: key + separator (kept)
-        ["']?
-        (?:password|passwd|pwd|pass|secret|token|api[_-]?key|apikey|
-           client_secret|access_token|refresh_token|otp|totp)
-        ["']?
-        \s* [:=] \s*
+        (?:
+            ["']
+            (?:password|passwd|pwd|pass|secret|token|api[_-]?key|apikey|
+               client_secret|access_token|refresh_token|otp|totp)
+            ["']
+            \s* : \s*
+            |
+            (?: ^[ \t]* | (?<=[{,]) [ \t]* )
+            (?:password|passwd|pwd|pass|secret|token|api[_-]?key|apikey|
+               client_secret|access_token|refresh_token|otp|totp)
+            \s* : \s*
+            |
+            (?<![A-Za-z0-9])
+            (?:password|passwd|pwd|pass|secret|token|api[_-]?key|apikey|
+               client_secret|access_token|refresh_token|otp|totp)
+            \s* = \s*
+        )
     )
     (                                   # group 2: value (masked)
         "(?:[^"\\]|\\.)*"               #   "double-quoted"

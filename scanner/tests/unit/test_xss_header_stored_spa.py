@@ -1,4 +1,4 @@
-"""P0-3: the header-stored GET-replay oracle must not run on SPA targets.
+"""The header-stored GET-replay oracle must not run on SPA targets.
 
 On an SPA the injected header value is rendered client-side from an API
 response and never appears in the raw HTML shell the raw-string oracle matches

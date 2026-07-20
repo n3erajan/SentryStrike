@@ -5,6 +5,13 @@ from pydantic import Field
 
 
 class CveRecord(Document):
+    """A cached NVD vulnerability record for a detected technology component.
+
+    Records are fetched during technology enrichment and reused across scans,
+    keyed by component name/version so repeat lookups avoid hitting the NVD
+    API on every scan.
+    """
+
     cve_id: Indexed(str, unique=True)
     component_name: Indexed(str)
     component_version: str | None = None

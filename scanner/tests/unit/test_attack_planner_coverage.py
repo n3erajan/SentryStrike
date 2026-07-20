@@ -1,4 +1,4 @@
-"""P0-1: coverage_summary must derive skips from real attempted/denied counts.
+"""coverage_summary must derive skips from real attempted/denied counts.
 
 Regression guard: a detector that ran fully but found nothing must report
 ``budget_exhausted == 0`` — the old code inferred budget exhaustion from a

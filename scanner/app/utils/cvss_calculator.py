@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 @dataclass
 class CvssResult:
+    """The output of a CVSS v3.1 calculation for a single vulnerability."""
+
     score: float
     vector: str
     severity: str

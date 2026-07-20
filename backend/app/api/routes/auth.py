@@ -10,10 +10,12 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _user_response(user: User) -> UserResponse:
+    """Project a User document to its API response shape."""
     return UserResponse(id=str(user.id), email=user.email, created_at=user.created_at)
 
 
 def _set_session_cookie(response: Response, token: str, max_age_seconds: int) -> None:
+    """Set an HttpOnly session cookie on the response."""
     settings = get_settings()
     response.set_cookie(
         key=settings.auth_cookie_name,
@@ -26,6 +28,7 @@ def _set_session_cookie(response: Response, token: str, max_age_seconds: int) ->
 
 
 def _clear_session_cookie(response: Response) -> None:
+    """Remove the session cookie from the response, effectively logging the user out."""
     settings = get_settings()
     response.delete_cookie(
         key=settings.auth_cookie_name,
@@ -36,10 +39,12 @@ def _clear_session_cookie(response: Response) -> None:
 
 
 def _session_max_age_seconds(session) -> int:
+    """Calculate the remaining lifetime of a session token in seconds."""
     return max(0, int((session.expires_at - session.created_at).total_seconds()))
 
 
 def _auth_response(user: User, token: str, expires_at) -> dict:
+    """Assemble the standard authentication response envelope."""
     return AuthResponse(user=_user_response(user), access_token=token, expires_at=expires_at).model_dump(mode="json")
 
 
@@ -49,6 +54,7 @@ async def register(
     response: Response,
     service: AuthService = Depends(get_auth_service),
 ) -> dict:
+    """Register a new user account and issue an initial session token."""
     try:
         user = await service.register(payload.email, payload.password)
         token, session = await service.create_session(user)
@@ -65,6 +71,7 @@ async def login(
     response: Response,
     service: AuthService = Depends(get_auth_service),
 ) -> dict:
+    """Authenticate with email and password, returning a session token."""
     try:
         user = await service.authenticate(payload.email, payload.password)
         token, session = await service.create_session(user)
@@ -82,6 +89,7 @@ async def logout(
     current_user: User = Depends(get_current_user),
     service: AuthService = Depends(get_auth_service),
 ) -> dict:
+    """Revoke the current session and clear the session cookie."""
     _ = current_user
     await service.revoke_session(token)
     _clear_session_cookie(response)
@@ -90,4 +98,5 @@ async def logout(
 
 @router.get("/me")
 async def me(current_user: User = Depends(get_current_user)) -> dict:
+    """Return the currently authenticated user's profile."""
     return json_response(_user_response(current_user).model_dump(mode="json"))

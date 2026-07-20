@@ -238,6 +238,77 @@ def test_observed_evidence_ignores_bare_sql_query_echo() -> None:
     assert findings == []
 
 
+def test_direct_fuzz_ignores_bare_query_echo_in_page_content() -> None:
+    # A low-specificity "SELECT ... FROM ... WHERE" match against ordinary page
+    # prose/HTML (not a DB engine error) must NOT produce an A10 verbose-error
+    # finding on the direct fuzz path. This mirrors the observed-evidence path's
+    # query-echo exclusion, so the two paths stay consistent. Reproduces the
+    # false positive on the stored-XSS guestbook page where benign navigation /
+    # instruction text happened to line up "select ... from ... where".
+    detector = ExceptionHandlingDetector()
+
+    finding = detector._analyse_response(
+        url="http://target.test/dvwa/vulnerabilities/xss_s/",
+        method="POST",
+        status=200,
+        body=(
+            "<html><body><h1>Guestbook</h1>"
+            "<p>Select a language from the dropdown where available.</p>"
+            "<p>Name: sentry_test_val</p></body></html>"
+        ),
+        headers=httpx.Headers({}),
+        trigger="form fuzz - single quote - SQL metacharacter / template error trigger",
+        parameter="txtName",
+        payload="'",
+    )
+
+    assert finding is None
+
+
+def test_direct_fuzz_still_reports_real_sql_engine_error() -> None:
+    # The query-echo exclusion must not suppress a genuine DB engine error that
+    # happens to also contain a query echo — the specific engine-error pattern
+    # keeps the finding.
+    detector = ExceptionHandlingDetector()
+
+    finding = detector._analyse_response(
+        url="http://target.test/item",
+        method="GET",
+        status=200,
+        body=(
+            "You have an error in your SQL syntax; check the manual. "
+            "SELECT * FROM users WHERE id = ''"
+        ),
+        headers=httpx.Headers({}),
+        trigger="single quote fuzz",
+        parameter="id",
+        payload="'",
+    )
+
+    assert finding is not None
+    assert finding.vuln_type == "Verbose Error Handling"
+
+
+def test_direct_fuzz_keeps_query_echo_on_server_error() -> None:
+    # A query echo on a genuine 5xx error response IS disclosure (the server threw
+    # and dumped the executing statement), so the status-aware exclusion keeps it.
+    detector = ExceptionHandlingDetector()
+
+    finding = detector._analyse_response(
+        url="http://target.test/api/search",
+        method="POST",
+        status=500,
+        body="Internal error executing: SELECT id FROM accounts WHERE token = ''",
+        headers=httpx.Headers({}),
+        trigger="json_body fuzz - single quote",
+        parameter="q",
+        payload="'",
+    )
+
+    assert finding is not None
+    assert finding.vuln_type == "Verbose Error Handling"
+
+
 def test_observed_evidence_line_does_not_fabricate_http_200() -> None:
     # The source finding carries no HTTP status, so the derived evidence line must
     # not claim "HTTP 200" (which previously mislabeled 500 error pages).

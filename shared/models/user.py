@@ -5,6 +5,8 @@ from pydantic import Field
 
 
 class User(Document):
+    """A registered account that can own and launch scans."""
+
     email: Indexed(str, unique=True)
     password_hash: str
     is_active: bool = True
@@ -17,6 +19,13 @@ class User(Document):
 
 
 class UserSession(Document):
+    """A server-side session token issued after successful authentication.
+
+    Only the SHA-256 hash of the bearer token is stored, so a database leak
+    does not expose usable credentials. Sessions support explicit revocation
+    and track last-use for auditing.
+    """
+
     user_id: Indexed(str)
     token_hash: Indexed(str, unique=True)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

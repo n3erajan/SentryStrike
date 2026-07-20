@@ -13,18 +13,32 @@ from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ApiEndpoint, CrawlState, RequestObservation, RouteCandidate, RouteSource
 from app.core.crawler.route_priority import score_route_surface
 from app.core.crawler.spa import SpaFallbackDetector, install_resource_blocking, settle_page
+from app.core.crawler.url_parser import is_session_termination_url, url_in_application_scope
 
 logger = logging.getLogger(__name__)
 
 
 DESTRUCTIVE_LABEL_RE = re.compile(
-    r"\b(delete|remove|destroy|purchase|checkout|pay|confirm|transfer|withdraw|subscribe|unsubscribe"
-    r"|logout|log ?out|sign ?out|sign ?off)\b",
+    r"\b(delete|remove|destroy|reset|initialize|install|setup|migrate|drop|truncate"
+    r"|purchase|checkout|pay|confirm|transfer|withdraw|subscribe|unsubscribe"
+    r"|logout|log ?out|sign ?out|sign ?off)\b"
+    r"|(?:change|new)[\s_-]*password|password[\s_-]*(?:change|new)",
     re.I,
 )
+# Configuration/authorization forms are not ordinary content workflows. Blindly
+# submitting them can change the session used by every later replay (security
+# level, role, feature mode, debug mode, permissions, etc.). Only treat a form as
+# configuration-changing when a sensitive field is presented as a choice control;
+# a text search for "security" remains safe and discoverable.
+SENSITIVE_CONFIGURATION_FIELD_RE = re.compile(
+    r"\b(security|seclev|access[_\s-]*level|permissions?|privileges?|roles?"
+    r"|configuration|config|settings?|preferences?|debug[_\s-]*mode|environment)\b",
+    re.I,
+)
+CHOICE_INPUT_TYPES = frozenset({"select", "radio", "checkbox", "range"})
 COOKIE_BANNER_LABEL_RE = re.compile(r"\b(accept|agree|allow|ok|got it|continue|close|dismiss)\b", re.I)
 SAFE_SUBMIT_LABEL_RE = re.compile(
-    r"\b(login|log in|sign in|register|sign up|submit|send|save|search|reset|upload|continue|next)\b",
+    r"\b(login|log in|sign in|register|sign up|submit|send|save|search|upload|continue|next)\b",
     re.I,
 )
 # A control that navigates away / abandons a form rather than submitting it.
@@ -43,6 +57,26 @@ CONFIRM_FIELD_RE = re.compile(
     r"(confirm|repeat|verify|retype|re-?enter|re-?type|again|match|_2\b|2$)",
     re.I,
 )
+
+
+def _is_sensitive_configuration_form(form: dict[str, Any]) -> bool:
+    """Return true when submitting the form could mutate scan-wide context."""
+    if str(form.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"}:
+        return False
+    inputs = [item for item in (form.get("inputs") or []) if isinstance(item, dict)]
+    if not any(str(item.get("type", "text")).lower() in CHOICE_INPUT_TYPES for item in inputs):
+        return False
+    haystack = " ".join(
+        [str(form.get("action", ""))]
+        + [
+            " ".join(
+                str(item.get(key, ""))
+                for key in ("name", "id", "label", "aria_label")
+            )
+            for item in inputs
+        ]
+    )
+    return bool(SENSITIVE_CONFIGURATION_FIELD_RE.search(haystack))
 # Ask the browser to submit a form element (honours HTML5 validity). Returns
 # true only when a form was actually submitted, so the caller can tell whether
 # this fallback fired anything.
@@ -405,7 +439,7 @@ SAFE_ACTION_CLICK_SCRIPT = r"""
     const o = opts || {};
     const LIMIT = (typeof o.limit === 'number' && o.limit > 0) ? o.limit : 15;
     const NON = /\b(back|cancel|close|dismiss|previous|prev|skip|abort|discard|return|logout|log\s*out|sign\s*out|sign\s*off|show|view|open|toggle|expand|collapse)\b/i;
-    const DESTRUCTIVE = /\b(delete|remove|destroy|purchase|checkout|pay|buy|order|transfer|withdraw|subscribe|unsubscribe)\b/i;
+    const DESTRUCTIVE = /\b(delete|remove|destroy|reset|initialize|install|setup|migrate|drop|truncate|purchase|checkout|pay|buy|order|transfer|withdraw|subscribe|unsubscribe)\b/i;
     // Action VERBS only. A bare noun ("basket", "cart", "bag") also appears on
     // navigation controls ("Your Basket", "Show the shopping cart") which merely
     // route away — clicking one aborts the whole in-page pass and fires no XHR.
@@ -425,6 +459,10 @@ SAFE_ACTION_CLICK_SCRIPT = r"""
       if (clicked.length >= LIMIT) break;
       const l = label(b);
       if (!l) continue;
+      // Real forms are handled by the form-submission path, which preserves their
+      // successful controls and captures the resulting body. Clicking their submit
+      // buttons again here can repeat or mutate account/configuration state.
+      if (b.form || b.closest('form')) continue;
       if (DESTRUCTIVE.test(l) || NON.test(l)) continue;
       if (!ACTION.test(l)) continue;
       if (b.disabled || !vis(b)) continue;
@@ -789,9 +827,23 @@ class BrowserDiscoveryEngine:
     activity that static crawling cannot see.
     """
 
-    def __init__(self, max_interactions: int = 25, workers: int | None = None) -> None:
+    def __init__(
+        self,
+        max_interactions: int = 25,
+        workers: int | None = None,
+        *,
+        auth_username: str | None = None,
+        auth_password: str | None = None,
+    ) -> None:
         self.max_interactions = max_interactions
         self.settings = get_settings()
+        # Per-scan login credentials, supplied by the caller from the scan's
+        # submitted account. Used only to auto-fill username/password fields
+        # while exercising forms during the browser crawl. There is no
+        # environment fallback: when the scan submitted no credentials these
+        # stay ``None`` and the engine fills forms with safe synthetic values.
+        self._auth_username = auth_username
+        self._auth_password = auth_password
         # Number of parallel crawl workers (each its own context/page). None =
         # read from settings at crawl time so a per-scan override can be threaded
         # in by the caller (as the spider does for max_interactions).
@@ -1514,7 +1566,7 @@ class BrowserDiscoveryEngine:
                     # Post-auth liveness re-check (generic). On the root a
                     # logged-out shell means the seeded storage_state never
                     # persisted (RC-A); on other routes it means interaction
-                    # dropped the session mid-crawl (P1-3). Re-seed cookies
+                    # dropped the session mid-crawl. Re-seed cookies
                     # when we have them rather than crawl unauthenticated.
                     is_root = self._normalize_for_seen(target_url) == self._normalize_for_seen(root_url)
                     if (storage_state or auth_cookie_entries) and await self._looks_logged_out(page):
@@ -1709,7 +1761,7 @@ class BrowserDiscoveryEngine:
                                 submitted_form_keys.add(key)
                                 submitted_form_keys.add(sig)
                                 new_forms.append(form)
-                        # Active form submission (Task B): fire the app's real
+                        # Active form submission: fire the app's real
                         # POST/PUT/PATCH XHR so on_request captures a replayable
                         # observation. Skips destructive forms.
                         wstate.browser_forms_submitted += await self._submit_discovered_forms(
@@ -2484,7 +2536,7 @@ class BrowserDiscoveryEngine:
         return any(not bool(form.get("all_named", True)) for form in forms or [])
 
     def _effective_deadline(self, deadline: float | None, loop: Any, route_count: int) -> float | None:
-        """Scale the browser budget to the number of routes to visit (Task B).
+        """Scale the browser budget to the number of routes to visit.
 
         ``base + per_route * min(routes, cap)`` clamped by the configured overall
         budget, so small apps finish fast and large apps get proportionally more.
@@ -2597,6 +2649,13 @@ class BrowserDiscoveryEngine:
             if DESTRUCTIVE_LABEL_RE.search(haystack):
                 logger.debug(
                     "form submit skipped (destructive) on %s: action=%s",
+                    route_url, form.get("action", ""),
+                )
+                submitted_keys.add(key)
+                continue
+            if _is_sensitive_configuration_form(form):
+                logger.debug(
+                    "form submit skipped (session/configuration mutation) on %s: action=%s",
                     route_url, form.get("action", ""),
                 )
                 submitted_keys.add(key)
@@ -3226,17 +3285,27 @@ class BrowserDiscoveryEngine:
 
     @staticmethod
     async def _select_first_option(page: Any, selector: str, timeout_ms: float) -> None:
-        """Choose the first enabled, non-placeholder option of a ``<select>``.
+        """Keep a valid current selection, otherwise choose the first real option.
 
         Reactive forms treat an empty/placeholder option as "no selection" and
         keep the form invalid, so pick the first option with a non-empty value
         (falling back to the last option, then to index 0). Raises on failure so
         the bounded caller records a miss and tries the next selector."""
         loc = page.locator(selector).first
-        values = await loc.evaluate(
-            "el => Array.from((el && el.options) || [])"
-            ".filter(o => !o.disabled).map(o => o.value)"
+        state = await loc.evaluate(
+            "el => ({ current: (el && el.value) || '', values: "
+            "Array.from((el && el.options) || [])"
+            ".filter(o => !o.disabled).map(o => o.value) })"
         )
+        if isinstance(state, dict):
+            current = str(state.get("current", "")).strip()
+            values = state.get("values", [])
+        else:
+            # Lightweight test/page stubs may expose the older values-only shape.
+            current = ""
+            values = state or []
+        if current and current in [str(value) for value in values or []]:
+            return
         chosen: str | None = None
         for candidate in values or []:
             if str(candidate).strip():
@@ -3327,12 +3396,12 @@ class BrowserDiscoveryEngine:
     def _value_from_semantics(self, joined: str, name: str, itype: str) -> str:
         """Pick a domain-appropriate value from a lowercased hint string."""
         has = lambda *toks: any(t in joined for t in toks)
-        if "password" in joined and self.settings.authentication_password:
-            return self.settings.authentication_password
-        if self.settings.authentication_username and has(
+        if "password" in joined and self._auth_password:
+            return self._auth_password
+        if self._auth_username and has(
             "email", "e-mail", "username", "user name", "login", "account"
         ):
-            return self.settings.authentication_username
+            return self._auth_username
         # Domain semantics (generic English field names/labels/placeholders).
         if has("phone", "mobile", "tel", "cell", "contact number", "whatsapp"):
             return "5551234567"
@@ -3574,6 +3643,10 @@ class BrowserDiscoveryEngine:
             absolute = self._canonical_route_url(root_url, item, hash_routed=hash_routed)
             if self._origin(absolute) != root_origin:
                 continue
+            if not url_in_application_scope(root_url, absolute):
+                continue
+            if absolute != root_url and is_session_termination_url(absolute):
+                continue
             key = self._normalize_for_seen(absolute)
             if key in emitted:
                 continue
@@ -3697,7 +3770,7 @@ class BrowserDiscoveryEngine:
 
     async def _fill_safe_fields(self, page: Any) -> None:
         input_selector = "input:not([type=hidden]):not([type=file])"
-        if not self.settings.authentication_password:
+        if not self._auth_password:
             input_selector = "input:not([type=hidden]):not([type=password]):not([type=file])"
         fields = page.locator(
             f"{input_selector}, textarea, [contenteditable=true]"
@@ -3932,6 +4005,18 @@ class BrowserDiscoveryEngine:
                 element = controls.nth(index)
                 if not await element.is_visible():
                     continue
+                # Form-associated controls are exercised by _submit_discovered_forms,
+                # which preserves the full successful-control set. Blind-clicking the
+                # same submit/reset controls here can change session/configuration
+                # state and makes later active probes run in a different context.
+                belongs_to_form = False
+                if hasattr(element, "evaluate"):
+                    belongs_to_form = await self._bounded(
+                        element.evaluate("el => !!(el && (el.form || el.closest('form')))"),
+                        300,
+                    )
+                if belongs_to_form is True:
+                    continue
                 label = await self._control_label(element)
                 control_key = await self._control_key(element, index, label)
                 if control_key in attempted:
@@ -4096,12 +4181,12 @@ class BrowserDiscoveryEngine:
     async def _value_for_field(self, field: Any) -> str:
         attrs = await self._field_attrs(field)
         joined = " ".join(attrs).lower()
-        if "password" in joined and self.settings.authentication_password:
-            return self.settings.authentication_password
-        if self.settings.authentication_username and any(
+        if "password" in joined and self._auth_password:
+            return self._auth_password
+        if self._auth_username and any(
             token in joined for token in ("email", "username", "user", "login", "account")
         ):
-            return self.settings.authentication_username
+            return self._auth_username
         for token, value in SAFE_FIELD_VALUES.items():
             if token in joined:
                 return value
@@ -4136,22 +4221,26 @@ class BrowserDiscoveryEngine:
             return root_url
         root = urlparse(root_url)
         root_base = urlunparse((root.scheme, root.netloc, "/", "", "", ""))
+        root_document_path = root.path or "/"
         if candidate.startswith(("#/", "#!/")):
             fragment = self._route_fragment(candidate[1:]) or candidate[1:]
-            return urlunparse((root.scheme, root.netloc, "/", "", "", fragment))
+            return urlunparse((root.scheme, root.netloc, root_document_path, "", "", fragment))
 
         absolute = urljoin(root_url, candidate)
         parsed = urlparse(absolute)
         route_fragment = self._route_fragment(parsed.fragment)
         if route_fragment:
-            return urlunparse((parsed.scheme, parsed.netloc, "/", "", "", route_fragment))
+            document_path = parsed.path or root_document_path
+            if not url_in_application_scope(root_url, absolute):
+                document_path = root_document_path
+            return urlunparse((parsed.scheme, parsed.netloc, document_path, "", "", route_fragment))
 
         path = parsed.path or "/"
         if hash_routed and path != "/" and not self._is_root_api_path(path):
             fragment = path
             if parsed.query:
                 fragment = f"{fragment}?{parsed.query}"
-            return urlunparse((parsed.scheme, parsed.netloc, "/", "", "", fragment))
+            return urlunparse((parsed.scheme, parsed.netloc, root_document_path, "", "", fragment))
 
         if self._is_root_relative_api_candidate(candidate):
             return urljoin(root_base, candidate.lstrip("/"))
@@ -4225,7 +4314,7 @@ class BrowserDiscoveryEngine:
             hash_routed = self._looks_hash_routed(root_url, routes)
         targets = [root_url]
         seen = {self._normalize_for_seen(root_url)}
-        # Seed all known static routes up to the route cap (Task B): high-value
+        # Seed all known static routes up to the route cap: high-value
         # auth/form/API routes must be enqueued with their score before the
         # crawl starts so even a short budget reaches them. Bounding the seed set
         # by the per-run route cap (not the per-page interaction budget) keeps
@@ -4234,6 +4323,10 @@ class BrowserDiscoveryEngine:
         for route in routes:
             absolute = self._canonical_route_url(root_url, route, hash_routed=hash_routed)
             if self._origin(absolute) != root_origin:
+                continue
+            if not url_in_application_scope(root_url, absolute):
+                continue
+            if absolute != root_url and is_session_termination_url(absolute):
                 continue
             key = self._normalize_for_seen(absolute)
             if key in seen:

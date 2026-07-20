@@ -109,6 +109,25 @@ async def test_access_control_detector_flags_admin_and_idor() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forced_browsing_ignores_file_exposure_paths() -> None:
+    # Accidental file / VCS / dotfile exposure (.git, .env, .htaccess) is A02
+    # Security Misconfiguration owned by the sensitive_paths detector — it should
+    # NOT be reported by forced browsing (A01), which is for gated functionality
+    # reachable without authorization. Probing these here made two detectors emit
+    # the same exposure under two different OWASP categories.
+    detector = AccessControlDetector()
+    urls = [
+        "https://example.com/.git/config",
+        "https://example.com/.env",
+        "https://example.com/.htaccess",
+    ]
+
+    findings = await detector.detect(urls=urls, forms=[])
+
+    assert not any("Forced Browsing" in f.vuln_type for f in findings)
+
+
+@pytest.mark.asyncio
 async def test_access_control_tests_json_body_idor_targets() -> None:
     detector = AccessControlDetector()
     endpoint = ApiEndpoint(

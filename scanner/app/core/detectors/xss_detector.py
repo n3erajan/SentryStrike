@@ -165,7 +165,7 @@ class XSSDetector(BaseDetector):
         browser_available = bool(kwargs.get("browser_available"))
         is_spa = bool(kwargs.get("is_spa", False))
         routes = kwargs.get("routes") or []
-        # Full authenticated storage_state (Task A): seed the DOM-sweep browser
+        # Full authenticated storage_state: seed the DOM-sweep browser
         # so authed-only routes render during confirmation. Opaque per-origin blob.
         storage_state = kwargs.get("auth_storage_state")
 
@@ -226,7 +226,7 @@ class XSSDetector(BaseDetector):
             stored_probe_urls, session_cookies,
         )
 
-        # ── Phase 0: Batch stored-XSS discovery ─────────────────────────────────
+        # ── Batch stored-XSS discovery ──
         # Group body-parameter candidates by (url, method) and inject a unique
         # canary into every parameter of each group in a single request, then
         # probe each display URL once. This discovers which (param, display_url)
@@ -293,7 +293,7 @@ class XSSDetector(BaseDetector):
                     len(stored_display_overrides),
                 )
 
-        # ── Phase 1: HTTP-only scanning ───────────────────────────────────────────
+        # ── HTTP-only scanning ──
         pending_browser_jobs: list[PendingBrowserVerification] = []
 
         async def verify_candidate(
@@ -314,12 +314,12 @@ class XSSDetector(BaseDetector):
 
             verifier = XSSVerifier()
             verifier.http_verifier.cookies = session_cookies
-            # P0-3: on SPA targets the header-stored GET-replay oracle cannot
+            # On SPA targets the header-stored GET-replay oracle cannot
             # observe client-rendered reflection; the verifier uses this flag to
             # disable that fan-out and defer the stored-header hypothesis to the
             # browser-DOM sweep instead.
             verifier.spa_mode = is_spa
-            # Phase 5: seed the browser-aware stored oracle with the same
+            # Seed the browser-aware stored oracle with the same
             # authenticated storage_state the DOM sweep uses, so it can render
             # authed-only display routes (e.g. a profile page carrying a stored
             # canary) during stored-XSS execution confirmation.
@@ -336,14 +336,13 @@ class XSSDetector(BaseDetector):
                     target=target,
                     stored_display_overrides=stored_display_overrides if stored_display_overrides else None,
                 )
-                pending: list[PendingBrowserVerification] = []
-                if result.evidence.get("browser_verification_pending"):
+                pending = list(result.evidence.get("pending_jobs") or [])
+                if not pending and result.evidence.get("browser_verification_pending"):
                     job = result.evidence.get("pending_job")
                     if job:
                         pending.append(job)
-                    return [], pending
-                if result.is_vulnerable:
-                    return result.findings, []
+                if result.is_vulnerable or pending:
+                    return result.findings if result.is_vulnerable else [], pending
             except Exception as e:
                 logger.error("XSS verification failed for %s param %s: %s", cand_url, param, e)
             finally:
@@ -379,7 +378,7 @@ class XSSDetector(BaseDetector):
             findings.extend(cand_findings)
             pending_browser_jobs.extend(cand_pending)
 
-        # ── Phase 2: Browser verification - runs after ALL HTTP scanning is done ──
+        # ── Browser verification (runs after ALL HTTP scanning completes) ──
         if pending_browser_jobs:
             logger.debug(
                 "XSSDetector: HTTP phase complete. Running browser verification for %d candidates.",
@@ -390,13 +389,24 @@ class XSSDetector(BaseDetector):
             if auth_headers:
                 browser_verifier.http_verifier.headers = {**browser_verifier.http_verifier.headers, **auth_headers}
             try:
+                confirmed_keys: set[tuple[str, str, str, str]] = set()
                 for job in pending_browser_jobs:
+                    job_key = (
+                        job.url,
+                        job.parameter,
+                        job.method,
+                        job.partial_finding.vuln_type,
+                    )
+                    if job_key in confirmed_keys:
+                        continue
                     browser_findings = await browser_verifier.run_browser_verification(job)
                     findings.extend(browser_findings)
+                    if browser_findings:
+                        confirmed_keys.add(job_key)
             finally:
                 await browser_verifier.close()
 
-        # ── Phase 1.5: Browser-driven DOM reflection sweep ────────────────────────
+        # ── Browser-driven DOM reflection sweep ──
         # Detect XSS that only executes in the rendered DOM (the dominant SPA
         # class), independent of HTTP-body reflection. Gated on a real browser
         # and bounded in both job count and wall-clock.
@@ -521,11 +531,18 @@ class XSSDetector(BaseDetector):
                         },
                         reproducible=True,
                         verified=True,
-                        verification_request_snippet=build_observed_request_snippet(
-                            url=winning_url,
-                            method="GET",
-                            headers={"User-Agent": "SentryStrikeScanner/1.0"},
-                            cookies=session_cookies,
+                        verification_request_snippet=(
+                            f"BROWSER NAVIGATION\nURL: {winning_url}\n\n"
+                            "NETWORK REQUEST\n"
+                            + (
+                                build_observed_request_snippet(
+                                    url=winning_url,
+                                    method="GET",
+                                    headers={"User-Agent": "SentryStrikeScanner/1.0"},
+                                    cookies=session_cookies,
+                                )
+                                or ""
+                            )
                         ),
                     )
                 )

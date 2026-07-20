@@ -1115,6 +1115,8 @@ def build_executive_summary(data: dict, styles: dict) -> list:
         url = vulns[0].get("location", {}).get("url", "")
         target = "/".join(url.split("/")[:3]) if url else "N/A"
 
+    ai_model = (d.get("report_metadata") or {}).get("ai_model")
+
     meta_rows = [
         ["Scan Target",  target],
         ["Scan ID",      d.get("scan_id", "N/A")],
@@ -1122,6 +1124,7 @@ def build_executive_summary(data: dict, styles: dict) -> list:
         ["Authorization Confirmed", "Yes" if (d.get("authorization") or {}).get("confirmed") else "No"],
         ["Authorization Confirmed At", _fmt_dt((d.get("authorization") or {}).get("confirmed_at"))],
         ["Generated At", date_str],
+        ["AI Analysis Model", ai_model or "Disabled (deterministic report)"],
         ["Risk Score",   f"{d.get('risk_score', 0):.2f} / 100" + (f" ({d.get('risk_level')})" if d.get('risk_level') else "")],
         ["Classification", "CONFIDENTIAL"],
     ]
@@ -1559,23 +1562,32 @@ def build_remediation_roadmap(data: dict, styles: dict) -> list:
     ))
     elems.append(Spacer(1, 3*mm))
 
+    # Bucket findings by severity. Exploitability breaks ties within each
+    # bucket so that the fastest wins surface first.
     phases = {
         "Immediate (Critical)": [],
-        "Short-Term (Medium / Easy)": [],
-        "Mid-Term (Medium)": [],
-        "Long-Term (Low)": [],
+        "Urgent (High)": [],
+        "Planned (Medium)": [],
+        "Backlog (Low / Informational)": [],
     }
+    _exploit_order = {"Easy": 0, "Medium": 1, "Hard": 2}
     for v in vulns:
-        sev    = _clean_enum(v.get("severity", "Low"))
-        exploi = _clean_enum(v.get("ai_analysis", {}).get("exploitability", "Medium"))
+        sev = _clean_enum(v.get("severity", "Low"))
         if sev == "Critical":
             phases["Immediate (Critical)"].append(v)
-        elif sev in ("High", "Medium") and exploi == "Easy":
-            phases["Short-Term (Medium / Easy)"].append(v)
+        elif sev == "High":
+            phases["Urgent (High)"].append(v)
         elif sev == "Medium":
-            phases["Mid-Term (Medium)"].append(v)
+            phases["Planned (Medium)"].append(v)
         else:
-            phases["Long-Term (Low)"].append(v)
+            phases["Backlog (Low / Informational)"].append(v)
+
+    # Sort each severity bucket by exploitability so the easiest-to-exploit
+    # items appear first — the fastest remediation wins at every level.
+    for items in phases.values():
+        items.sort(key=lambda v: _exploit_order.get(
+            _clean_enum(v.get("ai_analysis", {}).get("exploitability", "Medium")), 1
+        ))
 
     for phase, items in phases.items():
         if not items:

@@ -1,4 +1,4 @@
-"""Generic, application-agnostic route surface scoring (Task B).
+"""Generic, application-agnostic route surface scoring.
 
 The browser crawl has a finite time budget. Visiting routes in raw discovery
 order spends that budget on low-value pages while high-value ones (auth, forms,

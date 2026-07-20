@@ -1,4 +1,4 @@
-"""Phase 8 — coverage honesty: 0-request detector warnings.
+"""Coverage honesty: 0-request detector warnings.
 
 When a detector builds N candidates but sends 0 requests, the scan report
 must surface an explicit ``coverage_warning`` so the silent gap is visible to

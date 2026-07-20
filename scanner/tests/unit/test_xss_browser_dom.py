@@ -7,6 +7,7 @@ import pytest
 from app.core.crawler.models import ParameterLocation
 from app.core.detectors.attack_surface import AttackTarget
 from app.core.detectors.xss_detector import XSSDetector
+from app.core.verification.response_analyzer import ResponseData
 from app.core.verification.xss_verifier import XSSVerifier
 
 
@@ -214,17 +215,397 @@ def test_sweep_invokes_verify_reflected_dom_and_builds_finding(monkeypatch):
     # The winning vector/surface is threaded through to the finding.
     assert finding.detection_evidence.get("winning_vector") == "svg_onload"
     assert finding.detection_evidence.get("winning_surface") == "hash_query"
-    # DOM-XSS is delivered via browser navigation (no httpx send_request). The
-    # snippet represents the actual HTTP navigation: fragments and fake GET
-    # bodies are omitted, while the browser context's known UA is retained.
+    # DOM-XSS is delivered via browser navigation (no httpx send_request). Keep
+    # the full client-side URL for reproduction while separately showing the
+    # fragment-free network request that fetched the SPA shell.
     assert finding.verification_request_snippet is not None
-    assert finding.verification_request_snippet.startswith("GET / HTTP/1.1\nHost: x")
+    assert finding.verification_request_snippet.startswith(
+        "BROWSER NAVIGATION\n"
+        "URL: http://x/#/search?q=payload\n\n"
+        "NETWORK REQUEST\n"
+        "GET / HTTP/1.1\nHost: x"
+    )
     assert "User-Agent: SentryStrikeScanner/1.0" in finding.verification_request_snippet
     assert "Cookie: session=abc" in finding.verification_request_snippet
     assert "<svg onload=window.sentry_hook('c')>" not in finding.verification_request_snippet
 
 
-# --- Task D: multi-vector / multi-surface loop -----------------------------------------
+def test_browser_execution_uses_target_cookie_context(monkeypatch):
+    from app.core.verification import xss_verifier as xv
+
+    observed: dict[str, object] = {}
+
+    class _FakePage:
+        _fired = True
+
+        async def add_init_script(self, _script):
+            pass
+
+        def on(self, *_args):
+            pass
+
+        async def set_extra_http_headers(self, headers):
+            observed["headers"] = headers
+
+        async def goto(self, url, **_kwargs):
+            observed["url"] = url
+
+        async def evaluate(self, *_args):
+            return True
+
+    class _FakeContext:
+        async def add_cookies(self, cookies):
+            observed["cookies"] = cookies
+
+        async def new_page(self):
+            return _FakePage()
+
+        async def close(self):
+            pass
+
+    class _FakeBrowser:
+        async def new_context(self, **_kwargs):
+            return _FakeContext()
+
+        async def close(self):
+            pass
+
+    class _FakeChromium:
+        async def launch(self, **_kwargs):
+            return _FakeBrowser()
+
+    class _FakePlaywright:
+        chromium = _FakeChromium()
+
+    class _FakePlaywrightContext:
+        async def __aenter__(self):
+            return _FakePlaywright()
+
+        async def __aexit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(xv, "async_playwright", lambda: _FakePlaywrightContext())
+
+    verifier = XSSVerifier()
+    verifier.http_verifier.cookies = {"security": "high", "session": "stale"}
+    target = AttackTarget(
+        url="http://target.test/app/search",
+        parameter="q",
+        method="GET",
+        location=ParameterLocation.query,
+        headers={"X-Observed": "yes", "Cookie": "security=high; session=stale"},
+        cookies={"security": "low", "session": "fresh"},
+    )
+
+    fired = asyncio.run(
+        verifier._verify_browser_execution(
+            target.url,
+            target.parameter,
+            target.method,
+            "<script>window.sentry_hook('canary')</script>",
+            "canary",
+            None,
+            None,
+            False,
+            target=target,
+        )
+    )
+
+    assert fired is True
+    assert observed["cookies"] == [
+        {"name": "security", "value": "low", "domain": "target.test", "path": "/"},
+        {"name": "session", "value": "fresh", "domain": "target.test", "path": "/"},
+    ]
+    assert observed["headers"] == {"X-Observed": "yes"}
+
+
+def test_browser_execution_materializes_prepared_get_params(monkeypatch):
+    from app.core.verification import xss_verifier as xv
+
+    observed: dict[str, object] = {}
+
+    class _PreparedTarget(AttackTarget):
+        def build_request(self, _payload, *, merge_with_baseline=False):
+            from app.core.detectors.attack_surface import PreparedAttackRequest
+
+            return PreparedAttackRequest(
+                url="http://target.test/search?lang=en",
+                method="GET",
+                params={"q": "<script>window.sentry_hook('canary')</script>"},
+            )
+
+    class _Page:
+        _fired = True
+
+        async def add_init_script(self, _script):
+            pass
+
+        def on(self, *_args):
+            pass
+
+        async def goto(self, url, **_kwargs):
+            observed["url"] = url
+
+        async def evaluate(self, *_args):
+            return True
+
+    class _Context:
+        async def new_page(self):
+            return _Page()
+
+        async def close(self):
+            pass
+
+    class _Browser:
+        async def new_context(self, **_kwargs):
+            return _Context()
+
+        async def close(self):
+            pass
+
+    class _Chromium:
+        async def launch(self, **_kwargs):
+            return _Browser()
+
+    class _Playwright:
+        chromium = _Chromium()
+
+    class _PlaywrightContext:
+        async def __aenter__(self):
+            return _Playwright()
+
+        async def __aexit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(xv, "async_playwright", lambda: _PlaywrightContext())
+    target = _PreparedTarget(
+        url="http://target.test/search",
+        parameter="q",
+        method="GET",
+        location=ParameterLocation.query,
+    )
+
+    fired = asyncio.run(
+        XSSVerifier()._verify_browser_execution(
+            target.url,
+            target.parameter,
+            target.method,
+            "payload",
+            "canary",
+            None,
+            None,
+            False,
+            target=target,
+        )
+    )
+
+    assert fired is True
+    assert observed["url"] == (
+        "http://target.test/search?lang=en&q=%3Cscript%3Ewindow.sentry_hook%28%27canary%27%29%3C%2Fscript%3E"
+    )
+
+
+def test_http_reflection_is_handed_to_browser_phase(monkeypatch):
+    """Executable HTTP reflection must survive until the authenticated browser phase.
+
+    The page template contains an unrelated HTML entity near the echo. That
+    entity is not evidence that the injected payload was encoded; the exact
+    reflected payload still needs a browser execution proof.
+    """
+    from app.core.verification import xss_verifier as xv
+
+    verifier = XSSVerifier()
+    sent_phases: list[str] = []
+
+    async def fake_send(self, url, method="GET", params=None, data=None, **kwargs):
+        phase = kwargs.get("test_phase", "")
+        sent_phases.append(phase)
+        payload = kwargs.get("payload") or ""
+        if phase == "canary":
+            body = f"<html><body>echo {payload} &amp; nearby</body></html>"
+        elif phase.startswith("payload_"):
+            body = f"<html><body>&amp; nearby {payload}</body></html>"
+        else:
+            body = "<html><body>clean &amp; nearby</body></html>"
+        return ResponseData(
+            status_code=200,
+            headers={"Content-Type": "text/html"},
+            body=body,
+            response_time_ms=1.0,
+            request_snippet="request",
+            response_snippet=body,
+        )
+
+    async def fail_if_run(self, job):
+        raise AssertionError("verify() must hand jobs to XSSDetector")
+
+    monkeypatch.setattr(XSSVerifier, "_send", fake_send)
+    monkeypatch.setattr(XSSVerifier, "run_browser_verification", fail_if_run)
+    monkeypatch.setattr(xv, "PLAYWRIGHT_AVAILABLE", True)
+
+    result = asyncio.run(
+        verifier.verify(
+            "http://target.test/xss",
+            "name",
+            method="GET",
+            value="1",
+            stored_display_overrides={},
+        )
+    )
+
+    assert result.is_vulnerable is False
+    assert result.evidence.get("browser_verification_pending") is True
+    jobs = result.evidence.get("pending_jobs")
+    assert jobs and jobs[0].parameter == "name"
+    assert any(phase.startswith("payload_") for phase in sent_phases)
+
+
+def test_detector_runs_handed_off_jobs_until_first_confirmation(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.core.verification.verification_framework import VerificationResult
+
+    detector = XSSDetector()
+    target = _qtarget("http://target.test/xss", "name")
+    partial = SimpleNamespace(vuln_type="Stored XSS")
+    jobs = [
+        SimpleNamespace(
+            url=target.url,
+            parameter=target.parameter,
+            method=target.method,
+            partial_finding=partial,
+        ),
+        SimpleNamespace(
+            url=target.url,
+            parameter=target.parameter,
+            method=target.method,
+            partial_finding=partial,
+        ),
+    ]
+    confirmed = SimpleNamespace(vuln_type="Stored XSS", parameter="name")
+    browser_calls: list[object] = []
+
+    class _Planner:
+        def targets_for(self, _name):
+            return [target]
+
+    async def no_static_findings(self, _kwargs, _cookies):
+        return []
+
+    async def no_baselines(self, _urls, _cookies):
+        return {}
+
+    async def fake_verify(self, *_args, **_kwargs):
+        return VerificationResult(
+            is_vulnerable=False,
+            confidence_score=0.0,
+            detection_method="browser_verification_pending",
+            findings=[],
+            evidence={
+                "browser_verification_pending": True,
+                "pending_job": jobs[0],
+                "pending_jobs": jobs,
+            },
+        )
+
+    async def fake_run_browser(self, job):
+        browser_calls.append(job)
+        return [confirmed]
+
+    async def no_dom_sweep(self, *_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(XSSDetector, "_static_dom_findings_with_browser_confirmation", no_static_findings)
+    monkeypatch.setattr(XSSDetector, "_prefetch_stored_baselines", no_baselines)
+    monkeypatch.setattr(XSSDetector, "_build_header_candidates", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(XSSDetector, "_browser_dom_reflection_sweep", no_dom_sweep)
+    monkeypatch.setattr(XSSVerifier, "verify", fake_verify)
+    monkeypatch.setattr(XSSVerifier, "run_browser_verification", fake_run_browser)
+
+    findings = asyncio.run(
+        detector.detect(
+            [target.url],
+            [],
+            attack_planner=_Planner(),
+            session_cookies={"session": "authenticated"},
+            browser_available=True,
+        )
+    )
+
+    assert findings == [confirmed]
+    assert browser_calls == [jobs[0]]
+
+
+def test_browser_execution_keeps_hook_after_navigation_timeout(monkeypatch):
+    from app.core.verification import xss_verifier as xv
+
+    class _Page:
+        _fired = False
+
+        async def add_init_script(self, _script):
+            pass
+
+        def on(self, *_args):
+            pass
+
+        async def goto(self, _url, **_kwargs):
+            self._fired = True
+            raise RuntimeError("navigation timeout after response")
+
+        async def evaluate(self, *_args):
+            return self._fired
+
+    class _Context:
+        async def add_cookies(self, _cookies):
+            pass
+
+        async def new_page(self):
+            return _Page()
+
+        async def close(self):
+            pass
+
+    class _Browser:
+        async def new_context(self, **_kwargs):
+            return _Context()
+
+        async def close(self):
+            pass
+
+    class _Chromium:
+        async def launch(self, **_kwargs):
+            return _Browser()
+
+    class _Playwright:
+        chromium = _Chromium()
+
+    class _PlaywrightContext:
+        async def __aenter__(self):
+            return _Playwright()
+
+        async def __aexit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(xv, "async_playwright", lambda: _PlaywrightContext())
+
+    verifier = XSSVerifier()
+    fired = asyncio.run(
+        verifier._verify_browser_execution(
+            "http://target.test/xss",
+            "name",
+            "GET",
+            "<script>window.sentry_hook('canary')</script>",
+            "canary",
+            None,
+            None,
+            False,
+        )
+    )
+
+    assert fired is True
+
+
+# --- multi-vector / multi-surface loop -----------------------------------------
 
 
 def test_dom_xss_vectors_are_ordered_and_hook_bound():
@@ -295,7 +676,7 @@ def test_detect_runs_http_only_when_browser_unavailable(monkeypatch):
     assert isinstance(findings, list)
 
 
-# --- Phase 5: API↔SPA route cross-referencing ------------------------------------------
+# --- API↔SPA route cross-referencing ------------------------------------------
 
 
 def test_select_dom_reflection_jobs_projects_api_param_onto_spa_route():
@@ -375,7 +756,7 @@ def test_select_dom_reflection_jobs_path_router_api_needs_no_projection():
     assert q_jobs[0][0] == "http://x/search"
 
 
-# --- Phase 5: browser-aware stored oracle ---------------------------------------------
+# --- Browser-aware stored oracle ---------------------------------------------
 
 
 def _stub_playwright(monkeypatch, *, fired: bool):

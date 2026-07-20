@@ -149,7 +149,7 @@ class XSSVerifier(BaseVerifier):
     )
 
     _STORED_PROBE_URL_CAP = 25
-    # P0-3: hard ceiling on how many header-sink URLs a single header × payload
+    # Hard ceiling on how many header-sink URLs a single header × payload
     # combination re-probes. Bounds the header-stored GET-replay fan-out that
     # otherwise multiplies headers × payloads × every sink-like URL.
     _STORED_HEADER_SINK_CAP = 8
@@ -506,13 +506,23 @@ class XSSVerifier(BaseVerifier):
                     if job:
                         pending_jobs.append(job)
 
-            # Process deferred browser verification jobs sequentially using the built-in runner
-            if pending_jobs and PLAYWRIGHT_AVAILABLE:
-                logger.debug("Processing %d deferred browser verification jobs...", len(pending_jobs))
-                for job in pending_jobs:
-                    browser_findings = await self.run_browser_verification(job)
-                    if browser_findings:
-                        findings.extend(browser_findings)
+            # Browser verification is deferred until after all HTTP probes complete,
+            # ensuring no race between concurrent HTTP workers and Playwright.
+            # Keep the singular key for callers that predate batched payload handoff.
+            if pending_jobs:
+                best = max(findings, key=lambda finding: finding.confidence_score, default=None)
+                return VerificationResult(
+                    is_vulnerable=bool(findings),
+                    confidence_score=best.confidence_score if best else 0.0,
+                    detection_method=best.detection_method if best else "browser_verification_pending",
+                    findings=findings,
+                    evidence={
+                        "browser_verification_pending": True,
+                        "pending_job": pending_jobs[0],
+                        "pending_jobs": pending_jobs,
+                    },
+                    reproducible=bool(findings),
+                )
             if findings:
                 # Reapply your original stored deduplication consolidation routine
                 has_stored = any(f.vuln_type == "Stored XSS" for f in findings)
@@ -689,12 +699,20 @@ class XSSVerifier(BaseVerifier):
                     if job:
                         pending_jobs.append(job)
 
-        # Confirm any deferred executable contexts in the browser (mirrors verify()).
-        if pending_jobs and PLAYWRIGHT_AVAILABLE:
-            for job in pending_jobs:
-                browser_findings = await self.run_browser_verification(job)
-                if browser_findings:
-                    findings.extend(browser_findings)
+        if pending_jobs:
+            best = max(findings, key=lambda finding: finding.confidence_score, default=None)
+            return VerificationResult(
+                is_vulnerable=bool(findings),
+                confidence_score=best.confidence_score if best else 0.0,
+                detection_method=best.detection_method if best else "browser_verification_pending",
+                findings=findings,
+                evidence={
+                    "browser_verification_pending": True,
+                    "pending_job": pending_jobs[0],
+                    "pending_jobs": pending_jobs,
+                },
+                reproducible=bool(findings),
+            )
 
         if findings:
             has_stored = any(f.vuln_type == "Stored XSS" for f in findings)
@@ -781,7 +799,7 @@ class XSSVerifier(BaseVerifier):
                     injected_payload, injected.body, baseline_body=pre_test_baseline.body, canary=canary,
                 )
 
-            # P0-3: the header-stored GET-replay oracle is structurally incapable
+            # The header-stored GET-replay oracle is structurally incapable
             # of confirming reflection on an SPA (the injected header value is
             # rendered client-side from an API response and never appears in the
             # raw HTML shell that this raw-string oracle matches against). On SPA
@@ -993,14 +1011,24 @@ class XSSVerifier(BaseVerifier):
     ) -> bool:
         """Isolated Headless Engine handles explicit runtime execution proofs securely."""
         xss_fired = False
+        prepared = target.build_request(payload) if isinstance(target, AttackTarget) else None
         async with async_playwright() as p:
+            browser = None
+            context = None
+            page = None
             try:
                 browser = await p.chromium.launch(headless=True)
                 context = await browser.new_context(ignore_https_errors=True, user_agent="SentryStrikeScanner/1.0")
 
-                if hasattr(self, 'http_verifier') and hasattr(self.http_verifier, 'cookies'):
+                browser_cookies = dict(getattr(getattr(self, "http_verifier", None), "cookies", {}) or {})
+                if prepared and prepared.cookies:
+                    browser_cookies.update(prepared.cookies)
+                if browser_cookies:
                     domain = urlparse(url).netloc.split(':')[0]
-                    playwright_cookies = [{"name": str(k), "value": str(v), "domain": domain, "path": "/"} for k, v in self.http_verifier.cookies.items()]
+                    playwright_cookies = [
+                        {"name": str(k), "value": str(v), "domain": domain, "path": "/"}
+                        for k, v in browser_cookies.items()
+                    ]
                     if playwright_cookies:
                         await context.add_cookies(playwright_cookies)
 
@@ -1017,14 +1045,26 @@ class XSSVerifier(BaseVerifier):
 
                 page.on("dialog", lambda dialog: asyncio.create_task(handle_dialog(dialog)))
 
-                if isinstance(target, AttackTarget):
-                    prepared = target.build_request(payload)
+                if prepared is not None:
                     if prepared.headers:
-                        await page.set_extra_http_headers(prepared.headers)
+                        extra_headers = {
+                            name: value
+                            for name, value in prepared.headers.items()
+                            if name.lower() != "cookie"
+                        }
+                        if extra_headers:
+                            await page.set_extra_http_headers(extra_headers)
                     if prepared.method.upper() == "GET":
-                        await page.goto(prepared.url, wait_until="networkidle", timeout=4000)
+                        navigation_url = prepared.url
+                        if prepared.params:
+                            parts = list(urlparse(navigation_url))
+                            query = dict(parse_qsl(parts[4], keep_blank_values=True))
+                            query.update(prepared.params)
+                            parts[4] = urlencode(query, doseq=True)
+                            navigation_url = urlunparse(parts)
+                        await page.goto(navigation_url, wait_until="domcontentloaded", timeout=5000)
                     elif prepared.method.upper() == "POST" and form_inputs:
-                        await page.goto(url, wait_until="networkidle", timeout=4000)
+                        await page.goto(url, wait_until="domcontentloaded", timeout=5000)
                         resolved_inputs = {item.get('name') or item.get('id'): item.get('value', '') for item in form_inputs if hasattr(item, 'get')} if isinstance(form_inputs, list) else form_inputs
                         for field_name, baseline_val in resolved_inputs.items():
                             fill_value = payload if field_name == parameter else baseline_val
@@ -1032,30 +1072,37 @@ class XSSVerifier(BaseVerifier):
                             if await page.query_selector(sel):
                                 await page.fill(sel, str(fill_value))
                         await page.evaluate("document.querySelector('form').submit()")
-                        await page.wait_for_load_state("networkidle", timeout=4000)
+                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
                     else:
                         return False
                 elif is_header_injection:
                     header_name = method.split(":", 1)[1]
                     await page.set_extra_http_headers({header_name: payload})
-                    await page.goto(url, wait_until="networkidle", timeout=4000)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=5000)
                 elif method.upper() == "GET":
                     parts = list(urlparse(url))
                     q = dict(parse_qsl(parts[4]))
                     q[parameter] = payload
                     parts[4] = urlencode(q)
-                    await page.goto(urlunparse(parts), wait_until="networkidle", timeout=4000)
+                    await page.goto(urlunparse(parts), wait_until="domcontentloaded", timeout=5000)
                 elif method.upper() == "POST" and form_inputs:
-                    await page.goto(url, wait_until="networkidle", timeout=4000)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=5000)
                     resolved_inputs = {item.get('name') or item.get('id'): item.get('value', '') for item in form_inputs if hasattr(item, 'get')} if isinstance(form_inputs, list) else form_inputs
                     for field_name, baseline_val in resolved_inputs.items():
                         fill_value = payload if field_name == parameter else baseline_val
                         sel = f"input[name='{field_name}'], textarea[name='{field_name}'], [id='{field_name}']"
                         if await page.query_selector(sel): await page.fill(sel, str(fill_value))
                     await page.evaluate("document.querySelector('form').submit()")
-                    await page.wait_for_load_state("networkidle", timeout=4000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=5000)
 
-                if stored_display_urls and not getattr(page, '_fired', False):
+                # Evaluate the execution oracle BEFORE the stored-display sweep.
+                # add_init_script re-runs on every navigation and resets
+                # window.__sentry_xss_fired/__sentry_xss_events, so sweeping away
+                # from the payload page destroys hook-based evidence; only the
+                # dialog-based page._fired attribute survives navigation.
+                xss_fired = bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page)
+
+                if stored_display_urls and not xss_fired:
                     if is_header_injection:
                         sweep_urls = [u for u in stored_display_urls if self._HEADER_SINK_PATTERNS.search(u)][:3]
                     else:
@@ -1066,16 +1113,33 @@ class XSSVerifier(BaseVerifier):
                             break
                         try:
                             await page.goto(d_url, wait_until="domcontentloaded", timeout=3000)
+                            # Check the oracle on each swept page: a stored
+                            # payload renders on the display page, and the JS
+                            # flag only lives on the page where it fired.
+                            if await self._browser_xss_fired(page):
+                                xss_fired = True
+                                break
                             await asyncio.sleep(0.15)
                         except Exception:
                             pass
 
                 await asyncio.sleep(0.3)
-                xss_fired = bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page)
-                await context.close()
-                await browser.close()
+                xss_fired = xss_fired or bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page)
             except Exception as e:
                 logger.debug(f"Playwright runtime loop bypassed safely: {e}")
+                if page is not None:
+                    xss_fired = bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page)
+            finally:
+                if context is not None:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                if browser is not None:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
         return xss_fired
 
     async def verify_dom_xss_execution(self, url: str) -> bool:
@@ -1134,7 +1198,7 @@ class XSSVerifier(BaseVerifier):
 
         return False
 
-    # Task D: an ordered, generic set of hook-executing DOM XSS vectors. Each is
+    # An ordered, generic set of hook-executing DOM XSS vectors. Each is
     # parameterised by the per-probe canary via ``window.sentry_hook``; framework
     # sinks sanitise some vectors but execute others, so a single-vector sweep
     # yields incomplete negatives. Ordered cheap → specific. No app-specific payload.
@@ -1147,7 +1211,7 @@ class XSSVerifier(BaseVerifier):
     )
     # Hard cap on navigations per candidate so the vector × surface loop stays
     # inside a single job's timeout rather than multiplying the job count.
-    # P0-3: raised from 12 — the browser-DOM sweep is the genuinely effective SPA
+    # Raised from 12 — the browser-DOM sweep is the genuinely effective SPA
     # confirmer, so budget follows yield now that the header-stored HTTP fan-out
     # is disabled on SPAs.
     _DOM_MAX_ATTEMPTS_PER_CANDIDATE = 18
@@ -1168,7 +1232,7 @@ class XSSVerifier(BaseVerifier):
     ) -> dict:
         """Navigate an SPA route with executing canaries and assert on DOM execution.
 
-        Tries a small ordered set of generic execution vectors (Task D) across
+        Tries a small ordered set of generic execution vectors across
         the query, hash-route query, and fragment surfaces — SPAs read user input
         from both ``location.search`` and ``location.hash`` — stopping at the
         first vector/surface that fires the hooked canary. Independent of any
@@ -1288,7 +1352,7 @@ class XSSVerifier(BaseVerifier):
         return out
 
     async def _new_reflection_context(self, browser, route_url: str, storage_state: dict | None = None):
-        # Seed from the full authenticated storage_state when available (Task A)
+        # Seed from the full authenticated storage_state when available
         # so authenticated-only SPA routes render during DOM confirmation. Falls
         # back to cookie injection when absent. Opaque per-origin blob — generic.
         context = None
@@ -1412,7 +1476,7 @@ class XSSVerifier(BaseVerifier):
             all_urls.append(bare)
 
         if is_header_injection:
-            # P0-3: cap the header-sink fan-out. Even on non-SPA server-rendered
+            # Cap the header-sink fan-out. Even on non-SPA server-rendered
             # apps, probing every sink-like URL for every header × every payload
             # is the dominant traffic sink for near-zero yield; the highest-value
             # log/admin/audit views cluster in the first few matches.
@@ -1590,7 +1654,9 @@ class XSSVerifier(BaseVerifier):
         if not locations: return analysis
         loc = locations[0]
         context = response_body[max(0, loc - 100):min(len(response_body), loc + len(payload) + 100)]
-        analysis["encoding_type"] = "encoded" if any(x in context for x in ("%", "&#", "&amp;", "\\x")) else "unencoded"
+        # _detect_reflection only supplies raw locations here. Decoded-only
+        # matches are marked html_encoded by the caller; encoding markers in
+        # surrounding template text say nothing about the matched payload.
         if self.SCRIPT_TAG_CONTEXT.search(context):
             analysis["context_type"], analysis["is_executable"] = "script_tag", analysis["encoding_type"] == "unencoded"
         elif self.EVENT_HANDLER_CONTEXT.search(context):

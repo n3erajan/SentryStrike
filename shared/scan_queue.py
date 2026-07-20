@@ -12,6 +12,14 @@ from shared.schemas.scan_schema import ScanConfig
 
 
 class ScanJob(BaseModel):
+    """A single unit of scan work placed on the shared queue.
+
+    The payload travels between the backend API (producer) and scanner
+    workers (consumers) via Redis. Credentials ride along as plaintext in the
+    job payload only; they are removed from the queue once a worker claims the
+    job and are never persisted to the database.
+    """
+
     scan_id: str = Field(min_length=1)
     auth_accounts: list[ScanAuthAccount] = Field(default_factory=list)
     scan_config: ScanConfig | None = None
@@ -22,6 +30,13 @@ class ScanQueueError(RuntimeError):
 
 
 class ScanQueue(Protocol):
+    """Abstract contract for the scan job queue.
+
+    Both the backend API and scanner workers depend on this interface, which
+    keeps the concrete transport (Redis) swappable without touching either
+    service's business logic.
+    """
+
     async def enqueue(self, job: ScanJob) -> None: ...
 
     async def dequeue(self) -> ScanJob: ...
@@ -36,6 +51,13 @@ class ScanQueue(Protocol):
 
 
 class RedisScanQueue:
+    """Redis-backed implementation of the scan job queue.
+
+    Jobs are pushed onto a Redis list (``RPUSH``) and claimed with a blocking
+    pop (``BLPOP``) so workers idle efficiently instead of polling. Cancellation
+    and worker liveness are tracked with short-lived keys rather than queue
+    messages, because they are signals — not work items.
+    """
     def __init__(
         self,
         client: Redis,
@@ -55,6 +77,7 @@ class RedisScanQueue:
 
     @classmethod
     def from_settings(cls) -> RedisScanQueue:
+        """Build a queue client from the shared infrastructure settings."""
         settings = get_infrastructure_settings()
         client = Redis.from_url(settings.redis_url, decode_responses=True)
         return cls(
@@ -67,6 +90,7 @@ class RedisScanQueue:
         )
 
     def _cancel_key(self, scan_id: str) -> str:
+        """Return the Redis key that flags a scan for cancellation."""
         return f"{self.cancel_key_prefix}:{scan_id}"
 
     async def enqueue(self, job: ScanJob) -> None:
@@ -138,6 +162,7 @@ class RedisScanQueue:
             raise ScanQueueError("Unable to clear worker heartbeat") from exc
 
     async def count_active_scanners(self) -> int:
+        """Return the number of workers with a live heartbeat key."""
         try:
             keys = await self.client.keys(f"{self.heartbeat_key_prefix}:*")
             return len(keys)

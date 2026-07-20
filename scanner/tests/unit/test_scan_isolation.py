@@ -60,3 +60,38 @@ def test_spider_is_a_real_webspider_by_default():
     # Guard condition used by run_scan: only a real WebSpider is swapped.
     assert not (type(orch.spider) is WebSpider)
     assert orch.spider is fake
+
+
+def test_build_scan_runtime_isolates_default_mutable_components():
+    orch = _orchestrator()
+
+    runtime = orch._build_scan_runtime()
+
+    assert type(runtime.spider) is WebSpider
+    assert runtime.spider is not orch.spider
+    assert [type(detector) for detector in runtime.detectors] == [
+        type(detector) for detector in orch.detectors
+    ]
+    assert all(
+        runtime_detector is not configured_detector
+        for runtime_detector, configured_detector in zip(
+            runtime.detectors, orch.detectors
+        )
+    )
+    assert runtime.supply_chain_detector is not orch.supply_chain_detector
+
+
+def test_build_scan_runtime_preserves_injected_fakes():
+    orch = _orchestrator()
+    spider = object()
+    detector = object()
+    supply_chain = object()
+    orch.spider = spider
+    orch.detectors = [detector]
+    orch.supply_chain_detector = supply_chain
+
+    runtime = orch._build_scan_runtime()
+
+    assert runtime.spider is spider
+    assert runtime.detectors == [detector]
+    assert runtime.supply_chain_detector is supply_chain

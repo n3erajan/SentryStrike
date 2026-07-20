@@ -22,7 +22,6 @@ class ScannerSettings(InfrastructureSettings):
         default=8.0,
         alias="CRAWL_RATE_LIMIT_PER_SECOND",
     )
-    crawl_browser_enabled: bool = Field(default=False, alias="CRAWL_BROWSER_ENABLED")
     crawl_browser_mode: str = Field(default="auto", alias="CRAWL_BROWSER_MODE")
     crawl_browser_max_interactions: int = Field(
         default=25,
@@ -106,26 +105,12 @@ class ScannerSettings(InfrastructureSettings):
     )
 
     scan_mode: str = Field(default="verified", alias="SCAN_MODE")
-    authentication_username: str | None = Field(default=None, alias="SCAN_AUTH_USERNAME")
-    authentication_password: str | None = Field(default=None, alias="SCAN_AUTH_PASSWORD")
-    authentication_cookie: str | None = Field(default=None, alias="SCAN_AUTH_COOKIE")
-    authentication_header: str | None = Field(default=None, alias="SCAN_AUTH_HEADER")
-    authentication_second_cookie: str | None = Field(
-        default=None,
-        alias="SCAN_AUTH_SECOND_COOKIE",
-    )
-    authentication_second_header: str | None = Field(
-        default=None,
-        alias="SCAN_AUTH_SECOND_HEADER",
-    )
-    authentication_privileged_cookie: str | None = Field(
-        default=None,
-        alias="SCAN_AUTH_PRIVILEGED_COOKIE",
-    )
-    authentication_privileged_header: str | None = Field(
-        default=None,
-        alias="SCAN_AUTH_PRIVILEGED_HEADER",
-    )
+    # Scan credentials (username/password, raw cookies/headers, and the
+    # second/privileged test-account material) are NOT read from the environment.
+    # They are supplied per-scan with the submission request (``ScanAuthAccount``)
+    # and reach the worker via the Redis job payload. Environment-based scan
+    # credentials were removed because they would silently authenticate every
+    # scan even when the operator submitted none, and the UI cannot edit env vars.
     allow_secondary_provisioning: bool = Field(
         default=False,
         alias="ALLOW_SECONDARY_PROVISIONING",

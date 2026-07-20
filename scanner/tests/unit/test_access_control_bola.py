@@ -1,4 +1,4 @@
-"""Task 7 — cross-identity BOLA/IDOR + path-id extraction."""
+"""Cross-identity BOLA/IDOR + path-id extraction."""
 
 import json
 
@@ -8,6 +8,7 @@ import pytest
 from app.core.crawler.auth_manager import SmartAuthenticator
 from app.core.detectors.access_control import (
     AccessControlDetector,
+    _AuthMaterial,
     _differential_idor_verdict,
     _is_same_owner,
     _looks_like_login_page,
@@ -59,6 +60,22 @@ def test_looks_like_login_page_ignores_json_payloads(body, expected):
 )
 def test_looks_like_path_id_segment(segment, expected):
     assert _looks_like_path_id_segment(segment) is expected
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("ProductId", True),
+        ("product_id", True),
+        ("userId", True),
+        ("uuid", True),
+        ("message", False),
+        ("valid", False),
+        ("description", False),
+    ],
+)
+def test_idor_parameter_classifier_requires_identifier_shape(name, expected):
+    assert AccessControlDetector()._is_idor_param(name) is expected
 
 
 def test_concrete_path_idor_targets_extracts_int_uuid_hex():
@@ -169,9 +186,6 @@ async def test_second_user_blocked_yields_no_finding(monkeypatch):
 
 
 class _MockSettings:
-    authentication_cookie = None
-    authentication_username = None
-    authentication_password = None
     authentication_failure_text = None
     authentication_failure_regex = None
     authentication_success_text = None
@@ -453,7 +467,7 @@ def test_admin_like_url_alone_is_not_data_exposure():
 
 
 # ---------------------------------------------------------------------------
-# Cross-identity broken object-level authorization (Phase 4, mass exposure)
+# Cross-identity broken object-level authorization (mass exposure)
 #
 # An object-scoped request (an id names ONE record) that is denied to anonymous
 # callers but returns the SAME substantive record to two DISTINCT authenticated
@@ -639,6 +653,30 @@ def test_idor_verdict_suppressed_when_same_owner_reference():
     assert "same" in reason.lower()
 
 
+def test_idor_verdict_suppressed_when_mutation_stays_in_owned_container():
+    """Changing a referenced object inside the same owned container is not IDOR.
+
+    This is deliberately domain-agnostic: a child/resource reference may change,
+    but an unchanged basket/cart/order/tenant-style scope proves the request stayed
+    inside the same authorization boundary.
+    """
+    own = '{"data":{"id":10,"ProductId":10,"BasketId":6,"quantity":1}}'
+    mutated = '{"data":{"id":11,"ProductId":11,"BasketId":6,"quantity":1}}'
+    assert _is_same_owner(own, mutated) is True
+    is_idor, _, reason = _differential_idor_verdict(
+        own_body=own, mutated_authed_body=mutated, mutated_unauthed_body=None
+    )
+    assert is_idor is False
+    assert "same" in reason.lower()
+
+
+def test_owner_scope_comparison_normalizes_key_style_and_scalar_type():
+    own = '{"data":{"BasketId":6,"id":10}}'
+    mutated = '{"data":{"basket_id":"6","id":11}}'
+
+    assert _is_same_owner(own, mutated) is True
+
+
 def test_idor_verdict_still_flags_distinct_owners():
     """A genuine cross-user read (different owner reference) is still IDOR."""
     own = '{"data":{"UserId":24,"id":7,"city":"X"}}'
@@ -648,6 +686,122 @@ def test_idor_verdict_still_flags_distinct_owners():
         own_body=own, mutated_authed_body=victim, mutated_unauthed_body=None
     )
     assert is_idor is True
+
+
+def test_non_identifier_body_field_does_not_borrow_unrelated_response_ids():
+    detector = AccessControlDetector()
+    target = AttackTarget(
+        url="https://t.test/api/complaints",
+        parameter="message",
+        method="POST",
+        value="Scanner test submission",
+        location=ParameterLocation.json_body,
+    )
+
+    values = detector._baseline_values_for_target(
+        target,
+        {"userid": {"24"}, "*": {"24", "10"}},
+    )
+
+    assert values == []
+
+
+@pytest.mark.asyncio
+async def test_cross_identity_owner_assignment_on_post_is_reported_as_bola():
+    detector = AccessControlDetector()
+    target = AttackTarget(
+        url="https://t.test/api/complaints",
+        parameter="UserId",
+        method="POST",
+        value="24",
+        location=ParameterLocation.json_body,
+        json_template={"UserId": 24, "message": "test"},
+    )
+    accepted = '{"data":{"id":7,"UserId":24,"message":"test"}}'
+
+    findings = await detector._verify_idor_baseline(
+        target,
+        "24",
+        _V(default=(401, '{"error":"unauthorized"}')),
+        _V(default=(201, accepted)),
+        None,
+        _V(default=(201, accepted)),
+    )
+
+    assert len(findings) == 1
+    assert findings[0].vuln_type == "Broken Object-Level Authorization"
+    assert "ownership assignment" in findings[0].evidence.lower()
+
+
+@pytest.mark.asyncio
+async def test_post_id_mutation_without_cross_identity_proof_is_not_idor():
+    detector = AccessControlDetector()
+    target = AttackTarget(
+        url="https://t.test/api/items",
+        parameter="ProductId",
+        method="POST",
+        value="10",
+        location=ParameterLocation.json_body,
+        json_template={"ProductId": 10, "CartId": 6},
+    )
+    unauth = _V(default=(401, '{"error":"unauthorized"}'))
+    owner = _V(default=(201, '{"data":{"id":10,"ProductId":10,"CartId":6}}'))
+
+    findings = await detector._verify_idor_baseline(
+        target,
+        "10",
+        unauth,
+        owner,
+        None,
+        None,
+    )
+
+    assert findings == []
+    assert not any(phase == "idor_authed_mod" for _, _, phase in owner.calls)
+
+
+def test_same_opaque_auth_material_is_not_a_distinct_identity():
+    detector = AccessControlDetector()
+    low = _AuthMaterial(label="low", cookies={"session": "same"})
+    second = _AuthMaterial(label="second", cookies={"session": "same"})
+
+    assert detector._auth_materials_same_identity(low, second) is True
+
+
+def test_same_opaque_session_ignores_unrelated_cookie_differences():
+    detector = AccessControlDetector()
+    low = _AuthMaterial(
+        label="low",
+        cookies={"session_id": "same", "language": "en"},
+    )
+    second = _AuthMaterial(
+        label="second",
+        cookies={"session_id": "same", "language": "fr"},
+    )
+
+    assert detector._auth_materials_same_identity(low, second) is True
+
+
+def test_distinct_opaque_auth_material_remains_eligible_for_cross_identity_checks():
+    detector = AccessControlDetector()
+    low = _AuthMaterial(label="low", cookies={"session": "user-a"})
+    second = _AuthMaterial(label="second", cookies={"session": "user-b"})
+
+    assert detector._auth_materials_same_identity(low, second) is False
+
+
+def test_different_jwts_for_same_principal_are_not_distinct_identities():
+    detector = AccessControlDetector()
+    low = _AuthMaterial(
+        label="low",
+        headers={"Authorization": "Bearer e30.eyJzdWIiOiI0MiIsImlhdCI6MX0.sig-a"},
+    )
+    second = _AuthMaterial(
+        label="second",
+        headers={"Authorization": "Bearer e30.eyJzdWIiOiI0MiIsImlhdCI6Mn0.sig-b"},
+    )
+
+    assert detector._auth_materials_same_identity(low, second) is True
 
 
 def test_idor_verdict_owner_guard_inactive_without_owner_reference():

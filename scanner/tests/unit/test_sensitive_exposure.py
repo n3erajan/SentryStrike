@@ -73,6 +73,35 @@ def test_application_data_field_named_scoreboard_is_not_debug_metrics():
     assert matched is False
 
 
+def test_htaccess_with_directives_is_sensitive_file_exposure():
+    # .htaccess exposure moved from the forced-browsing (A01) detector to
+    # sensitive_paths (A02) — it is accidental config-file exposure, not a
+    # bypassed access control. A body carrying real Apache directives confirms it.
+    detector = SensitivePathsDetector()
+    body = "RewriteEngine On\nRewriteRule ^(.*)$ index.php [L]\n<Files ~ \"\\.inc$\">\nDeny from all\n</Files>"
+
+    matched, vuln_type, _evidence, severity = detector._classify_content(
+        "/.htaccess", body, "text/plain"
+    )
+
+    assert matched is True
+    assert vuln_type == "Sensitive File Exposure"
+    assert severity == SeverityLevel.medium
+
+
+def test_htaccess_path_without_directives_is_not_flagged():
+    # A path that merely contains ".htaccess" but returns ordinary page content
+    # (no Apache directives) must not be classified — avoids false positives on
+    # soft-404 / app pages.
+    detector = SensitivePathsDetector()
+
+    matched, *_ = detector._classify_content(
+        "/.htaccess", "<html><body>Not Found</body></html>", "text/html"
+    )
+
+    assert matched is False
+
+
 def test_apache_server_status_scoreboard_is_still_debug_metrics():
     detector = SensitivePathsDetector()
     body = "Apache Server Status for localhost\nScoreboard: _W_W..CC____\n"

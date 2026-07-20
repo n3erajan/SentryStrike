@@ -7,6 +7,8 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class RegisterRequest(BaseModel):
+    """Payload for creating a new user account."""
+
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=8, max_length=256)
 
@@ -20,6 +22,8 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
+    """Payload for authenticating against an existing account."""
+
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=1, max_length=256)
 
@@ -30,12 +34,16 @@ class LoginRequest(BaseModel):
 
 
 class UserResponse(BaseModel):
+    """Public-facing user profile returned by API endpoints."""
+
     id: str
     email: str
     created_at: datetime
 
 
 class AuthResponse(BaseModel):
+    """Envelope wrapping an authentication result with token metadata."""
+
     user: UserResponse
     access_token: str
     token_type: str = "bearer"

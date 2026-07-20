@@ -15,35 +15,52 @@ PASSWORD_ITERATIONS = 260_000
 
 
 class AuthError(Exception):
+    """Base exception for all authentication failures."""
+
     status_code = 400
     message = "Authentication error"
 
 
 class RegistrationClosedError(AuthError):
+    """Registration is disabled via server configuration."""
+
     status_code = 403
     message = "Sorry, we currently don't take new users registration."
 
 
 class DuplicateUserError(AuthError):
+    """An account with the requested email already exists."""
+
     status_code = 409
     message = "An account with this email already exists."
 
 
 class InvalidCredentialsError(AuthError):
+    """Email/password combination did not match a known account."""
+
     status_code = 401
     message = "Invalid email or password."
 
 
 class InvalidSessionError(AuthError):
+    """The session token is missing, expired, or revoked."""
+
     status_code = 401
     message = "Authentication required."
 
 
 def normalize_email(email: str) -> str:
+    """Canonicalize an email to lowercase with stripped whitespace."""
     return email.strip().lower()
 
 
 def hash_password(password: str) -> str:
+    """Hash a plaintext password with PBKDF2-SHA256 and a random salt.
+
+    Returns a string in the format ``algorithm$iterations$salt$digest`` so
+    that the hash is self-describing and the iteration count can be increased
+    transparently in the future.
+    """
     salt = secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac(
         "sha256",
@@ -55,6 +72,10 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, encoded_hash: str) -> bool:
+    """Compare a plaintext password against a PBKDF2 hash.
+
+    Uses HMAC-comparison to defend against timing side-channels.
+    """
     try:
         algorithm, iterations_text, salt, stored_digest = encoded_hash.split("$", 3)
         iterations = int(iterations_text)
@@ -74,18 +95,22 @@ def verify_password(password: str, encoded_hash: str) -> bool:
 
 
 def new_session_token() -> str:
+    """Generate a cryptographically random bearer token."""
     return secrets.token_urlsafe(48)
 
 
 def hash_session_token(token: str) -> str:
+    """Return the SHA-256 hash of a bearer token for server-side storage."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def utc_now() -> datetime:
+    """Return the current UTC time as a naive datetime (no tzinfo)."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def as_utc_naive(value: datetime | None) -> datetime | None:
+    """Normalise a timezone-aware datetime to a naive UTC datetime, or return None."""
     if value is None:
         return None
     if value.tzinfo is None:
@@ -94,6 +119,7 @@ def as_utc_naive(value: datetime | None) -> datetime | None:
 
 
 class AuthService:
+    """Application logic for user registration, login, session management, and logout."""
     async def register(self, email: str, password: str) -> User:
         settings = get_settings()
         if not settings.allow_registration:

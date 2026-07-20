@@ -1,4 +1,4 @@
-"""P1-1: cross-cutting request-budget governor.
+"""Cross-cutting request-budget governor.
 
 A per-scan governor consulted at the single HTTP chokepoint
 (:meth:`HttpVerifier.send_request`). It enforces per-detector and
@@ -52,7 +52,7 @@ _state: ContextVar[_GovernorState | None] = ContextVar("request_governor_state",
 
 
 def begin_governor(per_detector_cap: int, per_parameter_cap: int) -> None:
-    """Start governing the current scan context. 0 disables a given ceiling."""
+    """Initialise a per-scan request governor. A cap of 0 disables that ceiling."""
     _state.set(
         _GovernorState(
             per_detector_cap=max(0, int(per_detector_cap)),
@@ -62,6 +62,7 @@ def begin_governor(per_detector_cap: int, per_parameter_cap: int) -> None:
 
 
 def end_governor() -> None:
+    """Tear down the governor for the current scan context."""
     _state.set(None)
 
 

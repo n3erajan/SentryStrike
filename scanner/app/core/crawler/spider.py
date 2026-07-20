@@ -24,7 +24,14 @@ from app.core.crawler.browser_engine import BrowserDiscoveryEngine
 from app.core.crawler.models import ApiEndpoint, CrawlState, ParameterCandidate, RouteCandidate, RouteSource
 from app.core.crawler.param_discovery import ParamDiscovery
 from app.core.crawler.spa import SpaFallbackDetector
-from app.core.crawler.url_parser import STATIC_EXTENSIONS, normalize_url, same_domain, normalize_for_dedupe
+from app.core.crawler.url_parser import (
+    STATIC_EXTENSIONS,
+    is_session_termination_url,
+    normalize_for_dedupe,
+    normalize_url,
+    same_domain,
+    url_in_application_scope,
+)
 from app.utils.http_logging import make_httpx_response_logger
 from app.utils.scan_http import create_scan_client
 
@@ -37,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FormInput:
+    """A single input field within an HTML form."""
+
     name: str
     input_type: str = "text"
     value: str = ""
@@ -44,10 +53,12 @@ class FormInput:
 
 @dataclass
 class HtmlForm:
+    """Discovered HTML form with its action, method, and parsed inputs."""
     page_url: str
     action: str
     method: str
     inputs: list[FormInput] = field(default_factory=list)
+    content_type: str | None = None
     # Provenance: "html" for a literal server-rendered <form>, "browser_cluster"
     # for an input cluster captured at runtime by the browser engine. SPA clusters
     # submit JSON to an API, so they get a best-effort JSON-body synthesis fallback
@@ -58,6 +69,8 @@ class HtmlForm:
 
 @dataclass
 class CrawlResult:
+    """Aggregated output of a crawl pass: discovered URLs, forms, API endpoints, and auth state."""
+
     urls: list[str] = field(default_factory=list)
     forms: list[HtmlForm] = field(default_factory=list)
     session_cookies: dict[str, str] = field(default_factory=dict)
@@ -93,6 +106,13 @@ class CrawlResult:
 
 
 class WebSpider:
+    """HTTP-based web crawler that discovers URLs, forms, and API endpoints.
+
+    Performs recursive crawling from the target root, respecting robots.txt,
+    depth limits, and URL caps. Returns discovered surface as a ``CrawlResult``
+    for downstream detector and verification pipeline stages.
+    """
+
     def __init__(self) -> None:
         self.settings = get_settings()
         self.session_cookies = {}
@@ -134,6 +154,15 @@ class WebSpider:
                 redacted[key] = f"{scheme} {redact_secret(token)}" if token else redact_secret(value)
         return redacted
 
+    @staticmethod
+    def _redact_cookies(cookies: dict[str, str]) -> dict[str, str]:
+        redacted = dict(cookies)
+        sensitive_keys = {"token", "session", "auth", "jwt", "refresh", "access", "id_token", "sid"}
+        for key, value in list(redacted.items()):
+            if key.lower() in sensitive_keys:
+                redacted[key] = redact_secret(value)
+        return redacted
+
     async def crawl(self, root_url: str, max_depth: int | None = None, auth_override=None, scan_config: ScanConfig | None = None) -> CrawlResult:
         self._reset_scan_auth_state()
         self._auth_override = auth_override
@@ -166,6 +195,12 @@ class WebSpider:
             # and prevents payloads/requests reaching third-party hosts.
             if not same_domain(root_url, url_candidate):
                 logger.debug("skipping off-origin URL (out of scope): %s", url_candidate)
+                return False
+            if not url_in_application_scope(root_url, url_candidate):
+                logger.debug("skipping sibling application path (out of scope): %s", url_candidate)
+                return False
+            if url_candidate != root_url and is_session_termination_url(url_candidate):
+                logger.debug("skipping session-mutating navigation: %s", url_candidate)
                 return False
 
             p = urlparse(url_candidate)
@@ -251,7 +286,7 @@ class WebSpider:
                 "/api/v1", "/phpmyadmin", "/.env", "/.git", "/backup.sql"
             ]
             for path in common_paths:
-                brute_url = normalize_url(root_url, path)
+                brute_url = normalize_url(root_url, path.lstrip("/"))
                 await safe_enqueue(brute_url, 0, RouteSource.brute_force, 20)
 
             await self._inspect_api_documentation(client, root_url, crawl_state)
@@ -385,6 +420,11 @@ class WebSpider:
                         self.session_cookies.update(self._snapshot_cookies(client.cookies))
 
                     page_forms, links = self._parse_html(url, response.text)
+                    page_forms = [
+                        form
+                        for form in page_forms
+                        if form.action == root_url or not is_session_termination_url(form.action)
+                    ]
                     
                     async with lock:
                         forms.extend(page_forms)
@@ -447,7 +487,7 @@ class WebSpider:
                 ]
                 await self._run_browser_discovery(crawl_state, root_url, browser_routes)
 
-        # P4: browser routes reconstructed from a dead hash route hold a real
+        # Browser routes reconstructed from a dead hash route hold a real
         # server URL the HTTP worker never saw — a query-bearing endpoint
         # (/redirect?to=https://...) or a served file (/ftp/legal.md). Extend
         # discovered_urls so ParamDiscovery + all detectors (open_redirect,
@@ -469,7 +509,9 @@ class WebSpider:
                 # Scope guard: a browser route may have followed a redirect to a
                 # third-party host (e.g. /redirect?to=https://github.com/...).
                 # Never back-feed off-origin URLs into the tested URL set.
-                if not same_domain(root_url, _route.url):
+                if not url_in_application_scope(root_url, _route.url):
+                    continue
+                if is_session_termination_url(_route.url):
                     continue
                 _norm = normalize_for_dedupe(_route.url)
                 if _norm not in _seen_for_p4:
@@ -539,6 +581,8 @@ class WebSpider:
             if not action:
                 action = page_url
             if not same_domain(root_url, action):
+                continue
+            if action != root_url and is_session_termination_url(action):
                 continue
             inputs: list[FormInput] = []
             for raw_input in form.get("inputs") or []:
@@ -683,11 +727,11 @@ class WebSpider:
     def _should_run_browser(self, is_spa: bool) -> bool:
         """Decide whether dynamic browser discovery should run.
 
-        ``crawl_browser_enabled`` (legacy) forces it on. Otherwise honour
-        ``crawl_browser_mode``: ``always`` runs for any target, ``never`` is
-        static-only, and ``auto`` runs only when the target looks like an SPA.
+        SPAs always require dynamic discovery. For conventional sites, the
+        per-scan ``crawl_browser_mode=always`` option opts in; the default
+        ``auto`` and explicit ``never`` remain static-only.
         """
-        if self.settings.crawl_browser_enabled:
+        if is_spa:
             return True
         mode = (self._scan_config.get_val("crawl_browser_mode", self.settings.crawl_browser_mode) if self._scan_config else self.settings.crawl_browser_mode or "auto")
         mode = mode.strip().lower()
@@ -695,7 +739,7 @@ class WebSpider:
             return False
         if mode == "always":
             return True
-        return bool(is_spa)  # auto
+        return False
 
     async def _run_browser_discovery(
         self,
@@ -728,6 +772,10 @@ class WebSpider:
         engine = BrowserDiscoveryEngine(
             max_interactions=self._scan_config.get_val("crawl_browser_max_interactions", self.settings.crawl_browser_max_interactions) if self._scan_config else self.settings.crawl_browser_max_interactions,
             workers=self._scan_config.get_val("crawl_browser_workers", self.settings.crawl_browser_workers) if self._scan_config else self.settings.crawl_browser_workers,
+            # Per-scan credentials from the submitted account (if any) so browser
+            # form-fill can log in; no environment fallback.
+            auth_username=getattr(self._auth_override, "username", None),
+            auth_password=getattr(self._auth_override, "password", None),
         )
         # The app's OWN client routes (mined from JS bundles / HTML / sitemap).
         # Passed so the engine can distinguish a router-defined route that merely
@@ -931,9 +979,18 @@ class WebSpider:
         return await client.request(method, url, **kwargs)
 
     def _session_keeper_enabled(self) -> bool:
+        # Credentials come only from the per-scan submission (``_auth_override``),
+        # never from the environment. Session-keeping is enabled when this scan
+        # actually supplied auth material (cookie/header/username+password) or a
+        # login was already performed (replay state / captured auth headers).
+        override = self._auth_override
+        has_override_creds = bool(
+            getattr(override, "cookie", None)
+            or getattr(override, "header", None)
+            or (getattr(override, "username", None) and getattr(override, "password", None))
+        )
         return bool(
-            self.settings.authentication_cookie
-            or (self.settings.authentication_username and self.settings.authentication_password)
+            has_override_creds
             or self._auth_replay_state
             or self._auth_headers
         )
@@ -999,9 +1056,9 @@ class WebSpider:
     async def _authenticate_session(self, client: httpx.AsyncClient, root_url: str, force: bool = False):
         """Authenticate session using cookies or credentials.
 
-        Per-scan credentials submitted with the scan (``self._auth_override``)
-        take precedence over the env-based ``SCAN_AUTH_*`` settings so users can
-        authenticate the crawl without setting environment variables.
+        Auth material comes solely from the per-scan submission
+        (``self._auth_override``). There is no environment-based fallback, so a
+        scan that was submitted without credentials performs no login.
         """
         if self._auth_state in {AuthVerificationState.authenticated_unverified, AuthVerificationState.authenticated_verified} and not force:
             return
@@ -1015,11 +1072,14 @@ class WebSpider:
                 )
                 return
 
+        # Auth material is taken exclusively from the per-scan override
+        # submitted with the scan request. There is no environment fallback, so
+        # a scan with no submitted credentials never attempts to log in.
         override = self._auth_override
-        auth_cookie = (getattr(override, "cookie", None) or self.settings.authentication_cookie)
-        auth_header_cfg = (getattr(override, "header", None) or self.settings.authentication_header)
-        username = (getattr(override, "username", None) or self.settings.authentication_username)
-        password = (getattr(override, "password", None) or self.settings.authentication_password)
+        auth_cookie = getattr(override, "cookie", None)
+        auth_header_cfg = getattr(override, "header", None)
+        username = getattr(override, "username", None)
+        password = getattr(override, "password", None)
         login_url = (getattr(override, "login_url", None) or root_url)
 
         # 1. Parse cookie string if provided
@@ -1106,7 +1166,7 @@ class WebSpider:
                     self._auth_verification_evidence = result.verification_evidence
                     logger.info(
                         "Session authenticated successfully. Cookies: %s, Headers: %s",
-                        self.session_cookies,
+                        self._redact_cookies(self.session_cookies),
                         self._redact_headers(self._auth_headers),
                     )
                 else:
@@ -1173,6 +1233,7 @@ class WebSpider:
         for form in soup.find_all("form"):
             action = form.get("action", page_url)
             method = form.get("method", "GET").upper()
+            content_type = form.get("enctype")
             inputs = []
             for inp in form.find_all(["input", "textarea", "select", "button"]):
                 name = inp.get("name")
@@ -1190,6 +1251,14 @@ class WebSpider:
                 if inp.name == "textarea":
                     value = inp.get_text("", strip=False)
                 inputs.append(FormInput(name=name, input_type=inp_type, value=value))
-            forms.append(HtmlForm(page_url=page_url, action=normalize_url(page_url, action), method=method, inputs=inputs))
+            forms.append(
+                HtmlForm(
+                    page_url=page_url,
+                    action=normalize_url(page_url, action),
+                    method=method,
+                    inputs=inputs,
+                    content_type=content_type,
+                )
+            )
 
         return forms, links

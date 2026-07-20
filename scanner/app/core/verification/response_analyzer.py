@@ -564,9 +564,9 @@ class ResponseAnalyzer:
             if pos >= 0:
                 payload_positions.append(pos)
 
-        # Module/parameter/phase markers are contextual labels that may
-        # accidentally match generic page text (e.g. parameter "name" matching
-        # an HTML attribute). Only use them as a last resort.
+        # Contextual labels (module, parameter, etc.) may accidentally match
+        # generic page text (e.g. parameter "name" matching an HTML attribute).
+        # Only use them as a last resort.
         extra_positions: list[int] = []
         for marker in (extra_markers or []):
             if marker:

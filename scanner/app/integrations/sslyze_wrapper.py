@@ -4,6 +4,14 @@ from urllib.parse import urlparse
 
 
 class SslAnalyzer:
+    """Lightweight TLS handshake checker.
+
+    Performs an async TLS handshake with the target on port 443 and reports
+    whether the connection succeeded. Does not inspect certificate chains or
+    cipher suites — it is a basic gate that flags targets without HTTPS.
+    Production-grade TLS evaluation is deferred to an external tool.
+    """
+
     async def analyze(self, url: str) -> dict:
         parsed = urlparse(url)
         hostname = parsed.hostname

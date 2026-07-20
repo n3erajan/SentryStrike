@@ -203,20 +203,12 @@ class CommandInjectionVerifier(BaseVerifier):
                         injected_body
                     )
 
-                    # --- FIX 1: Context-window baseline filtering ---
-                    # BUG (original): is_pattern_present used re.search() against the full
-                    # baseline body. Broad regex patterns like r"root|www-data|nobody|nginx|apache"
-                    # match the word "root" anywhere in the page (navigation links, page titles,
-                    # etc.), causing ALL unix_patterns to be stripped even when the injected
-                    # response contains real command output. After stripping, cmd_detected=False
-                    # and the verifier skips the confirmed injection entirely.
-                    #
-                    # FIX: For each pattern match in the INJECTED body, extract a 60-char
-                    # context window around that specific match and check whether that exact
-                    # context window exists in the baseline. This means a pattern is only
-                    # suppressed when the same text in the same surroundings was already present
-                    # before injection - not just because the pattern regex matches somewhere
-                    # else in the page.
+                    # Context-window baseline filtering: for each pattern match in
+                    # the injected body, extract a context window around that specific
+                    # match and check whether the same context existed in the baseline.
+                    # This avoids suppressing injection evidence just because a broad
+                    # pattern (e.g. "root|www-data") happens to match somewhere else in
+                    # the unmodified page (navigation links, page titles, etc.).
                     def is_pattern_new(pattern: str, injected: str, baseline: str) -> bool:
                         """Return True if *pattern* produces at least one match in *injected*
                         whose surrounding context does NOT appear in *baseline*."""
@@ -237,23 +229,8 @@ class CommandInjectionVerifier(BaseVerifier):
                     windows_patterns = [p for p in windows_patterns if is_pattern_new(p, injected_body, baseline_body)]
                     cmd_detected = bool(unix_patterns or windows_patterns)
 
-                    # Check for explicit uid= matches that are absent from baseline.
-                    # Always run the context-window diff - never skip based on whether
-                    # uid= appears in the baseline. The context window is what
-                    # distinguishes a pre-existing stored match from a new one caused
-                    # by this payload. Skipping when uid_in_baseline=True caused the
-                    # verifier to miss injections whenever a prior test phase left
-                    # command output in the page (e.g. stored via DVWA session).
-                    #
-                    # BUG (original): 30-char context window was too narrow. If the
-                    # injected uid= output landed near a page boundary or boilerplate
-                    # HTML that also appears in the baseline, the window matched and
-                    # uid_in_delta stayed False. This caused the verifier to skip the
-                    # confirmed injection when cmd_detected was also False (stripped by
-                    # the over-aggressive baseline filter above).
-                    #
-                    # FIX: Use the full line containing the uid= match as context.
-                    # A line like "uid=33(www-data) gid=33(www-data) groups=33(www-data)"
+                    # Use the full line containing the uid= match as context (rather
+                    # than a narrow window) because a line like "uid=33(www-data) …"
                     # is extremely unlikely to appear identically in the baseline.
                     uid_match = None
                     uid_in_delta = False
@@ -272,7 +249,8 @@ class CommandInjectionVerifier(BaseVerifier):
                     if not cmd_detected and not uid_in_delta:
                         continue
 
-                    # --- FIX 2: PRECISION SNIPPET CRITICAL CROP ---
+                    # Crop the evidence snippet to the exact injection point so
+                    # the report only shows the relevant command output context.
                     focus_index = -1
 
                     if uid_in_delta and uid_match:

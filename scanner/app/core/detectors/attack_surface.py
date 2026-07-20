@@ -41,6 +41,37 @@ class PreparedAttackRequest:
     files: dict[str, Any] | None = None
 
 
+def _headers_with_cookie_context(
+    headers: dict[str, str], cookies: dict[str, str]
+) -> dict[str, str]:
+    """Carry an observed cookie context through header-only verifier paths.
+
+    Several active verifiers historically retained ``PreparedAttackRequest.headers``
+    but dropped its separate ``cookies`` field when building payload requests.  That
+    made the clean baseline use the browser-observed cookies while the injected
+    request fell back to the scan-wide cookie jar.  Path-scoped cookies could then
+    select a different session/security context, producing systematic false
+    negatives across unrelated detector classes.
+
+    An explicit Cookie header is the request-level source of truth.  Rebuild it from
+    the observed cookie mapping so duplicate names from the client jar cannot be
+    appended, while keeping ``cookies`` on the prepared request for callers that use
+    the structured field directly.
+    """
+    if not cookies:
+        return headers
+
+    merged = {
+        str(name): str(value)
+        for name, value in headers.items()
+        if str(name).lower() != "cookie"
+    }
+    merged["Cookie"] = "; ".join(
+        f"{name}={value}" for name, value in cookies.items()
+    )
+    return merged
+
+
 @dataclass
 class _ObservedFormInput:
     name: str
@@ -75,6 +106,7 @@ class AttackTarget:
         method = self.method.upper()
         headers = dict(self.headers or {})
         cookies = dict(self.cookies or {})
+        headers = _headers_with_cookie_context(headers, cookies)
 
         if self.location == ParameterLocation.path:
             return PreparedAttackRequest(
@@ -141,6 +173,7 @@ class AttackTarget:
 
         if self.location == ParameterLocation.cookie:
             cookies[self.parameter] = str(value)
+            headers = _headers_with_cookie_context(headers, cookies)
             return PreparedAttackRequest(url=self.url, method=method, headers=headers or None, cookies=cookies or None)
 
         return PreparedAttackRequest(url=self.url, method=method, headers=headers or None, cookies=cookies or None)
@@ -197,8 +230,8 @@ class AttackSurface:
                     # detector. The real endpoint is captured separately as the
                     # form's observed XHR (an ``/api/…`` request). This mirrors
                     # ``_synthesize_form_cluster_targets`` (which skips the same
-                    # clusters): "Phase 3 translates discovered route URLs, not
-                    # synthetic form submissions."
+                    # clusters): translation targets discovered route URLs, not
+                    # synthetic form submissions.
                     continue
                 # Read-style candidates (query/path in the URL) may map to a real
                 # served resource (``/#/ftp/legal.md?file=`` -> ``/ftp/legal.md``),
@@ -220,10 +253,19 @@ class AttackSurface:
                 continue
             template = None
             form_inputs = candidate.context.get("form_inputs")
-            metadata_headers, metadata_cookies = request_metadata.get(
-                (candidate.url, candidate.method.upper()),
-                ({}, {}),
-            )
+            # Server-rendered query/form candidates already replay through the
+            # scan-wide authenticated client. Do not let a later browser form
+            # interaction overwrite that clean context with request-local cookies
+            # produced by an unrelated state mutation. Browser/API candidates keep
+            # exact observed metadata below, which is essential for SPA token and
+            # path-scoped session replay.
+            if candidate.source in {"query", "form"}:
+                metadata_headers, metadata_cookies = {}, {}
+            else:
+                metadata_headers, metadata_cookies = request_metadata.get(
+                    (candidate.url, candidate.method.upper()),
+                    ({}, {}),
+                )
             headers = {
                 **metadata_headers,
                 **(candidate.context.get("headers") or {}),
@@ -670,8 +712,8 @@ class AttackSurface:
                 continue
             if cls._has_unresolved_path_placeholder(endpoint.url):
                 continue
-            # Task C (RC-C): only synthesize bodies for genuine API/JSON/form
-            # endpoints. SPA HTML navigation routes (e.g. a POST /login route
+            # Only synthesize bodies for genuine API/JSON/form endpoints. SPA
+            # HTML navigation routes (e.g. a POST /login route
             # returning the 200 HTML shell) exercise no vulnerable code, so
             # placeholder bodies aimed at them waste the injection budget.
             # Observed bodies always win (deduped out above), so this gate only
@@ -772,7 +814,7 @@ class AttackSurface:
         XHR), the captured field names/types are still known — so synthesize a
         skeleton JSON body and emit one low-confidence ``json_body`` target per
         field (``replayable=False``, ``source_confidence="form_synth"``). This
-        decouples injection coverage from the fragile runtime submit (Phase 4).
+        decouples injection coverage from the fragile runtime submit.
 
         Observed request bodies and higher-confidence targets always win: any leaf
         already emitted under the same ``(url, method, name, location, parent_path)``
@@ -788,9 +830,9 @@ class AttackSurface:
                 # SPA clusters have no real ``action`` so this falls back to the
                 # route URL (``/#/address/create``). That fragment is stripped on
                 # the wire, so a POST here only hits the shell — the synthesized
-                # body tests nothing. Keep form-cluster robustness for Phase 9;
-                # Phase 3 translates discovered route URLs, not synthetic form
-                # submissions.
+                # body tests nothing. Form-cluster robustness tracks separately;
+                # route URL translation targets discovered routes, not synthetic
+                # form submissions.
                 continue
             # A cluster submitted from an SPA is a mutation (login, register,
             # create). The DOM method defaults to GET on orphan clusters that have
@@ -1105,8 +1147,13 @@ class AttackSurface:
     ) -> dict[tuple[str, str], tuple[dict[str, str], dict[str, str]]]:
         metadata: dict[tuple[str, str], tuple[dict[str, str], dict[str, str]]] = {}
         for request in requests:
-            metadata[(request.url, request.method.upper())] = (
-                AttackSurface._request_replay_metadata(request)
+            # The first observation is the closest to the seeded crawl state.
+            # Later repetitions may follow form submissions that deliberately
+            # mutate cookies or authorization context; replacing the first entry
+            # made replay order-dependent and contaminated unrelated targets.
+            metadata.setdefault(
+                (request.url, request.method.upper()),
+                AttackSurface._request_replay_metadata(request),
             )
         return metadata
 

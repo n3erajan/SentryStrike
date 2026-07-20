@@ -439,7 +439,7 @@ async def test_crawl_into_filters_off_origin_runtime_requests(monkeypatch):
 
 
 def test_browser_targets_visit_same_origin_routes_only():
-    # Seed set is bounded by the route cap (Task B), not the per-page interaction
+    # Seed set is bounded by the route cap, not the per-page interaction
     # budget, so all same-origin routes are enqueued regardless of max_interactions.
     engine = BrowserDiscoveryEngine(max_interactions=3)
 
@@ -558,7 +558,7 @@ def test_browser_json_observation_metadata_preserves_body_and_replay_headers():
     ],
 )
 def test_browser_json_body_replayable_even_when_schema_empty(raw_body):
-    """P0-1: an observed JSON body must be replayable whenever it parses as
+    """An observed JSON body must be replayable whenever it parses as
     JSON, not only when schema inference produced a non-empty field list. Empty
     objects, top-level arrays, and primitive JSON bodies were being dropped,
     collapsing ``replayable_json_bodies`` to 0 on real SPA traffic."""
@@ -596,7 +596,7 @@ async def test_build_observation_marks_large_body_truncated_and_not_replayable()
 
 
 def test_auth_cookie_entries_targets_origin():
-    """P1-3: auth cookies are turned into origin-scoped Playwright cookie dicts."""
+    """Auth cookies are turned into origin-scoped Playwright cookie dicts."""
     engine = BrowserDiscoveryEngine()
     entries = engine._auth_cookie_entries("http://target.test:8080/app", {"session": "abc", "csrf": "d"})
     assert {e["name"] for e in entries} == {"session", "csrf"}
@@ -608,7 +608,7 @@ def test_auth_cookie_entries_targets_origin():
 
 @pytest.mark.asyncio
 async def test_reseed_session_readds_cookies_and_is_failsafe():
-    """P1-3: mid-crawl session recovery re-applies auth cookies, never raising."""
+    """Mid-crawl session recovery re-applies auth cookies, never raising."""
     engine = BrowserDiscoveryEngine()
 
     class _Ctx:
@@ -733,19 +733,14 @@ async def test_browser_field_values_use_configured_credentials():
         async def get_attribute(self, name):
             return self.attrs.get(name)
 
-    engine = BrowserDiscoveryEngine()
-    original_username = engine.settings.authentication_username
-    original_password = engine.settings.authentication_password
+    # Per-scan credentials are passed to the engine constructor, not read from env.
+    engine = BrowserDiscoveryEngine(
+        auth_username="alice@example.test",
+        auth_password="CorrectHorseBatteryStaple",
+    )
 
-    try:
-        engine.settings.authentication_username = "alice@example.test"
-        engine.settings.authentication_password = "CorrectHorseBatteryStaple"
-
-        assert await engine._value_for_field(Field({"name": "email", "type": "email"})) == "alice@example.test"
-        assert await engine._value_for_field(Field({"name": "password", "type": "password"})) == "CorrectHorseBatteryStaple"
-    finally:
-        engine.settings.authentication_username = original_username
-        engine.settings.authentication_password = original_password
+    assert await engine._value_for_field(Field({"name": "email", "type": "email"})) == "alice@example.test"
+    assert await engine._value_for_field(Field({"name": "password", "type": "password"})) == "CorrectHorseBatteryStaple"
 
 
 @pytest.mark.asyncio
@@ -828,15 +823,11 @@ async def test_workflow_explorer_exercises_multi_step_spa_and_file_inputs():
         async def wait_for_timeout(self, timeout):
             return None
 
+    # No per-scan credentials supplied: form-fill uses safe synthetic values.
     engine = BrowserDiscoveryEngine(max_interactions=5)
-    original_username = engine.settings.authentication_username
-    engine.settings.authentication_username = None
     page = FakePage()
 
-    try:
-        stats = await engine._exercise_page(page)
-    finally:
-        engine.settings.authentication_username = original_username
+    stats = await engine._exercise_page(page)
 
     assert page.clicked == ["Next", "Submit"]
     assert page.filled["email"] == "scanner@example.com"
@@ -888,7 +879,7 @@ async def test_exercise_page_stops_at_time_budget(monkeypatch):
     assert interactions["n"] == 50
 
 
-# --- Task 2: SPA interaction & navigation --------------------------------
+# --- SPA interaction & navigation --------------------------------
 
 
 @pytest.mark.asyncio
@@ -1227,7 +1218,7 @@ async def test_crawl_into_discovers_and_visits_client_side_routes(monkeypatch):
     assert ws[0].replayable is False
 
 
-# --- Task A: full authenticated storage_state propagation -------------------
+# --- full authenticated storage_state propagation -------------------
 
 
 @pytest.mark.asyncio
@@ -1263,7 +1254,7 @@ async def test_crawl_into_seeds_context_from_storage_state(monkeypatch):
 @pytest.mark.asyncio
 async def test_crawl_into_falls_back_to_bare_context_without_storage_state(monkeypatch):
     """No storage_state → plain ``new_context()`` (cookie/header injection path),
-    preserving the pre-Task-A behavior for cookie-auth and static-auth apps."""
+    preserving the pre-context behavior for cookie-auth and static-auth apps."""
     page = _FakePage(goto_sleep=0.0)
     _install_fake_playwright(monkeypatch, page)
 
@@ -1393,7 +1384,7 @@ async def test_crawl_into_launches_chromium_exactly_once(monkeypatch):
     assert launches["n"] == 1
 
 
-# --- Task B: value-ordered, submission-driven crawl -------------------------
+# --- value-ordered, submission-driven crawl -------------------------
 
 
 def test_effective_deadline_scales_with_route_count_and_is_capped():
@@ -1603,7 +1594,53 @@ async def test_submit_discovered_forms_skips_destructive_and_dedups():
     assert len(page.fills) == prev
 
 
-@pytest.mark.parametrize("label", ["logout", "Log out", "Sign Out", "sign off", "LOGOUT"])
+@pytest.mark.asyncio
+async def test_submit_discovered_forms_skips_configuration_choice_form():
+    engine = BrowserDiscoveryEngine()
+    page = _SubmitFakePage()
+    form = {
+        "action": "http://spa.test/account/settings",
+        "method": "POST",
+        "inputs": [
+            {"name": "security_level", "type": "select"},
+            {"name": "save", "type": "submit"},
+        ],
+    }
+    submitted: set = set()
+
+    await engine._submit_discovered_forms(
+        page, [form], "http://spa.test/", "http://spa.test/account/settings", submitted,
+    )
+
+    assert page.submit_clicks == 0
+    assert submitted
+
+
+def test_configuration_guard_keeps_text_search_with_security_term():
+    from app.core.crawler.browser_engine import _is_sensitive_configuration_form
+
+    form = {
+        "action": "http://spa.test/api/security/search",
+        "method": "POST",
+        "inputs": [{"name": "security_query", "type": "text", "field_id": "0:0"}],
+    }
+
+    assert _is_sensitive_configuration_form(form) is False
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "logout",
+        "Log out",
+        "Sign Out",
+        "sign off",
+        "LOGOUT",
+        "Reset database",
+        "Initialize application",
+        "Change password",
+    ],
+)
 def test_destructive_label_matches_signout_variants(label):
     # RC-4b: blind clicking / submission must never drop the authenticated
     # session by hitting a sign-out control mid-crawl.
@@ -1861,6 +1898,27 @@ def test_runtime_hash_hint_converts_flat_seed_routes_to_hash():
     for route in ("login", "register", "search", "administration"):
         assert f"http://spa.test/#/{route}" in hashed
         assert f"http://spa.test/{route}" not in hashed
+
+
+def test_path_hosted_hash_spa_keeps_document_path_and_captures_root_api():
+    engine = BrowserDiscoveryEngine()
+
+    targets = engine._browser_targets(
+        "http://spa.test/app/",
+        ["/login", "/api/users", "/sign-out"],
+        hash_routed=True,
+    )
+
+    assert "http://spa.test/app/#/login" in targets
+    assert "http://spa.test/api/users" not in targets
+    assert not any("sign-out" in target for target in targets)
+
+    class _Request:
+        url = "http://spa.test/api/users"
+        method = "POST"
+        resource_type = "xhr"
+
+    assert engine._classify_runtime_request("http://spa.test/app/", _Request()) == "capture"
 
 
 @pytest.mark.asyncio

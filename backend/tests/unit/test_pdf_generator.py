@@ -115,6 +115,87 @@ def test_pdf_remediation_roadmap_keeps_full_remediation_text() -> None:
     assert "..." not in action_cell.getPlainText()
 
 
+def _roadmap_phase_of(elems, vuln_type: str) -> str | None:
+    """Return the roadmap phase heading under which *vuln_type* is listed.
+
+    Walks the flowables in document order, tracking the most recent sub-header
+    (phase label) and returning it when a table row naming *vuln_type* appears.
+    """
+    current_phase = None
+    for elem in elems:
+        text = getattr(elem, "text", None)
+        if text and any(
+            marker in text
+            for marker in ("Immediate", "Urgent", "Planned", "Backlog")
+        ):
+            current_phase = text
+        if hasattr(elem, "_cellvalues"):
+            for row in elem._cellvalues:
+                cell = row[0]
+                cell_text = cell.getPlainText() if hasattr(cell, "getPlainText") else str(cell)
+                if vuln_type in cell_text:
+                    return current_phase
+    return None
+
+
+def test_roadmap_high_severity_sqli_is_urgent_not_backlog() -> None:
+    # Regression: a High-severity SQL injection with Medium exploitability must
+    # NOT fall through to the low-priority backlog phase. Severity drives the
+    # phase; exploitability only orders within it.
+    scan_data = {
+        "data": {
+            "vulnerabilities": [
+                {
+                    "vuln_type": "SQL Injection (Error-Based)",
+                    "severity": "SeverityLevel.high",
+                    "ai_analysis": {
+                        "exploitability": "Exploitability.medium",
+                        "remediation": "Use prepared statements.",
+                    },
+                },
+                {
+                    "vuln_type": "Missing Security Header",
+                    "severity": "SeverityLevel.low",
+                    "ai_analysis": {
+                        "exploitability": "Exploitability.medium",
+                        "remediation": "Add headers.",
+                    },
+                },
+            ]
+        }
+    }
+
+    elems = build_remediation_roadmap(scan_data, build_styles())
+
+    assert _roadmap_phase_of(elems, "SQL Injection (Error-Based)") == "Urgent (High)"
+    assert "Backlog" in (_roadmap_phase_of(elems, "Missing Security Header") or "")
+
+
+def test_roadmap_orders_by_exploitability_within_phase() -> None:
+    # Within one severity phase, easier-to-exploit items are listed first.
+    scan_data = {
+        "data": {
+            "vulnerabilities": [
+                {
+                    "vuln_type": "Hard High Finding",
+                    "severity": "SeverityLevel.high",
+                    "ai_analysis": {"exploitability": "Exploitability.hard", "remediation": "x"},
+                },
+                {
+                    "vuln_type": "Easy High Finding",
+                    "severity": "SeverityLevel.high",
+                    "ai_analysis": {"exploitability": "Exploitability.easy", "remediation": "y"},
+                },
+            ]
+        }
+    }
+
+    elems = build_remediation_roadmap(scan_data, build_styles())
+    table = next(elem for elem in elems if hasattr(elem, "_cellvalues"))
+    ordered = [row[0].getPlainText() for row in table._cellvalues[1:]]
+    assert ordered == ["Easy High Finding", "Hard High Finding"]
+
+
 def test_pdf_detailed_findings_do_not_repeat_remediation_section() -> None:
     scan_data = {
         "data": {

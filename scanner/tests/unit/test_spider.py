@@ -17,7 +17,6 @@ def _disable_real_browser(monkeypatch):
     """Unit tests must never launch a real browser (CI has no Chromium
     guarantee). Dynamic-discovery behaviour is covered via mocks. Tests can
     still opt in by overriding these env vars and clearing the settings cache."""
-    monkeypatch.setenv("CRAWL_BROWSER_ENABLED", "false")
     monkeypatch.setenv("CRAWL_BROWSER_MODE", "never")
 
 
@@ -27,7 +26,7 @@ async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch
     observations into the crawl state (the merge runs in ``finally``)."""
 
     class _StubEngine:
-        def __init__(self, max_interactions=25, workers=None):
+        def __init__(self, max_interactions=25, workers=None, *, auth_username=None, auth_password=None):
             self.max_interactions = max_interactions
 
         @staticmethod
@@ -70,17 +69,16 @@ async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch
 
 
 @pytest.mark.parametrize(
-    "enabled,mode,is_spa,expected",
+    "mode,is_spa,expected",
     [
-        (False, "auto", True, True),      # SPA in auto -> run
-        (False, "auto", False, False),    # non-SPA in auto -> skip
-        (False, "always", False, True),   # always -> run regardless
-        (False, "never", True, False),    # never -> skip even for SPA
-        (True, "never", False, True),     # legacy enabled overrides mode
+        ("auto", True, True),      # SPA in auto -> run
+        ("auto", False, False),    # non-SPA in auto -> skip
+        ("always", False, True),   # frontend opt-in -> run for conventional site
+        ("never", True, True),     # SPA detection overrides static-only preference
+        ("never", False, False),   # conventional site remains static-only
     ],
 )
-def test_should_run_browser_decision_matrix(monkeypatch, enabled, mode, is_spa, expected):
-    monkeypatch.setenv("CRAWL_BROWSER_ENABLED", "true" if enabled else "false")
+def test_should_run_browser_decision_matrix(monkeypatch, mode, is_spa, expected):
     monkeypatch.setenv("CRAWL_BROWSER_MODE", mode)
     get_settings = __import__("app.config", fromlist=["get_settings"]).get_settings
     get_settings.cache_clear()
@@ -98,7 +96,7 @@ async def test_run_browser_discovery_degrades_when_playwright_unavailable(monkey
     ``browser_error`` and returns, and the merge surfaces that as static-only."""
 
     class _UnreadyEngine:
-        def __init__(self, max_interactions=25, workers=None):
+        def __init__(self, max_interactions=25, workers=None, *, auth_username=None, auth_password=None):
             self.max_interactions = max_interactions
 
         async def crawl_into(
@@ -315,6 +313,7 @@ def test_parse_html_self_closing_form_includes_file_input():
     assert input_types["uploaded"] == "file"
     assert input_types["MAX_FILE_SIZE"] == "hidden"
     assert input_types["Upload"] == "submit"
+    assert forms[0].content_type == "multipart/form-data"
 
 
 class FakeSessionClient:

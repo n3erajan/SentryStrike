@@ -1,0 +1,1 @@
+"""Internal authentication detector responsibilities."""

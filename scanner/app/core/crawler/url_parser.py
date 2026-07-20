@@ -1,5 +1,7 @@
 import pathlib
-from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
+import posixpath
+import re
+from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlunparse
 
 # Canonical set of file extensions that are inert static assets — never an
 # HTML page or an injectable HTTP endpoint. This is the SINGLE source of truth
@@ -47,6 +49,60 @@ def normalize_url(base_url: str, candidate: str) -> str:
 
 def same_domain(url_a: str, url_b: str) -> bool:
     return urlparse(url_a).netloc == urlparse(url_b).netloc
+
+
+def application_base_path(root_url: str) -> str:
+    """Return the navigable path boundary implied by a submitted target URL."""
+    raw_path = unquote(urlparse(root_url).path or "/")
+    normalized = posixpath.normpath(raw_path)
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    if raw_path.endswith("/"):
+        base = normalized
+    elif pathlib.PurePosixPath(normalized).suffix:
+        base = posixpath.dirname(normalized)
+    else:
+        base = normalized
+    return "/" if base == "/" else f"{base.rstrip('/')}/"
+
+
+def url_in_application_scope(root_url: str, candidate_url: str) -> bool:
+    """Keep page navigation inside a path-hosted app on the same origin."""
+    if not same_domain(root_url, candidate_url):
+        return False
+    base = application_base_path(root_url)
+    if base == "/":
+        return True
+    path = posixpath.normpath(unquote(urlparse(candidate_url).path or "/"))
+    return path == base.rstrip("/") or path.startswith(base)
+
+
+def is_session_termination_url(url: str) -> bool:
+    """Identify navigation that can poison the session used by later probes.
+
+    Besides explicit sign-out routes, security configuration pages can overwrite
+    authorization-context cookies simply by being submitted. Active detectors must
+    not fuzz those pages with the shared scan session because a response-level
+    ``Set-Cookie`` then changes the behavior of every later probe.
+    """
+    parsed = urlparse(url)
+    route_text = f"{parsed.path}/{parsed.fragment.partition('?')[0]}"
+    for segment in unquote(route_text).lower().split("/"):
+        # Strip a trailing file extension (``logout.php``, ``sign-out.aspx``,
+        # ``logoff.jsp`` …) BEFORE removing separators. The separator-strip below
+        # deletes the dot too, so without this a server-rendered auth page like
+        # ``logout.php`` canonicalized to ``logoutphp`` and slipped past the token
+        # set — only extensionless SPA routes (``/auth/sign-out``) were caught.
+        # That let the crawler enqueue ``logout.php`` and detectors GET it,
+        # destroying the shared session so later probes were redirected to login.
+        # Extension-agnostic: matches any short alphanumeric suffix, no framework
+        # list. Query/fragment are already excluded above, so this only trims a
+        # real trailing extension.
+        base = re.sub(r"\.[a-z0-9]{1,6}$", "", segment)
+        canonical = re.sub(r"[-_.\s]", "", base)
+        if canonical in {"logout", "signout", "logoff", "endsession", "security"}:
+            return True
+    return False
 
 
 def extract_query_params(url: str) -> list[str]:

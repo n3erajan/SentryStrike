@@ -232,6 +232,8 @@ def build_scan_headers(auth_headers: Mapping[str, object] | None = None) -> dict
 
 
 def scan_http_timeout(total: float | None = None) -> httpx.Timeout:
+    """Build an httpx.Timeout from the global scanner config, with a
+    conservative connect-timeout cap of 5 s to avoid long aggregation waits."""
     settings = get_settings()
     total = total if total is not None else settings.request_timeout_seconds
     return httpx.Timeout(
@@ -243,6 +245,7 @@ def scan_http_timeout(total: float | None = None) -> httpx.Timeout:
 
 
 def scan_http_limits() -> httpx.Limits:
+    """Build an httpx.Limits matching the configured scanner concurrency."""
     pool_size = max(1, get_settings().scanner_concurrency)
     return httpx.Limits(
         max_connections=pool_size,
@@ -251,6 +254,7 @@ def scan_http_limits() -> httpx.Limits:
 
 
 def same_origin_url(left: str, right: str) -> bool:
+    """Return True when two URLs share scheme, hostname, and port."""
     try:
         left_parsed = urlparse(str(left))
         right_parsed = urlparse(str(right))

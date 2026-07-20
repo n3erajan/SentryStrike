@@ -50,6 +50,7 @@ def _build_report_payload(scan, scan_id: str) -> dict:
         "risk_level": getattr(scan, "overall_risk_level", None),
         "technology_stack": [tech.model_dump(mode="json") for tech in scan.technology_stack],
         "vulnerabilities": [v.model_dump(mode="json") for v in scan.vulnerabilities],
+        "site_title": getattr(scan, "site_title", ""),
         "report_metadata": report_metadata,
         "evidence_strength_breakdown": report_metadata.get("evidence_strength_breakdown", {}),
         "spa_api_coverage": report_metadata.get("spa_api_coverage", {}),
@@ -65,6 +66,7 @@ async def get_report_data(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
+    """Return the structured report data for a completed scan."""
     scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
@@ -78,6 +80,7 @@ async def generate_pdf_report(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> Response:
+    """Generate and download a client-ready PDF report for a completed scan."""
     scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")

@@ -8,6 +8,8 @@ from shared.models.vulnerability import TechnologyComponent, Vulnerability
 
 
 class ScanStatus(str, Enum):
+    """Lifecycle state of a scan from submission to a terminal state."""
+
     queued = "queued"
     running = "running"
     completed = "completed"
@@ -16,6 +18,8 @@ class ScanStatus(str, Enum):
 
 
 class ScanPhase(str, Enum):
+    """Fine-grained pipeline stage reported to the user while a scan runs."""
+
     queued = "queued"
     initializing = "initializing"
     crawling = "crawling"
@@ -32,11 +36,15 @@ class ScanPhase(str, Enum):
 
 
 class CrawlMode(str, Enum):
+    """Determines how deeply the crawler traverses the target."""
+
     full = "full"
     single = "single"
 
 
 class ScanAuthRole(str, Enum):
+    """Semantic label for a test-account slot within a scan."""
+
     main = "main"
     second = "second"
     admin = "admin"
@@ -66,6 +74,8 @@ class ScanAuthAccount(BaseModel):
 
 
 class SeverityBreakdown(BaseModel):
+    """Count of findings per severity level for a scan."""
+
     critical: int = 0
     high: int = 0
     medium: int = 0
@@ -74,12 +84,16 @@ class SeverityBreakdown(BaseModel):
 
 
 class ScanStatistics(BaseModel):
+    """Aggregate counts and summary metrics for a completed scan."""
+
     total_urls_crawled: int = 0
     total_vulnerabilities: int = 0
     severity_breakdown: SeverityBreakdown = Field(default_factory=SeverityBreakdown)
 
 
 class SpaApiCoverage(BaseModel):
+    """Metrics collected during SPA crawling and API extraction."""
+
     spa_detected: bool = False
     js_assets_inspected: int = 0
     routes_extracted: int = 0
@@ -103,12 +117,14 @@ class SpaApiCoverage(BaseModel):
     browser_forms_discovered: int = 0
     browser_forms_submitted: int = 0
     file_inputs_discovered: int = 0
-    # Overall dynamic-discovery health for honest reporting (Task 11):
+    # Overall dynamic-discovery health for honest reporting:
     # dynamic_ok | dynamic_partial | dynamic_failed.
     dynamic_status: str = "dynamic_ok"
 
 
 class AuthCoverage(BaseModel):
+    """Describes what the scanner achieved with the supplied credentials."""
+
     state: str = "unauthenticated"
     authenticated_url_count: int = 0
     unauthenticated_url_count: int = 0
@@ -118,6 +134,8 @@ class AuthCoverage(BaseModel):
 
 
 class EvidenceStrengthBreakdown(BaseModel):
+    """Count of findings grouped by evidence strength."""
+
     confirmed_exploit: int = 0
     confirmed_observation: int = 0
     probable: int = 0
@@ -126,6 +144,8 @@ class EvidenceStrengthBreakdown(BaseModel):
 
 
 class DetectorCoverageMetric(BaseModel):
+    """Per-detector statistics recorded during the scan for the report."""
+
     detector: str
     candidates_built: int = 0
     candidates_filtered: int = 0
@@ -145,6 +165,8 @@ class DetectorCoverageMetric(BaseModel):
 
 
 class AttackChain(BaseModel):
+    """A multi-step exploitation path that chains individual findings."""
+
     id: str
     description: str
     vulnerability_ids: list[str]
@@ -152,8 +174,11 @@ class AttackChain(BaseModel):
 
 
 class ReportMetadata(BaseModel):
+    """Metadata about the generated report and coverage quality."""
+
     generated_at: datetime | None = None
     generated_by: str = "ai"
+    ai_model: str | None = None
     summary: str | None = None
     attack_chains: list[AttackChain] = Field(default_factory=list)
     spa_api_coverage: SpaApiCoverage = Field(default_factory=SpaApiCoverage)
@@ -192,6 +217,7 @@ class Scan(Document):
     overall_risk_level: str = Field(default="Info")
     technology_stack: list[TechnologyComponent] = Field(default_factory=list)
     vulnerabilities: list[Vulnerability] = Field(default_factory=list)
+    site_title: str = ""
     report_metadata: ReportMetadata = Field(default_factory=ReportMetadata)
     error_message: str | None = None
 

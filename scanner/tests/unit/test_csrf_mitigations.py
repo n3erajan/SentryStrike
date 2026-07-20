@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+from types import SimpleNamespace
 
 from app.core.detectors import csrf_detector as csrf_module
 from app.core.detectors.csrf_detector import CSRFDetector
@@ -135,6 +136,89 @@ async def test_csrf_cookie_auth_consumes_browser_discovered_forms(monkeypatch):
     assert finding.severity in {SeverityLevel.high, SeverityLevel.medium}
 
 
+@pytest.mark.asyncio
+async def test_csrf_actively_verifies_get_password_change_form(monkeypatch):
+    """A GET password-change form is actively verified by CSRFDetector."""
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
+
+    detector = CSRFDetector()
+    action_url = "http://target.test/form-handler"
+    form = SimpleNamespace(
+        action=action_url,
+        page_url="http://target.test/account",
+        method="GET",
+        inputs=[
+            SimpleNamespace(name="password_new", input_type="password", value=""),
+            SimpleNamespace(name="password_conf", input_type="password", value=""),
+            SimpleNamespace(name="Change", input_type="submit", value="Change"),
+        ],
+    )
+
+    findings = await detector.detect(
+        [action_url],
+        [form],
+        session_cookies={"session": "abc123"},
+        auth_headers={},
+        browser_forms=[],
+    )
+
+    assert findings, "expected the CSRF detector to actively verify the GET form"
+    finding = findings[0]
+    assert "Cross-Site Request Forgery" in finding.vuln_type
+    assert finding.verified is True
+    assert finding.detection_method == "missing_token_state_change"
+
+
+@pytest.mark.asyncio
+async def test_csrf_ignores_generic_login_form_with_field_aliases(monkeypatch):
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
+
+    detector = CSRFDetector()
+    form = SimpleNamespace(
+        action="http://target.test/submit",
+        page_url="http://target.test/",
+        method="GET",
+        inputs=[
+            SimpleNamespace(name="user", input_type="text", value=""),
+            SimpleNamespace(name="passwd", input_type="password", value=""),
+        ],
+    )
+
+    findings = await detector.detect(
+        ["http://target.test/submit"],
+        [form],
+        session_cookies={"session": "abc123"},
+        auth_headers={},
+        browser_forms=[],
+    )
+
+    assert findings == []
+
+
+@pytest.mark.asyncio
+async def test_csrf_ignores_benign_get_search_form(monkeypatch):
+    """A plain GET search form is not a CSRF candidate."""
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
+
+    detector = CSRFDetector()
+    form = SimpleNamespace(
+        action="http://target.test/search",
+        page_url="http://target.test/search",
+        method="GET",
+        inputs=[SimpleNamespace(name="q", input_type="text", value="")],
+    )
+
+    findings = await detector.detect(
+        ["http://target.test/search"],
+        [form],
+        session_cookies={"session": "abc123"},
+        auth_headers={},
+        browser_forms=[],
+    )
+
+    assert findings == []
+
+
 _SPA_SHELL = (
     "<html><head><title>App</title></head><body>"
     "<app-root></app-root><script src=\"main.js\"></script></body></html>"
@@ -154,7 +238,7 @@ class _ShellVerifier(_FakeVerifier):
 
 @pytest.mark.asyncio
 async def test_csrf_no_finding_on_spa_client_routes(monkeypatch):
-    """P0-4: browser-discovered SPA "forms" are client-side routes whose action
+    """Browser-discovered SPA "forms" are client-side routes whose action
     returns the 200 HTML shell. With no observed mutating API backing them, they
     must not be tested at all — no CSRF findings on navigation routes."""
     monkeypatch.setattr(csrf_module, "HttpVerifier", _ShellVerifier)
@@ -183,7 +267,7 @@ async def test_csrf_no_finding_on_spa_client_routes(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_csrf_shell_guard_suppresses_finding_for_shell_response(monkeypatch):
-    """P0-4: even a confirmed mutating-API candidate must not produce a finding
+    """Even a confirmed mutating-API candidate must not produce a finding
     when the verification response is the SPA shell (no state change occurred)."""
     from app.core.crawler.models import RequestObservation
 
@@ -218,7 +302,7 @@ async def test_csrf_shell_guard_suppresses_finding_for_shell_response(monkeypatc
 
 @pytest.mark.asyncio
 async def test_csrf_finding_on_real_mutating_api(monkeypatch):
-    """P0-4: an observed mutating XHR (real API) that accepts a tampered,
+    """An observed mutating XHR (real API) that accepts a tampered,
     foreign-Origin submission with a non-shell response is a genuine CSRF finding.
 
     The observed request is form-encoded, so it is genuinely cross-site
@@ -307,7 +391,67 @@ async def test_csrf_builds_candidate_from_mutating_api_schema(monkeypatch):
     # and no forced Content-Type header (the client sets it for form data).
     assert calls[0]["data"] == {"displayName": "sentry_test_val"}
     assert calls[0]["json_body"] is None
-    assert calls[0]["headers"] is None
+    assert calls[0]["headers"] == {
+        "Origin": "https://evil.example",
+        "Referer": "https://evil.example/malicious",
+    }
+
+
+@pytest.mark.asyncio
+async def test_csrf_plain_200_without_processing_evidence_is_not_verified(monkeypatch):
+    class _GenericOkVerifier(_FakeVerifier):
+        async def send_request(self, url, method, params, data, headers=None, test_phase="", **kwargs):
+            return _FakeResponse(status_code=200, body="Welcome to the application")
+
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _GenericOkVerifier)
+    detector = CSRFDetector()
+    form = {
+        "action": "http://target.test/profile/update",
+        "method": "POST",
+        "inputs": [{"name": "displayName", "type": "text"}],
+        "page_url": "http://target.test/profile",
+    }
+
+    findings = await detector.detect(
+        [],
+        [form],
+        session_cookies={"session": "abc123"},
+    )
+
+    assert findings == []
+
+
+@pytest.mark.asyncio
+async def test_csrf_token_bypass_requires_valid_control_and_equivalent_foreign_probe(monkeypatch):
+    phases: list[str] = []
+
+    class _TokenVerifier(_FakeVerifier):
+        async def send_request(self, url, method, params, data, headers=None, test_phase="", **kwargs):
+            phases.append(test_phase)
+            return _FakeResponse(status_code=200, body="Profile updated successfully")
+
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _TokenVerifier)
+    detector = CSRFDetector()
+    form = {
+        "action": "http://target.test/profile/update",
+        "method": "POST",
+        "inputs": [
+            {"name": "csrf", "type": "hidden", "value": "observed-valid-token"},
+            {"name": "displayName", "type": "text"},
+        ],
+        "page_url": "http://target.test/profile",
+    }
+
+    findings = await detector.detect(
+        [],
+        [form],
+        session_cookies={"session": "abc123"},
+    )
+
+    assert phases == ["valid_token_control", "origin_token_bypass"]
+    assert len(findings) == 1
+    assert findings[0].verified is True
+    assert findings[0].parameter == "csrf"
 
 
 @pytest.mark.asyncio

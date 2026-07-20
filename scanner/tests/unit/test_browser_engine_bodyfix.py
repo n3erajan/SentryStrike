@@ -57,8 +57,8 @@ def test_observation_key_collapses_volatile_timestamp_only_bodies():
 
 def test_synthetic_value_uses_typed_format_for_constrained_types():
     engine = BrowserDiscoveryEngine()
-    engine.settings.authentication_username = ""
-    engine.settings.authentication_password = ""
+    engine._auth_username = ""
+    engine._auth_password = ""
     assert engine._synthetic_value("dob", "date") == "2020-01-01"
     assert engine._synthetic_value("age", "number") == "1"
     assert engine._synthetic_value("homepage", "url") == "https://example.com/"
@@ -115,12 +115,42 @@ async def test_select_field_uses_select_option_not_fill():
 
 
 @pytest.mark.asyncio
+async def test_select_field_preserves_existing_non_placeholder_value():
+    engine = BrowserDiscoveryEngine()
+
+    class _SelectedPage(_RecordFillPage):
+        def locator(self, selector):
+            page = self
+
+            class _L:
+                def __init__(self, sel):
+                    self._sel = sel
+                    self.first = self
+
+                async def evaluate(self, script):
+                    return {"current": "low", "values": ["high", "medium", "low"]}
+
+                async def select_option(self, value=None, index=None, timeout=None):
+                    page.fills.append((self._sel, value if value is not None else f"index={index}"))
+
+            return _L(selector)
+
+    page = _SelectedPage()
+    form = {"cluster_id": 4, "inputs": [{"name": "security", "type": "select", "field_id": "4:0"}]}
+
+    filled = await engine._fill_form_fields(page, form)
+
+    assert filled is True
+    assert page.fills == []
+
+
+@pytest.mark.asyncio
 async def test_confirm_field_echoes_primary_value():
     """A confirm/repeat field echoes the primary same-type value so generic
     'must match' validators pass."""
     engine = BrowserDiscoveryEngine()
-    engine.settings.authentication_username = ""
-    engine.settings.authentication_password = ""
+    engine._auth_username = ""
+    engine._auth_password = ""
     page = _RecordFillPage()
     form = {
         "cluster_id": 5,

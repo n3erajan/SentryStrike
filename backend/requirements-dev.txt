@@ -1,0 +1,10 @@
+# Development / CI dependencies for the backend.
+# Installs the runtime requirements plus the test toolchain.
+#   pip install -r backend/requirements-dev.txt
+#
+# Production images install requirements.txt only — pytest never ships.
+-r requirements.txt
+
+pytest==8.3.5
+pytest-asyncio==0.26.0
+pytest-cov==6.1.1

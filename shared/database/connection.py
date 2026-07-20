@@ -8,10 +8,14 @@ from shared.models.scan import Scan
 from shared.models.user import User, UserSession
 
 
+# Module-level client singleton. Both the API and the worker call init_db()
+# once at startup and close_db() on shutdown; the ODM resolves the active
+# connection internally after initialization.
 _client: AsyncIOMotorClient | None = None
 
 
 async def init_db() -> None:
+    """Open the MongoDB connection and register all Beanie document models."""
     global _client
     settings = get_infrastructure_settings()
     _client = AsyncIOMotorClient(settings.mongodb_uri)
@@ -22,6 +26,7 @@ async def init_db() -> None:
 
 
 async def close_db() -> None:
+    """Close the MongoDB connection if one is open."""
     global _client
     if _client is not None:
         _client.close()

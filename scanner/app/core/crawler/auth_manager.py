@@ -73,6 +73,8 @@ async def _merge_session_storage(storage_state: Any, page: Any) -> Any:
 
 
 class AuthStrategy(str, Enum):
+    """The type of login mechanism a target uses."""
+
     redirect = "redirect"
     html_form = "html_form"
     js_api = "js_api"
@@ -81,6 +83,8 @@ class AuthStrategy(str, Enum):
 
 
 class AuthVerificationState(str, Enum):
+    """The authentication verification lifecycle of a scan session."""
+
     unauthenticated = "unauthenticated"
     attempted = "attempted"
     authenticated_unverified = "authenticated_unverified"
@@ -90,6 +94,8 @@ class AuthVerificationState(str, Enum):
 
 @dataclass
 class AuthReplayState:
+    """Stores the winning login recipe so it can be replayed for additional accounts."""
+
     login_url: str
     action: str
     method: str
@@ -101,6 +107,8 @@ class AuthReplayState:
 
 @dataclass
 class AuthResult:
+    """The outcome of an authentication attempt, including session material and replay state."""
+
     cookies: dict[str, str] = field(default_factory=dict)
     bearer_token: str | None = None
     strategy: AuthStrategy | None = None
