@@ -449,7 +449,7 @@ textarea:focus-visible {
   padding: 8px 6px;
   background: var(--dark2);
   border-radius: 5px;
-  font-size: 0.58rem;
+  font-size: 0.63rem;
   color: oklch(66% 0.03 255);
   text-align: center;
 }
@@ -475,7 +475,7 @@ textarea:focus-visible {
   align-items: center;
   padding: 9px 0;
   border-bottom: 1px solid oklch(29% 0.035 255);
-  font-size: 0.64rem;
+  font-size: 0.66rem;
 }
 .sev {
   width: 7px;
@@ -674,7 +674,7 @@ textarea:focus-visible {
 }
 .field-error {
   color: var(--bad);
-  font-size: 0.62rem;
+  font-size: 0.66rem;
 }
 .coverage {
   display: grid;
@@ -686,6 +686,13 @@ textarea:focus-visible {
   grid-template-columns: 125px 1fr 38px;
   gap: 10px;
   align-items: center;
+  font-size: 0.67rem;
+}
+.coverage-stat {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
   font-size: 0.67rem;
 }
 .mini {
@@ -757,7 +764,7 @@ textarea:focus-visible {
   border: 1px solid oklch(38% 0.04 255);
   border-radius: 999px;
   padding: 6px 10px;
-  font-size: 0.64rem;
+  font-size: 0.66rem;
 }
 .roles {
   display: flex;
@@ -995,8 +1002,8 @@ footer.public-footer {
   font-size: 0.75rem;
 }
 
-/* ============ WORKSPACE ============ */
-.workspace-shell {
+/* ============ APP SHELL ============ */
+.app-shell {
   display: grid;
   grid-template-columns: 216px minmax(0, 1fr);
   min-height: 100dvh;
@@ -1025,17 +1032,6 @@ footer.public-footer {
 }
 .side-overlay {
   display: none;
-}
-.workspace-name {
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  padding: 9px 10px;
-  margin-bottom: 12px;
-  font-size: 0.7rem;
-}
-.workspace-name small {
-  display: block;
-  color: var(--muted);
 }
 .app-nav {
   display: grid;
@@ -1414,7 +1410,7 @@ footer.public-footer {
 }
 .mode-choice small {
   color: var(--muted);
-  font-size: 0.62rem;
+  font-size: 0.66rem;
 }
 .mode-choice button.active small {
   color: var(--brand2);
@@ -1532,33 +1528,30 @@ footer.public-footer {
   display: inline-flex;
   padding: 3px 8px;
   border-radius: 999px;
-  background: var(--soft);
+  /* background: var(--soft); */
   color: var(--sub);
-  font-size: 0.6rem;
+  font-size: 0.65rem;
   font-weight: 700;
 }
 .status-pill.running,
 .status-pill.queued {
-  background: var(--brandsoft);
+  /* background: var(--brandsoft); */
   color: var(--brand2);
 }
 .status-pill.completed {
-  background: oklch(94% 0.06 150);
+  /* background: oklch(94% 0.06 150); */
   color: var(--good);
 }
 .status-pill.failed,
 .status-pill.cancelled {
-  background: oklch(96% 0.03 28);
+  /* background: oklch(96% 0.03 28); */
   color: var(--bad);
 }
 
 /* ---- Reports table (full-width, labelled columns) ---- */
 .reports-table {
   width: 100%;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  overflow: hidden;
-  background: var(--paper);
+  background: var(--bg);
 }
 .reports-head,
 .reports-row {
@@ -1566,28 +1559,25 @@ footer.public-footer {
   grid-template-columns: minmax(240px, 2fr) 0.9fr 1fr 0.8fr 120px;
   gap: 16px;
   align-items: center;
-  padding: 0 18px;
+  padding: 0 4px;
 }
 .reports-head {
   min-height: 42px;
-  background: var(--soft);
-  border-bottom: 1px solid var(--line);
-  font-size: 0.6rem;
+  border-bottom: 1px solid var(--ink);
+  font-size: 0.65rem;
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--sub);
 }
 .reports-row {
   min-height: 68px;
   border-bottom: 1px solid var(--line);
   font-size: 0.72rem;
-}
-.reports-row:last-child {
-  border-bottom: 0;
+  cursor: pointer;
 }
 .reports-row:hover {
-  background: var(--soft);
+  background: var(--paper);
 }
 .rep-target {
   display: grid;
@@ -1609,48 +1599,41 @@ footer.public-footer {
 }
 .sev-tag {
   padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 0.58rem;
+  /* border-radius: 999px; */
+  font-size: 0.63rem;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 .sev-tag.critical {
-  background: var(--sev-critical-bg);
+  /* background: var(--sev-critical-bg); */
   color: var(--sev-critical);
 }
 .sev-tag.high {
-  background: var(--sev-high-bg);
+  /* background: var(--sev-high-bg); */
   color: var(--sev-high);
 }
 .sev-tag.medium {
-  background: var(--sev-medium-bg);
+  /* background: var(--sev-medium-bg); */
   color: var(--sev-medium);
 }
 .sev-tag.low {
-  background: var(--sev-low-bg);
+  /* background: var(--sev-low-bg); */
   color: var(--sev-low);
 }
 .sev-tag.info {
-  background: var(--sev-info-bg);
+  /* background: var(--sev-info-bg); */
   color: var(--sev-info);
 }
 .reports-row .rowactions {
   gap: 6px;
-}
-.reports-row .rowactions .btn {
-  height: 33px;
-  padding: 0 10px;
-  font-size: 0.68rem;
+  justify-content: flex-start;
 }
 
 /* ---- Active scans table ---- */
 .scans-table {
   width: 100%;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  overflow: hidden;
-  background: var(--paper);
+  background: var(--bg);
 }
 .scans-head,
 .scans-row {
@@ -1658,17 +1641,16 @@ footer.public-footer {
   grid-template-columns: minmax(240px, 2fr) 120px 100px 1fr 60px;
   gap: 16px;
   align-items: center;
-  padding: 0 18px;
+  padding: 0 4px;
 }
 .scans-head {
   min-height: 42px;
-  background: var(--soft);
-  border-bottom: 1px solid var(--line);
-  font-size: 0.6rem;
+  border-bottom: 1px solid var(--ink);
+  font-size: 0.65rem;
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--sub);
 }
 .scans-row {
   min-height: 64px;
@@ -1676,11 +1658,8 @@ footer.public-footer {
   font-size: 0.72rem;
   cursor: pointer;
 }
-.scans-row:last-child {
-  border-bottom: 0;
-}
 .scans-row:hover {
-  background: var(--soft);
+  background: var(--paper);
 }
 
 /* ---- Team table ---- */
@@ -1703,7 +1682,7 @@ footer.public-footer {
   min-height: 42px;
   background: var(--soft);
   border-bottom: 1px solid var(--line);
-  font-size: 0.6rem;
+  font-size: 0.65rem;
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1826,7 +1805,7 @@ footer.public-footer {
   font-size: 1.1rem;
 }
 .severity span {
-  font-size: 0.62rem;
+  font-size: 0.66rem;
   color: var(--muted);
 }
 
@@ -1864,12 +1843,60 @@ footer.public-footer {
   background: var(--soft);
 }
 .kv-cell span {
-  font-size: 0.6rem;
+  font-size: 0.65rem;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 .kv-cell b {
+  font-size: 0.78rem;
+}
+
+/* Two-column layout that fits the coverage and evidence tables side by side. */
+.metric-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 26px;
+  align-items: start;
+  margin-top: 20px;
+}
+.metric-cols .metric-table {
+  margin-top: 0;
+}
+
+/* Borderless label/value table — same visual language as the reports and
+   active-scans tables: a bold header rule over thin horizontal row rules. */
+.metric-table {
+  width: 100%;
+  margin-top: 20px;
+  background: var(--bg);
+}
+.metric-head,
+.metric-row {
+  display: grid;
+  grid-template-columns: minmax(200px, 2fr) 1fr;
+  gap: 16px;
+  align-items: center;
+  padding: 0 4px;
+}
+.metric-head {
+  min-height: 42px;
+  border-bottom: 1px solid var(--ink);
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sub);
+}
+.metric-row {
+  min-height: 44px;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.72rem;
+}
+.metric-row span {
+  color: var(--sub);
+}
+.metric-row b {
   font-size: 0.78rem;
 }
 .tech-list {
@@ -1922,7 +1949,7 @@ footer.public-footer {
 }
 .finding-head {
   display: grid;
-  grid-template-columns: 12px minmax(0, 1fr) auto auto 40px 20px;
+  grid-template-columns: 12px minmax(0, 1fr) auto auto auto 40px 20px;
   gap: 12px;
   align-items: center;
   width: 100%;
@@ -1988,8 +2015,39 @@ footer.public-footer {
 .finding-block {
   margin-top: 14px;
 }
+
+/* AI verdict badge on a finding row. The slot is always rendered (empty when
+   the model returned no verdict) so the header grid stays aligned. */
+.verdict-tag {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.63rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+.verdict-tag.verdict-confirmed {
+  background: var(--sev-high-bg);
+  color: var(--sev-high);
+}
+.verdict-tag.verdict-uncertain {
+  background: var(--sev-medium-bg);
+  color: var(--sev-medium);
+}
+.verdict-tag.verdict-fp {
+  background: var(--soft);
+  color: var(--muted);
+}
+/* Findings the model flagged as likely false positives read as de-emphasised
+   without being hidden — the user can still expand and review them. */
+.finding.dimmed {
+  opacity: 0.62;
+}
+.finding.dimmed.open {
+  opacity: 1;
+}
 .finding-block h4 {
-  font-size: 0.62rem;
+  font-size: 0.66rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--muted);
@@ -2135,7 +2193,7 @@ footer.public-footer {
     flex-direction: column;
     gap: 8px;
   }
-  .workspace-shell {
+  .app-shell {
     grid-template-columns: 1fr;
   }
   .side {
@@ -2172,6 +2230,10 @@ footer.public-footer {
   .head {
     align-items: start;
     flex-direction: column;
+  }
+  .metric-cols {
+    grid-template-columns: 1fr;
+    gap: 20px;
   }
   .summary {
     grid-template-columns: 1fr 1fr;
@@ -2256,7 +2318,7 @@ footer.public-footer {
     color: var(--muted);
     display: grid;
     justify-items: center;
-    font-size: 0.54rem;
+    font-size: 0.65rem;
     text-decoration: none;
     padding: 6px 0;
   }

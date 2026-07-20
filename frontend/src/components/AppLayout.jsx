@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Outlet, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { Menu, Plus } from "lucide-react";
-import Sidebar, { workspaceName } from "./Sidebar.jsx";
+import Sidebar, { displayName } from "./Sidebar.jsx";
 import { MOBILE_NAV, ROUTE_NAMES } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
 
@@ -27,7 +27,7 @@ function AppLayout() {
   }, [location.pathname]);
 
   return (
-    <div className='workspace-shell'>
+    <div className='app-shell'>
       <Sidebar open={menuOpen} onClose={() => setMenuOpen(false)} />
       {menuOpen && (
         <button
@@ -49,7 +49,7 @@ function AppLayout() {
             >
               <Menu className='ico' />
             </button>
-            {workspaceName(user)} / <b>{crumbFor(location.pathname)}</b>
+            {displayName(user)} / <b>{crumbFor(location.pathname)}</b>
           </div>
           <div className='app-actions'>
             {!onScanPage && (

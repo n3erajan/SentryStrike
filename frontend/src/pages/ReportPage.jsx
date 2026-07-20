@@ -62,12 +62,43 @@ function titleCase(value) {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : "—";
 }
 
+// The AI verdict (confirmed | uncertain | likely_false_positive) is the model's
+// calibrated judgement, reconciled against evidence grade so weak proof can't be
+// over-confirmed. Map it to a label + color class for the finding badge.
+const VERDICT_META = {
+  confirmed: { label: "AI: Confirmed", cls: "verdict-confirmed" },
+  uncertain: { label: "AI: Uncertain", cls: "verdict-uncertain" },
+  likely_false_positive: {
+    label: "AI: Likely false positive",
+    cls: "verdict-fp",
+  },
+};
+
 function hostnameOf(url) {
   try {
     return new URL(url).hostname;
   } catch {
     return url || "Report";
   }
+}
+
+// A borderless label/value table (same visual language as the reports and
+// active-scans tables): a bold header rule with thin horizontal row rules.
+function MetricTable({ title, rows }) {
+  return (
+    <div className='metric-table'>
+      <div className='metric-head'>
+        <span>{title}</span>
+        <span></span>
+      </div>
+      {rows.map(([label, value]) => (
+        <div key={label} className='metric-row'>
+          <span>{label}</span>
+          <b>{value}</b>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // A single finding row that expands to reveal the full backend detail:
@@ -83,9 +114,18 @@ function Finding({ v }) {
     loc.parameters && loc.parameters.length
       ? loc.parameters.join(", ")
       : loc.parameter || "";
+  const verdict = VERDICT_META[sevKey(ai.verdict)];
+  const fpPercent =
+    typeof ai.false_positive_probability === "number"
+      ? Math.round(ai.false_positive_probability * 100)
+      : null;
+  const isLikelyFp =
+    sevKey(ai.verdict) === "likely_false_positive" || v.is_false_positive;
 
   return (
-    <article className={`finding${open ? " open" : ""}`}>
+    <article
+      className={`finding${open ? " open" : ""}${isLikelyFp ? " dimmed" : ""}`}
+    >
       <button
         type='button'
         className='finding-head'
@@ -97,6 +137,11 @@ function Finding({ v }) {
           <div className='rowtitle'>{titleCase(v.vuln_type)}</div>
           <div className='small mono'>{url}</div>
         </div>
+        {verdict ? (
+          <span className={`verdict-tag ${verdict.cls}`}>{verdict.label}</span>
+        ) : (
+          <span />
+        )}
         <span className='finding-cat small'>{v.category}</span>
         <span className={`sev-tag ${severityClass(v.severity)}`}>
           {SEVERITY_META[sevKey(v.severity)]?.label || v.severity}
@@ -141,12 +186,37 @@ function Finding({ v }) {
                 <b>{ai.exploitability}</b>
               </div>
             )}
+            {ai.evidence_grade && (
+              <div className='kv-cell'>
+                <span>Evidence grade</span>
+                <b>{titleCase(ai.evidence_grade)}</b>
+              </div>
+            )}
+            {fpPercent !== null && (
+              <div className='kv-cell'>
+                <span>False-positive likelihood</span>
+                <b>{fpPercent}%</b>
+              </div>
+            )}
+            {ai.ai_analysis_status && ai.ai_analysis_status !== "success" && (
+              <div className='kv-cell'>
+                <span>AI analysis</span>
+                <b>{titleCase(ai.ai_analysis_status)}</b>
+              </div>
+            )}
           </div>
 
           {v.cvss_vector && (
             <p className='small mono' style={{ marginTop: 12 }}>
               {v.cvss_vector}
             </p>
+          )}
+
+          {ai.description && (
+            <div className='finding-block'>
+              <h4>What this is</h4>
+              <p>{ai.description}</p>
+            </div>
           )}
 
           {ev.payload && (
@@ -178,6 +248,24 @@ function Finding({ v }) {
             <div className='finding-block'>
               <h4>Remediation</h4>
               <p>{ai.remediation}</p>
+            </div>
+          )}
+          {ai.exploitability_reasoning && (
+            <div className='finding-block'>
+              <h4>Exploitability reasoning</h4>
+              <p>{ai.exploitability_reasoning}</p>
+            </div>
+          )}
+          {ai.evidence_grade_reason && (
+            <div className='finding-block'>
+              <h4>Evidence grade reasoning</h4>
+              <p>{ai.evidence_grade_reason}</p>
+            </div>
+          )}
+          {ai.false_positive_reasoning && (
+            <div className='finding-block'>
+              <h4>False-positive assessment</h4>
+              <p>{ai.false_positive_reasoning}</p>
             </div>
           )}
         </div>
@@ -275,6 +363,9 @@ function ReportPage() {
   const score = Math.round(report.risk_score || 0);
   const targetUrl = report.target_url || target || "";
   const targetHost = hostnameOf(targetUrl);
+  // Prefer the crawled site's <title> when the scanner captured one; fall back
+  // to the URL hostname otherwise.
+  const siteTitle = (report.site_title || "").trim() || targetHost;
   const scanTime =
     report.started_at || report.completed_at || report.generated_at;
   const tech = report.technology_stack || [];
@@ -283,6 +374,7 @@ function ReportPage() {
   const evidence = report.evidence_strength_breakdown || {};
   const chains = report.attack_chains || [];
   const limitations = report.scanner_limitations || [];
+  const authorization = report.authorization || {};
   const coverage =
     report.coverage_summary?.overall_coverage_pct ??
     report.report_metadata?.coverage_percent;
@@ -297,7 +389,7 @@ function ReportPage() {
       </button>
       <div className='head'>
         <div>
-          <h2>{targetHost}</h2>
+          <h2>{siteTitle}</h2>
           <p className='mono' style={{ wordBreak: "break-all" }}>
             {targetUrl}
           </p>
@@ -350,6 +442,22 @@ function ReportPage() {
               <b>{titleCase(authCov.state)}</b>
             </div>
           )}
+          <div className='kv'>
+            <span>Authorization</span>
+            <b>{authorization.confirmed ? "Confirmed" : "Not confirmed"}</b>
+          </div>
+          {authorization.confirmed_at && (
+            <div className='kv'>
+              <span>Confirmed at</span>
+              <b>{formatDateTime(authorization.confirmed_at)}</b>
+            </div>
+          )}
+          {authorization.text && (
+            <div className='kv'>
+              <span>Reference</span>
+              <b style={{ wordBreak: "break-word" }}>{authorization.text}</b>
+            </div>
+          )}
         </aside>
         <div className='reportbody'>
           <h2>
@@ -384,79 +492,41 @@ function ReportPage() {
         </div>
       </div>
 
-      <div className='panel'>
-        <div className='panel-h'>Scan coverage</div>
-        <div className='panel-b'>
-          <div className='kv-grid'>
-            <div className='kv-cell'>
-              <span>Crawl scope</span>
-              <b>{crawlLabel(report.crawl_mode)}</b>
-            </div>
-            <div className='kv-cell'>
-              <span>URLs crawled</span>
-              <b>{stats.total_urls_crawled ?? "—"}</b>
-            </div>
-            <div className='kv-cell'>
-              <span>Auth state</span>
-              <b>{titleCase(authCov.state) || "Unauthenticated"}</b>
-            </div>
-            <div className='kv-cell'>
-              <span>Authed URLs</span>
-              <b>{authCov.authenticated_url_count ?? 0}</b>
-            </div>
-            <div className='kv-cell'>
-              <span>Protected targets verified</span>
-              <b>{authCov.protected_targets_verified ?? 0}</b>
-            </div>
-            <div className='kv-cell'>
-              <span>SPA detected</span>
-              <b>{spaCov.spa_detected ? "Yes" : "No"}</b>
-            </div>
-            <div className='kv-cell'>
-              <span>API endpoints found</span>
-              <b>{spaCov.api_endpoints_extracted ?? 0}</b>
-            </div>
-            <div className='kv-cell'>
-              <span>Routes extracted</span>
-              <b>{spaCov.routes_extracted ?? 0}</b>
-            </div>
-          </div>
-        </div>
-      </div>
+      <div className='metric-cols'>
+        <MetricTable
+          title='Scan coverage'
+          rows={[
+            ["Crawl scope", crawlLabel(report.crawl_mode)],
+            ["URLs crawled", stats.total_urls_crawled ?? "—"],
+            ["Auth state", titleCase(authCov.state) || "Unauthenticated"],
+            ["Authed URLs", authCov.authenticated_url_count ?? 0],
+            [
+              "Protected targets verified",
+              authCov.protected_targets_verified ?? 0,
+            ],
+            ["SPA detected", spaCov.spa_detected ? "Yes" : "No"],
+            ["API endpoints found", spaCov.api_endpoints_extracted ?? 0],
+            ["Routes extracted", spaCov.routes_extracted ?? 0],
+          ]}
+        />
 
-      {(evidence.confirmed_exploit ||
-        evidence.confirmed_observation ||
-        evidence.probable ||
-        evidence.possible ||
-        evidence.informational) > 0 && (
-        <div className='panel'>
-          <div className='panel-h'>Evidence strength</div>
-          <div className='panel-b'>
-            <div className='kv-grid'>
-              <div className='kv-cell'>
-                <span>Confirmed exploit</span>
-                <b>{evidence.confirmed_exploit ?? 0}</b>
-              </div>
-              <div className='kv-cell'>
-                <span>Confirmed observation</span>
-                <b>{evidence.confirmed_observation ?? 0}</b>
-              </div>
-              <div className='kv-cell'>
-                <span>Probable</span>
-                <b>{evidence.probable ?? 0}</b>
-              </div>
-              <div className='kv-cell'>
-                <span>Possible</span>
-                <b>{evidence.possible ?? 0}</b>
-              </div>
-              <div className='kv-cell'>
-                <span>Informational</span>
-                <b>{evidence.informational ?? 0}</b>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+        {(evidence.confirmed_exploit ||
+          evidence.confirmed_observation ||
+          evidence.probable ||
+          evidence.possible ||
+          evidence.informational) > 0 && (
+          <MetricTable
+            title='Evidence strength'
+            rows={[
+              ["Confirmed exploit", evidence.confirmed_exploit ?? 0],
+              ["Confirmed observation", evidence.confirmed_observation ?? 0],
+              ["Probable", evidence.probable ?? 0],
+              ["Possible", evidence.possible ?? 0],
+              ["Informational", evidence.informational ?? 0],
+            ]}
+          />
+        )}
+      </div>
 
       {tech.length > 0 && (
         <div className='panel'>

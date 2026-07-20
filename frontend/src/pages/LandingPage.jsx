@@ -13,7 +13,7 @@ const WORKFLOW = [
   {
     id: "provide",
     title: "Provide the application",
-    desc: "Add URL, environment, authorization, and optional test users.",
+    desc: "Add URL, confirm authorization, set crawl scope, and optional test users.",
   },
   {
     id: "scan",
@@ -33,14 +33,26 @@ const OWASP = {
     label: "A01 · BROKEN ACCESS CONTROL",
     title: "Test what each identity can reach.",
     p: "Compare unauthenticated, normal-user, secondary-user, and administrator access to verify horizontal and vertical authorization failures.",
-    chips: ["IDOR / BOLA", "Privilege escalation", "Cross-tenant access"],
+    chips: [
+      "IDOR / BOLA",
+      "Privilege escalation",
+      "Cross-tenant access",
+      "SSRF / CSRF",
+    ],
   },
   a02: {
     nav: "A02 Misconfiguration",
     label: "A02 · SECURITY MISCONFIGURATION",
     title: "Find dangerous defaults and exposed surfaces.",
-    p: "Inspect headers, sensitive paths, directory listings, backup files, and exception pages.",
+    p: "Inspect headers, sensitive paths, directory listings, and backup files.",
     chips: ["Security headers", "Sensitive paths", "Error disclosure"],
+  },
+  a03: {
+    nav: " A03 Supply Chain",
+    label: "A03 · SOFTWARE SUPPLY CHAIN FAILURES",
+    title: "Identify vulnerable dependencies.",
+    p: "Cross-reference detected components and versions against known CVEs via NVD.",
+    chips: ["Dependency CVEs", "Version exposure"],
   },
   a04: {
     nav: "A04 Cryptographic",
@@ -53,15 +65,22 @@ const OWASP = {
     nav: "A05 Injection",
     label: "A05 · INJECTION",
     title: "Verify input-driven execution.",
-    p: "Test SQL injection, XSS, command injection, file inclusion, upload, and SSRF.",
-    chips: ["SQLi", "XSS", "Command injection", "SSRF"],
+    p: "Test SQL/NoSQL injection, XSS, command injection, file inclusion, and upload.",
+    chips: ["SQLi / NoSQLi", "XSS", "Command injection", "SSRF"],
   },
   a07: {
     nav: "A07 Authentication",
     label: "A07 · AUTHENTICATION FAILURES",
     title: "Test sessions and login boundaries.",
     p: "Evaluate authentication workflows, sessions, CSRF protection, and role boundaries.",
-    chips: ["Session validation", "CSRF", "Auth bypass"],
+    chips: ["Session validation", "Auth bypass", "JWT validation"],
+  },
+  a10: {
+    nav: "A10 Exceptional Conditions",
+    label: "A10 · MISHANDLING OF EXCEPTIONAL CONDITIONS",
+    title: "Inspect error handling and failures.",
+    p: "Surface stack traces, verbose errors, and debug pages that leak internals.",
+    chips: ["Stack traces", "Error disclosure", "Debug pages"],
   },
 };
 
@@ -74,7 +93,6 @@ const ROLES = {
       "Security score and release recommendation",
       "Plain-language impact",
       "Prioritized action plan",
-      "Historical comparison",
     ],
   },
   developer: {
@@ -91,7 +109,7 @@ const ROLES = {
   security: {
     nav: "Security team",
     title: "Judge coverage, not just findings.",
-    desc: "Review authentication context, evidence strength, detector metrics, attack chains, and limitations.",
+    desc: "Review authentication context, evidence strength, coverage quality, attack chains, and limitations.",
     items: [
       "SPA and API coverage",
       "Authenticated target verification",
@@ -112,7 +130,7 @@ const FAQS = [
   ],
   [
     "Can teams compare past reports?",
-    "Yes. Each application keeps assessment history so teams can compare scores, resolved findings, new findings, and coverage changes.",
+    "Every completed assessment is saved and listed under Reports, and each application shows its latest security score. Side-by-side comparison of past reports is on the roadmap.",
   ],
 ];
 
@@ -178,7 +196,7 @@ function ScanPreview() {
         </div>
         <div className='target'>
           <input
-            defaultValue='https://staging.acme.io'
+            defaultValue='https://example.com'
             aria-label='Preview target'
           />
           <button onClick={start} aria-label='Start preview scan'>
@@ -241,13 +259,13 @@ function WorkflowVisual({ id }) {
             <div className='field'>
               <label>Application URL</label>
               <div className='control'>
-                <input defaultValue='https://staging.acme.io' readOnly />
+                <input defaultValue='https://example.com' readOnly />
               </div>
             </div>
             <div className='field'>
-              <label>Standard</label>
+              <label>Crawl Scope</label>
               <div className='control'>
-                <input defaultValue='OWASP Top 10 2025' readOnly />
+                <input defaultValue='Full Site' readOnly />
               </div>
             </div>
             <Link
@@ -376,19 +394,21 @@ HTTP 200 OK
             <span>Dynamic partial</span>
           </div>
           <div className='coverage'>
-            <div className='coverage-row'>
-              <span>Access control</span>
-              <div className='mini'>
-                <span style={{ width: "91%" }} />
-              </div>
-              <b>91%</b>
+            <div className='coverage-stat'>
+              <span>Authenticated targets verified</span>
+              <b className='mono'>12</b>
             </div>
-            <div className='coverage-row'>
-              <span>XSS</span>
-              <div className='mini'>
-                <span style={{ width: "84%" }} />
-              </div>
-              <b>84%</b>
+            <div className='coverage-stat'>
+              <span>API endpoints extracted</span>
+              <b className='mono'>37</b>
+            </div>
+            <div className='coverage-stat'>
+              <span>Confirmed evidence</span>
+              <b className='mono'>9</b>
+            </div>
+            <div className='coverage-stat'>
+              <span>SPA detected</span>
+              <b className='mono'>Yes</b>
             </div>
           </div>
         </div>
@@ -633,7 +653,7 @@ function LandingPage() {
             <p>Get an OWASP Top 10 2025 VAPT report your whole team can use.</p>
           </div>
           <Link className='btn' to='/register'>
-            Create workspace
+            Create account
           </Link>
         </section>
       </main>

@@ -5,7 +5,7 @@ function AuthBrand({ mode = "login" }) {
     : "Security progress your team can see.";
   const sub = register
     ? "Run verified assessments and give each stakeholder the detail they need."
-    : "Keep every application, assessment, report, and retest in one workspace.";
+    : "Keep every application, assessment, report, and retest in one place.";
   const proof = register
     ? [
         ["Standard", "OWASP Top 10 2025"],

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowUpRight, Download, FileBarChart, Search } from "lucide-react";
+import { Download, FileBarChart, Search } from "lucide-react";
 import { listScans } from "../services/scan.js";
 import { downloadReportPdf } from "../services/reports.js";
 import { saveBlob } from "../utils/helpers.js";
@@ -141,7 +141,13 @@ function ReportsPage() {
             <span>Report</span>
           </div>
           {rows.map((r) => (
-            <article key={r.id} className='reports-row'>
+            <article
+              key={r.id}
+              className='reports-row'
+              onClick={() =>
+                navigate(`/report/${r.id}`, { state: { target: r.target } })
+              }
+            >
               <div className='rep-target'>
                 <div className='rowtitle'>{r.host}</div>
                 <div className='small mono'>{r.target}</div>
@@ -159,19 +165,13 @@ function ReportsPage() {
                 <button
                   type='button'
                   aria-label='Download PDF'
-                  onClick={() => handleDownload(r.id)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleDownload(r.id);
+                  }}
                   disabled={busy === r.id}
                 >
                   <Download className='ico' />
-                </button>
-                <button
-                  type='button'
-                  className='btn'
-                  onClick={() =>
-                    navigate(`/report/${r.id}`, { state: { target: r.target } })
-                  }
-                >
-                  <ArrowUpRight className='ico' />
                 </button>
               </span>
             </article>

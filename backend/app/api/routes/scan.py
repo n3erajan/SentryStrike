@@ -92,9 +92,8 @@ async def create_scan(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    """Submit a new scan target and enqueue the job for processing.
-
-    Credentials are serialized into the Redis job as plaintext and removed
+    """Submit a new scan target and enqueue the job for processing."""
+    #Credentials are serialized into the Redis job as plaintext and removed
     # atomically when a worker claims the job. MongoDB persists only role names.
     auth_accounts = _auth_accounts_from_payload(payload.credentials)
     scan = await repo.create(

@@ -4,18 +4,6 @@ import { NAV_ITEMS } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import { useActiveScans } from "../hooks/useActiveScans.js";
 
-function workspaceName(user) {
-  if (!user) return "Workspace";
-  if (user.company) return user.company;
-  const email = user.email || "";
-  const domain = email.split("@")[1];
-  if (!domain) return "Workspace";
-  const base = domain.split(".")[0];
-  return base
-    ? `${base.charAt(0).toUpperCase()}${base.slice(1)} Workspace`
-    : "Workspace";
-}
-
 function displayName(user) {
   if (!user) return "Signed in";
   if (user.fullName) return user.fullName;
@@ -55,11 +43,7 @@ function Sidebar({ open = false, onClose }) {
           <X className='ico' />
         </button>
       </div>
-      {/* <div className='workspace-name'>
-        <b>{workspaceName(user)}</b>
-        <small>Business plan</small>
-      </div> */}
-      <nav className='app-nav' aria-label='Workspace'>
+      <nav className='app-nav' aria-label='Primary'>
         {NAV_ITEMS.map(({ to, label, Icon, badge, end }) => (
           <NavLink
             key={to}
@@ -99,4 +83,4 @@ function Sidebar({ open = false, onClose }) {
 }
 
 export default Sidebar;
-export { workspaceName, displayName };
+export { displayName };

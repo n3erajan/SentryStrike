@@ -101,7 +101,7 @@ function HomePage() {
         </div>
         <div className='stat'>
           <strong>{loading ? "—" : postureLetter(completed)}</strong>
-          <span>Workspace posture</span>
+          <span>Security posture</span>
         </div>
       </div>
 

@@ -27,10 +27,6 @@ function ActiveScansPage() {
       <div className='head'>
         <div>
           <h1>Active scans</h1>
-          <p>
-            Queued and running assessments remain visible here while scanner
-            workers process them.
-          </p>
         </div>
         {Number.isInteger(workerCount) && (
           <span className={workerCount === 0 ? "high" : "low"}>

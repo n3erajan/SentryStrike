@@ -18,7 +18,7 @@ function SettingsPage() {
     <div className='view'>
       <div className='head'>
         <div>
-          <h1>Workspace settings</h1>
+          <h1>Settings</h1>
           <p>Company profile, defaults, billing, and retention.</p>
         </div>
         <button className='btn primary' onClick={handleSave}>
