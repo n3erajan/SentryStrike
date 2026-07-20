@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { ShieldCheck, CheckCircle2, Loader2, Eye, EyeOff } from "lucide-react";
+import { CheckCircle2, Loader2, Eye, EyeOff } from "lucide-react";
 import { useAuth } from "../context/AuthContext.jsx";
 import AuthBrand from "../components/AuthBrand.jsx";
 
@@ -81,9 +81,7 @@ function RegisterPage() {
     <div className='auth-shell'>
       <div className='auth-left'>
         <Link to='/' className='brand'>
-          <span className='mark'>
-            <ShieldCheck className='ico' />
-          </span>
+          <img src='/shield.png' alt='' className='mark-img' />
           SentryStrike
         </Link>
         <div className='auth-box'>

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
-  ShieldCheck,
   BadgeCheck,
   ArrowUpRight,
   LockKeyhole,
@@ -436,9 +435,7 @@ function LandingPage() {
     <div className='landing'>
       <nav className='public-nav'>
         <div className='brand'>
-          <span className='mark'>
-            <ShieldCheck className='ico' />
-          </span>
+          <img src='/shield.png' className='mark-img' alt='' />
           SentryStrike
         </div>
         <div className='navlinks'>

@@ -1,5 +1,5 @@
 import { NavLink, useNavigate } from "react-router-dom";
-import { ShieldCheck, X } from "lucide-react";
+import { X, LogOut } from "lucide-react";
 import { NAV_ITEMS } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import { useActiveScans } from "../hooks/useActiveScans.js";
@@ -43,9 +43,7 @@ function Sidebar({ open = false, onClose }) {
     <aside className={`side${open ? " open" : ""}`}>
       <div className='side-top'>
         <NavLink to='/home' className='brand' onClick={onClose}>
-          <span className='mark'>
-            <ShieldCheck className='ico' />
-          </span>
+          <img src='/shield.png' className='mark-img' alt='' />
           SentryStrike
         </NavLink>
         <button
@@ -57,10 +55,10 @@ function Sidebar({ open = false, onClose }) {
           <X className='ico' />
         </button>
       </div>
-      <div className='workspace-name'>
+      {/* <div className='workspace-name'>
         <b>{workspaceName(user)}</b>
         <small>Business plan</small>
-      </div>
+      </div> */}
       <nav className='app-nav' aria-label='Workspace'>
         {NAV_ITEMS.map(({ to, label, Icon, badge, end }) => (
           <NavLink
@@ -79,13 +77,20 @@ function Sidebar({ open = false, onClose }) {
         ))}
       </nav>
       <div className='sidefoot'>
+        <span>User</span>
         <b title={user?.email}>{displayName(user)}</b>
-        <span>Workspace owner</span>
+
         <button
           className='text-btn'
           onClick={handleLogout}
-          style={{ marginTop: 8 }}
+          style={{
+            marginTop: 8,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+          }}
         >
+          <LogOut className='ico' />
           Sign out
         </button>
       </div>

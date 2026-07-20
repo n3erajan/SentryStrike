@@ -170,7 +170,8 @@ function ScanPage() {
     canStart,
     startScan,
   } = useScanForm();
-  const scanMode = config.scan_mode || "";
+  // Backend default is "verified"; reflect that as pre-selected in the UI.
+  const scanMode = config.scan_mode || "verified";
   const primary = credentials.main || {};
 
   async function handleStart() {

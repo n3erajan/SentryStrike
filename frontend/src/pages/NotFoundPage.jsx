@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { ShieldCheck, ArrowLeft } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 
 function NotFoundPage() {
   return (
@@ -15,9 +15,7 @@ function NotFoundPage() {
       }}
     >
       <div className='card' style={{ maxWidth: 520 }}>
-        <span className='mark'>
-          <ShieldCheck className='ico' />
-        </span>
+        <img src='/shield.png' alt='SentryStrike' className='mark-img' />
         <span
           className='mono'
           style={{
