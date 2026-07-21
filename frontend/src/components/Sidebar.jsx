@@ -3,6 +3,7 @@ import { X, LogOut } from "lucide-react";
 import { NAV_ITEMS } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import { useActiveScans } from "../hooks/useActiveScans.js";
+import { useBackendHealth } from "../hooks/useBackendHealth.js";
 
 function displayName(user) {
   if (!user) return "Signed in";
@@ -21,6 +22,21 @@ function Sidebar({ open = false, onClose }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const { count } = useActiveScans();
+  const { health, loading: healthLoading, error: healthError } =
+    useBackendHealth();
+  const scannerCount = health?.active_scanners;
+  const scannerStatusKnown = Number.isInteger(scannerCount) && !healthError;
+  const scannersOnline = scannerStatusKnown && scannerCount > 0;
+
+  let scannerStatus = "Scanner status unavailable";
+  let scannerDetail = "Could not reach scanner health";
+  if (healthLoading) {
+    scannerStatus = "Checking scanner";
+    scannerDetail = "Reading active scanners";
+  } else if (scannerStatusKnown) {
+    scannerStatus = scannersOnline ? "Scanner online" : "Scanner offline";
+    scannerDetail = `${scannerCount} active ${scannerCount === 1 ? "scanner" : "scanners"}`;
+  }
 
   async function handleLogout() {
     await logout();
@@ -60,6 +76,19 @@ function Sidebar({ open = false, onClose }) {
           </NavLink>
         ))}
       </nav>
+      <div
+        className={`scanner-status${
+          healthLoading ? " checking" : scannersOnline ? " online" : " offline"
+        }`}
+        role='status'
+        aria-live='polite'
+      >
+        <span className='scanner-status-dot' aria-hidden='true' />
+        <span className='scanner-status-copy'>
+          <b>{scannerStatus}</b>
+          <small>{scannerDetail}</small>
+        </span>
+      </div>
       <div className='sidefoot'>
         <span>User</span>
         <b title={user?.email}>{displayName(user)}</b>

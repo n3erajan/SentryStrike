@@ -1,7 +1,7 @@
 // Scan service — wraps the backend `/scans/*` routes (mounted under /api/v1).
 //
 //   POST   /scans                 { target_url, crawl_mode,
-//                                   authorization_confirmed, authorization_text,
+//                                   authorization_confirmed,
 //                                   credentials? (main/second/admin accounts),
 //                                   config? (full ScanConfig overrides) }
 //                                 -> 202 { scan_id, status, progress, ... }
@@ -42,7 +42,6 @@ export function createScan({
   targetUrl,
   crawlMode,
   authorizationConfirmed,
-  authorizationText,
   credentials,
   config,
 }) {
@@ -52,7 +51,6 @@ export function createScan({
       target_url: targetUrl,
       crawl_mode: crawlMode,
       authorization_confirmed: authorizationConfirmed,
-      authorization_text: authorizationText ? authorizationText.trim() : null,
       credentials: buildCredentials(credentials),
       config: compact(config),
     },

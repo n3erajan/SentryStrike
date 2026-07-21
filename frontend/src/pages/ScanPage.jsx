@@ -25,8 +25,10 @@ function coerce(field, raw) {
 
 function ConfigField({ field, value, onChange, disabled }) {
   const id = `cfg-${field.key}`;
+  const descriptionId = `${id}-description`;
   const commonProps = {
     id,
+    "aria-describedby": descriptionId,
     value: value ?? "",
     onChange: (event) =>
       onChange(
@@ -70,6 +72,9 @@ function ConfigField({ field, value, onChange, disabled }) {
           />
         )}
       </div>
+      <p className='field-description' id={descriptionId}>
+        {field.description}
+      </p>
     </div>
   );
 }
@@ -97,17 +102,25 @@ function CredentialAccount({ role, account, onField, disabled }) {
       <div className='grid2'>
         {basic.map((f) => (
           <div key={f.key} className='field'>
-            <label>{f.label}</label>
+            <label htmlFor={`credential-${role.key}-${f.key}`}>{f.label}</label>
             <div className='control'>
               <input
+                id={`credential-${role.key}-${f.key}`}
                 type={f.type}
                 autoComplete='off'
                 maxLength={f.maxLength}
                 value={account[f.key] ?? ""}
                 onChange={(e) => onField(role.key, f.key, e.target.value)}
                 disabled={disabled}
+                aria-describedby={`credential-${role.key}-${f.key}-description`}
               />
             </div>
+            <p
+              className='field-description'
+              id={`credential-${role.key}-${f.key}-description`}
+            >
+              {f.description}
+            </p>
           </div>
         ))}
       </div>
@@ -125,9 +138,12 @@ function CredentialAccount({ role, account, onField, disabled }) {
         <div className='grid2'>
           {advanced.map((f) => (
             <div key={f.key} className='field'>
-              <label>{f.label}</label>
+              <label htmlFor={`credential-${role.key}-${f.key}`}>
+                {f.label}
+              </label>
               <div className='control'>
                 <input
+                  id={`credential-${role.key}-${f.key}`}
                   type='text'
                   autoComplete='off'
                   maxLength={f.maxLength}
@@ -135,8 +151,15 @@ function CredentialAccount({ role, account, onField, disabled }) {
                   value={account[f.key] ?? ""}
                   onChange={(e) => onField(role.key, f.key, e.target.value)}
                   disabled={disabled}
+                  aria-describedby={`credential-${role.key}-${f.key}-description`}
                 />
               </div>
+              <p
+                className='field-description'
+                id={`credential-${role.key}-${f.key}-description`}
+              >
+                {f.description}
+              </p>
             </div>
           ))}
         </div>
@@ -148,14 +171,13 @@ function CredentialAccount({ role, account, onField, disabled }) {
 function ScanPage() {
   const navigate = useNavigate();
   const toast = useToast();
+  const [usersOpen, setUsersOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const {
     url,
     setUrl,
     crawlMode,
     setCrawlMode,
-    authText,
-    setAuthText,
     consent,
     setConsent,
     touched,
@@ -216,6 +238,7 @@ function ScanPage() {
                     onChange={(e) => setUrl(e.target.value)}
                     onBlur={() => setTouched(true)}
                     disabled={submitting}
+                    aria-describedby='target-url-description'
                   />
                 </div>
                 {touched && url && !valid && (
@@ -223,6 +246,10 @@ function ScanPage() {
                     Enter a valid URL including http:// or https://
                   </span>
                 )}
+                <p className='field-description' id='target-url-description'>
+                  Enter the public or staging URL where the assessment should
+                  begin.
+                </p>
               </div>
             </div>
           </section>
@@ -274,33 +301,69 @@ function ScanPage() {
 
           <button
             type='button'
+            className={`advanced-toggle${usersOpen ? " open" : ""}`}
+            onClick={() => setUsersOpen((value) => !value)}
+            aria-expanded={usersOpen}
+            aria-controls='test-users-panel'
+          >
+            Test users
+            <span className='advanced-toggle-hint'>
+              Optional accounts for authenticated and access-control testing
+            </span>
+            <ChevronDown className='ico chev' />
+          </button>
+
+          {usersOpen && (
+            <div className='advanced-panel users-panel' id='test-users-panel'>
+              <p className='panel-intro'>
+                Add up to three dedicated test accounts to improve authenticated
+                coverage. Do not use personal or production credentials.
+              </p>
+              {CRED_ROLES.map((role) => (
+                <CredentialAccount
+                  key={role.key}
+                  role={role}
+                  account={credentials[role.key] || {}}
+                  onField={setCredentialField}
+                  disabled={submitting}
+                />
+              ))}
+
+              <label className='consent secondary-provisioning'>
+                <input
+                  type='checkbox'
+                  checked={Boolean(config.allow_secondary_provisioning)}
+                  onChange={(e) =>
+                    setConfigField(
+                      "allow_secondary_provisioning",
+                      e.target.checked ? true : "",
+                    )
+                  }
+                  disabled={submitting}
+                />
+                <span>
+                  Auto-provision a throwaway second identity for horizontal IDOR
+                  testing when none is supplied.
+                </span>
+              </label>
+            </div>
+          )}
+
+          <button
+            type='button'
             className={`advanced-toggle${advancedOpen ? " open" : ""}`}
             onClick={() => setAdvancedOpen((v) => !v)}
             aria-expanded={advancedOpen}
           >
             Advanced configuration
             <span className='advanced-toggle-hint'>
-              Scope reference, engine tuning, test users
+              Crawler, scanner, injection, and browser tuning
             </span>
             <ChevronDown className='ico chev' />
           </button>
 
           {advancedOpen && (
             <div className='advanced-panel'>
-              <h3>Scope reference</h3>
-              <div className='field'>
-                <label>Authorization reference</label>
-                <div className='control'>
-                  <input
-                    value={authText}
-                    onChange={(e) => setAuthText(e.target.value)}
-                    disabled={submitting}
-                    placeholder='SEC-241 / staging approval'
-                    maxLength={1000}
-                  />
-                </div>
-              </div>
-
               {CONFIG_GROUPS.map((group) => (
                 <div key={group.title}>
                   <h3>{group.title}</h3>
@@ -318,39 +381,6 @@ function ScanPage() {
                   </div>
                 </div>
               ))}
-
-              <h3>Test users</h3>
-              <p className='muted-text'>
-                Authenticated testing improves access-control coverage. Up to
-                three accounts.
-              </p>
-              {CRED_ROLES.map((role) => (
-                <CredentialAccount
-                  key={role.key}
-                  role={role}
-                  account={credentials[role.key] || {}}
-                  onField={setCredentialField}
-                  disabled={submitting}
-                />
-              ))}
-
-              <label className='consent' style={{ marginTop: 18 }}>
-                <input
-                  type='checkbox'
-                  checked={Boolean(config.allow_secondary_provisioning)}
-                  onChange={(e) =>
-                    setConfigField(
-                      "allow_secondary_provisioning",
-                      e.target.checked ? true : "",
-                    )
-                  }
-                  disabled={submitting}
-                />
-                <span>
-                  Auto-provision a throwaway second identity for horizontal IDOR
-                  testing when none is supplied.
-                </span>
-              </label>
             </div>
           )}
 

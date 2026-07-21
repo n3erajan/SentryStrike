@@ -676,6 +676,13 @@ textarea:focus-visible {
   color: var(--bad);
   font-size: 0.66rem;
 }
+.field-description {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.64rem;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
 .coverage {
   display: grid;
   gap: 12px;
@@ -1076,9 +1083,61 @@ footer.public-footer {
   text-align: center;
   line-height: 18px;
 }
-.sidefoot {
-  margin-top: auto;
+.scanner-status {
+  margin: auto 9px 0;
+  padding: 13px 0;
   border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+}
+.scanner-status-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 3px;
+  border-radius: 50%;
+  background: var(--bad);
+  box-shadow: 0 0 0 3px var(--sev-high-bg);
+}
+.scanner-status.online .scanner-status-dot {
+  background: var(--sev-low);
+  box-shadow: 0 0 0 3px var(--sev-low-bg);
+}
+.scanner-status.checking .scanner-status-dot {
+  background: var(--muted);
+  box-shadow: 0 0 0 3px var(--soft);
+  animation: scanner-pulse 1.4s var(--ease) infinite;
+}
+.scanner-status-copy {
+  min-width: 0;
+}
+.scanner-status-copy b,
+.scanner-status-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scanner-status-copy b {
+  color: var(--sub);
+  font-size: 0.7rem;
+  line-height: 1.1;
+}
+.scanner-status-copy small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.62rem;
+  font-variant-numeric: tabular-nums;
+}
+@keyframes scanner-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+.sidefoot {
+  margin-top: 0;
   padding: 12px 9px;
   font-size: 0.7rem;
 }
@@ -1272,6 +1331,15 @@ footer.public-footer {
   color: var(--muted);
   margin-bottom: 12px;
 }
+.advanced-panel p.field-description {
+  margin: 0;
+  font-size: 0.64rem;
+}
+.advanced-panel .panel-intro {
+  max-width: 62ch;
+  margin: 10px 0 2px;
+  line-height: 1.5;
+}
 .advanced-toggle-hint {
   color: var(--muted);
   font-weight: 500;
@@ -1385,6 +1453,12 @@ footer.public-footer {
 }
 .advanced-panel .grid2 {
   margin-top: 8px;
+}
+.users-panel {
+  padding-top: 1px;
+}
+.secondary-provisioning {
+  margin-top: 18px;
 }
 .mode-choice {
   display: grid;

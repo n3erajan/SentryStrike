@@ -87,6 +87,7 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_depth",
         label: "Crawl depth",
+        description: "Maximum number of link levels to follow from the target page.",
         type: "int",
         min: 1,
         max: 10,
@@ -95,6 +96,7 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_max_urls",
         label: "Max URLs",
+        description: "Stops discovery after this many unique URLs have been collected.",
         type: "int",
         min: 10,
         max: 5000,
@@ -103,6 +105,7 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_rate_limit_per_second",
         label: "Rate limit",
+        description: "Caps requests per second to reduce load on the target.",
         type: "float",
         min: 0.5,
         max: 100,
@@ -113,6 +116,7 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_browser_mode",
         label: "Browser mode",
+        description: "Controls when a real browser is used for JavaScript-rendered pages.",
         type: "select",
         options: [
           ["auto", "Auto (SPA only)"],
@@ -123,6 +127,7 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_browser_max_interactions",
         label: "Browser interactions",
+        description: "Maximum clicks and form interactions performed during discovery.",
         type: "int",
         min: 1,
         max: 200,
@@ -131,6 +136,7 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_browser_budget_seconds",
         label: "Browser budget",
+        description: "Maximum time reserved for browser-based crawling.",
         type: "float",
         min: 10,
         max: 3600,
@@ -146,6 +152,7 @@ const CONFIG_GROUPS = [
       {
         key: "scanner_concurrency",
         label: "Concurrency",
+        description: "Maximum number of security checks that can run at the same time.",
         type: "int",
         min: 1,
         max: 50,
@@ -154,6 +161,7 @@ const CONFIG_GROUPS = [
       {
         key: "request_timeout_seconds",
         label: "Request timeout",
+        description: "How long each request may wait before it is treated as timed out.",
         type: "float",
         min: 1,
         max: 120,
@@ -163,6 +171,7 @@ const CONFIG_GROUPS = [
       {
         key: "sensitive_paths_permutation_cap",
         label: "Sensitive-path cap",
+        description: "Limits generated path variations used to find exposed resources.",
         type: "int",
         min: 0,
         max: 2000,
@@ -177,6 +186,7 @@ const CONFIG_GROUPS = [
       {
         key: "blind_injection_timing_threshold",
         label: "Blind timing threshold",
+        description: "Minimum response-time confidence used for blind injection signals.",
         type: "float",
         min: 0.1,
         max: 1,
@@ -186,6 +196,7 @@ const CONFIG_GROUPS = [
       {
         key: "ssrf_inband_timing_delta_ms",
         label: "SSRF timing delta",
+        description: "Minimum delay used to identify possible in-band SSRF behavior.",
         type: "float",
         min: 100,
         max: 30000,
@@ -195,6 +206,7 @@ const CONFIG_GROUPS = [
       {
         key: "oast_callback_base_url",
         label: "OAST callback URL",
+        description: "Callback base URL used to verify out-of-band interactions.",
         type: "text",
         maxLength: 2048,
         placeholder: "https://oast.example/…",
@@ -202,6 +214,7 @@ const CONFIG_GROUPS = [
       {
         key: "oast_poll_url",
         label: "OAST poll URL",
+        description: "Endpoint polled for captured out-of-band interaction results.",
         type: "text",
         maxLength: 2048,
         placeholder: "https://oast.example/poll",
@@ -215,6 +228,7 @@ const CONFIG_GROUPS = [
       {
         key: "xss_browser_dom_max_jobs",
         label: "Max DOM jobs",
+        description: "Maximum browser jobs used to verify client-side XSS behavior.",
         type: "int",
         min: 0,
         max: 100,
@@ -223,6 +237,7 @@ const CONFIG_GROUPS = [
       {
         key: "xss_browser_dom_budget_seconds",
         label: "DOM sweep budget",
+        description: "Maximum time reserved for the browser-driven DOM XSS sweep.",
         type: "float",
         min: 0,
         max: 600,
@@ -252,11 +267,24 @@ const CRED_ROLES = [
 ];
 
 const CRED_FIELDS = [
-  { key: "username", label: "Username / email", type: "text", maxLength: 320 },
-  { key: "password", label: "Password", type: "password", maxLength: 512 },
+  {
+    key: "username",
+    label: "Username / email",
+    type: "text",
+    maxLength: 320,
+    description: "Account identifier used to sign in to the target application.",
+  },
+  {
+    key: "password",
+    label: "Password",
+    type: "password",
+    maxLength: 512,
+    description: "Password for this test account; leave blank for session-only access.",
+  },
   {
     key: "cookie",
     label: "Cookie",
+    description: "Existing session cookies to attach when a login flow is unavailable.",
     type: "text",
     maxLength: 8192,
     advanced: true,
@@ -265,6 +293,7 @@ const CRED_FIELDS = [
   {
     key: "header",
     label: "Header",
+    description: "Custom authentication header sent with requests for this account.",
     type: "text",
     maxLength: 8192,
     advanced: true,
@@ -273,6 +302,7 @@ const CRED_FIELDS = [
   {
     key: "login_url",
     label: "Login URL",
+    description: "Exact page where this account submits its sign-in details.",
     type: "text",
     maxLength: 2048,
     advanced: true,
@@ -280,6 +310,7 @@ const CRED_FIELDS = [
   {
     key: "success_url",
     label: "Success URL",
+    description: "URL expected after a successful sign-in.",
     type: "text",
     maxLength: 2048,
     advanced: true,
@@ -287,6 +318,7 @@ const CRED_FIELDS = [
   {
     key: "success_text",
     label: "Success text",
+    description: "Page text that confirms the account signed in successfully.",
     type: "text",
     maxLength: 256,
     advanced: true,
@@ -294,6 +326,7 @@ const CRED_FIELDS = [
   {
     key: "success_regex",
     label: "Success regex",
+    description: "Regular expression matched against a successful sign-in response.",
     type: "text",
     maxLength: 512,
     advanced: true,
@@ -301,6 +334,7 @@ const CRED_FIELDS = [
   {
     key: "failure_text",
     label: "Failure text",
+    description: "Page text that indicates the sign-in attempt failed.",
     type: "text",
     maxLength: 256,
     advanced: true,
@@ -308,6 +342,7 @@ const CRED_FIELDS = [
   {
     key: "failure_regex",
     label: "Failure regex",
+    description: "Regular expression matched against a failed sign-in response.",
     type: "text",
     maxLength: 512,
     advanced: true,
@@ -315,6 +350,7 @@ const CRED_FIELDS = [
   {
     key: "validation_url",
     label: "Validation URL",
+    description: "Authenticated page used to confirm the session remains valid.",
     type: "text",
     maxLength: 2048,
     advanced: true,

@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { listScans } from "../services/scan.js";
 import { useActiveScans } from "../hooks/useActiveScans.js";
-import { useBackendHealth } from "../hooks/useBackendHealth.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import { displayName } from "../components/Sidebar.jsx";
 
@@ -35,7 +34,6 @@ function hostnameOf(url) {
 function HomePage() {
   const { user } = useAuth();
   const { scans: active, count } = useActiveScans();
-  const { health } = useBackendHealth();
   const [scans, setScans] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -68,7 +66,6 @@ function HomePage() {
   );
   const latestCompleted = completed[0];
   const runningScan = active[0];
-  const workersOnline = (health?.active_scanners ?? 0) > 0;
 
   return (
     <div className='view'>
@@ -79,9 +76,6 @@ function HomePage() {
           </h1>
           <p>Security posture across your web applications.</p>
         </div>
-        <span className={workersOnline ? "low" : "high"}>
-          ● {workersOnline ? "Scanner available" : "Scanner offline"}
-        </span>
       </div>
 
       <div className='summary'>

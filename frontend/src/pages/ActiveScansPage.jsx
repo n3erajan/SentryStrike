@@ -1,7 +1,6 @@
 import { useNavigate } from "react-router-dom";
 import { ArrowUpRight, ShieldCheck } from "lucide-react";
 import { useActiveScans } from "../hooks/useActiveScans.js";
-import { useBackendHealth } from "../hooks/useBackendHealth.js";
 
 function formatRelative(iso) {
   if (!iso) return "-";
@@ -19,8 +18,6 @@ function formatRelative(iso) {
 function ActiveScansPage() {
   const navigate = useNavigate();
   const { scans, loading, error } = useActiveScans();
-  const { health } = useBackendHealth();
-  const workerCount = health?.active_scanners;
 
   return (
     <div className='view'>
@@ -28,14 +25,6 @@ function ActiveScansPage() {
         <div>
           <h1>Active scans</h1>
         </div>
-        {Number.isInteger(workerCount) && (
-          <span className={workerCount === 0 ? "high" : "low"}>
-            ●{" "}
-            {workerCount === 0
-              ? "No scanner workers online"
-              : `${workerCount} scanner ${workerCount === 1 ? "worker" : "workers"} online`}
-          </span>
-        )}
       </div>
 
       {loading && scans.length === 0 ? (

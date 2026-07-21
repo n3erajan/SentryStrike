@@ -11,7 +11,6 @@ function useScanForm() {
   // Inputs required by the backend CreateScanRequest.
   const [url, setUrl] = useState("");
   const [crawlMode, setCrawlMode] = useState("full"); // full | single
-  const [authText, setAuthText] = useState("");
   const [consent, setConsent] = useState(false);
   const [touched, setTouched] = useState(false);
 
@@ -67,7 +66,6 @@ function useScanForm() {
         targetUrl: url,
         crawlMode,
         authorizationConfirmed: consent,
-        authorizationText: authText,
         config,
         credentials,
       });
@@ -78,7 +76,7 @@ function useScanForm() {
     } finally {
       setSubmitting(false);
     }
-  }, [valid, consent, submitting, url, crawlMode, authText, config, credentials]);
+  }, [valid, consent, submitting, url, crawlMode, config, credentials]);
 
   return {
     // inputs
@@ -86,8 +84,6 @@ function useScanForm() {
     setUrl,
     crawlMode,
     setCrawlMode,
-    authText,
-    setAuthText,
     consent,
     setConsent,
     touched,
