@@ -183,8 +183,14 @@ class ReportMetadata(BaseModel):
 
 class Scan(Document):
     target_url: Indexed(str)
+    org_id: Indexed(str)
+    # Who submitted the scan.
     owner_user_id: Indexed(str) | None = None
     owner_email: str | None = None
+    # Who cancelled it, if anyone (may differ from the submitter — any non-viewer
+    # org member can cancel a scan).
+    cancelled_by_user_id: str | None = None
+    cancelled_by_email: str | None = None
     crawl_mode: CrawlMode = CrawlMode.full
     status: ScanStatus = ScanStatus.queued
     progress: int = Field(default=0, ge=0, le=100)
@@ -217,8 +223,10 @@ class Scan(Document):
         name = "scans"
         indexes = [
             "target_url",
+            "org_id",
             "owner_user_id",
             "status",
+            [("org_id", 1), ("created_at", -1)],
             [("owner_user_id", 1), ("created_at", -1)],
             [("created_at", -1)],
         ]
