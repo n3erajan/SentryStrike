@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.dependencies import get_current_user
-from app.api.routes import analysis, auth, health, oast, reports, scan
+from app.api.routes import analysis, auth, health, oast, reports, scan, workspace
 from app.config import get_settings
 from app.core.exceptions import AppError
 from shared.database.connection import close_db, init_db
@@ -55,6 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(scan.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(analysis.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(reports.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
+    app.include_router(workspace.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
 
     # OAST callback collaborator — unauthenticated by design (the tested target
     # is unauthenticated when its server-side fetch calls back). No /api/v1 prefix.

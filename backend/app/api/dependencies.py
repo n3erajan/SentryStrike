@@ -5,12 +5,16 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from app.config import get_settings
 from app.core.auth import AuthService, InvalidSessionError
 from app.core.invites import InviteService
+from shared.database.repositories.member_repository import MemberRepository
+from shared.database.repositories.organization_repository import OrganizationRepository
 from shared.database.repositories.scan_repository import ScanRepository
 from shared.models.user import User, UserRole
 
 # Module-level singletons wired once. FastAPI's Depends resolver calls the
 # factory functions below, which return these shared instances.
 scan_repository = ScanRepository()
+member_repository = MemberRepository()
+organization_repository = OrganizationRepository()
 auth_service = AuthService()
 invite_service = InviteService()
 
@@ -18,6 +22,16 @@ invite_service = InviteService()
 def get_scan_repository() -> ScanRepository:
     """FastAPI dependency: provide the shared ScanRepository singleton."""
     return scan_repository
+
+
+def get_member_repository() -> MemberRepository:
+    """FastAPI dependency: provide the shared MemberRepository singleton."""
+    return member_repository
+
+
+def get_organization_repository() -> OrganizationRepository:
+    """FastAPI dependency: provide the shared OrganizationRepository singleton."""
+    return organization_repository
 
 
 def get_auth_service() -> AuthService:
