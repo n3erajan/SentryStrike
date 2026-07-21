@@ -13,6 +13,8 @@ def _queue(client: AsyncMock) -> RedisScanQueue:
         queue_name="test:scans",
         cancel_key_prefix="test:cancel",
         cancel_ttl_seconds=120,
+        lease_key_prefix="test:lease",
+        lease_ttl_seconds=30,
     )
 
 
@@ -62,3 +64,45 @@ async def test_cancellation_key_uses_bounded_ttl() -> None:
     await queue.request_cancel("scan-3")
 
     client.set.assert_awaited_once_with("test:cancel:scan-3", "1", ex=120)
+
+
+@pytest.mark.asyncio
+async def test_request_cancel_also_publishes_for_immediate_delivery() -> None:
+    client = AsyncMock()
+    queue = _queue(client)
+
+    await queue.request_cancel("scan-3")
+
+    # Durable key (backstop) plus a publish on the cancel channel so a running
+    # worker's watcher can cancel the scan task immediately.
+    client.publish.assert_awaited_once_with("test:cancel:channel", "scan-3")
+
+
+@pytest.mark.asyncio
+async def test_lease_renew_sets_key_with_ttl() -> None:
+    client = AsyncMock()
+    queue = _queue(client)
+
+    await queue.renew_lease("scan-5")
+
+    client.set.assert_awaited_once_with("test:lease:scan-5", "1", ex=30)
+
+
+@pytest.mark.asyncio
+async def test_is_lease_alive_checks_key_existence() -> None:
+    client = AsyncMock()
+    client.exists.return_value = 1
+    queue = _queue(client)
+
+    assert await queue.is_lease_alive("scan-5") is True
+    client.exists.assert_awaited_once_with("test:lease:scan-5")
+
+
+@pytest.mark.asyncio
+async def test_clear_lease_deletes_key() -> None:
+    client = AsyncMock()
+    queue = _queue(client)
+
+    await queue.clear_lease("scan-5")
+
+    client.delete.assert_awaited_once_with("test:lease:scan-5")

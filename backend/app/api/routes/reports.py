@@ -36,7 +36,6 @@ def _build_report_payload(scan, scan_id: str) -> dict:
         "owner_email": getattr(scan, "owner_email", None),
         "authorization": {
             "confirmed": getattr(scan, "authorization_confirmed", False),
-            "text": getattr(scan, "authorization_text", None),
             "confirmed_at": getattr(scan, "authorization_confirmed_at", None),
         },
         "statistics": scan.statistics.model_dump(mode="json"),

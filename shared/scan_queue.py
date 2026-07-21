@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Protocol
+import logging
+from typing import AsyncIterator, Protocol
 
 from pydantic import BaseModel, Field, ValidationError
 from redis.asyncio import Redis
@@ -9,6 +10,8 @@ from redis.exceptions import RedisError
 from shared.config import get_infrastructure_settings
 from shared.models.scan import ScanAuthAccount
 from shared.schemas.scan_schema import ScanConfig
+
+logger = logging.getLogger(__name__)
 
 
 class ScanJob(BaseModel):
@@ -47,6 +50,14 @@ class ScanQueue(Protocol):
 
     async def clear_cancel(self, scan_id: str) -> None: ...
 
+    def watch_cancellations(self) -> AsyncIterator[str]: ...
+
+    async def renew_lease(self, scan_id: str) -> None: ...
+
+    async def is_lease_alive(self, scan_id: str) -> bool: ...
+
+    async def clear_lease(self, scan_id: str) -> None: ...
+
     async def close(self) -> None: ...
 
 
@@ -65,8 +76,10 @@ class RedisScanQueue:
         queue_name: str,
         cancel_key_prefix: str,
         cancel_ttl_seconds: int,
-        heartbeat_key_prefix: str,
-        heartbeat_ttl_seconds: int,
+        heartbeat_key_prefix: str = "sentrystrike:worker:heartbeat",
+        heartbeat_ttl_seconds: int = 20,
+        lease_key_prefix: str = "sentrystrike:scan:lease",
+        lease_ttl_seconds: int = 30,
     ) -> None:
         self.client = client
         self.queue_name = queue_name
@@ -74,6 +87,12 @@ class RedisScanQueue:
         self.cancel_ttl_seconds = cancel_ttl_seconds
         self.heartbeat_key_prefix = heartbeat_key_prefix.rstrip(":")
         self.heartbeat_ttl_seconds = heartbeat_ttl_seconds
+        self.lease_key_prefix = lease_key_prefix.rstrip(":")
+        self.lease_ttl_seconds = lease_ttl_seconds
+        # Pub/Sub channel carrying cancellation signals for immediate delivery.
+        # The cancel key (below) remains the durable backstop; this channel is
+        # the low-latency fast path a running worker subscribes to.
+        self.cancel_channel = f"{self.cancel_key_prefix}:channel"
 
     @classmethod
     def from_settings(cls) -> RedisScanQueue:
@@ -87,11 +106,17 @@ class RedisScanQueue:
             cancel_ttl_seconds=settings.scan_cancel_ttl_seconds,
             heartbeat_key_prefix=settings.worker_heartbeat_prefix,
             heartbeat_ttl_seconds=settings.worker_heartbeat_ttl_seconds,
+            lease_key_prefix=settings.scan_lease_key_prefix,
+            lease_ttl_seconds=settings.scan_lease_ttl_seconds,
         )
 
     def _cancel_key(self, scan_id: str) -> str:
         """Return the Redis key that flags a scan for cancellation."""
         return f"{self.cancel_key_prefix}:{scan_id}"
+
+    def _lease_key(self, scan_id: str) -> str:
+        """Return the Redis key that proves a worker is actively running a scan."""
+        return f"{self.lease_key_prefix}:{scan_id}"
 
     async def enqueue(self, job: ScanJob) -> None:
         try:
@@ -118,12 +143,17 @@ class RedisScanQueue:
             raise ScanQueueError("Discarded invalid scan job payload") from exc
 
     async def request_cancel(self, scan_id: str) -> None:
+        # Two signals, deliberately: the key is the durable backstop (survives a
+        # worker that is between subscribing, restarting, or not yet running the
+        # scan) and the publish is the low-latency fast path a running worker's
+        # watcher reacts to within milliseconds.
         try:
             await self.client.set(
                 self._cancel_key(scan_id),
                 "1",
                 ex=self.cancel_ttl_seconds,
             )
+            await self.client.publish(self.cancel_channel, scan_id)
         except RedisError as exc:
             raise ScanQueueError("Unable to request scan cancellation") from exc
 
@@ -138,6 +168,63 @@ class RedisScanQueue:
             await self.client.delete(self._cancel_key(scan_id))
         except RedisError as exc:
             raise ScanQueueError("Unable to clear scan cancellation") from exc
+
+    async def watch_cancellations(self) -> AsyncIterator[str]:
+        """Yield scan ids as cancellation requests are published.
+
+        Subscribes to the cancel channel and yields each published ``scan_id``.
+        A running worker consumes this to cancel the in-flight scan task the
+        moment a request arrives, instead of waiting for the next phase-boundary
+        poll of the cancel key. The subscribe/publish race (a publish that lands
+        between a worker starting and this subscription being live) is closed by
+        the caller doing an initial ``is_cancelled`` key read after subscribing.
+        """
+        pubsub = self.client.pubsub()
+        try:
+            await pubsub.subscribe(self.cancel_channel)
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                data = message.get("data")
+                if data is None:
+                    continue
+                yield data if isinstance(data, str) else data.decode()
+        except RedisError as exc:
+            raise ScanQueueError("Unable to watch scan cancellations") from exc
+        finally:
+            try:
+                await pubsub.unsubscribe(self.cancel_channel)
+                await pubsub.aclose()
+            except RedisError:
+                logger.debug("failed to close cancel-channel pubsub cleanly")
+
+    async def renew_lease(self, scan_id: str) -> None:
+        """Refresh the per-scan lease, proving a worker is actively running it.
+
+        The lease is a short-TTL key a running worker renews on a timer. If the
+        worker dies, the key expires and the scan becomes detectable as orphaned.
+        """
+        try:
+            await self.client.set(
+                self._lease_key(scan_id),
+                "1",
+                ex=self.lease_ttl_seconds,
+            )
+        except RedisError as exc:
+            raise ScanQueueError("Unable to renew scan lease") from exc
+
+    async def is_lease_alive(self, scan_id: str) -> bool:
+        """Return True while a worker holds a live lease on this scan."""
+        try:
+            return bool(await self.client.exists(self._lease_key(scan_id)))
+        except RedisError as exc:
+            raise ScanQueueError("Unable to check scan lease") from exc
+
+    async def clear_lease(self, scan_id: str) -> None:
+        try:
+            await self.client.delete(self._lease_key(scan_id))
+        except RedisError as exc:
+            raise ScanQueueError("Unable to clear scan lease") from exc
 
     async def close(self) -> None:
         await self.client.aclose()

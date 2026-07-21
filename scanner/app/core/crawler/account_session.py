@@ -89,7 +89,7 @@ async def resolve_account_session(
     # 2. Credential login against the target to obtain a fresh, complete session.
     if account.username and account.password:
         settings = get_settings()
-        login_target = account.login_url or root_url
+        login_target = root_url
         prior_username, prior_password = primary_credentials or (None, None)
         try:
             async with create_scan_client(

@@ -43,13 +43,6 @@ async def _never_cancelled(_: str) -> bool:
 
 
 class ScanOrchestrator(
-    """Top-level scan pipeline orchestrator.
-
-    Composes all pipeline stages (crawl, detect, verify, analyze, score, report)
-    via multiple mixins, each owning one phase of the scan lifecycle. A single
-    ``run_scan`` call sequences these stages with progress reporting, ETA
-    estimation, and cancellation support.
-    """
     PipelineMixin,
     RuntimeMixin,
     DetectorExecutionMixin,
@@ -59,6 +52,14 @@ class ScanOrchestrator(
     TechnologyEnrichmentMixin,
     ProgressMixin,
 ):
+    """Top-level scan pipeline orchestrator.
+
+    Composes all pipeline stages (crawl, detect, verify, analyze, score, report)
+    via multiple mixins, each owning one phase of the scan lifecycle. A single
+    ``run_scan`` call sequences these stages with progress reporting, ETA
+    estimation, and cancellation support.
+    """
+
     def __init__(
         self,
         repository: ScanRepository,

@@ -258,15 +258,8 @@ class CoverageMixin:
         ctx = crawl_context or {}
         if not (ctx.get("second_user_cookies") or ctx.get("second_user_headers")):
             warnings.append("No second-user account configured; horizontal IDOR comparison was not tested.")
-        scan_config = ctx.get("scan_config")
-        oast_callback = (
-            (scan_config.oast_callback_base_url if scan_config else None)
-            or settings.oast_callback_base_url
-        )
-        oast_poll = (
-            (scan_config.oast_poll_url if scan_config else None)
-            or settings.oast_poll_url
-        )
+        oast_callback = settings.oast_callback_base_url
+        oast_poll = settings.oast_poll_url
         if not (oast_callback and oast_poll):
             warnings.append(
                 "OAST callback/polling is not fully configured; blind SSRF was "

@@ -16,11 +16,17 @@ class FakeScanQueue:
         *,
         enqueue_error: Exception | None = None,
         cancel_error: Exception | None = None,
+        lease_alive: bool = True,
+        lease_error: Exception | None = None,
     ) -> None:
         self.queued: list[str] = []
         self.cancelled: list[str] = []
         self.enqueue_error = enqueue_error
         self.cancel_error = cancel_error
+        # Controls what reconcile_if_orphaned sees: True = a worker still holds
+        # the lease, False = worker died, error = Redis unreachable.
+        self.lease_alive = lease_alive
+        self.lease_error = lease_error
 
     async def enqueue(self, job) -> None:
         if self.enqueue_error is not None:
@@ -31,6 +37,11 @@ class FakeScanQueue:
         if self.cancel_error is not None:
             raise self.cancel_error
         self.cancelled.append(scan_id)
+
+    async def is_lease_alive(self, scan_id: str) -> bool:
+        if self.lease_error is not None:
+            raise self.lease_error
+        return self.lease_alive
 
 
 class FakeScan:
@@ -45,10 +56,10 @@ class FakeScan:
         self.current_phase = ScanPhase.queued
         self.phase_message = "Scan queued"
         self.authorization_confirmed = True
-        self.authorization_text = "Ticket SEC-123"
         self.authorization_confirmed_at = datetime(2026, 6, 8, 9, 10, 17, tzinfo=timezone.utc)
         self.started_at = None
         self.completed_at = None
+        self.eta_seconds = None
         self.created_at = datetime(2026, 6, 8, 9, 10, 17, tzinfo=timezone.utc)
         self.updated_at = datetime(2026, 6, 8, 9, 10, 17, tzinfo=timezone.utc)
         self.statistics = ScanStatistics(total_urls_crawled=1, total_vulnerabilities=0)
@@ -71,7 +82,6 @@ class FakeScan:
             "current_phase": self.current_phase,
             "phase_message": self.phase_message,
             "authorization_confirmed": self.authorization_confirmed,
-            "authorization_text": self.authorization_text,
             "authorization_confirmed_at": self.authorization_confirmed_at,
             "statistics": self.statistics.model_dump(mode="json"),
             "overall_risk_score": self.overall_risk_score,
@@ -100,7 +110,6 @@ class FakeScanRepository:
         created = FakeScan("scan-new", kwargs["owner_user_id"], kwargs["owner_email"])
         created.target_url = target_url
         created.authorization_confirmed = kwargs["authorization_confirmed"]
-        created.authorization_text = kwargs["authorization_text"]
         self.scans[str(created.id)] = created
         return created
 
@@ -134,6 +143,28 @@ class FakeScanRepository:
             item.error_message = error_message
         return item
 
+    async def reconcile_if_orphaned(self, scan: FakeScan, queue) -> FakeScan:
+        """Mirror production: only fail a running scan when the lease is
+        provably absent. If the lease check raises (Redis down) or the queue is
+        missing, leave the scan untouched."""
+        if scan.status != ScanStatus.running:
+            return scan
+        if queue is None:
+            return scan
+        try:
+            lease_alive = await queue.is_lease_alive(str(scan.id))
+        except Exception:
+            return scan
+        if lease_alive:
+            return scan
+        return await self.update_status(
+            scan,
+            ScanStatus.failed,
+            current_phase=ScanPhase.failed,
+            phase_message="Scan worker stopped unexpectedly",
+            error_message="Scan worker stopped unexpectedly; no active worker is processing this scan.",
+        )
+
 def _client(repo: FakeScanRepository, user_id: str = "user-1") -> TestClient:
     app = FastAPI()
     app.include_router(scan.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
@@ -166,7 +197,6 @@ def test_create_scan_binds_owner_and_authorization_metadata() -> None:
         json={
             "target_url": "https://target.example",
             "authorization_confirmed": True,
-            "authorization_text": "Ticket SEC-123",
         },
     )
 
@@ -174,7 +204,6 @@ def test_create_scan_binds_owner_and_authorization_metadata() -> None:
     assert repo.created_kwargs["owner_user_id"] == "user-1"
     assert repo.created_kwargs["owner_email"] == "user-1@example.test"
     assert repo.created_kwargs["authorization_confirmed"] is True
-    assert repo.created_kwargs["authorization_text"] == "Ticket SEC-123"
     assert scan_queue.queued == ["scan-new"]
 
 
@@ -241,6 +270,8 @@ def test_list_scans_only_returns_current_users_scans() -> None:
 
 def test_scan_status_returns_phase_and_message_for_polling() -> None:
     repo = FakeScanRepository()
+    # A live worker still holds the lease, so reconciliation leaves it running.
+    scan.set_scan_queue(FakeScanQueue(lease_alive=True))
     owned = repo.scans["scan-owned"]
     owned.status = ScanStatus.running
     owned.progress = 45
@@ -295,4 +326,72 @@ def test_report_payload_includes_owner_and_authorization_audit_fields() -> None:
     assert data["owner_user_id"] == "user-1"
     assert data["owner_email"] == "user1@example.test"
     assert data["authorization"]["confirmed"] is True
-    assert data["authorization"]["text"] == "Ticket SEC-123"
+
+
+def _running(repo: FakeScanRepository, scan_id: str = "scan-owned") -> FakeScan:
+    """Put an owned scan into the running state for reconciliation tests."""
+    scan = repo.scans[scan_id]
+    scan.status = ScanStatus.running
+    scan.progress = 40
+    scan.current_phase = ScanPhase.vulnerability_detection
+    return scan
+
+
+def test_status_of_running_scan_with_dead_worker_is_reconciled_to_failed() -> None:
+    repo = FakeScanRepository()
+    _running(repo)
+    # No live lease => the worker died; the read must flip it to failed.
+    scan.set_scan_queue(FakeScanQueue(lease_alive=False))
+    client = _client(repo, user_id="user-1")
+
+    response = client.get("/api/v1/scans/scan-owned/status")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["status"] == "failed"
+    assert data["current_phase"] == "failed"
+    assert repo.scans["scan-owned"].status == ScanStatus.failed
+
+
+def test_status_of_running_scan_with_live_lease_stays_running() -> None:
+    repo = FakeScanRepository()
+    _running(repo)
+    scan.set_scan_queue(FakeScanQueue(lease_alive=True))
+    client = _client(repo, user_id="user-1")
+
+    response = client.get("/api/v1/scans/scan-owned/status")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == "running"
+    assert repo.scans["scan-owned"].status == ScanStatus.running
+
+
+def test_running_scan_is_not_reconciled_when_redis_is_unavailable() -> None:
+    repo = FakeScanRepository()
+    _running(repo)
+    # Lease check raises => cannot tell a dead worker from an unreachable Redis,
+    # so the scan must be left untouched rather than falsely failed.
+    scan.set_scan_queue(FakeScanQueue(lease_error=ScanQueueError("offline")))
+    client = _client(repo, user_id="user-1")
+
+    response = client.get("/api/v1/scans/scan-owned/status")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == "running"
+    assert repo.scans["scan-owned"].status == ScanStatus.running
+
+
+def test_cancel_of_scan_with_dead_worker_resolves_to_failed_without_queue_key() -> None:
+    repo = FakeScanRepository()
+    _running(repo)
+    fake_queue = FakeScanQueue(lease_alive=False)
+    scan.set_scan_queue(fake_queue)
+    client = _client(repo, user_id="user-1")
+
+    response = client.post("/api/v1/scans/scan-owned/cancel")
+
+    # A dead scan cancels into failed without setting a cancel key nobody reads.
+    assert response.status_code == 200
+    assert response.json()["data"]["cancelled"] is False
+    assert repo.scans["scan-owned"].status == ScanStatus.failed
+    assert fake_queue.cancelled == []

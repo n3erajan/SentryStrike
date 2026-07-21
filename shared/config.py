@@ -27,6 +27,24 @@ class InfrastructureSettings(BaseSettings):
         ge=60,
         alias="SCAN_CANCEL_TTL_SECONDS",
     )
+    # Pub/Sub channel used to signal an immediate cancel to the worker actively
+    # running a scan (the cancel key above remains the durable backstop).
+    scan_cancel_channel: str = Field(
+        default="sentrystrike:scan:cancel-channel",
+        alias="SCAN_CANCEL_CHANNEL",
+    )
+    # Per-scan lease refreshed by the worker while it actively owns a scan. When
+    # the worker dies the lease expires, letting readers detect an orphaned scan
+    # that is still marked ``running`` in the database.
+    scan_lease_key_prefix: str = Field(
+        default="sentrystrike:scan:lease",
+        alias="SCAN_LEASE_KEY_PREFIX",
+    )
+    scan_lease_ttl_seconds: int = Field(
+        default=30,
+        ge=10,
+        alias="SCAN_LEASE_TTL_SECONDS",
+    )
 
     # Both services initialize the same Beanie model and must agree on its TTL.
     oast_interaction_ttl_seconds: int = Field(

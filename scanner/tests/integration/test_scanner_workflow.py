@@ -121,7 +121,6 @@ class FakeScan:
         self.current_phase = ScanPhase.queued
         self.phase_message = "Scan queued"
         self.authorization_confirmed = True
-        self.authorization_text = "Test authorization"
         self.authorization_confirmed_at = datetime.now(timezone.utc)
         self.created_at = datetime.now(timezone.utc)
         self.updated_at = datetime.now(timezone.utc)

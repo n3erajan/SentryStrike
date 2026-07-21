@@ -21,6 +21,94 @@ TERMINAL_SCAN_STATUSES = {
 }
 
 
+def _make_cancellation_checker(queue: ScanQueue):
+    """Build a fail-safe cancellation checker for the orchestrator.
+
+    The cancel key is a *signal*, not scan data. If Redis is unreachable when
+    the orchestrator polls it at a phase boundary, we must NOT abort the scan —
+    "can't tell" is treated as "not cancelled" so the scan proceeds. A genuine
+    cancellation still lands via the pub/sub watcher (task cancel) and, once
+    Redis recovers, the next phase-boundary poll.
+    """
+
+    async def _is_cancelled(scan_id: str) -> bool:
+        try:
+            return await queue.is_cancelled(scan_id)
+        except ScanQueueError:
+            logger.warning(
+                "cancel-key check failed for scan %s (Redis unavailable?); "
+                "treating as not cancelled so the scan continues",
+                scan_id,
+            )
+            return False
+
+    return _is_cancelled
+
+
+async def _best_effort_clear_cancel(queue: ScanQueue, scan_id: str) -> None:
+    """Delete the cancel key, swallowing Redis errors.
+
+    Clearing the signal must never break job flow: a stale cancel key expires
+    on its own TTL, so a failed delete is logged and ignored.
+    """
+    try:
+        await queue.clear_cancel(scan_id)
+    except ScanQueueError:
+        logger.warning("failed to clear cancellation key for scan %s", scan_id)
+
+
+async def _lease_loop(queue: ScanQueue, scan_id: str, ttl_seconds: int) -> None:
+    """Renew the per-scan lease while the scan runs.
+
+    Refreshes at half the TTL so a single missed renewal does not expire the
+    lease. Best-effort: a failed renewal is logged and retried, never fatal to
+    the scan — the lease only drives dead-worker detection, not scan logic.
+    """
+    interval = max(1, ttl_seconds // 2)
+    while True:
+        try:
+            await queue.renew_lease(scan_id)
+        except ScanQueueError:
+            logger.warning("lease renewal failed for scan %s", scan_id)
+        await asyncio.sleep(interval)
+
+
+async def _cancel_watcher(
+    queue: ScanQueue,
+    scan_id: str,
+    scan_task: asyncio.Task,
+) -> None:
+    """Cancel ``scan_task`` the instant a cancellation for ``scan_id`` arrives.
+
+    Subscribes to the cancel pub/sub channel for immediate (sub-second)
+    delivery, then closes the subscribe/publish race with a single cancel-key
+    read (a request published before the subscription went live). Entirely
+    best-effort: if Redis is down the subscription simply never fires and
+    cancellation falls back to the orchestrator's phase-boundary key polls.
+    """
+    # Close the race: a cancel may have been requested between the worker
+    # claiming the job and this subscription becoming live.
+    try:
+        if await queue.is_cancelled(scan_id):
+            scan_task.cancel()
+            return
+    except ScanQueueError:
+        logger.debug("initial cancel-key read failed for scan %s", scan_id)
+
+    try:
+        async for cancelled_id in queue.watch_cancellations():
+            if cancelled_id == scan_id:
+                logger.info("cancellation received for scan %s; cancelling task", scan_id)
+                scan_task.cancel()
+                return
+    except ScanQueueError:
+        logger.warning(
+            "cancel watcher for scan %s stopped (Redis unavailable?); "
+            "falling back to phase-boundary cancellation checks",
+            scan_id,
+        )
+
+
 async def process_scan_job(
     job: ScanJob,
     *,
@@ -35,12 +123,12 @@ async def process_scan_job(
     """
     scan = await repository.get_by_id(job.scan_id)
     if scan is None:
-        await queue.clear_cancel(job.scan_id)
+        await _best_effort_clear_cancel(queue, job.scan_id)
         logger.error("discarding scan job %s: scan document not found", job.scan_id)
         return
 
     if scan.status in TERMINAL_SCAN_STATUSES:
-        await queue.clear_cancel(job.scan_id)
+        await _best_effort_clear_cancel(queue, job.scan_id)
         logger.info(
             "discarding scan job %s: scan already %s",
             job.scan_id,
@@ -48,7 +136,19 @@ async def process_scan_job(
         )
         return
 
-    if await queue.is_cancelled(job.scan_id):
+    # Best-effort pre-run cancel check: if Redis is unreachable we cannot tell,
+    # so we proceed with the scan rather than abort it (the signal is not scan
+    # data). A genuine cancel still lands via the watcher / phase-boundary polls.
+    try:
+        already_cancelled = await queue.is_cancelled(job.scan_id)
+    except ScanQueueError:
+        logger.warning(
+            "pre-run cancel check failed for scan %s (Redis unavailable?); "
+            "proceeding with the scan",
+            job.scan_id,
+        )
+        already_cancelled = False
+    if already_cancelled:
         await repository.update_status(
             scan,
             ScanStatus.cancelled,
@@ -56,21 +156,42 @@ async def process_scan_job(
             current_phase=ScanPhase.cancelled,
             phase_message="Scan cancelled by user",
         )
-        await queue.clear_cancel(job.scan_id)
+        await _best_effort_clear_cancel(queue, job.scan_id)
         logger.info("discarding cancelled scan job %s", job.scan_id)
         return
 
-    try:
-        await orchestrator.run_scan(
+    # Run the scan as a task so a cancellation can interrupt it at the next
+    # await anywhere in the pipeline (mid-crawl, mid-detector, mid-AI), not only
+    # at the orchestrator's phase boundaries. A concurrent watcher cancels the
+    # task the moment a request is published; a lease loop proves this worker is
+    # alive so a crash leaves the scan detectable as orphaned rather than stuck.
+    lease_ttl = getattr(queue, "lease_ttl_seconds", 30)
+    scan_task = asyncio.create_task(
+        orchestrator.run_scan(
             job.scan_id,
             auth_accounts=job.auth_accounts,
             scan_config=job.scan_config,
         )
+    )
+    watcher_task = asyncio.create_task(_cancel_watcher(queue, job.scan_id, scan_task))
+    lease_task = asyncio.create_task(_lease_loop(queue, job.scan_id, lease_ttl))
+    try:
+        await scan_task
     finally:
+        watcher_task.cancel()
+        lease_task.cancel()
+        for background in (watcher_task, lease_task):
+            try:
+                await background
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
+                pass
+        # Best-effort cleanup: releasing the lease and cancel key must never
+        # turn a finished scan into a failure if Redis is unavailable.
         try:
-            await queue.clear_cancel(job.scan_id)
+            await queue.clear_lease(job.scan_id)
         except ScanQueueError:
-            logger.exception("failed to clear cancellation key for scan %s", job.scan_id)
+            logger.warning("failed to clear lease for scan %s", job.scan_id)
+        await _best_effort_clear_cancel(queue, job.scan_id)
 
 
 async def _heartbeat_loop(queue: RedisScanQueue, worker_id: str) -> None:
@@ -101,7 +222,7 @@ async def run_worker() -> None:
     repository = ScanRepository()
     orchestrator = ScanOrchestrator(
         repository,
-        cancellation_checker=queue.is_cancelled,
+        cancellation_checker=_make_cancellation_checker(queue),
     )
 
     logger.info(

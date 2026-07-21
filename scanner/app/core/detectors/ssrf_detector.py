@@ -233,8 +233,8 @@ class SSRFDetector(BaseDetector):
         auth_headers = kwargs.get("auth_headers")
         scan_config = kwargs.get("scan_config")
         settings = get_settings()
-        oast_callback = scan_config.get_val("oast_callback_base_url", settings.oast_callback_base_url) if scan_config else settings.oast_callback_base_url
-        oast_poll = scan_config.get_val("oast_poll_url", settings.oast_poll_url) if scan_config else settings.oast_poll_url
+        oast_callback = settings.oast_callback_base_url
+        oast_poll = settings.oast_poll_url
         ssrf_timing_delta = scan_config.get_val("ssrf_inband_timing_delta_ms", settings.ssrf_inband_timing_delta_ms) if scan_config else settings.ssrf_inband_timing_delta_ms
         oast_poll_attempts = scan_config.get_val("ssrf_oast_poll_attempts", settings.ssrf_oast_poll_attempts) if scan_config else settings.ssrf_oast_poll_attempts
         oast_poll_interval = scan_config.get_val("ssrf_oast_poll_interval_seconds", settings.ssrf_oast_poll_interval_seconds) if scan_config else settings.ssrf_oast_poll_interval_seconds
