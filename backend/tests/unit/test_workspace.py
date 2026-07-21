@@ -15,15 +15,27 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import (
+    get_audit_repository,
     get_current_user,
     get_invite_service,
     get_member_repository,
     get_organization_repository,
 )
 from app.api.routes import workspace
+from shared.models.audit import AuditAction
 from shared.models.invite import InviteState
 from shared.models.organization import MIN_RETENTION_DAYS
 from shared.models.user import UserRole
+
+
+class FakeAuditRepository:
+    """In-memory audit sink; records the kwargs of each ``record`` call."""
+
+    def __init__(self) -> None:
+        self.entries: list[dict] = []
+
+    async def record(self, **kwargs) -> None:
+        self.entries.append(kwargs)
 
 
 class FakeMember:
@@ -151,6 +163,7 @@ def _client(
     orgs: FakeOrganizationRepository,
     invites: FakeInviteService,
     email: FakeEmailBackend | None = None,
+    audit: FakeAuditRepository | None = None,
     user_id: str = "user-owner",
     org_id: str = "org-1",
     role: UserRole = UserRole.owner,
@@ -158,11 +171,13 @@ def _client(
 ) -> TestClient:
     if email is not None and monkeypatch is not None:
         monkeypatch.setattr(workspace, "get_email_backend", lambda: email)
+    audit = audit if audit is not None else FakeAuditRepository()
     app = FastAPI()
     app.include_router(workspace.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.dependency_overrides[get_member_repository] = lambda: members
     app.dependency_overrides[get_organization_repository] = lambda: orgs
     app.dependency_overrides[get_invite_service] = lambda: invites
+    app.dependency_overrides[get_audit_repository] = lambda: audit
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=user_id, email=f"{user_id}@example.test", org_id=org_id, role=role
     )
@@ -446,5 +461,110 @@ def test_viewer_cannot_update_retention() -> None:
     client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.viewer)
 
     response = client.put("/api/v1/workspace/retention", json={"retention_days": 120})
+
+    assert response.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Audit trail
+# ---------------------------------------------------------------------------
+
+
+def test_member_removal_is_audited() -> None:
+    members, orgs, invites = _repos()
+    audit = FakeAuditRepository()
+    client = _client(
+        members=members, orgs=orgs, invites=invites, audit=audit,
+        user_id="user-admin", role=UserRole.admin,
+    )
+
+    client.delete("/api/v1/workspace/members/user-dev")
+
+    assert len(audit.entries) == 1
+    entry = audit.entries[0]
+    assert entry["action"] == AuditAction.member_removed
+    assert entry["actor_user_id"] == "user-admin"
+    assert entry["target_id"] == "user-dev"
+
+
+def test_role_change_records_from_and_to() -> None:
+    members, orgs, invites = _repos()
+    audit = FakeAuditRepository()
+    client = _client(
+        members=members, orgs=orgs, invites=invites, audit=audit,
+        user_id="user-admin", role=UserRole.admin,
+    )
+
+    client.patch("/api/v1/workspace/members/user-dev/role", json={"role": "analyst"})
+
+    assert audit.entries[0]["action"] == AuditAction.member_role_changed
+    assert audit.entries[0]["metadata"]["from"] == "developer"
+    assert audit.entries[0]["metadata"]["to"] == "analyst"
+
+
+def test_invite_creation_is_audited(monkeypatch) -> None:
+    members, orgs, invites = _repos()
+    audit = FakeAuditRepository()
+    client = _client(
+        members=members, orgs=orgs, invites=invites, audit=audit, email=FakeEmailBackend(),
+        user_id="user-admin", role=UserRole.admin, monkeypatch=monkeypatch,
+    )
+
+    client.post("/api/v1/workspace/invites", json={"email": "hire@example.test", "role": "developer"})
+
+    assert audit.entries[0]["action"] == AuditAction.invite_created
+    assert audit.entries[0]["metadata"]["email"] == "hire@example.test"
+
+
+def test_a_failed_action_is_not_audited() -> None:
+    members, orgs, invites = _repos()
+    audit = FakeAuditRepository()
+    # Removing the owner is rejected before any state change; nothing is audited.
+    client = _client(
+        members=members, orgs=orgs, invites=invites, audit=audit,
+        user_id="user-admin", role=UserRole.admin,
+    )
+
+    response = client.delete("/api/v1/workspace/members/user-owner")
+
+    assert response.status_code == 403
+    assert audit.entries == []
+
+
+def test_audit_log_is_readable_by_admin_and_org_scoped() -> None:
+    members, orgs, invites = _repos()
+    audit = FakeAuditRepository()
+
+    async def _list_in_org(org_id, skip=0, limit=50):
+        assert org_id == "org-1"
+        return [
+            SimpleNamespace(
+                id="entry-1",
+                action=AuditAction.member_removed,
+                actor_user_id="user-admin",
+                actor_email="user-admin@example.test",
+                target_type="user",
+                target_id="user-dev",
+                metadata={"email": "user-dev@example.test"},
+                created_at=datetime(2026, 7, 21, 9, 10, 17, tzinfo=timezone.utc),
+            )
+        ]
+
+    audit.list_in_org = _list_in_org
+    client = _client(members=members, orgs=orgs, invites=invites, audit=audit, role=UserRole.admin)
+
+    response = client.get("/api/v1/workspace/audit-log")
+
+    assert response.status_code == 200
+    items = response.json()["data"]["items"]
+    assert items[0]["action"] == "member_removed"
+    assert items[0]["target_id"] == "user-dev"
+
+
+def test_viewer_cannot_read_audit_log() -> None:
+    members, orgs, invites = _repos()
+    client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.viewer)
+
+    response = client.get("/api/v1/workspace/audit-log")
 
     assert response.status_code == 403

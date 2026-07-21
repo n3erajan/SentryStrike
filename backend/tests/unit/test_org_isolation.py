@@ -14,11 +14,21 @@ from types import SimpleNamespace
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_current_user, get_scan_repository
+from app.api.dependencies import get_current_user, get_audit_repository, get_scan_repository
 from app.api.routes import analysis, reports, scan
 from shared.models.scan import CrawlMode, ReportMetadata, ScanPhase, ScanStatistics, ScanStatus
 from shared.models.user import UserRole
 from shared.scan_queue import ScanQueueError
+
+
+class FakeAuditRepository:
+    """In-memory audit sink so handlers under test never touch the database."""
+
+    def __init__(self) -> None:
+        self.entries: list[dict] = []
+
+    async def record(self, **kwargs) -> None:
+        self.entries.append(kwargs)
 
 
 class FakeScanQueue:
@@ -194,6 +204,7 @@ def _client(
     app.include_router(analysis.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(reports.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.dependency_overrides[get_scan_repository] = lambda: repo
+    app.dependency_overrides[get_audit_repository] = lambda: FakeAuditRepository()
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=user_id, email=f"{user_id}@example.test", org_id=org_id, role=role
     )

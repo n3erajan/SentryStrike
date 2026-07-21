@@ -17,6 +17,10 @@ class OrganizationRepository:
             return None
         return await Organization.get(oid)
 
+    async def list_all(self) -> list[Organization]:
+        """List every organization (used by the retention purge to sweep each tenant)."""
+        return await Organization.find_all().to_list()
+
     async def set_default_scan_config(self, org: Organization, config: dict) -> Organization:
         """Replace the stored default scan config blob."""
         org.default_scan_config = config

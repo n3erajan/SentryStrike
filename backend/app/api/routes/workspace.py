@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.dependencies import (
+    get_audit_repository,
     get_current_user,
     get_invite_service,
     get_member_repository,
@@ -10,8 +11,10 @@ from app.api.dependencies import (
 )
 from app.core.email import get_email_backend
 from app.core.invites import InviteError, InviteService, build_invite_link
+from shared.database.repositories.audit_repository import AuditRepository
 from shared.database.repositories.member_repository import MemberRepository
 from shared.database.repositories.organization_repository import OrganizationRepository
+from shared.models.audit import AuditAction
 from shared.models.invite import Invite
 from shared.models.user import User, UserRole
 from app.schemas.workspace_schema import (
@@ -91,6 +94,7 @@ async def list_members(
 async def remove_member(
     user_id: str,
     members: MemberRepository = Depends(get_member_repository),
+    audit: AuditRepository = Depends(get_audit_repository),
     current_user: User = Depends(require_role(*WORKSPACE_ADMIN_ROLES)),
 ) -> dict:
     """Remove a member: a hard delete of their account and all their sessions.
@@ -106,7 +110,18 @@ async def remove_member(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
     if target.role == UserRole.owner:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The owner cannot be removed.")
+    removed_email = target.email
+    removed_role = target.role.value
     await members.delete_member(target)
+    await audit.record(
+        org_id=current_user.org_id,
+        action=AuditAction.member_removed,
+        actor_user_id=str(current_user.id),
+        actor_email=current_user.email,
+        target_type="user",
+        target_id=user_id,
+        metadata={"email": removed_email, "role": removed_role},
+    )
     return json_response({"removed": True}, "member removed")
 
 
@@ -115,6 +130,7 @@ async def change_member_role(
     user_id: str,
     payload: ChangeRoleRequest,
     members: MemberRepository = Depends(get_member_repository),
+    audit: AuditRepository = Depends(get_audit_repository),
     current_user: User = Depends(require_role(*WORKSPACE_ADMIN_ROLES)),
 ) -> dict:
     """Change a member's role. Cannot target the owner, self, or grant ownership.
@@ -129,7 +145,17 @@ async def change_member_role(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
     if target.role == UserRole.owner:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The owner's role cannot be changed.")
+    previous_role = target.role.value
     await members.set_role(target, payload.role)
+    await audit.record(
+        org_id=current_user.org_id,
+        action=AuditAction.member_role_changed,
+        actor_user_id=str(current_user.id),
+        actor_email=current_user.email,
+        target_type="user",
+        target_id=user_id,
+        metadata={"email": target.email, "from": previous_role, "to": payload.role.value},
+    )
     return json_response(_member_response(target), "role updated")
 
 
@@ -153,6 +179,7 @@ async def invite_member(
     payload: InviteMemberRequest,
     orgs: OrganizationRepository = Depends(get_organization_repository),
     invites: InviteService = Depends(get_invite_service),
+    audit: AuditRepository = Depends(get_audit_repository),
     current_user: User = Depends(require_role(*WORKSPACE_ADMIN_ROLES)),
 ) -> dict:
     """Invite an email into the caller's org with a pinned role. Owner/admin only.
@@ -180,6 +207,15 @@ async def invite_member(
         get_email_backend().send(to=payload.email, subject=subject, body_text=body)
     except Exception:  # noqa: BLE001 — delivery failure must not void a created invite
         pass
+    await audit.record(
+        org_id=current_user.org_id,
+        action=AuditAction.invite_created,
+        actor_user_id=str(current_user.id),
+        actor_email=current_user.email,
+        target_type="invite",
+        target_id=str(invite.id),
+        metadata={"email": payload.email, "role": payload.role.value},
+    )
     return json_response(_invite_response(invite), "invite sent")
 
 
@@ -188,6 +224,7 @@ async def cancel_invite(
     invite_id: str,
     orgs: OrganizationRepository = Depends(get_organization_repository),
     invites: InviteService = Depends(get_invite_service),
+    audit: AuditRepository = Depends(get_audit_repository),
     current_user: User = Depends(require_role(*WORKSPACE_ADMIN_ROLES)),
 ) -> dict:
     """Invalidate a pending invite so its token no longer accepts. Owner/admin only."""
@@ -195,7 +232,41 @@ async def cancel_invite(
     if invite is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
     invite = await invites.cancel(invite)
+    await audit.record(
+        org_id=current_user.org_id,
+        action=AuditAction.invite_cancelled,
+        actor_user_id=str(current_user.id),
+        actor_email=current_user.email,
+        target_type="invite",
+        target_id=invite_id,
+        metadata={"email": invite.email, "role": invite.role.value},
+    )
     return json_response(_invite_response(invite), "invite cancelled")
+
+
+@router.get("/audit-log")
+async def list_audit_log(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    audit: AuditRepository = Depends(get_audit_repository),
+    current_user: User = Depends(require_role(*WORKSPACE_ADMIN_ROLES)),
+) -> dict:
+    """Return the org's audit-log entries, newest first. Owner/admin only."""
+    entries = await audit.list_in_org(current_user.org_id, skip=skip, limit=limit)
+    items = [
+        {
+            "id": str(entry.id),
+            "action": entry.action.value,
+            "actor_user_id": entry.actor_user_id,
+            "actor_email": entry.actor_email,
+            "target_type": entry.target_type,
+            "target_id": entry.target_id,
+            "metadata": entry.metadata,
+            "created_at": entry.created_at,
+        }
+        for entry in entries
+    ]
+    return json_response({"items": items, "total": len(items)})
 
 
 # --------------------------------------------------------------------------- #

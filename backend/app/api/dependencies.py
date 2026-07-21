@@ -5,6 +5,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from app.config import get_settings
 from app.core.auth import AuthService, InvalidSessionError
 from app.core.invites import InviteService
+from shared.database.repositories.audit_repository import AuditRepository
 from shared.database.repositories.member_repository import MemberRepository
 from shared.database.repositories.organization_repository import OrganizationRepository
 from shared.database.repositories.scan_repository import ScanRepository
@@ -15,6 +16,7 @@ from shared.models.user import User, UserRole
 scan_repository = ScanRepository()
 member_repository = MemberRepository()
 organization_repository = OrganizationRepository()
+audit_repository = AuditRepository()
 auth_service = AuthService()
 invite_service = InviteService()
 
@@ -32,6 +34,11 @@ def get_member_repository() -> MemberRepository:
 def get_organization_repository() -> OrganizationRepository:
     """FastAPI dependency: provide the shared OrganizationRepository singleton."""
     return organization_repository
+
+
+def get_audit_repository() -> AuditRepository:
+    """FastAPI dependency: provide the shared AuditRepository singleton."""
+    return audit_repository
 
 
 def get_auth_service() -> AuthService:

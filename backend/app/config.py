@@ -39,6 +39,15 @@ class BackendSettings(InfrastructureSettings):
     email_smtp_password: str | None = Field(default=None, alias="EMAIL_SMTP_PASSWORD")
     email_smtp_starttls: bool = Field(default=True, alias="EMAIL_SMTP_STARTTLS")
 
+    # Retention purge. The background worker runs a purge pass on this interval,
+    # deleting each org's scans older than its retention window. Twelve hours by
+    # default: retention is measured in days, so a sub-daily cadence is ample.
+    retention_purge_interval_seconds: int = Field(
+        default=43200,
+        ge=60,
+        alias="RETENTION_PURGE_INTERVAL_SECONDS",
+    )
+
     @field_validator("auth_cookie_samesite")
     @classmethod
     def _validate_cookie_samesite(cls, value: str) -> str:

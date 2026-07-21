@@ -1,7 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from app.api.dependencies import get_current_user, get_scan_repository, json_response, require_role
+from app.api.dependencies import (
+    get_audit_repository,
+    get_current_user,
+    get_scan_repository,
+    json_response,
+    require_role,
+)
+from shared.database.repositories.audit_repository import AuditRepository
 from shared.database.repositories.scan_repository import ScanRepository
+from shared.models.audit import AuditAction
 from shared.models.scan import ScanAuthAccount, ScanAuthRole, ScanPhase, ScanStatus
 from shared.models.user import User, UserRole
 from shared.scan_queue import ScanJob, ScanQueue, ScanQueueError
@@ -79,6 +87,7 @@ def _scan_summary(scan) -> dict:
 async def create_scan(
     payload: CreateScanRequest,
     repo: ScanRepository = Depends(get_scan_repository),
+    audit: AuditRepository = Depends(get_audit_repository),
     current_user: User = Depends(require_role(*SCAN_ACTOR_ROLES)),
 ) -> dict:
     """Submit a new scan target and enqueue the job for processing.
@@ -119,6 +128,15 @@ async def create_scan(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Scan queue unavailable",
         ) from exc
+    await audit.record(
+        org_id=current_user.org_id,
+        action=AuditAction.scan_created,
+        actor_user_id=str(current_user.id),
+        actor_email=current_user.email,
+        target_type="scan",
+        target_id=str(scan.id),
+        metadata={"target_url": scan.target_url, "crawl_mode": scan.crawl_mode.value},
+    )
     return json_response(
         {
             "scan_id": str(scan.id),
@@ -202,6 +220,7 @@ async def get_scan_status(
 async def cancel_scan(
     scan_id: str,
     repo: ScanRepository = Depends(get_scan_repository),
+    audit: AuditRepository = Depends(get_audit_repository),
     current_user: User = Depends(require_role(*SCAN_ACTOR_ROLES)),
 ) -> dict:
     """Request cancellation of a running or queued scan.
@@ -242,4 +261,13 @@ async def cancel_scan(
         # Running scan: the worker will transition status on the cancel signal;
         # persist the canceller attribution now.
         await scan.save()
+    await audit.record(
+        org_id=current_user.org_id,
+        action=AuditAction.scan_cancelled,
+        actor_user_id=str(current_user.id),
+        actor_email=current_user.email,
+        target_type="scan",
+        target_id=scan_id,
+        metadata={"target_url": scan.target_url},
+    )
     return json_response({"cancelled": True})

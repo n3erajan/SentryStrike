@@ -21,6 +21,7 @@ import sys
 
 from app.core.email import get_email_backend
 from app.core.invites import InviteError, InviteService, build_invite_link
+from app.core.retention import RetentionService
 from shared.database.connection import close_db, init_db
 from shared.models.user import UserRole
 
@@ -77,6 +78,20 @@ async def _invite_owner(email: str, org: str) -> int:
         await close_db()
 
 
+async def _purge_retention() -> int:
+    await init_db()
+    try:
+        summary = await RetentionService().purge_once()
+        total = sum(summary.values())
+        print(f"Retention purge complete: {total} scan(s) deleted across {len(summary)} workspace(s).")
+        for org_id, count in summary.items():
+            if count:
+                print(f"  {org_id}: {count} scan(s) deleted")
+        return 0
+    finally:
+        await close_db()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="app.cli", description="SentryStrike management CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -85,10 +100,14 @@ def main(argv: list[str] | None = None) -> int:
     invite.add_argument("--email", required=True, help="Email address of the owner to invite")
     invite.add_argument("--org", required=True, help="Name of the workspace the owner will create")
 
+    sub.add_parser("purge-retention", help="Run one scan-data retention purge pass across all workspaces")
+
     args = parser.parse_args(argv)
 
     if args.command == "invite-owner":
         return asyncio.run(_invite_owner(args.email, args.org))
+    if args.command == "purge-retention":
+        return asyncio.run(_purge_retention())
     parser.error(f"unknown command: {args.command}")
     return 2
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime, timezone
 
 from beanie import PydanticObjectId
@@ -67,6 +69,14 @@ class ScanRepository:
         """
         query = Scan.find(Scan.org_id == org_id) if org_id else Scan.find_all()
         return await query.sort(-Scan.created_at).skip(skip).limit(limit).to_list()
+
+    async def list_expired(self, org_id: str, cutoff: datetime) -> list[Scan]:
+        """List an org's scans created strictly before ``cutoff`` (retention purge).
+
+        The comparison runs in MongoDB against the stored UTC ``created_at``; a
+        timezone-aware ``cutoff`` is converted to UTC by the driver.
+        """
+        return await Scan.find(Scan.org_id == org_id, Scan.created_at < cutoff).to_list()
 
     async def delete(self, scan_id: str) -> bool:
         scan = await self.get_by_id(scan_id)
