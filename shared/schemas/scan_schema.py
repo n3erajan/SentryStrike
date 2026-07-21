@@ -1,9 +1,16 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
-from shared.models.scan import CrawlMode, ScanPhase, ScanStatus, ScanStatistics
+from shared.models.scan import (
+    CrawlMode,
+    ScanAuthAccount,
+    ScanAuthRole,
+    ScanPhase,
+    ScanStatus,
+    ScanStatistics,
+)
 from shared.models.vulnerability import TechnologyComponent, Vulnerability
 
 
@@ -16,6 +23,8 @@ class ScanAccountCredential(BaseModel):
     accepts an email too — it is submitted as-is into the login form's
     identifier field (frontend may label it "username / email").
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     username: str | None = Field(default=None, max_length=320)
     password: str | None = Field(default=None, max_length=512)
@@ -40,6 +49,8 @@ class ScanAccountCredential(BaseModel):
 class ScanCredentials(BaseModel):
     """Up to three optional accounts used for access-control / IDOR testing."""
 
+    model_config = ConfigDict(extra="forbid")
+
     main: ScanAccountCredential | None = Field(
         default=None,
         description="Primary user; authenticates the crawl and acts as the authed baseline.",
@@ -54,9 +65,37 @@ class ScanCredentials(BaseModel):
     )
 
 
+def scan_auth_accounts_from_credentials(
+    credentials: ScanCredentials | None,
+) -> list[ScanAuthAccount]:
+    """Flatten populated credential slots for the temporary Redis job payload."""
+    if credentials is None:
+        return []
+    accounts: list[ScanAuthAccount] = []
+    for role, credential in (
+        (ScanAuthRole.main, credentials.main),
+        (ScanAuthRole.second, credentials.second),
+        (ScanAuthRole.admin, credentials.admin),
+    ):
+        if credential is None or not credential.is_populated:
+            continue
+        accounts.append(
+            ScanAuthAccount(
+                role=role,
+                username=credential.username,
+                password=credential.password,
+                cookie=credential.cookie,
+                header=credential.header,
+            )
+        )
+    return accounts
+
+
 class ScanConfig(BaseModel):
     """Per-scan configuration overrides. Every field is optional — when unset
     the global ``.env`` / ``config.py`` default is used."""
+
+    model_config = ConfigDict(extra="forbid")
 
     crawl_depth: int | None = Field(
         default=None, ge=1, le=10,
@@ -147,6 +186,8 @@ class ScanConfig(BaseModel):
 
 
 class CreateScanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     target_url: HttpUrl
     crawl_mode: CrawlMode = CrawlMode.full
     authorization_confirmed: bool = Field(
@@ -172,6 +213,9 @@ class CreateScanRequest(BaseModel):
 class ScanResponse(BaseModel):
     id: str
     target_url: str
+    submitted_by_user_id: str
+    submitted_by_full_name: str
+    submitted_by_email: str
     crawl_mode: CrawlMode = CrawlMode.full
     status: ScanStatus
     progress: int

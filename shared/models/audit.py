@@ -19,6 +19,7 @@ class AuditAction(str, Enum):
     member_role_changed = "member_role_changed"
     scan_created = "scan_created"
     scan_cancelled = "scan_cancelled"
+    finding_reverification_created = "finding_reverification_created"
     scan_purged = "scan_purged"
 
 

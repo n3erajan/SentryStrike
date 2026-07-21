@@ -153,6 +153,15 @@ async def test_access_control_tests_json_body_idor_targets() -> None:
                 request_snippet=f"{method} {url}",
                 response_snippet="HTTP/1.1 200 OK",
             )
+        if kwargs.get("test_phase") == "idor_second_user_own":
+            return ResponseData(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"userId": user_id, "email": "alice@example.com", "balance": 100}),
+                1.0,
+                request_snippet=f"{method} {url}",
+                response_snippet="HTTP/1.1 200 OK",
+            )
         if kwargs.get("test_phase") == "idor_authed_mod":
             return ResponseData(
                 200,
@@ -170,10 +179,23 @@ async def test_access_control_tests_json_body_idor_targets() -> None:
             forms=[],
             api_endpoints=[endpoint],
             session_cookies={"sid": "low"},
+            second_user_cookies={"sid": "second"},
         )
 
-    assert any(f.vuln_type == "Insecure Direct Object Reference (IDOR)" for f in findings)
-    assert any(phase == "idor_authed_mod" and body == {"userId": "2", "include": "summary"} for phase, body in calls)
+    assert any(f.vuln_type == "Broken Object-Level Authorization" for f in findings)
+    bola = next(f for f in findings if f.vuln_type == "Broken Object-Level Authorization")
+    assert bola.detection_evidence["parameter_location"] == "json_body"
+    assert bola.detection_evidence["request_url"] == "https://example.com/api/profile"
+    assert bola.detection_evidence["request_template"] == {
+        "replay_exact": True,
+        "json_body": {"userId": "1", "include": "summary"},
+    }
+    assert any(
+        phase == "idor_second_user_own"
+        and body == {"userId": "1", "include": "summary"}
+        for phase, body in calls
+    )
+    assert not any(phase == "idor_authed_mod" for phase, _ in calls)
 
 
 @pytest.mark.asyncio
@@ -202,6 +224,9 @@ async def test_access_control_tests_path_template_idor_targets() -> None:
         )
 
     assert any(f.vuln_type == "Insecure Direct Object Reference (IDOR)" for f in findings)
+    idor = next(f for f in findings if f.vuln_type == "Insecure Direct Object Reference (IDOR)")
+    assert idor.detection_evidence["request_url"] == "https://example.com/api/users/2"
+    assert idor.detection_evidence["request_template"] == {"replay_exact": True}
     assert ("idor_authed_mod", "https://example.com/api/users/2") in requested_urls
 
 

@@ -1120,7 +1120,7 @@ def build_executive_summary(data: dict, styles: dict) -> list:
     meta_rows = [
         ["Scan Target",  target],
         ["Scan ID",      d.get("scan_id", "N/A")],
-        ["Submitted By", d.get("owner_email") or d.get("owner_user_id") or "N/A"],
+        ["Submitted By", f"{d['submitted_by_full_name']} {d['submitted_by_email']}"],
         ["Authorization Confirmed", "Yes" if (d.get("authorization") or {}).get("confirmed") else "No"],
         ["Authorization Confirmed At", _fmt_dt((d.get("authorization") or {}).get("confirmed_at"))],
         ["Generated At", date_str],

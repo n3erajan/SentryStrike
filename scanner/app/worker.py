@@ -6,10 +6,15 @@ import socket
 import uuid
 
 from app.core.scanner import ScanOrchestrator
+from app.reverification import run_focused_reverification
 from shared.database.connection import close_db, init_db
 from shared.database.repositories.scan_repository import ScanRepository
+from shared.database.repositories.notification_repository import NotificationRepository
+from shared.database.repositories.reverification_repository import ReverificationRepository
+from shared.models.notification import NotificationType
+from shared.models.reverification import ReverificationStatus
 from shared.models.scan import ScanPhase, ScanStatus
-from shared.scan_queue import RedisScanQueue, ScanJob, ScanQueue, ScanQueueError
+from shared.scan_queue import RedisScanQueue, ScanJob, ScanJobKind, ScanQueue, ScanQueueError
 from shared.utils.logger import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -19,6 +24,32 @@ TERMINAL_SCAN_STATUSES = {
     ScanStatus.failed,
     ScanStatus.cancelled,
 }
+
+
+async def _notify_terminal_scan(scan) -> None:
+    """Emit one idempotent terminal notification for the scan submitter."""
+    mapping = {
+        ScanStatus.completed: (NotificationType.scan_completed, "Scan completed", "completed"),
+        ScanStatus.failed: (NotificationType.scan_failed, "Scan failed", "failed"),
+        ScanStatus.cancelled: (NotificationType.scan_cancelled, "Scan cancelled", "was cancelled"),
+    }
+    details = mapping.get(scan.status)
+    if details is None:
+        return
+    notification_type, title, verb = details
+    target_url = scan.target_url
+    message = f"The scan of {target_url} {verb}."
+    await NotificationRepository().create(
+        org_id=scan.org_id,
+        recipient_user_id=scan.submitted_by_user_id,
+        type=notification_type,
+        title=title,
+        message=message,
+        resource_type="scan",
+        resource_id=str(scan.id),
+        metadata={"status": scan.status.value, "target_url": target_url},
+        dedupe_key=f"scan-terminal:{scan.org_id}:{scan.id}:{scan.status.value}",
+    )
 
 
 def _make_cancellation_checker(queue: ScanQueue):
@@ -156,6 +187,7 @@ async def process_scan_job(
             current_phase=ScanPhase.cancelled,
             phase_message="Scan cancelled by user",
         )
+        await _notify_terminal_scan(scan)
         await _best_effort_clear_cancel(queue, job.scan_id)
         logger.info("discarding cancelled scan job %s", job.scan_id)
         return
@@ -177,6 +209,9 @@ async def process_scan_job(
     lease_task = asyncio.create_task(_lease_loop(queue, job.scan_id, lease_ttl))
     try:
         await scan_task
+        refreshed = await repository.get_by_id(job.scan_id)
+        if refreshed is not None:
+            await _notify_terminal_scan(refreshed)
     finally:
         watcher_task.cancel()
         lease_task.cancel()
@@ -192,6 +227,59 @@ async def process_scan_job(
         except ScanQueueError:
             logger.warning("failed to clear lease for scan %s", job.scan_id)
         await _best_effort_clear_cancel(queue, job.scan_id)
+
+
+async def process_reverification_job(
+    job: ScanJob,
+    *,
+    repository: ReverificationRepository,
+) -> None:
+    """Run one focused finding replay and persist its immutable evidence."""
+    if not job.reverification_job_id:
+        logger.error("discarding re-verification queue item without a job id")
+        return
+    verification = await repository.get_by_id(job.reverification_job_id)
+    if verification is None:
+        logger.error(
+            "discarding re-verification job %s: record not found",
+            job.reverification_job_id,
+        )
+        return
+    if verification.status in {
+        ReverificationStatus.completed,
+        ReverificationStatus.failed,
+    }:
+        return
+
+    await repository.mark_running(verification)
+    try:
+        outcome, evidence = await run_focused_reverification(
+            verification.target, job.auth_accounts
+        )
+        await repository.complete(verification, outcome=outcome, evidence=evidence)
+        message = (
+            f"Re-verification finished with outcome: {outcome.value.replace('_', ' ')}."
+        )
+    except Exception as exc:
+        logger.exception("re-verification job %s failed", verification.id)
+        await repository.fail(verification, str(exc))
+        message = "Re-verification failed before a result could be determined."
+
+    await NotificationRepository().create(
+        org_id=verification.org_id,
+        recipient_user_id=verification.requested_by_user_id,
+        type=NotificationType.reverification_completed,
+        title="Finding re-verification completed",
+        message=message,
+        resource_type="reverification",
+        resource_id=str(verification.id),
+        metadata={
+            "scan_id": verification.scan_id,
+            "vulnerability_id": verification.vulnerability_id,
+            "outcome": verification.outcome.value if verification.outcome else None,
+        },
+        dedupe_key=f"reverification-terminal:{verification.org_id}:{verification.id}",
+    )
 
 
 async def _heartbeat_loop(queue: RedisScanQueue, worker_id: str) -> None:
@@ -220,6 +308,7 @@ async def run_worker() -> None:
     heartbeat_task = asyncio.create_task(_heartbeat_loop(queue, worker_id))
 
     repository = ScanRepository()
+    reverification_repository = ReverificationRepository()
     orchestrator = ScanOrchestrator(
         repository,
         cancellation_checker=_make_cancellation_checker(queue),
@@ -240,12 +329,17 @@ async def run_worker() -> None:
                 continue
 
             try:
-                await process_scan_job(
-                    job,
-                    queue=queue,
-                    repository=repository,
-                    orchestrator=orchestrator,
-                )
+                if job.kind == ScanJobKind.finding_reverification:
+                    await process_reverification_job(
+                        job, repository=reverification_repository
+                    )
+                else:
+                    await process_scan_job(
+                        job,
+                        queue=queue,
+                        repository=repository,
+                        orchestrator=orchestrator,
+                    )
             except Exception:
                 logger.exception("worker failed while handling scan %s", job.scan_id)
     finally:

@@ -6,6 +6,7 @@ from pydantic import Field
 # Compliance floor for scan-data retention. A workspace may keep data longer,
 # but never less than this many days.
 MIN_RETENTION_DAYS = 30
+DEFAULT_MEMBER_LIMIT = 10
 
 
 class Organization(Document):
@@ -17,6 +18,11 @@ class Organization(Document):
 
     name: str
     owner_user_id: Indexed(str)
+    # Seats include the owner, active members, and pending unexpired member
+    # invitations. Invitations reserve a seat until accepted, cancelled, or
+    # expired so concurrent issuers cannot oversubscribe a workspace.
+    member_limit: int = Field(default=DEFAULT_MEMBER_LIMIT, ge=1)
+    occupied_seats: int = Field(default=1, ge=1)
     # Scan data older than this is eligible for the retention purge. Enforced to
     # never drop below ``MIN_RETENTION_DAYS`` on write for compliance.
     retention_days: int = 90

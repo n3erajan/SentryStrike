@@ -1,3 +1,4 @@
+import json
 import math
 import re
 from collections.abc import Iterable
@@ -15,6 +16,7 @@ from shared.models.vulnerability import (
     LocationInfo,
     SeverityLevel,
     Vulnerability,
+    VerificationTarget,
 )
 
 
@@ -122,6 +124,38 @@ class FindingProcessingMixin:
             cvss_score = cvss.score
             cvss_vector = cvss.vector
 
+        detection_evidence = getattr(finding, "detection_evidence", {}) or {}
+
+        # Deduplication merges evidence values into lists. Replay metadata still
+        # describes the primary (highest-confidence) finding, so consume its first
+        # value while continuing to support detectors that emit scalar metadata.
+        def primary_evidence_value(key: str, default=None):
+            value = detection_evidence.get(key, default)
+            if isinstance(value, list):
+                return value[0] if value else default
+            return value
+
+        request_template = primary_evidence_value("request_template", {})
+        if not isinstance(request_template, dict):
+            request_template = {}
+        serialized_template = json.dumps(request_template, default=str)
+        safe_template = json.loads(
+            redact_secrets(serialized_template, extra_secrets) or "{}"
+        )
+        detector_id = str(
+            getattr(finding, "detector_name", None)
+            or getattr(finding, "detection_method", None)
+            or "unknown_detector"
+        ).strip().lower().replace(" ", "_")
+        response_snippet = redact_secrets(
+            self._finding_response_snippet(finding), extra_secrets
+        )
+        verification_url = redact_secrets(
+            str(primary_evidence_value("request_url", finding.url)), extra_secrets
+        ) or finding.url
+        control_payload = primary_evidence_value("control_payload")
+        expected_status_code = primary_evidence_value("status_code", "")
+
         return Vulnerability(
             id=str(uuid4()),
             category=finding.category,
@@ -130,21 +164,25 @@ class FindingProcessingMixin:
             cvss_score=cvss_score,
             cvss_vector=cvss_vector,
             location=LocationInfo(
-                url=finding.url,
+                url=verification_url,
                 parameter=finding.parameter,
                 parameters=(
                     list(getattr(finding, "affected_parameters", None) or [])
                     or ([finding.parameter] if finding.parameter else [])
                 ),
                 http_method=finding.method,
-                parameter_location=(getattr(finding, "parameter_location", None) or None),
+                parameter_location=(
+                    getattr(finding, "parameter_location", None)
+                    or primary_evidence_value("parameter_location")
+                    or None
+                ),
             ),
             evidence=Evidence(
                 payload=redact_secrets(finding.payload, extra_secrets),
                 request_snippet=redact_secrets(
                     getattr(finding, "verification_request_snippet", None), extra_secrets
                 ),
-                response_snippet=redact_secrets(self._finding_response_snippet(finding), extra_secrets),
+                response_snippet=response_snippet,
                 verified=getattr(finding, "verified", False),
                 confidence_score=float(getattr(finding, "confidence_score", 0.0) or 0.0),
                 detection_method=getattr(finding, "detection_method", None),
@@ -154,6 +192,28 @@ class FindingProcessingMixin:
             ),
             evidence_strength=evidence_strength,
             auth_context=auth_context,
+            verification_target=VerificationTarget(
+                detector_id=detector_id,
+                url=finding.url,
+                method=finding.method or "GET",
+                parameter=finding.parameter,
+                parameter_location=(
+                    getattr(finding, "parameter_location", None)
+                    or primary_evidence_value("parameter_location")
+                    or None
+                ),
+                request_template=safe_template,
+                payload=redact_secrets(finding.payload, extra_secrets),
+                control_payload=(
+                    str(control_payload) if control_payload is not None else None
+                ),
+                proof_type=getattr(finding, "detection_method", None),
+                auth_context=auth_context,
+                expected_response_snippet=(response_snippet or "")[:1000] or None,
+                expected_status_code=(
+                    int(expected_status_code) if str(expected_status_code).isdigit() else None
+                ),
+            ),
         )
 
     @staticmethod

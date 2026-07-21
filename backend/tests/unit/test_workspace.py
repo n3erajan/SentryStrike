@@ -19,11 +19,13 @@ from app.api.dependencies import (
     get_current_user,
     get_invite_service,
     get_member_repository,
+    get_notification_repository,
     get_organization_repository,
 )
 from app.api.routes import workspace
+from app.core.invites import InviteThrottleError, WorkspaceMemberLimitError
 from shared.models.audit import AuditAction
-from shared.models.invite import InviteState
+from shared.models.invite import InviteEmailStatus, InviteState
 from shared.models.organization import MIN_RETENTION_DAYS
 from shared.models.user import UserRole
 
@@ -38,11 +40,21 @@ class FakeAuditRepository:
         self.entries.append(kwargs)
 
 
+class FakeNotificationRepository:
+    def __init__(self) -> None:
+        self.entries: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.entries.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+
 class FakeMember:
     def __init__(self, user_id: str, org_id: str, role: UserRole, email: str | None = None) -> None:
         self.id = user_id
         self.org_id = org_id
         self.role = role
+        self.full_name = user_id.replace("-", " ").title()
         self.email = email or f"{user_id}@example.test"
         self.is_active = True
         self.created_at = datetime(2026, 6, 8, 9, 10, 17, tzinfo=timezone.utc)
@@ -87,6 +99,10 @@ class FakeInvite:
         self.expires_at = datetime(2026, 7, 28, 9, 10, 17, tzinfo=timezone.utc)
         self.created_at = datetime(2026, 7, 21, 9, 10, 17, tzinfo=timezone.utc)
         self.invited_by_user_id = None
+        self.email_delivery_status = InviteEmailStatus.not_attempted
+        self.email_delivery_backend = None
+        self.email_delivery_attempted_at = None
+        self.email_delivery_error = None
 
 
 class FakeOrg:
@@ -95,6 +111,8 @@ class FakeOrg:
         self.name = name
         self.retention_days = 90
         self.default_scan_config: dict = {}
+        self.member_limit = 10
+        self.occupied_seats = 3 if org_id == "org-1" else 1
 
 
 class FakeOrganizationRepository:
@@ -115,6 +133,11 @@ class FakeOrganizationRepository:
     async def set_retention_days(self, org: FakeOrg, days: int) -> FakeOrg:
         org.retention_days = max(MIN_RETENTION_DAYS, days)
         return org
+
+    async def release_member_seat(self, org_id: str) -> bool:
+        org = self.orgs[org_id]
+        org.occupied_seats = max(1, org.occupied_seats - 1)
+        return True
 
     async def list_pending_invites(self, org_id: str):
         return [i for i in self.invites.values() if i.org_id == org_id and i.state == InviteState.pending]
@@ -143,6 +166,16 @@ class FakeInviteService:
         invite.invited_by_user_id = invited_by_user_id
         return "raw-token", invite
 
+    async def expire_pending_member_invites(self, org_id: str) -> None:
+        _ = org_id
+
+    async def record_email_delivery(self, invite, *, status, backend, error=None):
+        invite.email_delivery_status = status
+        invite.email_delivery_backend = backend
+        invite.email_delivery_attempted_at = datetime.now(timezone.utc)
+        invite.email_delivery_error = error
+        return invite
+
     async def cancel(self, invite: FakeInvite) -> FakeInvite:
         invite.state = InviteState.cancelled
         self.cancelled.append(str(invite.id))
@@ -150,11 +183,26 @@ class FakeInviteService:
 
 
 class FakeEmailBackend:
+    name = "smtp"
+
     def __init__(self) -> None:
         self.sent: list[dict] = []
 
-    def send(self, *, to: str, subject: str, body_text: str, body_html: str | None = None) -> None:
-        self.sent.append({"to": to, "subject": subject})
+    def send(self, *, to: str, subject: str, body_text: str, body_html: str | None = None):
+        self.sent.append(
+            {
+                "to": to,
+                "subject": subject,
+                "body_text": body_text,
+                "body_html": body_html,
+            }
+        )
+
+
+class FailingEmailBackend(FakeEmailBackend):
+    def send(self, **kwargs) -> None:
+        _ = kwargs
+        raise RuntimeError("smtp unavailable")
 
 
 def _client(
@@ -178,6 +226,7 @@ def _client(
     app.dependency_overrides[get_organization_repository] = lambda: orgs
     app.dependency_overrides[get_invite_service] = lambda: invites
     app.dependency_overrides[get_audit_repository] = lambda: audit
+    app.dependency_overrides[get_notification_repository] = lambda: FakeNotificationRepository()
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=user_id, email=f"{user_id}@example.test", org_id=org_id, role=role
     )
@@ -203,6 +252,9 @@ def test_list_members_returns_only_callers_org() -> None:
     ids = {m["id"] for m in response.json()["data"]["items"]}
     assert ids == {"user-owner", "user-admin", "user-dev"}
     assert "user-other" not in ids
+    assert all(m["full_name"] for m in response.json()["data"]["items"])
+    assert response.json()["data"]["member_limit"] == 10
+    assert response.json()["data"]["occupied_seats"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +397,30 @@ def test_admin_can_invite_a_member_bound_to_their_org(monkeypatch) -> None:
     assert invites.created_kwargs["role"] == UserRole.developer
     assert invites.created_kwargs["invited_by_user_id"] == "user-admin"
     assert email.sent and email.sent[0]["to"] == "hire@example.test"
+    assert "Join Acme Corp on SentryStrike" in email.sent[0]["body_html"]
+    assert "Accept invitation" in email.sent[0]["body_html"]
+    assert response.json()["data"]["email_delivery_status"] == "smtp_accepted"
+    assert response.json()["message"] == "invite email accepted by SMTP server"
+
+
+def test_failed_invite_email_cancels_invite_and_releases_reservation(monkeypatch) -> None:
+    members, orgs, invites = _repos()
+    client = _client(
+        members=members,
+        orgs=orgs,
+        invites=invites,
+        email=FailingEmailBackend(),
+        role=UserRole.admin,
+        monkeypatch=monkeypatch,
+    )
+
+    response = client.post(
+        "/api/v1/workspace/invites",
+        json={"email": "hire@example.test", "role": "developer"},
+    )
+
+    assert response.status_code == 503
+    assert invites.cancelled == ["invite-new"]
 
 
 def test_cannot_invite_an_owner(monkeypatch) -> None:
@@ -365,6 +441,56 @@ def test_viewer_cannot_invite() -> None:
 
     assert response.status_code == 403
     assert invites.created_kwargs is None
+
+
+def test_invite_rate_limit_returns_retry_after(monkeypatch) -> None:
+    members, orgs, invites = _repos()
+
+    async def limited(**kwargs):
+        _ = kwargs
+        raise InviteThrottleError(37)
+
+    invites.create_invite = limited
+    client = _client(
+        members=members,
+        orgs=orgs,
+        invites=invites,
+        role=UserRole.admin,
+        monkeypatch=monkeypatch,
+    )
+
+    response = client.post(
+        "/api/v1/workspace/invites",
+        json={"email": "hire@example.test", "role": "developer"},
+    )
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "37"
+
+
+def test_full_workspace_rejects_invite(monkeypatch) -> None:
+    members, orgs, invites = _repos()
+
+    async def full(**kwargs):
+        _ = kwargs
+        raise WorkspaceMemberLimitError()
+
+    invites.create_invite = full
+    client = _client(
+        members=members,
+        orgs=orgs,
+        invites=invites,
+        role=UserRole.admin,
+        monkeypatch=monkeypatch,
+    )
+
+    response = client.post(
+        "/api/v1/workspace/invites",
+        json={"email": "hire@example.test", "role": "developer"},
+    )
+
+    assert response.status_code == 409
+    assert "member limit" in response.json()["detail"].lower()
 
 
 def test_list_pending_invites_is_org_scoped() -> None:
@@ -419,17 +545,33 @@ def test_admin_can_replace_default_config() -> None:
     members, orgs, invites = _repos()
     client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.admin)
 
-    response = client.put("/api/v1/workspace/default-config", json={"config": {"concurrency": 8}})
+    response = client.put("/api/v1/workspace/default-config", json={"config": {"scanner_concurrency": 8}})
 
     assert response.status_code == 200
-    assert orgs.orgs["org-1"].default_scan_config == {"concurrency": 8}
+    assert orgs.orgs["org-1"].default_scan_config == {"scanner_concurrency": 8}
+
+
+def test_default_config_rejects_unknown_or_out_of_range_fields() -> None:
+    members, orgs, invites = _repos()
+    client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.admin)
+
+    unknown = client.put(
+        "/api/v1/workspace/default-config", json={"config": {"concurrency": 8}}
+    )
+    out_of_range = client.put(
+        "/api/v1/workspace/default-config",
+        json={"config": {"scanner_concurrency": 500}},
+    )
+
+    assert unknown.status_code == 422
+    assert out_of_range.status_code == 422
 
 
 def test_viewer_cannot_replace_default_config() -> None:
     members, orgs, invites = _repos()
     client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.viewer)
 
-    response = client.put("/api/v1/workspace/default-config", json={"config": {"concurrency": 8}})
+    response = client.put("/api/v1/workspace/default-config", json={"config": {"scanner_concurrency": 8}})
 
     assert response.status_code == 403
 

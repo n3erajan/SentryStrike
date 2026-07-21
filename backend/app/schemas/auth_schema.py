@@ -14,8 +14,17 @@ class RegisterRequest(BaseModel):
     """
 
     invite_token: str = Field(min_length=1, max_length=512)
+    full_name: str = Field(min_length=2, max_length=120)
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=8, max_length=256)
+
+    @field_validator("full_name")
+    @classmethod
+    def _validate_full_name(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if len(normalized) < 2:
+            raise ValueError("Enter your full name.")
+        return normalized
 
     @field_validator("email")
     @classmethod
@@ -42,6 +51,7 @@ class UserResponse(BaseModel):
     """Public-facing user profile returned by API endpoints."""
 
     id: str
+    full_name: str
     email: str
     org_id: str
     role: str

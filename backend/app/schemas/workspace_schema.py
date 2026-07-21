@@ -4,6 +4,7 @@ import re
 from pydantic import BaseModel, Field, field_validator
 
 from shared.models.user import UserRole
+from shared.schemas.scan_schema import ScanConfig
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -53,7 +54,7 @@ class ChangeRoleRequest(BaseModel):
 class DefaultConfigRequest(BaseModel):
     """Payload for replacing the workspace's stored default scan config blob."""
 
-    config: dict = Field(default_factory=dict)
+    config: ScanConfig = Field(default_factory=ScanConfig)
 
 
 class RetentionRequest(BaseModel):
@@ -66,6 +67,7 @@ class MemberResponse(BaseModel):
     """Public-facing member profile within a workspace."""
 
     id: str
+    full_name: str
     email: str
     role: str
     is_active: bool
@@ -82,3 +84,7 @@ class InviteResponse(BaseModel):
     expires_at: datetime
     created_at: datetime
     invited_by_user_id: str | None = None
+    email_delivery_status: str
+    email_delivery_backend: str | None = None
+    email_delivery_attempted_at: datetime | None = None
+    email_delivery_error: str | None = None

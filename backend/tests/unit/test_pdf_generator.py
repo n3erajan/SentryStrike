@@ -224,16 +224,17 @@ def test_pdf_detailed_findings_do_not_repeat_remediation_section() -> None:
     assert "REMEDIATION" not in labels
 
 
-def test_pdf_executive_summary_includes_owner_and_authorization_metadata() -> None:
+def test_pdf_executive_summary_includes_submitter_and_authorization_metadata() -> None:
     from app.utils.pdf_generator import build_executive_summary
 
     scan_data = {
         "data": {
             "scan_id": "scan-1",
             "generated_at": "2026-06-08T09:10:17",
+            "submitted_by_full_name": "Niuradaj Adhadh",
+            "submitted_by_email": "user@example.test",
             "executive_summary": "Summary.",
             "risk_score": 45.0,
-            "owner_email": "user@example.test",
             "authorization": {
                 "confirmed": True,
                 "confirmed_at": "2026-06-08T09:00:00",
@@ -245,6 +246,7 @@ def test_pdf_executive_summary_includes_owner_and_authorization_metadata() -> No
     text = _flowable_text(build_executive_summary(scan_data, build_styles()))
 
     assert "Submitted By" in text
+    assert "Niuradaj Adhadh user@example.test" in text
     assert "user@example.test" in text
     assert "Authorization Confirmed" in text
     assert "Yes" in text
@@ -399,6 +401,8 @@ def test_pdf_builds_with_full_long_response_snippet() -> None:
         "data": {
             "scan_id": "scan-1",
             "generated_at": "2026-06-08T09:10:17",
+            "submitted_by_full_name": "Niuradaj Adhadh",
+            "submitted_by_email": "user@example.test",
             "executive_summary": "Summary.",
             "statistics": {
                 "total_urls_crawled": 1,
@@ -455,6 +459,8 @@ def test_pdf_escapes_dynamic_markup_in_ai_text() -> None:
         "data": {
             "scan_id": "scan-markup",
             "generated_at": "2026-06-08T09:10:17",
+            "submitted_by_full_name": "Niuradaj Adhadh",
+            "submitted_by_email": "user@example.test",
             "executive_summary": "Summary with <raw> tag.",
             "statistics": {
                 "total_urls_crawled": 1,

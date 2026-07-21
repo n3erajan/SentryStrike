@@ -11,20 +11,13 @@ class MemberRepository:
     its sessions (a member's only exit is owner/admin-initiated removal).
     """
 
-    async def get_by_id(self, user_id: str) -> User | None:
-        """Fetch a user by string id, returning None for malformed ids."""
+    async def get_in_org(self, user_id: str, org_id: str) -> User | None:
+        """Fetch a user only if they belong to the given organization."""
         try:
             oid = PydanticObjectId(user_id)
         except Exception:
             return None
-        return await User.get(oid)
-
-    async def get_in_org(self, user_id: str, org_id: str) -> User | None:
-        """Fetch a user only if they belong to the given organization."""
-        user = await self.get_by_id(user_id)
-        if user is None or user.org_id != org_id:
-            return None
-        return user
+        return await User.find_one(User.id == oid, User.org_id == org_id)
 
     async def list_in_org(self, org_id: str) -> list[User]:
         """List all members of an organization, newest first."""

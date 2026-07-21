@@ -113,8 +113,9 @@ class FakeScan:
     def __init__(self) -> None:
         self.id = "mock-id"
         self.target_url = "https://example.com"
-        self.owner_user_id = "user-1"
-        self.owner_email = "user@example.test"
+        self.submitted_by_user_id = "user-1"
+        self.submitted_by_full_name = "Scan Submitter"
+        self.submitted_by_email = "user@example.test"
         self.crawl_mode = CrawlMode.full
         self.status = ScanStatus.queued
         self.progress = 0

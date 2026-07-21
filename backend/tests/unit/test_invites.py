@@ -1,26 +1,29 @@
 """Invite service helpers and token-gated registration route behavior.
 
-The DB-touching methods (create/accept) are exercised at the route layer with a
-fake InviteService, matching the house style (no live Mongo in unit tests). The
-pure helpers — token hashing and link building — are tested directly.
+DB-touching paths use small ODM fakes so token rotation and uniqueness keys are
+covered without requiring a live Mongo instance.
 """
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import get_auth_service, get_invite_service
 from app.api.routes import auth
-from app.config import get_settings
+from app.core import invites as invite_module
 from app.core.invites import (
     InvalidInviteError,
     InviteEmailMismatchError,
+    InviteService,
     build_invite_link,
     hash_invite_token,
 )
 from shared.config import get_infrastructure_settings
+from shared.models.invite import InviteEmailStatus, InviteState
+from shared.models.user import UserRole
 
 
 # ---------------------------------------------------------------------------
@@ -39,27 +42,22 @@ def test_hash_invite_token_is_deterministic_and_hides_raw_token() -> None:
 
 def test_build_invite_link_uses_public_hostname(monkeypatch) -> None:
     monkeypatch.setenv("PUBLIC_HOSTNAME", "sentry.example.com")
-    monkeypatch.setenv("INVITE_SIGNUP_PATH", "/signup")
     get_infrastructure_settings.cache_clear()
-    get_settings.cache_clear()
     try:
         link = build_invite_link("abc123")
-        assert link == "http://sentry.example.com/signup?invite=abc123"
+        assert link == "http://sentry.example.com/register?invite=abc123"
     finally:
         get_infrastructure_settings.cache_clear()
-        get_settings.cache_clear()
 
 
 def test_build_invite_link_preserves_explicit_scheme(monkeypatch) -> None:
     monkeypatch.setenv("PUBLIC_HOSTNAME", "https://mypage.com")
     get_infrastructure_settings.cache_clear()
-    get_settings.cache_clear()
     try:
         link = build_invite_link("tok")
-        assert link == "https://mypage.com/signup?invite=tok"
+        assert link == "https://mypage.com/register?invite=tok"
     finally:
         get_infrastructure_settings.cache_clear()
-        get_settings.cache_clear()
 
 
 def test_build_invite_link_returns_none_without_hostname(monkeypatch) -> None:
@@ -69,6 +67,124 @@ def test_build_invite_link_returns_none_without_hostname(monkeypatch) -> None:
         assert build_invite_link("tok") is None
     finally:
         get_infrastructure_settings.cache_clear()
+
+
+class _Field:
+    def __eq__(self, other):
+        _ = other
+        return self
+
+
+@pytest.mark.asyncio
+async def test_owner_invites_use_email_specific_pending_key(monkeypatch) -> None:
+    inserted = []
+
+    class FakeUser:
+        email = _Field()
+
+        @classmethod
+        async def find_one(cls, *args):
+            _ = args
+            return None
+
+    class FakeInvite:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.id = "invite-1"
+
+        async def insert(self):
+            inserted.append(self)
+
+    monkeypatch.setattr(invite_module, "User", FakeUser)
+    monkeypatch.setattr(invite_module, "Invite", FakeInvite)
+    monkeypatch.setattr(
+        invite_module,
+        "get_settings",
+        lambda: SimpleNamespace(invite_ttl_hours=168),
+    )
+
+    _, invite = await InviteService().create_invite(
+        email="OWNER@Example.test",
+        role=UserRole.owner,
+        org_id=None,
+        org_name="Acme",
+        invited_by_user_id=None,
+        member_limit=10,
+    )
+
+    assert inserted == [invite]
+    assert invite.pending_key == "owner:owner@example.test"
+
+
+@pytest.mark.asyncio
+async def test_failed_pending_owner_invite_rotates_token_on_same_record(monkeypatch) -> None:
+    pending = SimpleNamespace(
+        id="invite-1",
+        email="owner@example.test",
+        role=UserRole.owner,
+        state=InviteState.pending,
+        expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        email_delivery_status=InviteEmailStatus.failed,
+        email_delivery_backend="smtp",
+        email_delivery_attempted_at=datetime(2026, 7, 21, tzinfo=timezone.utc),
+        email_delivery_error="SMTPAuthenticationError",
+        token_hash="old-token-hash",
+        pending_key=None,
+        org_name="Old name",
+        member_limit=10,
+    )
+    updates = []
+
+    class Collection:
+        async def update_one(self, query, update):
+            updates.append((query, update))
+            return SimpleNamespace(modified_count=1)
+
+    class FakeUser:
+        email = _Field()
+
+        @classmethod
+        async def find_one(cls, *args):
+            _ = args
+            return None
+
+    class FakeInvite:
+        email = _Field()
+        role = _Field()
+        state = _Field()
+
+        @classmethod
+        async def find_one(cls, *args):
+            _ = args
+            return pending
+
+        @classmethod
+        def get_motor_collection(cls):
+            return Collection()
+
+    monkeypatch.setattr(invite_module, "User", FakeUser)
+    monkeypatch.setattr(invite_module, "Invite", FakeInvite)
+    monkeypatch.setattr(invite_module, "_new_token", lambda: "rotated-token")
+    monkeypatch.setattr(
+        invite_module,
+        "get_settings",
+        lambda: SimpleNamespace(invite_ttl_hours=168),
+    )
+
+    token, invite, retried = await InviteService().create_or_retry_owner_invite(
+        email="owner@example.test",
+        org_name="Correct name",
+        member_limit=25,
+    )
+
+    assert token == "rotated-token"
+    assert invite is pending
+    assert retried is True
+    assert pending.pending_key == "owner:owner@example.test"
+    assert pending.org_name == "Correct name"
+    assert pending.member_limit == 25
+    assert pending.email_delivery_status == InviteEmailStatus.not_attempted
+    assert updates[0][1]["$set"]["pending_key"] == "owner:owner@example.test"
 
 
 # ---------------------------------------------------------------------------
@@ -92,14 +208,20 @@ class FakeInviteService:
             raise InvalidInviteError()
         return self.pending
 
-    async def accept(self, *, token, email, password):
+    async def accept(self, *, token, full_name, email, password):
         if token != "good-token":
             raise InvalidInviteError()
         if email != self.pending.email:
             raise InviteEmailMismatchError()
-        self.accepted = {"token": token, "email": email, "password": password}
+        self.accepted = {
+            "token": token,
+            "full_name": full_name,
+            "email": email,
+            "password": password,
+        }
         return SimpleNamespace(
             id="user-9",
+            full_name=full_name,
             email=email,
             org_id="org-1",
             role=SimpleNamespace(value="developer"),
@@ -152,6 +274,7 @@ def test_register_consumes_invite_and_issues_session() -> None:
         "/api/v1/auth/register",
         json={
             "invite_token": "good-token",
+            "full_name": "Niuradaj   Adhadh",
             "email": "invitee@example.test",
             "password": "password123",
         },
@@ -160,10 +283,12 @@ def test_register_consumes_invite_and_issues_session() -> None:
     assert response.status_code == 201
     body = response.json()["data"]
     assert body["access_token"] == "session-token"
+    assert body["user"]["full_name"] == "Niuradaj Adhadh"
     assert body["user"]["email"] == "invitee@example.test"
     assert body["user"]["role"] == "developer"
     assert body["user"]["org_id"] == "org-1"
     assert invites.accepted["token"] == "good-token"
+    assert invites.accepted["full_name"] == "Niuradaj Adhadh"
     assert "sentrystrike_session=session-token" in response.headers["set-cookie"]
 
 
@@ -174,6 +299,7 @@ def test_register_rejects_email_not_matching_invite() -> None:
         "/api/v1/auth/register",
         json={
             "invite_token": "good-token",
+            "full_name": "Niuradaj Adhadh",
             "email": "someone-else@example.test",
             "password": "password123",
         },
@@ -187,8 +313,27 @@ def test_register_requires_invite_token() -> None:
 
     response = client.post(
         "/api/v1/auth/register",
-        json={"email": "invitee@example.test", "password": "password123"},
+        json={
+            "full_name": "Niuradaj Adhadh",
+            "email": "invitee@example.test",
+            "password": "password123",
+        },
     )
 
     # Missing invite_token fails schema validation before any service call.
+    assert response.status_code == 422
+
+
+def test_register_requires_full_name() -> None:
+    client = _client(FakeInviteService())
+
+    response = client.post(
+        "/api/v1/auth/register",
+        json={
+            "invite_token": "good-token",
+            "email": "invitee@example.test",
+            "password": "password123",
+        },
+    )
+
     assert response.status_code == 422

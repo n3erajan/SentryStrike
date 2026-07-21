@@ -44,8 +44,9 @@ def test_report_payload_exposes_evidence_and_coverage_metadata() -> None:
         ),
         statistics=ScanStatistics(total_urls_crawled=9, total_vulnerabilities=15),
         overall_risk_score=82.0,
-        owner_user_id="user-1",
-        owner_email="user@example.test",
+        submitted_by_user_id="user-1",
+        submitted_by_full_name="Niuradaj Adhadh",
+        submitted_by_email="user@example.test",
         authorization_confirmed=True,
         authorization_confirmed_at=generated_at,
         technology_stack=[],
@@ -59,7 +60,8 @@ def test_report_payload_exposes_evidence_and_coverage_metadata() -> None:
     assert payload["evidence_strength_breakdown"]["confirmed_exploit"] == 2
     assert payload["auth_coverage"]["state"] == "authenticated_verified"
     assert payload["spa_api_coverage"]["api_endpoints_extracted"] == 8
-    assert payload["owner_user_id"] == "user-1"
-    assert payload["owner_email"] == "user@example.test"
+    assert payload["submitted_by_user_id"] == "user-1"
+    assert payload["submitted_by_full_name"] == "Niuradaj Adhadh"
+    assert payload["submitted_by_email"] == "user@example.test"
     assert payload["authorization"]["confirmed"] is True
     assert payload["scanner_limitations"] == SCANNER_LIMITATIONS

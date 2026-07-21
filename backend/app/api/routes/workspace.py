@@ -5,17 +5,20 @@ from app.api.dependencies import (
     get_current_user,
     get_invite_service,
     get_member_repository,
+    get_notification_repository,
     get_organization_repository,
     json_response,
     require_role,
 )
-from app.core.email import get_email_backend
+from app.core.email import get_email_backend, render_workspace_invite_email
 from app.core.invites import InviteError, InviteService, build_invite_link
 from shared.database.repositories.audit_repository import AuditRepository
 from shared.database.repositories.member_repository import MemberRepository
+from shared.database.repositories.notification_repository import NotificationRepository
 from shared.database.repositories.organization_repository import OrganizationRepository
 from shared.models.audit import AuditAction
-from shared.models.invite import Invite
+from shared.models.invite import Invite, InviteEmailStatus
+from shared.models.notification import NotificationType
 from shared.models.user import User, UserRole
 from app.schemas.workspace_schema import (
     ChangeRoleRequest,
@@ -37,6 +40,7 @@ def _member_response(user: User) -> dict:
     """Project a User document to its workspace member representation."""
     return MemberResponse(
         id=str(user.id),
+        full_name=user.full_name,
         email=user.email,
         role=user.role.value,
         is_active=user.is_active,
@@ -54,25 +58,11 @@ def _invite_response(invite: Invite) -> dict:
         expires_at=invite.expires_at,
         created_at=invite.created_at,
         invited_by_user_id=invite.invited_by_user_id,
+        email_delivery_status=invite.email_delivery_status.value,
+        email_delivery_backend=invite.email_delivery_backend,
+        email_delivery_attempted_at=invite.email_delivery_attempted_at,
+        email_delivery_error=invite.email_delivery_error,
     ).model_dump(mode="json")
-
-
-def _render_member_invite_email(org_name: str | None, role: UserRole, link: str | None, token: str) -> tuple[str, str]:
-    """Return (subject, body) for a member invitation email."""
-    workspace = org_name or "your team's"
-    subject = f"You're invited to join the {org_name} workspace on SentryStrike" if org_name else (
-        "You're invited to join a workspace on SentryStrike"
-    )
-    where = link or f"your SentryStrike signup page with this invite token:\n\n    {token}"
-    body = (
-        f"Hello,\n\n"
-        f"You've been invited to join the {workspace} workspace on SentryStrike "
-        f"as a {role.value}.\n\n"
-        f"To accept, complete registration here:\n\n    {where}\n\n"
-        f"This link is single-use and will expire. If you weren't expecting this, "
-        f"you can ignore this email.\n"
-    )
-    return subject, body
 
 
 # --------------------------------------------------------------------------- #
@@ -83,17 +73,29 @@ def _render_member_invite_email(org_name: str | None, role: UserRole, link: str 
 @router.get("/members")
 async def list_members(
     members: MemberRepository = Depends(get_member_repository),
+    orgs: OrganizationRepository = Depends(get_organization_repository),
+    invites: InviteService = Depends(get_invite_service),
     current_user: User = Depends(get_current_user),
 ) -> dict:
     """List every member of the caller's organization. Any member may read."""
+    await invites.expire_pending_member_invites(current_user.org_id)
     users = await members.list_in_org(current_user.org_id)
-    return json_response({"items": [_member_response(u) for u in users], "total": len(users)})
+    org = await orgs.get_by_id(current_user.org_id)
+    return json_response(
+        {
+            "items": [_member_response(u) for u in users],
+            "total": len(users),
+            "member_limit": getattr(org, "member_limit", None),
+            "occupied_seats": getattr(org, "occupied_seats", None),
+        }
+    )
 
 
 @router.delete("/members/{user_id}")
 async def remove_member(
     user_id: str,
     members: MemberRepository = Depends(get_member_repository),
+    orgs: OrganizationRepository = Depends(get_organization_repository),
     audit: AuditRepository = Depends(get_audit_repository),
     current_user: User = Depends(require_role(*WORKSPACE_ADMIN_ROLES)),
 ) -> dict:
@@ -113,6 +115,7 @@ async def remove_member(
     removed_email = target.email
     removed_role = target.role.value
     await members.delete_member(target)
+    await orgs.release_member_seat(current_user.org_id)
     await audit.record(
         org_id=current_user.org_id,
         action=AuditAction.member_removed,
@@ -130,6 +133,7 @@ async def change_member_role(
     user_id: str,
     payload: ChangeRoleRequest,
     members: MemberRepository = Depends(get_member_repository),
+    notifications: NotificationRepository = Depends(get_notification_repository),
     audit: AuditRepository = Depends(get_audit_repository),
     current_user: User = Depends(require_role(*WORKSPACE_ADMIN_ROLES)),
 ) -> dict:
@@ -147,6 +151,20 @@ async def change_member_role(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The owner's role cannot be changed.")
     previous_role = target.role.value
     await members.set_role(target, payload.role)
+    await notifications.create(
+        org_id=current_user.org_id,
+        recipient_user_id=user_id,
+        type=NotificationType.member_role_changed,
+        title="Workspace role changed",
+        message=f"Your workspace role changed from {previous_role} to {payload.role.value}.",
+        resource_type="member",
+        resource_id=user_id,
+        metadata={"from": previous_role, "to": payload.role.value},
+        dedupe_key=(
+            f"member-role:{current_user.org_id}:{user_id}:"
+            f"{previous_role}:{payload.role.value}"
+        ),
+    )
     await audit.record(
         org_id=current_user.org_id,
         action=AuditAction.member_role_changed,
@@ -167,9 +185,11 @@ async def change_member_role(
 @router.get("/invites")
 async def list_invites(
     orgs: OrganizationRepository = Depends(get_organization_repository),
+    invite_service: InviteService = Depends(get_invite_service),
     current_user: User = Depends(require_role(*WORKSPACE_ADMIN_ROLES)),
 ) -> dict:
     """List pending invites for the caller's organization. Owner/admin only."""
+    await invite_service.expire_pending_member_invites(current_user.org_id)
     invites = await orgs.list_pending_invites(current_user.org_id)
     return json_response({"items": [_invite_response(i) for i in invites], "total": len(invites)})
 
@@ -199,14 +219,46 @@ async def invite_member(
             invited_by_user_id=str(current_user.id),
         )
     except InviteError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+        headers = None
+        retry_after = getattr(exc, "retry_after", None)
+        if retry_after is not None:
+            headers = {"Retry-After": str(retry_after)}
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.message, headers=headers
+        ) from exc
 
     link = build_invite_link(token)
-    subject, body = _render_member_invite_email(org_name, payload.role, link, token)
+    subject, body_text, body_html = render_workspace_invite_email(
+        org_name=org_name,
+        role=payload.role.value,
+        link=link,
+        token=token,
+    )
+    backend = get_email_backend()
     try:
-        get_email_backend().send(to=payload.email, subject=subject, body_text=body)
-    except Exception:  # noqa: BLE001 — delivery failure must not void a created invite
-        pass
+        backend.send(
+            to=payload.email,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+        )
+    except Exception as exc:  # noqa: BLE001 — compensate the persisted invite and seat
+        await invites.record_email_delivery(
+            invite,
+            status=InviteEmailStatus.failed,
+            backend=backend.name,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        await invites.cancel(invite)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Invitation email could not be delivered; no invitation was created.",
+        ) from exc
+    await invites.record_email_delivery(
+        invite,
+        status=InviteEmailStatus.smtp_accepted,
+        backend=backend.name,
+    )
     await audit.record(
         org_id=current_user.org_id,
         action=AuditAction.invite_created,
@@ -216,7 +268,7 @@ async def invite_member(
         target_id=str(invite.id),
         metadata={"email": payload.email, "role": payload.role.value},
     )
-    return json_response(_invite_response(invite), "invite sent")
+    return json_response(_invite_response(invite), "invite email accepted by SMTP server")
 
 
 @router.post("/invites/{invite_id}/cancel")
@@ -300,7 +352,9 @@ async def set_default_config(
     org = await orgs.get_by_id(current_user.org_id)
     if org is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-    org = await orgs.set_default_scan_config(org, payload.config)
+    org = await orgs.set_default_scan_config(
+        org, payload.config.model_dump(mode="json", exclude_none=True)
+    )
     return json_response({"config": org.default_scan_config}, "default config updated")
 
 

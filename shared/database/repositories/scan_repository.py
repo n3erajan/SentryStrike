@@ -11,7 +11,7 @@ class ScanRepository:
     """Persistence layer for Scan documents.
 
     Centralizes all database access for scans so that both the API and the
-    worker operate on the same query logic (ownership checks, lifecycle
+    worker operate on the same query logic (workspace scoping, lifecycle
     timestamps, status transitions) rather than duplicating it per service.
     """
 
@@ -20,8 +20,9 @@ class ScanRepository:
         target_url: str,
         *,
         org_id: str,
-        owner_user_id: str,
-        owner_email: str,
+        submitted_by_user_id: str,
+        submitted_by_full_name: str,
+        submitted_by_email: str,
         authorization_confirmed: bool,
         crawl_mode: CrawlMode = CrawlMode.full,
         auth_roles_provided: list[ScanAuthRole] | None = None,
@@ -30,8 +31,9 @@ class ScanRepository:
         scan = Scan(
             target_url=target_url,
             org_id=org_id,
-            owner_user_id=owner_user_id,
-            owner_email=owner_email,
+            submitted_by_user_id=submitted_by_user_id,
+            submitted_by_full_name=submitted_by_full_name,
+            submitted_by_email=submitted_by_email,
             crawl_mode=crawl_mode,
             status=ScanStatus.queued,
             authorization_confirmed=authorization_confirmed,
@@ -56,19 +58,19 @@ class ScanRepository:
         so callers cannot distinguish between the two cases (a member of one
         workspace cannot probe for the existence of another workspace's scans).
         """
-        scan = await self.get_by_id(scan_id)
-        if scan is None or scan.org_id != org_id:
+        try:
+            oid = PydanticObjectId(scan_id)
+        except Exception:
             return None
-        return scan
+        return await Scan.find_one(Scan.id == oid, Scan.org_id == org_id)
 
-    async def list(self, skip: int = 0, limit: int = 20, org_id: str | None = None) -> list[Scan]:
+    async def list(self, org_id: str, skip: int = 0, limit: int = 20) -> list[Scan]:
         """List scans for an organization (all members share one view), newest first.
 
-        ``org_id`` is required in practice; the None branch exists only for
-        administrative/diagnostic use and lists across all orgs.
+        The organization id is mandatory: cross-tenant listing is not a valid
+        repository operation.
         """
-        query = Scan.find(Scan.org_id == org_id) if org_id else Scan.find_all()
-        return await query.sort(-Scan.created_at).skip(skip).limit(limit).to_list()
+        return await Scan.find(Scan.org_id == org_id).sort(-Scan.created_at).skip(skip).limit(limit).to_list()
 
     async def list_expired(self, org_id: str, cutoff: datetime) -> list[Scan]:
         """List an org's scans created strictly before ``cutoff`` (retention purge).
@@ -78,12 +80,33 @@ class ScanRepository:
         """
         return await Scan.find(Scan.org_id == org_id, Scan.created_at < cutoff).to_list()
 
-    async def delete(self, scan_id: str) -> bool:
-        scan = await self.get_by_id(scan_id)
-        if not scan:
+    async def attach_reverification_job(
+        self,
+        *,
+        scan_id: str,
+        org_id: str,
+        vulnerability_id: str,
+        job_id: str,
+    ) -> bool:
+        """Atomically attach a verification-history reference to one finding."""
+        try:
+            oid = PydanticObjectId(scan_id)
+        except Exception:
             return False
-        await scan.delete()
-        return True
+        result = await Scan.get_motor_collection().update_one(
+            {
+                "_id": oid,
+                "org_id": org_id,
+                "vulnerabilities.id": vulnerability_id,
+            },
+            {
+                "$addToSet": {
+                    "vulnerabilities.$.reverification_job_ids": job_id,
+                },
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+        return result.modified_count == 1
 
     async def update_status(
         self,

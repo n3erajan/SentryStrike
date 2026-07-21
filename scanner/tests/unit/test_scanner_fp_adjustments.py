@@ -48,7 +48,12 @@ def test_to_vulnerability_preserves_detector_verification_metadata() -> None:
         evidence="Timing delta confirmed.",
         confidence_score=90.0,
         detection_method="time_based",
-        detection_evidence={"timing_delta_ms": 5100},
+        detection_evidence={
+            "timing_delta_ms": 5100,
+            "parameter_location": ["json_body"],
+            "request_template": [{"json_body": {"id": "7", "name": "record"}}],
+            "status_code": [200],
+        },
         verified=True,
     )
 
@@ -57,7 +62,19 @@ def test_to_vulnerability_preserves_detector_verification_metadata() -> None:
     assert vulnerability.evidence.verified is True
     assert vulnerability.evidence.confidence_score == 90.0
     assert vulnerability.evidence.detection_method == "time_based"
-    assert vulnerability.evidence.detection_evidence == {"timing_delta_ms": 5100}
+    assert vulnerability.evidence.detection_evidence == {
+        "timing_delta_ms": 5100,
+        "parameter_location": ["json_body"],
+        "request_template": [{"json_body": {"id": "7", "name": "record"}}],
+        "status_code": [200],
+    }
+    assert vulnerability.location.parameter_location == "json_body"
+    assert vulnerability.verification_target is not None
+    assert vulnerability.verification_target.parameter_location == "json_body"
+    assert vulnerability.verification_target.request_template == {
+        "json_body": {"id": "7", "name": "record"}
+    }
+    assert vulnerability.verification_target.expected_status_code == 200
     assert vulnerability.cvss_score == 9.1
     assert vulnerability.cvss_vector == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
 

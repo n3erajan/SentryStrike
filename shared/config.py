@@ -72,7 +72,7 @@ class InfrastructureSettings(BaseSettings):
     # Two things derive from it:
     #   * the OAST callback/poll URLs the scanner hands to a target (route layout
     #     /oast and /oast/poll), and
-    #   * the invite links the backend emails (route /signup?invite=<token>).
+    #   * the invite links the backend emails (route /register?invite=<token>).
     # A bare hostname is given an http:// scheme. Leave unset for local dev.
     public_hostname: str | None = Field(default=None, alias="PUBLIC_HOSTNAME")
 

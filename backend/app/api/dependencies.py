@@ -5,8 +5,11 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from app.config import get_settings
 from app.core.auth import AuthService, InvalidSessionError
 from app.core.invites import InviteService
+from app.core.invite_rate_limit import RedisInviteRateLimiter
 from shared.database.repositories.audit_repository import AuditRepository
 from shared.database.repositories.member_repository import MemberRepository
+from shared.database.repositories.notification_repository import NotificationRepository
+from shared.database.repositories.reverification_repository import ReverificationRepository
 from shared.database.repositories.organization_repository import OrganizationRepository
 from shared.database.repositories.scan_repository import ScanRepository
 from shared.models.user import User, UserRole
@@ -17,8 +20,10 @@ scan_repository = ScanRepository()
 member_repository = MemberRepository()
 organization_repository = OrganizationRepository()
 audit_repository = AuditRepository()
+notification_repository = NotificationRepository()
+reverification_repository = ReverificationRepository()
 auth_service = AuthService()
-invite_service = InviteService()
+invite_service = InviteService(RedisInviteRateLimiter.from_settings())
 
 
 def get_scan_repository() -> ScanRepository:
@@ -39,6 +44,14 @@ def get_organization_repository() -> OrganizationRepository:
 def get_audit_repository() -> AuditRepository:
     """FastAPI dependency: provide the shared AuditRepository singleton."""
     return audit_repository
+
+
+def get_notification_repository() -> NotificationRepository:
+    return notification_repository
+
+
+def get_reverification_repository() -> ReverificationRepository:
+    return reverification_repository
 
 
 def get_auth_service() -> AuthService:
@@ -111,22 +124,6 @@ def require_role(*allowed: UserRole):
                 detail="You do not have permission to perform this action.",
             )
         return current_user
-
-    return _inner
-
-
-def ensure_scan_exists(scan_id: str, repo: ScanRepository = Depends(get_scan_repository)):
-    """Return a dependency that verifies a scan exists by id.
-
-    Usage: ``Depends(ensure_scan_exists("some-id"))``. Raises 404 when
-    the scan is not found.
-    """
-
-    async def _inner() -> object:
-        scan = await repo.get_by_id(scan_id)
-        if not scan:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
-        return scan
 
     return _inner
 

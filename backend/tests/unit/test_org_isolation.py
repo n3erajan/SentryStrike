@@ -14,7 +14,12 @@ from types import SimpleNamespace
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_current_user, get_audit_repository, get_scan_repository
+from app.api.dependencies import (
+    get_audit_repository,
+    get_current_user,
+    get_notification_repository,
+    get_scan_repository,
+)
 from app.api.routes import analysis, reports, scan
 from shared.models.scan import CrawlMode, ReportMetadata, ScanPhase, ScanStatistics, ScanStatus
 from shared.models.user import UserRole
@@ -29,6 +34,15 @@ class FakeAuditRepository:
 
     async def record(self, **kwargs) -> None:
         self.entries.append(kwargs)
+
+
+class FakeNotificationRepository:
+    def __init__(self) -> None:
+        self.entries: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.entries.append(kwargs)
+        return SimpleNamespace(**kwargs)
 
 
 class FakeScanQueue:
@@ -66,12 +80,20 @@ class FakeScanQueue:
 
 
 class FakeScan:
-    def __init__(self, scan_id: str, org_id: str, owner_user_id: str, owner_email: str = "owner@example.test") -> None:
+    def __init__(
+        self,
+        scan_id: str,
+        org_id: str,
+        submitted_by_user_id: str,
+        submitted_by_email: str = "submitter@example.test",
+        submitted_by_full_name: str = "Scan Submitter",
+    ) -> None:
         self.id = scan_id
         self.target_url = "https://target.example"
         self.org_id = org_id
-        self.owner_user_id = owner_user_id
-        self.owner_email = owner_email
+        self.submitted_by_user_id = submitted_by_user_id
+        self.submitted_by_full_name = submitted_by_full_name
+        self.submitted_by_email = submitted_by_email
         self.cancelled_by_user_id = None
         self.cancelled_by_email = None
         self.crawl_mode = CrawlMode.full
@@ -99,8 +121,9 @@ class FakeScan:
         return {
             "target_url": self.target_url,
             "org_id": self.org_id,
-            "owner_user_id": self.owner_user_id,
-            "owner_email": self.owner_email,
+            "submitted_by_user_id": self.submitted_by_user_id,
+            "submitted_by_full_name": self.submitted_by_full_name,
+            "submitted_by_email": self.submitted_by_email,
             "crawl_mode": self.crawl_mode,
             "status": self.status,
             "progress": self.progress,
@@ -134,7 +157,13 @@ class FakeScanRepository:
 
     async def create(self, target_url: str, **kwargs):
         self.created_kwargs = {"target_url": target_url, **kwargs}
-        created = FakeScan("scan-new", kwargs["org_id"], kwargs["owner_user_id"], kwargs["owner_email"])
+        created = FakeScan(
+            "scan-new",
+            kwargs["org_id"],
+            kwargs["submitted_by_user_id"],
+            kwargs["submitted_by_email"],
+            kwargs["submitted_by_full_name"],
+        )
         created.target_url = target_url
         created.authorization_confirmed = kwargs["authorization_confirmed"]
         self.scans[str(created.id)] = created
@@ -205,8 +234,13 @@ def _client(
     app.include_router(reports.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.dependency_overrides[get_scan_repository] = lambda: repo
     app.dependency_overrides[get_audit_repository] = lambda: FakeAuditRepository()
+    app.dependency_overrides[get_notification_repository] = lambda: FakeNotificationRepository()
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
-        id=user_id, email=f"{user_id}@example.test", org_id=org_id, role=role
+        id=user_id,
+        full_name="Niuradaj Adhadh",
+        email=f"{user_id}@example.test",
+        org_id=org_id,
+        role=role,
     )
     return TestClient(app)
 
@@ -227,7 +261,25 @@ def test_create_scan_requires_authorization_confirmation() -> None:
     assert repo.created_kwargs is None
 
 
-def test_create_scan_binds_org_owner_and_authorization_metadata() -> None:
+def test_create_scan_rejects_client_supplied_submitter_identity() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue())
+    client = _client(repo)
+
+    response = client.post(
+        "/api/v1/scans",
+        json={
+            "target_url": "https://target.example",
+            "authorization_confirmed": True,
+            "submitted_by_email": "attacker-controlled@example.test",
+        },
+    )
+
+    assert response.status_code == 422
+    assert repo.created_kwargs is None
+
+
+def test_create_scan_binds_org_submitter_and_authorization_metadata() -> None:
     repo = FakeScanRepository()
     scan_queue = FakeScanQueue()
     scan.set_scan_queue(scan_queue)
@@ -243,8 +295,9 @@ def test_create_scan_binds_org_owner_and_authorization_metadata() -> None:
 
     assert response.status_code == 202
     assert repo.created_kwargs["org_id"] == "org-1"
-    assert repo.created_kwargs["owner_user_id"] == "user-1"
-    assert repo.created_kwargs["owner_email"] == "user-1@example.test"
+    assert repo.created_kwargs["submitted_by_user_id"] == "user-1"
+    assert repo.created_kwargs["submitted_by_full_name"] == "Niuradaj Adhadh"
+    assert repo.created_kwargs["submitted_by_email"] == "user-1@example.test"
     assert repo.created_kwargs["authorization_confirmed"] is True
     assert scan_queue.queued == ["scan-new"]
 
@@ -467,7 +520,7 @@ def test_pdf_report_for_other_orgs_scan_returns_not_found() -> None:
     assert response.status_code == 404
 
 
-def test_report_payload_includes_owner_and_authorization_audit_fields() -> None:
+def test_report_payload_includes_submitter_and_authorization_audit_fields() -> None:
     repo = FakeScanRepository()
     client = _client(repo, user_id="user-1")
 
@@ -475,8 +528,9 @@ def test_report_payload_includes_owner_and_authorization_audit_fields() -> None:
 
     assert response.status_code == 200
     data = response.json()["data"]
-    assert data["owner_user_id"] == "user-1"
-    assert data["owner_email"] == "user1@example.test"
+    assert data["submitted_by_user_id"] == "user-1"
+    assert data["submitted_by_full_name"] == "Scan Submitter"
+    assert data["submitted_by_email"] == "user1@example.test"
     assert data["authorization"]["confirmed"] is True
 
 

@@ -20,6 +20,7 @@ def _user_response(user: User) -> UserResponse:
     """Project a User document to its API response shape."""
     return UserResponse(
         id=str(user.id),
+        full_name=user.full_name,
         email=user.email,
         org_id=user.org_id,
         role=user.role.value,
@@ -96,6 +97,7 @@ async def register(
     try:
         user = await invites.accept(
             token=payload.invite_token,
+            full_name=payload.full_name,
             email=payload.email,
             password=payload.password,
         )

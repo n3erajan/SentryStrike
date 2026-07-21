@@ -14,6 +14,7 @@ class FakeAuthService:
         self.revoked_token: str | None = None
         self.user = SimpleNamespace(
             id="user-1",
+            full_name="Niuradaj Adhadh",
             email="user@example.test",
             org_id="org-1",
             role=SimpleNamespace(value="owner"),
@@ -72,6 +73,7 @@ def test_login_returns_token_and_http_only_cookie() -> None:
     body = response.json()
     assert body["data"]["access_token"] == "test-token"
     assert body["data"]["token_type"] == "bearer"
+    assert body["data"]["user"]["full_name"] == "Niuradaj Adhadh"
     assert body["data"]["user"]["email"] == "user@example.test"
     assert "sentrystrike_session=test-token" in response.headers["set-cookie"]
     assert "HttpOnly" in response.headers["set-cookie"]

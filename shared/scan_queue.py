@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+from enum import Enum
 from typing import AsyncIterator, Protocol
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -12,6 +13,11 @@ from shared.models.scan import ScanAuthAccount
 from shared.schemas.scan_schema import ScanConfig
 
 logger = logging.getLogger(__name__)
+
+
+class ScanJobKind(str, Enum):
+    full_scan = "full_scan"
+    finding_reverification = "finding_reverification"
 
 
 class ScanJob(BaseModel):
@@ -24,8 +30,21 @@ class ScanJob(BaseModel):
     """
 
     scan_id: str = Field(min_length=1)
+    kind: ScanJobKind = ScanJobKind.full_scan
+    reverification_job_id: str | None = None
     auth_accounts: list[ScanAuthAccount] = Field(default_factory=list)
     scan_config: ScanConfig | None = None
+
+    @model_validator(mode="after")
+    def _require_reverification_id(self) -> "ScanJob":
+        if (
+            self.kind == ScanJobKind.finding_reverification
+            and not self.reverification_job_id
+        ):
+            raise ValueError("reverification_job_id is required for re-verification jobs")
+        if self.kind == ScanJobKind.full_scan and self.reverification_job_id is not None:
+            raise ValueError("full scan jobs cannot reference a re-verification job")
+        return self
 
 
 class ScanQueueError(RuntimeError):

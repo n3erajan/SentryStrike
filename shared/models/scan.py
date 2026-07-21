@@ -185,8 +185,9 @@ class Scan(Document):
     target_url: Indexed(str)
     org_id: Indexed(str)
     # Who submitted the scan.
-    owner_user_id: Indexed(str) | None = None
-    owner_email: str | None = None
+    submitted_by_user_id: Indexed(str)
+    submitted_by_full_name: str
+    submitted_by_email: str
     # Who cancelled it, if anyone (may differ from the submitter — any non-viewer
     # org member can cancel a scan).
     cancelled_by_user_id: str | None = None
@@ -224,10 +225,10 @@ class Scan(Document):
         indexes = [
             "target_url",
             "org_id",
-            "owner_user_id",
+            "submitted_by_user_id",
             "status",
             [("org_id", 1), ("created_at", -1)],
-            [("owner_user_id", 1), ("created_at", -1)],
+            [("submitted_by_user_id", 1), ("created_at", -1)],
             [("created_at", -1)],
         ]
 

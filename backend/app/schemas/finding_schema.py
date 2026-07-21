@@ -1,6 +1,7 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from shared.models.vulnerability import RemediationStatus
+from shared.schemas.scan_schema import ScanCredentials
 
 
 class AssignFindingRequest(BaseModel):
@@ -23,3 +24,11 @@ class RemediationRequest(BaseModel):
     """Payload for advancing a finding's remediation workflow state."""
 
     remediation_status: RemediationStatus
+
+
+class ReverificationRequest(BaseModel):
+    """Optional target credentials; retained only in the Redis job payload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    credentials: ScanCredentials | None = None

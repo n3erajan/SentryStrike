@@ -23,9 +23,10 @@ class UserRole(str, Enum):
 
 
 class User(Document):
-    """A registered account that belongs to one organization and can own and launch scans."""
+    """A registered account that belongs to one organization and can submit scans."""
 
     email: Indexed(str, unique=True)
+    full_name: str
     password_hash: str
     org_id: Indexed(str)
     role: UserRole

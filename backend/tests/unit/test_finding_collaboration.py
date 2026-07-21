@@ -14,7 +14,12 @@ from types import SimpleNamespace
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_current_user, get_member_repository, get_scan_repository
+from app.api.dependencies import (
+    get_current_user,
+    get_member_repository,
+    get_notification_repository,
+    get_scan_repository,
+)
 from app.api.routes import analysis
 from shared.models.user import UserRole
 from shared.models.vulnerability import (
@@ -82,6 +87,15 @@ class FakeMemberRepository:
         return member
 
 
+class FakeNotificationRepository:
+    def __init__(self) -> None:
+        self.entries: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.entries.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+
 def _client(
     repo: FakeScanRepository,
     members: FakeMemberRepository,
@@ -94,6 +108,7 @@ def _client(
     app.include_router(analysis.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.dependency_overrides[get_scan_repository] = lambda: repo
     app.dependency_overrides[get_member_repository] = lambda: members
+    app.dependency_overrides[get_notification_repository] = lambda: FakeNotificationRepository()
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=user_id, email=f"{user_id}@example.test", org_id=org_id, role=role
     )

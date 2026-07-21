@@ -5,8 +5,10 @@ from shared.config import get_infrastructure_settings
 from shared.models.audit import AuditLogEntry
 from shared.models.cve import CveRecord
 from shared.models.invite import Invite
+from shared.models.notification import Notification
 from shared.models.oast_interaction import OastInteractionRecord
 from shared.models.organization import Organization
+from shared.models.reverification import ReverificationJob
 from shared.models.scan import Scan
 from shared.models.user import User, UserSession
 
@@ -24,7 +26,7 @@ async def init_db() -> None:
     _client = AsyncIOMotorClient(settings.mongodb_uri)
     await init_beanie(
         database=_client[settings.mongodb_db_name],
-        document_models=[Scan, CveRecord, User, UserSession, OastInteractionRecord, Organization, Invite, AuditLogEntry],
+        document_models=[Scan, CveRecord, User, UserSession, OastInteractionRecord, Organization, Invite, AuditLogEntry, Notification, ReverificationJob],
     )
 
 

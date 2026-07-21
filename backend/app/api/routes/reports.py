@@ -32,8 +32,9 @@ def _build_report_payload(scan, scan_id: str) -> dict:
         "scan_id": scan_id,
         "generated_at": generated_at,
         "executive_summary": scan.report_metadata.summary or "No summary available.",
-        "owner_user_id": getattr(scan, "owner_user_id", None),
-        "owner_email": getattr(scan, "owner_email", None),
+        "submitted_by_user_id": scan.submitted_by_user_id,
+        "submitted_by_full_name": scan.submitted_by_full_name,
+        "submitted_by_email": scan.submitted_by_email,
         "authorization": {
             "confirmed": getattr(scan, "authorization_confirmed", False),
             "confirmed_at": getattr(scan, "authorization_confirmed_at", None),
