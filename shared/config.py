@@ -67,6 +67,29 @@ class InfrastructureSettings(BaseSettings):
     # Optional. Empty/unset = console only (typical for the API). Scanner sets a path.
     log_file: str | None = Field(default=None, alias="LOG_FILE")
 
+    # The single public hostname (or full URL) at which this deployment is
+    # reachable, e.g. "sentry.example.com" or "https://sentry.example.com".
+    # Two things derive from it:
+    #   * the OAST callback/poll URLs the scanner hands to a target (route layout
+    #     /oast and /oast/poll), and
+    #   * the invite links the backend emails (route /signup?invite=<token>).
+    # A bare hostname is given an http:// scheme. Leave unset for local dev.
+    public_hostname: str | None = Field(default=None, alias="PUBLIC_HOSTNAME")
+
+    @property
+    def public_base_url(self) -> str | None:
+        """The normalized public base URL (scheme + host, no trailing slash), or None.
+
+        A bare hostname is promoted to ``http://``; anything with an explicit
+        scheme is preserved so operators can pin ``https://`` in production.
+        """
+        base = (self.public_hostname or "").strip().rstrip("/")
+        if not base:
+            return None
+        if "://" not in base:
+            base = f"http://{base}"
+        return base
+
 
 @lru_cache
 def get_infrastructure_settings() -> InfrastructureSettings:

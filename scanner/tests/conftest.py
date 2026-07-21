@@ -17,7 +17,9 @@ def _isolated_scanner_settings(monkeypatch):
     # A developer's local scanner/.env may point OAST at a live collaborator.
     # Left set, detectors that build an OAST client from settings (e.g. SSRF)
     # would attempt real callback/poll network requests during unit tests.
-    # Neutralize them so tests exercise the OAST-unconfigured default path.
+    # Neutralize the derived-from hostname and both explicit URLs so tests
+    # exercise the OAST-unconfigured default path.
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "")
     monkeypatch.setenv("OAST_CALLBACK_BASE_URL", "")
     monkeypatch.setenv("OAST_POLL_URL", "")
     get_settings.cache_clear()

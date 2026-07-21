@@ -4,6 +4,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 
 from app.config import get_settings
 from app.core.auth import AuthService, InvalidSessionError
+from app.core.invites import InviteService
 from shared.database.repositories.scan_repository import ScanRepository
 from shared.models.user import User, UserRole
 
@@ -11,6 +12,7 @@ from shared.models.user import User, UserRole
 # factory functions below, which return these shared instances.
 scan_repository = ScanRepository()
 auth_service = AuthService()
+invite_service = InviteService()
 
 
 def get_scan_repository() -> ScanRepository:
@@ -21,6 +23,11 @@ def get_scan_repository() -> ScanRepository:
 def get_auth_service() -> AuthService:
     """FastAPI dependency: provide the shared AuthService singleton."""
     return auth_service
+
+
+def get_invite_service() -> InviteService:
+    """FastAPI dependency: provide the shared InviteService singleton."""
+    return invite_service
 
 
 def _bearer_token(authorization: str | None) -> str | None:

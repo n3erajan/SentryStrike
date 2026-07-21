@@ -1,14 +1,12 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import get_auth_service, get_current_user, get_session_token
 from app.api.routes import auth, scan
-from app.config import get_settings
-from app.core.auth import AuthService, RegistrationClosedError, as_utc_naive, hash_password, utc_now, verify_password
+from app.core.auth import as_utc_naive, hash_password, utc_now, verify_password
 
 
 class FakeAuthService:
@@ -17,14 +15,12 @@ class FakeAuthService:
         self.user = SimpleNamespace(
             id="user-1",
             email="user@example.test",
+            org_id="org-1",
+            role=SimpleNamespace(value="owner"),
             created_at=datetime(2026, 6, 8, 9, 10, 17, tzinfo=timezone.utc),
         )
         now = datetime.now(timezone.utc)
         self.session = SimpleNamespace(created_at=now, expires_at=now + timedelta(hours=24))
-
-    async def register(self, email: str, password: str):
-        _ = (email, password)
-        return self.user
 
     async def authenticate(self, email: str, password: str):
         _ = (email, password)
@@ -37,12 +33,6 @@ class FakeAuthService:
     async def revoke_session(self, token: str | None) -> bool:
         self.revoked_token = token
         return True
-
-
-class RegistrationClosedService(FakeAuthService):
-    async def register(self, email: str, password: str):
-        _ = (email, password)
-        raise RegistrationClosedError()
 
 
 def _auth_app(service: FakeAuthService) -> TestClient:
@@ -68,29 +58,6 @@ def test_auth_datetime_helpers_compare_database_naive_values() -> None:
     assert as_utc_naive(aware_expires_at).tzinfo is None
     assert as_utc_naive(naive_expires_at) > utc_now()
     assert as_utc_naive(aware_expires_at) > utc_now()
-
-
-def test_register_returns_closed_message_when_registration_disabled() -> None:
-    client = _auth_app(RegistrationClosedService())
-
-    response = client.post(
-        "/api/v1/auth/register",
-        json={"email": "user@example.test", "password": "password123"},
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Sorry, we currently don't take new users registration."
-
-
-@pytest.mark.asyncio
-async def test_auth_service_registration_is_closed_by_env(monkeypatch) -> None:
-    monkeypatch.setenv("ALLOW_REGISTRATION", "false")
-    get_settings.cache_clear()
-
-    with pytest.raises(RegistrationClosedError):
-        await AuthService().register("user@example.test", "password123")
-
-    get_settings.cache_clear()
 
 
 def test_login_returns_token_and_http_only_cookie() -> None:

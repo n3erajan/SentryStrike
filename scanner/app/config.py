@@ -145,15 +145,12 @@ class ScannerSettings(InfrastructureSettings):
         default=0.7,
         alias="BLIND_INJECTION_TIMING_THRESHOLD",
     )
-    # The one knob most deployments need: the backend hostname (or full URL)
-    # the target can reach us at, e.g. "sentry.example.com" or
-    # "https://sentry.example.com". Both OAST URLs are derived from it using the
-    # backend's known route layout (/oast for callbacks, /oast/poll for polling).
-    # A bare hostname gets an http:// scheme. The two explicit URLs below are
-    # optional overrides for the one split topology that needs them (a host-run
-    # scanner probing a dockerized target, where the callback must resolve from
-    # inside the target container but polling resolves from the scanner host).
-    oast_hostname: str | None = Field(default=None, alias="OAST_HOSTNAME")
+    # OAST callback/poll URLs are derived from the shared PUBLIC_HOSTNAME using
+    # the backend's known route layout (/oast for callbacks, /oast/poll for
+    # polling). The two explicit URLs below are optional overrides for the one
+    # split topology that needs them (a host-run scanner probing a dockerized
+    # target, where the callback must resolve from inside the target container
+    # but polling resolves from the scanner host).
     oast_callback_base_url: str | None = Field(default=None, alias="OAST_CALLBACK_BASE_URL")
     oast_poll_url: str | None = Field(default=None, alias="OAST_POLL_URL")
     ssrf_oast_poll_attempts: int = Field(default=5, alias="SSRF_OAST_POLL_ATTEMPTS")
@@ -168,10 +165,8 @@ class ScannerSettings(InfrastructureSettings):
 
     @model_validator(mode="after")
     def _derive_oast_urls_from_hostname(self) -> "ScannerSettings":
-        base = (self.oast_hostname or "").strip().rstrip("/")
+        base = self.public_base_url
         if base:
-            if "://" not in base:
-                base = f"http://{base}"
             if not self.oast_callback_base_url:
                 self.oast_callback_base_url = f"{base}/oast"
             if not self.oast_poll_url:

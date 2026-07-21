@@ -19,10 +19,10 @@ def test_scanner_settings_exclude_backend_configuration() -> None:
 
 def _settings(**overrides) -> ScannerSettings:
     # Init kwargs outrank env, so start every OAST field at None (the conftest
-    # autouse fixture sets the two URL vars to "" to block a developer's local
-    # .env from leaking in), then apply only what the test wants.
+    # autouse fixture sets the hostname + URL vars to "" to block a developer's
+    # local .env from leaking in), then apply only what the test wants.
     kwargs = {
-        "OAST_HOSTNAME": None,
+        "PUBLIC_HOSTNAME": None,
         "OAST_CALLBACK_BASE_URL": None,
         "OAST_POLL_URL": None,
     }
@@ -30,15 +30,15 @@ def _settings(**overrides) -> ScannerSettings:
     return ScannerSettings(_env_file=None, **kwargs)
 
 
-def test_oast_hostname_derives_both_urls() -> None:
-    settings = _settings(OAST_HOSTNAME="sentry.example.com")
+def test_public_hostname_derives_both_oast_urls() -> None:
+    settings = _settings(PUBLIC_HOSTNAME="sentry.example.com")
 
     assert settings.oast_callback_base_url == "http://sentry.example.com/oast"
     assert settings.oast_poll_url == "http://sentry.example.com/oast/poll"
 
 
-def test_oast_hostname_preserves_explicit_scheme_and_port() -> None:
-    settings = _settings(OAST_HOSTNAME="https://sentry.example.com:9000/")
+def test_public_hostname_preserves_explicit_scheme_and_port() -> None:
+    settings = _settings(PUBLIC_HOSTNAME="https://sentry.example.com:9000/")
 
     assert settings.oast_callback_base_url == "https://sentry.example.com:9000/oast"
     assert settings.oast_poll_url == "https://sentry.example.com:9000/oast/poll"
@@ -46,7 +46,7 @@ def test_oast_hostname_preserves_explicit_scheme_and_port() -> None:
 
 def test_explicit_oast_urls_override_derived_values() -> None:
     settings = _settings(
-        OAST_HOSTNAME="sentry.example.com",
+        PUBLIC_HOSTNAME="sentry.example.com",
         OAST_POLL_URL="http://poll.internal/x",
     )
 
