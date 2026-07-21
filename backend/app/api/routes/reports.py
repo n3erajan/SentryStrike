@@ -60,7 +60,7 @@ async def get_report_data(
     current_user: User = Depends(get_current_user),
 ) -> dict:
     """Return the structured report data for a completed scan."""
-    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
+    scan = await repo.get_in_org(scan_id, current_user.org_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 
@@ -74,7 +74,7 @@ async def generate_pdf_report(
     current_user: User = Depends(get_current_user),
 ) -> Response:
     """Generate and download a client-ready PDF report for a completed scan."""
-    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
+    scan = await repo.get_in_org(scan_id, current_user.org_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 

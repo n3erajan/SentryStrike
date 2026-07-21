@@ -16,7 +16,7 @@ async def list_vulnerabilities(
     current_user: User = Depends(get_current_user),
 ) -> dict:
     """Return vulnerabilities for a given scan, optionally filtered by severity or category."""
-    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
+    scan = await repo.get_in_org(scan_id, current_user.org_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 
@@ -37,7 +37,7 @@ async def get_vulnerability_details(
     current_user: User = Depends(get_current_user),
 ) -> dict:
     """Return the full detail for a specific vulnerability within a scan."""
-    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
+    scan = await repo.get_in_org(scan_id, current_user.org_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 

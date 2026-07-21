@@ -1,3 +1,13 @@
+"""Organization-scoped authorization and cross-tenant isolation tests.
+
+These cover the security-critical predicate of the workspace model: a scan is
+visible to *every* member of its organization and to no one outside it, and
+role gates which members may launch or cancel scans (everyone except a viewer).
+A gap here is a cross-tenant data leak, so every read/write handler is exercised
+against a scan in another org, and the viewer role is checked on both action
+endpoints.
+"""
+
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -7,6 +17,7 @@ from fastapi.testclient import TestClient
 from app.api.dependencies import get_current_user, get_scan_repository
 from app.api.routes import analysis, reports, scan
 from shared.models.scan import CrawlMode, ReportMetadata, ScanPhase, ScanStatistics, ScanStatus
+from shared.models.user import UserRole
 from shared.scan_queue import ScanQueueError
 
 
@@ -45,11 +56,14 @@ class FakeScanQueue:
 
 
 class FakeScan:
-    def __init__(self, scan_id: str, owner_user_id: str, owner_email: str = "owner@example.test") -> None:
+    def __init__(self, scan_id: str, org_id: str, owner_user_id: str, owner_email: str = "owner@example.test") -> None:
         self.id = scan_id
         self.target_url = "https://target.example"
+        self.org_id = org_id
         self.owner_user_id = owner_user_id
         self.owner_email = owner_email
+        self.cancelled_by_user_id = None
+        self.cancelled_by_email = None
         self.crawl_mode = CrawlMode.full
         self.status = ScanStatus.queued
         self.progress = 0
@@ -74,6 +88,7 @@ class FakeScan:
     def model_dump(self, *_, **__) -> dict:
         return {
             "target_url": self.target_url,
+            "org_id": self.org_id,
             "owner_user_id": self.owner_user_id,
             "owner_email": self.owner_email,
             "crawl_mode": self.crawl_mode,
@@ -99,27 +114,29 @@ class FakeScan:
 
 class FakeScanRepository:
     def __init__(self) -> None:
+        # scan-owned lives in org-1; scan-other lives in org-2. A member of org-1
+        # must never reach scan-other through any handler.
         self.scans = {
-            "scan-owned": FakeScan("scan-owned", "user-1", "user1@example.test"),
-            "scan-other": FakeScan("scan-other", "user-2", "user2@example.test"),
+            "scan-owned": FakeScan("scan-owned", "org-1", "user-1", "user1@example.test"),
+            "scan-other": FakeScan("scan-other", "org-2", "user-2", "user2@example.test"),
         }
         self.created_kwargs: dict | None = None
 
     async def create(self, target_url: str, **kwargs):
         self.created_kwargs = {"target_url": target_url, **kwargs}
-        created = FakeScan("scan-new", kwargs["owner_user_id"], kwargs["owner_email"])
+        created = FakeScan("scan-new", kwargs["org_id"], kwargs["owner_user_id"], kwargs["owner_email"])
         created.target_url = target_url
         created.authorization_confirmed = kwargs["authorization_confirmed"]
         self.scans[str(created.id)] = created
         return created
 
-    async def list(self, skip: int = 0, limit: int = 20, owner_user_id: str | None = None):
-        items = [scan for scan in self.scans.values() if owner_user_id is None or scan.owner_user_id == owner_user_id]
+    async def list(self, skip: int = 0, limit: int = 20, org_id: str | None = None):
+        items = [scan for scan in self.scans.values() if org_id is None or scan.org_id == org_id]
         return items[skip: skip + limit]
 
-    async def get_owned_by_id(self, scan_id: str, owner_user_id: str):
+    async def get_in_org(self, scan_id: str, org_id: str):
         item = self.scans.get(scan_id)
-        if item is None or item.owner_user_id != owner_user_id:
+        if item is None or item.org_id != org_id:
             return None
         return item
 
@@ -165,14 +182,27 @@ class FakeScanRepository:
             error_message="Scan worker stopped unexpectedly; no active worker is processing this scan.",
         )
 
-def _client(repo: FakeScanRepository, user_id: str = "user-1") -> TestClient:
+
+def _client(
+    repo: FakeScanRepository,
+    user_id: str = "user-1",
+    org_id: str = "org-1",
+    role: UserRole = UserRole.owner,
+) -> TestClient:
     app = FastAPI()
     app.include_router(scan.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(analysis.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(reports.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.dependency_overrides[get_scan_repository] = lambda: repo
-    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id, email=f"{user_id}@example.test")
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id=user_id, email=f"{user_id}@example.test", org_id=org_id, role=role
+    )
     return TestClient(app)
+
+
+# ---------------------------------------------------------------------------
+# Scan creation
+# ---------------------------------------------------------------------------
 
 
 def test_create_scan_requires_authorization_confirmation() -> None:
@@ -186,7 +216,7 @@ def test_create_scan_requires_authorization_confirmation() -> None:
     assert repo.created_kwargs is None
 
 
-def test_create_scan_binds_owner_and_authorization_metadata() -> None:
+def test_create_scan_binds_org_owner_and_authorization_metadata() -> None:
     repo = FakeScanRepository()
     scan_queue = FakeScanQueue()
     scan.set_scan_queue(scan_queue)
@@ -201,6 +231,7 @@ def test_create_scan_binds_owner_and_authorization_metadata() -> None:
     )
 
     assert response.status_code == 202
+    assert repo.created_kwargs["org_id"] == "org-1"
     assert repo.created_kwargs["owner_user_id"] == "user-1"
     assert repo.created_kwargs["owner_email"] == "user-1@example.test"
     assert repo.created_kwargs["authorization_confirmed"] is True
@@ -228,11 +259,45 @@ def test_create_scan_marks_scan_failed_when_queue_is_unavailable() -> None:
     assert created.error_message == "Scan queue unavailable"
 
 
-def test_cancel_queued_scan_marks_it_cancelled_and_sets_queue_key() -> None:
+def test_viewer_cannot_create_scan() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue())
+    client = _client(repo, role=UserRole.viewer)
+
+    response = client.post(
+        "/api/v1/scans",
+        json={"target_url": "https://target.example", "authorization_confirmed": True},
+    )
+
+    assert response.status_code == 403
+    assert repo.created_kwargs is None
+
+
+def test_developer_can_create_scan() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue())
+    client = _client(repo, role=UserRole.developer)
+
+    response = client.post(
+        "/api/v1/scans",
+        json={"target_url": "https://target.example", "authorization_confirmed": True},
+    )
+
+    assert response.status_code == 202
+    assert repo.created_kwargs["org_id"] == "org-1"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_queued_scan_marks_it_cancelled_and_records_canceller() -> None:
     repo = FakeScanRepository()
     scan_queue = FakeScanQueue()
     scan.set_scan_queue(scan_queue)
-    client = _client(repo)
+    # A different org-1 member (not the submitter user-1) cancels the scan.
+    client = _client(repo, user_id="user-9", role=UserRole.analyst)
 
     response = client.post("/api/v1/scans/scan-owned/cancel")
 
@@ -241,6 +306,9 @@ def test_cancel_queued_scan_marks_it_cancelled_and_sets_queue_key() -> None:
     assert scan_queue.cancelled == ["scan-owned"]
     assert repo.scans["scan-owned"].status == ScanStatus.cancelled
     assert repo.scans["scan-owned"].current_phase == ScanPhase.cancelled
+    # The canceller is recorded and differs from the submitter.
+    assert repo.scans["scan-owned"].cancelled_by_user_id == "user-9"
+    assert repo.scans["scan-owned"].cancelled_by_email == "user-9@example.test"
 
 
 def test_cancel_scan_returns_service_unavailable_when_queue_is_offline() -> None:
@@ -254,18 +322,58 @@ def test_cancel_scan_returns_service_unavailable_when_queue_is_offline() -> None
     assert repo.scans["scan-owned"].status == ScanStatus.queued
 
 
-def test_list_scans_only_returns_current_users_scans() -> None:
+def test_viewer_cannot_cancel_scan() -> None:
     repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue())
+    client = _client(repo, role=UserRole.viewer)
+
+    response = client.post("/api/v1/scans/scan-owned/cancel")
+
+    assert response.status_code == 403
+    assert repo.scans["scan-owned"].status == ScanStatus.queued
+
+
+def test_cannot_cancel_scan_in_another_org() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue())
+    # user-1 (org-1) tries to cancel scan-other (org-2).
+    client = _client(repo)
+
+    response = client.post("/api/v1/scans/scan-other/cancel")
+
+    assert response.status_code == 404
+    assert repo.scans["scan-other"].status == ScanStatus.queued
+
+
+# ---------------------------------------------------------------------------
+# Org-scoped visibility (shared view within an org)
+# ---------------------------------------------------------------------------
+
+
+def test_list_scans_returns_all_scans_in_the_callers_org() -> None:
+    repo = FakeScanRepository()
+    # A second scan in org-1 submitted by a different member; both must appear.
+    repo.scans["scan-teammate"] = FakeScan("scan-teammate", "org-1", "user-7", "user7@example.test")
     client = _client(repo, user_id="user-1")
 
     response = client.get("/api/v1/scans")
 
     assert response.status_code == 200
     items = response.json()["data"]["items"]
-    assert [item["id"] for item in items] == ["scan-owned"]
-    assert items[0]["owner_user_id"] == "user-1"
-    assert items[0]["current_phase"] == "queued"
-    assert items[0]["phase_message"] == "Scan queued"
+    ids = {item["id"] for item in items}
+    assert ids == {"scan-owned", "scan-teammate"}
+    assert "scan-other" not in ids
+
+
+def test_list_scans_excludes_other_orgs() -> None:
+    repo = FakeScanRepository()
+    client = _client(repo, user_id="user-2", org_id="org-2")
+
+    response = client.get("/api/v1/scans")
+
+    assert response.status_code == 200
+    items = response.json()["data"]["items"]
+    assert [item["id"] for item in items] == ["scan-other"]
 
 
 def test_scan_status_returns_phase_and_message_for_polling() -> None:
@@ -288,7 +396,12 @@ def test_scan_status_returns_phase_and_message_for_polling() -> None:
     assert data["phase_message"] == "Running active detectors"
 
 
-def test_scan_detail_for_other_user_returns_not_found() -> None:
+# ---------------------------------------------------------------------------
+# Cross-tenant isolation — every read handler against another org's scan
+# ---------------------------------------------------------------------------
+
+
+def test_scan_detail_for_other_org_returns_not_found() -> None:
     repo = FakeScanRepository()
     client = _client(repo, user_id="user-1")
 
@@ -297,7 +410,17 @@ def test_scan_detail_for_other_user_returns_not_found() -> None:
     assert response.status_code == 404
 
 
-def test_analysis_for_other_users_scan_returns_not_found() -> None:
+def test_scan_status_for_other_org_returns_not_found() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue())
+    client = _client(repo, user_id="user-1")
+
+    response = client.get("/api/v1/scans/scan-other/status")
+
+    assert response.status_code == 404
+
+
+def test_analysis_for_other_orgs_scan_returns_not_found() -> None:
     repo = FakeScanRepository()
     client = _client(repo, user_id="user-1")
 
@@ -306,11 +429,29 @@ def test_analysis_for_other_users_scan_returns_not_found() -> None:
     assert response.status_code == 404
 
 
-def test_report_for_other_users_scan_returns_not_found() -> None:
+def test_vulnerability_detail_for_other_orgs_scan_returns_not_found() -> None:
+    repo = FakeScanRepository()
+    client = _client(repo, user_id="user-1")
+
+    response = client.get("/api/v1/analysis/scans/scan-other/vulnerabilities/some-vuln-id")
+
+    assert response.status_code == 404
+
+
+def test_report_for_other_orgs_scan_returns_not_found() -> None:
     repo = FakeScanRepository()
     client = _client(repo, user_id="user-1")
 
     response = client.get("/api/v1/reports/scan-other")
+
+    assert response.status_code == 404
+
+
+def test_pdf_report_for_other_orgs_scan_returns_not_found() -> None:
+    repo = FakeScanRepository()
+    client = _client(repo, user_id="user-1")
+
+    response = client.get("/api/v1/reports/scan-other/pdf")
 
     assert response.status_code == 404
 
@@ -328,8 +469,13 @@ def test_report_payload_includes_owner_and_authorization_audit_fields() -> None:
     assert data["authorization"]["confirmed"] is True
 
 
+# ---------------------------------------------------------------------------
+# Worker-death reconciliation (unchanged behavior, org-scoped)
+# ---------------------------------------------------------------------------
+
+
 def _running(repo: FakeScanRepository, scan_id: str = "scan-owned") -> FakeScan:
-    """Put an owned scan into the running state for reconciliation tests."""
+    """Put an org-1 scan into the running state for reconciliation tests."""
     scan = repo.scans[scan_id]
     scan.status = ScanStatus.running
     scan.progress = 40

@@ -1,13 +1,16 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from app.api.dependencies import get_current_user, get_scan_repository, json_response
+from app.api.dependencies import get_current_user, get_scan_repository, json_response, require_role
 from shared.database.repositories.scan_repository import ScanRepository
 from shared.models.scan import ScanAuthAccount, ScanAuthRole, ScanPhase, ScanStatus
-from shared.models.user import User
+from shared.models.user import User, UserRole
 from shared.scan_queue import ScanJob, ScanQueue, ScanQueueError
 from shared.schemas.scan_schema import CreateScanRequest, ScanCredentials
 
 router = APIRouter(prefix="/scans", tags=["scans"])
+
+# Everyone except a viewer may launch or cancel scans.
+SCAN_ACTOR_ROLES = (UserRole.owner, UserRole.admin, UserRole.analyst, UserRole.developer)
 
 # Module-level scan queue reference, wired at startup via set_scan_queue().
 # A global is used because FastAPI lifespan context cannot be passed directly
@@ -76,7 +79,7 @@ def _scan_summary(scan) -> dict:
 async def create_scan(
     payload: CreateScanRequest,
     repo: ScanRepository = Depends(get_scan_repository),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role(*SCAN_ACTOR_ROLES)),
 ) -> dict:
     """Submit a new scan target and enqueue the job for processing.
 
@@ -86,6 +89,7 @@ async def create_scan(
     auth_accounts = _auth_accounts_from_payload(payload.credentials)
     scan = await repo.create(
         str(payload.target_url),
+        org_id=current_user.org_id,
         owner_user_id=str(current_user.id),
         owner_email=current_user.email,
         authorization_confirmed=payload.authorization_confirmed,
@@ -137,8 +141,12 @@ async def list_scans(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    """Return a paginated list of scans owned by the authenticated user."""
-    scans = await repo.list(skip=skip, limit=limit, owner_user_id=str(current_user.id))
+    """Return a paginated list of scans for the caller's organization.
+
+    All org members share one view, so scans are scoped by ``org_id`` rather
+    than by the individual submitter.
+    """
+    scans = await repo.list(skip=skip, limit=limit, org_id=current_user.org_id)
     # Flip any scan whose worker died (running in DB, no live lease) to failed so
     # the list never shows a permanently "running" zombie. Best-effort: a Redis
     # outage leaves the scan untouched rather than falsely failing it.
@@ -155,7 +163,7 @@ async def get_scan_details(
     current_user: User = Depends(get_current_user),
 ) -> dict:
     """Return full scan details including all vulnerabilities and metadata."""
-    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
+    scan = await repo.get_in_org(scan_id, current_user.org_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     scan = await repo.reconcile_if_orphaned(scan, scan_queue)
@@ -173,7 +181,7 @@ async def get_scan_status(
     current_user: User = Depends(get_current_user),
 
 ) -> dict:
-    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
+    scan = await repo.get_in_org(scan_id, current_user.org_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     scan = await repo.reconcile_if_orphaned(scan, scan_queue)
@@ -194,10 +202,14 @@ async def get_scan_status(
 async def cancel_scan(
     scan_id: str,
     repo: ScanRepository = Depends(get_scan_repository),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role(*SCAN_ACTOR_ROLES)),
 ) -> dict:
-    """Request cancellation of a running or queued scan."""
-    scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
+    """Request cancellation of a running or queued scan.
+
+    Any non-viewer member of the scan's org may cancel it (not just the
+    submitter); the canceller is recorded on the scan.
+    """
+    scan = await repo.get_in_org(scan_id, current_user.org_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     # A scan whose worker died is not really running: cancelling it should
@@ -216,6 +228,8 @@ async def cancel_scan(
             detail="Scan queue unavailable",
         ) from exc
 
+    scan.cancelled_by_user_id = str(current_user.id)
+    scan.cancelled_by_email = current_user.email
     if scan.status == ScanStatus.queued:
         await repo.update_status(
             scan,
@@ -224,4 +238,8 @@ async def cancel_scan(
             current_phase=ScanPhase.cancelled,
             phase_message="Scan cancelled by user",
         )
+    else:
+        # Running scan: the worker will transition status on the cancel signal;
+        # persist the canceller attribution now.
+        await scan.save()
     return json_response({"cancelled": True})

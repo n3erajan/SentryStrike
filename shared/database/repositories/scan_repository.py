@@ -17,6 +17,7 @@ class ScanRepository:
         self,
         target_url: str,
         *,
+        org_id: str,
         owner_user_id: str,
         owner_email: str,
         authorization_confirmed: bool,
@@ -26,6 +27,7 @@ class ScanRepository:
         now = datetime.now(timezone.utc)
         scan = Scan(
             target_url=target_url,
+            org_id=org_id,
             owner_user_id=owner_user_id,
             owner_email=owner_email,
             crawl_mode=crawl_mode,
@@ -45,19 +47,25 @@ class ScanRepository:
             return None
         return await Scan.get(oid)
 
-    async def get_owned_by_id(self, scan_id: str, owner_user_id: str) -> Scan | None:
-        """Fetch a scan only if it belongs to the given user.
+    async def get_in_org(self, scan_id: str, org_id: str) -> Scan | None:
+        """Fetch a scan only if it belongs to the given organization.
 
-        Returns None when the scan does not exist or is owned by someone
-        else, so callers cannot distinguish between the two cases.
+        Returns None when the scan does not exist or belongs to another org,
+        so callers cannot distinguish between the two cases (a member of one
+        workspace cannot probe for the existence of another workspace's scans).
         """
         scan = await self.get_by_id(scan_id)
-        if scan is None or scan.owner_user_id != owner_user_id:
+        if scan is None or scan.org_id != org_id:
             return None
         return scan
 
-    async def list(self, skip: int = 0, limit: int = 20, owner_user_id: str | None = None) -> list[Scan]:
-        query = Scan.find(Scan.owner_user_id == owner_user_id) if owner_user_id else Scan.find_all()
+    async def list(self, skip: int = 0, limit: int = 20, org_id: str | None = None) -> list[Scan]:
+        """List scans for an organization (all members share one view), newest first.
+
+        ``org_id`` is required in practice; the None branch exists only for
+        administrative/diagnostic use and lists across all orgs.
+        """
+        query = Scan.find(Scan.org_id == org_id) if org_id else Scan.find_all()
         return await query.sort(-Scan.created_at).skip(skip).limit(limit).to_list()
 
     async def delete(self, scan_id: str) -> bool:

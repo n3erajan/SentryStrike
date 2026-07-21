@@ -5,7 +5,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from app.config import get_settings
 from app.core.auth import AuthService, InvalidSessionError
 from shared.database.repositories.scan_repository import ScanRepository
-from shared.models.user import User
+from shared.models.user import User, UserRole
 
 # Module-level singletons wired once. FastAPI's Depends resolver calls the
 # factory functions below, which return these shared instances.
@@ -65,6 +65,26 @@ async def get_current_user(
             detail=exc.message,
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+
+
+def require_role(*allowed: UserRole):
+    """Build a dependency that admits only members holding one of ``allowed`` roles.
+
+    Resolves the authenticated user (401 if unauthenticated), then checks their
+    org role against the allow-list, raising 403 otherwise. Visibility is always
+    org-wide; this gates *actions* (e.g. launching a scan is everyone except a
+    viewer). Usage: ``Depends(require_role(UserRole.owner, UserRole.admin))``.
+    """
+
+    async def _inner(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to perform this action.",
+            )
+        return current_user
+
+    return _inner
 
 
 def ensure_scan_exists(scan_id: str, repo: ScanRepository = Depends(get_scan_repository)):
