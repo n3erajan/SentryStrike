@@ -6,8 +6,12 @@ import socket
 import uuid
 
 from app.core.scanner import ScanOrchestrator
+from app.config import get_settings
 from app.reverification import run_focused_reverification
+from shared.analysis_handoff import reconcile_missing_analysis_jobs
+from shared.analysis_queue import RedisAnalysisQueue
 from shared.database.connection import close_db, init_db
+from shared.database.repositories.analysis_job_repository import AnalysisJobRepository
 from shared.database.repositories.scan_repository import ScanRepository
 from shared.database.repositories.notification_repository import NotificationRepository
 from shared.database.repositories.reverification_repository import ReverificationRepository
@@ -298,20 +302,52 @@ async def _heartbeat_loop(queue: RedisScanQueue, worker_id: str) -> None:
         await asyncio.sleep(interval)
 
 
+async def _analysis_reconciliation_loop(
+    *,
+    scan_repository: ScanRepository,
+    analysis_repository: AnalysisJobRepository,
+    analysis_queue: RedisAnalysisQueue,
+) -> None:
+    """Periodically repair completed scans missing their durable analysis job."""
+    interval = get_settings().analysis_reconcile_interval_seconds
+    while True:
+        try:
+            await reconcile_missing_analysis_jobs(
+                scan_repository=scan_repository,
+                analysis_repository=analysis_repository,
+                analysis_queue=analysis_queue,
+            )
+        except Exception:
+            logger.exception("analysis reconciliation pass failed")
+        await asyncio.sleep(interval)
+
+
 async def run_worker() -> None:
     """Main worker loop: initialise services, then dequeue and process scan jobs forever."""
-    configure_logging()
-    await init_db()
+    settings = get_settings()
+    configure_logging(log_level=settings.log_level, log_file=settings.log_file)
+    await init_db(settings)
 
-    queue = RedisScanQueue.from_settings()
+    queue = RedisScanQueue.from_settings(settings)
+    analysis_queue = RedisAnalysisQueue.from_settings(settings)
     worker_id = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
     heartbeat_task = asyncio.create_task(_heartbeat_loop(queue, worker_id))
 
     repository = ScanRepository()
+    analysis_repository = AnalysisJobRepository()
     reverification_repository = ReverificationRepository()
     orchestrator = ScanOrchestrator(
         repository,
         cancellation_checker=_make_cancellation_checker(queue),
+        analysis_repository=analysis_repository,
+        analysis_queue=analysis_queue,
+    )
+    reconciliation_task = asyncio.create_task(
+        _analysis_reconciliation_loop(
+            scan_repository=repository,
+            analysis_repository=analysis_repository,
+            analysis_queue=analysis_queue,
+        )
     )
 
     logger.info(
@@ -344,11 +380,18 @@ async def run_worker() -> None:
                 logger.exception("worker failed while handling scan %s", job.scan_id)
     finally:
         heartbeat_task.cancel()
+        reconciliation_task.cancel()
+        for background in (heartbeat_task, reconciliation_task):
+            try:
+                await background
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown
+                pass
         try:
             await queue.clear_heartbeat(worker_id)
         except ScanQueueError:
             logger.exception("failed to clear heartbeat for worker %s", worker_id)
         await queue.close()
+        await analysis_queue.close()
         await close_db()
 
 

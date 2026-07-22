@@ -16,14 +16,12 @@ logger = logging.getLogger("app.core.scanner")
 # per-stage progress bar the frontend displays.
 PHASE_WEIGHTS = {
     ScanPhase.initializing: 2,
-    ScanPhase.crawling: 25,
-    ScanPhase.technology_detection: 5,
-    ScanPhase.tls_analysis: 3,
-    ScanPhase.vulnerability_detection: 45,
-    ScanPhase.deduplication: 3,
-    ScanPhase.ai_analysis: 12,
+    ScanPhase.crawling: 30,
+    ScanPhase.technology_detection: 6,
+    ScanPhase.tls_analysis: 4,
+    ScanPhase.vulnerability_detection: 52,
+    ScanPhase.deduplication: 4,
     ScanPhase.risk_scoring: 2,
-    ScanPhase.report_generation: 3,
 }
 
 DETECTOR_PAYLOADS_PER_TARGET: dict[str, int] = {
@@ -65,11 +63,8 @@ SHORT_PHASE_PRIOR_S: dict[ScanPhase, float] = {
     ScanPhase.tls_analysis: 3.0,
     ScanPhase.deduplication: 2.0,
     ScanPhase.risk_scoring: 2.0,
-    ScanPhase.report_generation: 8.0,
 }
 
-AI_PRIOR_PER_FINDING_S = 8.0
-AI_PENDING_PRIOR_S = 60.0
 CRAWL_PRIOR_S = 150.0
 DETECTOR_PENDING_PRIOR_S = 480.0
 DEFAULT_LATENCY_MS = 200.0
@@ -110,9 +105,7 @@ class _EtaState:
             ScanPhase.tls_analysis,
             ScanPhase.vulnerability_detection,
             ScanPhase.deduplication,
-            ScanPhase.ai_analysis,
             ScanPhase.risk_scoring,
-            ScanPhase.report_generation,
         )
     )
 

@@ -15,6 +15,7 @@ from shared.models.vulnerability import OwaspCategory, SeverityLevel, Technology
 class FakeRepo:
     def __init__(self, scan: object):
         self.scan = scan
+        self.analysis_attachments = []
 
     async def get_by_id(self, _: str):
         return self.scan
@@ -26,6 +27,31 @@ class FakeRepo:
         if error_message:
             scan.error_message = error_message
         return scan
+
+    async def attach_initial_analysis_job(self, **kwargs):
+        assert self.scan.status == ScanStatus.completed
+        self.analysis_attachments.append(kwargs)
+        return True
+
+class FakeAnalysisRepository:
+    def __init__(self) -> None:
+        self.created = []
+
+    async def create_initial(self, **kwargs):
+        self.created.append(kwargs)
+        return SimpleNamespace(
+            id="analysis-job-1",
+            revision=1,
+            queued_at=datetime.now(timezone.utc),
+        )
+
+
+class FakeAnalysisQueue:
+    def __init__(self) -> None:
+        self.signals = []
+
+    async def enqueue(self, signal) -> None:
+        self.signals.append(signal)
 
 
 class FakeSpider:
@@ -104,14 +130,10 @@ class FakeRemediation:
         return vulnerabilities
 
 
-class FakeReport:
-    async def generate(self, scan: object):
-        return {"executive_summary": "Summary"}
-
-
 class FakeScan:
     def __init__(self) -> None:
         self.id = "mock-id"
+        self.org_id = "org-1"
         self.target_url = "https://example.com"
         self.submitted_by_user_id = "user-1"
         self.submitted_by_full_name = "Scan Submitter"
@@ -135,7 +157,14 @@ class FakeScan:
         self.overall_risk_score = 0.0
         self.technology_stack = []
         self.vulnerabilities = []
-        self.report_metadata = SimpleNamespace(generated_at=None, generated_by="ai", summary=None)
+        self.report_metadata = SimpleNamespace(
+            generated_at=None,
+            generated_by=None,
+            ai_model=None,
+            prompt_version=None,
+            summary=None,
+        )
+        self.analysis = None
         self.error_message = None
 
     async def save(self) -> None:
@@ -145,8 +174,15 @@ class FakeScan:
 @pytest.mark.asyncio
 async def test_scanner_workflow_completes() -> None:
     scan = FakeScan()
+    repository = FakeRepo(scan)
+    analysis_repository = FakeAnalysisRepository()
+    analysis_queue = FakeAnalysisQueue()
 
-    orchestrator = ScanOrchestrator(FakeRepo(scan))
+    orchestrator = ScanOrchestrator(
+        repository,
+        analysis_repository=analysis_repository,
+        analysis_queue=analysis_queue,
+    )
     orchestrator.spider = FakeSpider()
     orchestrator.technology_detector = FakeTechDetector()
     orchestrator.cve_service = FakeCveService()
@@ -156,7 +192,6 @@ async def test_scanner_workflow_completes() -> None:
     orchestrator.prioritizer = FakePrioritizer()
     orchestrator.false_positive = FakeFP()
     orchestrator.remediation_gen = FakeRemediation()
-    orchestrator.ai_report = FakeReport()
 
     await orchestrator.run_scan("mock-id")
 
@@ -166,6 +201,20 @@ async def test_scanner_workflow_completes() -> None:
     assert scan.phase_message == "Scan completed"
     assert scan.statistics.total_vulnerabilities >= 1
     assert scan.overall_risk_score > 0
+    assert scan.report_metadata.summary is None
+    assert all(v.ai_analysis.ai_analysis_status.value == "pending" for v in scan.vulnerabilities)
+    assert all(v.evidence.evidence_grade for v in scan.vulnerabilities)
+    assert analysis_repository.created == [
+        {
+            "scan_id": "mock-id",
+            "org_id": "org-1",
+            "finding_count": len(scan.vulnerabilities),
+        }
+    ]
+    assert repository.analysis_attachments[0]["job_id"] == "analysis-job-1"
+    assert [signal.model_dump() for signal in analysis_queue.signals] == [
+        {"analysis_job_id": "analysis-job-1"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -192,7 +241,6 @@ async def test_single_path_scan_uses_fetch_single(monkeypatch):
     orchestrator.ssl_analyzer = FakeSsl()
     orchestrator.detectors = [FakeDetector()]
     orchestrator.supply_chain_detector = FakeDetector()
-    orchestrator.ai_report = FakeReport()
 
     await orchestrator.run_scan("mock-id")
 
@@ -238,7 +286,7 @@ def run_mock_server(httpd):
     httpd.serve_forever()
 
 @pytest.mark.asyncio
-async def test_full_scan_against_mock_server(monkeypatch):
+async def test_full_scan_against_mock_server():
     # Start mock server
     server_address = ('127.0.0.1', 8089)
     httpd = HTTPServer(server_address, MockServerRequestHandler)
@@ -250,21 +298,6 @@ async def test_full_scan_against_mock_server(monkeypatch):
     time.sleep(0.5)
     
     try:
-        # Mock AI Client to avoid actual LLM calls
-        from app.analyzers.ai_client import AIClient
-        
-        async def mock_generate_json_list(*args, **kwargs):
-            # Return empty list or fallbacks
-            expected_count = kwargs.get('expected_count', 1)
-            fallback = kwargs.get('fallback', {})
-            return [fallback for _ in range(expected_count)]
-            
-        async def mock_generate_json(*args, **kwargs):
-            return kwargs.get('fallback', {})
-            
-        monkeypatch.setattr(AIClient, "generate_json_list", mock_generate_json_list)
-        monkeypatch.setattr(AIClient, "generate_json", mock_generate_json)
-        
         scan = FakeScan()
         scan.target_url = "http://127.0.0.1:8089"
         orchestrator = ScanOrchestrator(FakeRepo(scan))

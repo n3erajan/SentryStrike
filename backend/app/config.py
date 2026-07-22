@@ -1,17 +1,33 @@
 from functools import lru_cache
 
 from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import SettingsConfigDict
 
-from shared.config import InfrastructureSettings
+from shared.config import (
+    AnalysisQueueSettings,
+    InfrastructureSettings,
+    PublicUrlSettings,
+    ScanQueueSettings,
+    service_env_files,
+)
 
 
-class BackendSettings(InfrastructureSettings):
+class BackendSettings(
+    ScanQueueSettings,
+    AnalysisQueueSettings,
+    PublicUrlSettings,
+    InfrastructureSettings,
+):
+    model_config = SettingsConfigDict(
+        env_file=service_env_files("backend"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     app_name: str = Field(default="Sentry Strike Backend", alias="APP_NAME")
-    app_env: str = Field(default="dev", alias="APP_ENV")
     app_debug: bool = Field(default=True, alias="APP_DEBUG")
-    app_host: str = Field(default="0.0.0.0", alias="APP_HOST")
-    app_port: int = Field(default=8000, alias="APP_PORT")
     cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     auth_session_ttl_hours: int = Field(default=24, ge=1, alias="AUTH_SESSION_TTL_HOURS")
     auth_cookie_name: str = Field(

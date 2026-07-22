@@ -1,4 +1,3 @@
-import asyncio
 import copy
 import json
 import logging
@@ -6,7 +5,6 @@ import re
 import time
 from urllib.parse import urlparse
 
-from app.config import get_settings
 from app.core.detectors.base_detector import Finding
 from shared.models.vulnerability import SeverityLevel
 
@@ -384,8 +382,6 @@ class AuthApiProbeMixin:
         usernames: list[str],
         domains: list[str],
         email_login: bool,
-        extra_users: tuple[str, ...] = (),
-        extra_passwords: tuple[str, ...] = (),
     ) -> list[tuple[str, str]]:
         """Cross observed/derived identities with weak passwords into login pairs.
 
@@ -408,24 +404,13 @@ class AuthApiProbeMixin:
                     add_user(f"{localpart}@{domain}")
             for email in emails:
                 add_user(email)
-            for extra in extra_users:
-                if "@" in extra:
-                    add_user(extra)
-                else:
-                    for domain in domains:
-                        add_user(f"{extra}@{domain}")
         else:
             for username in usernames:
                 add_user(username)
             for localpart in self._DEFAULT_LOCALPARTS:
                 add_user(localpart)
-            for extra in extra_users:
-                add_user(extra)
 
         passwords = list(self._WEAK_PASSWORDS)
-        for extra in extra_passwords:
-            if extra and extra not in passwords:
-                passwords.append(extra)
 
         # Per-user password list: the local-part itself and "<localpart>123" are
         # the two most common default patterns, tried before the generic list.
@@ -475,38 +460,7 @@ class AuthApiProbeMixin:
         denied_baseline = baseline_status in {400, 401, 403, 409, 422}
         return has_token or (denied_baseline and status not in {400, 401, 403, 409, 422})
 
-    async def _ai_enrich_credentials(
-        self, kwargs: dict[str, object], domains: list[str]
-    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        """Optionally enrich the candidate lists via the AI layer.
 
-        Runs ONLY when ``ai_analysis_enabled`` is set. Any failure (disabled, no
-        key, timeout, bad JSON) falls back to empty lists so the deterministic
-        harvest remains the base mechanism and no-AI runs are unaffected.
-        """
-        if not get_settings().ai_analysis_enabled:
-            return (), ()
-        try:
-            from app.analyzers.ai_client import AIClient
-
-            host = urlparse(str(kwargs.get("root_url") or "")).hostname or ""
-            technologies = kwargs.get("technologies") or kwargs.get("technology_stack") or []
-            tech_names = ", ".join(str(getattr(t, "name", t)) for t in technologies)[:200]
-            prompt = (
-                "You are assisting an authorised security scan. Given a target web application, "
-                "propose likely DEFAULT or WEAK administrative credentials to test against its login. "
-                f"Target host: {host or 'unknown'}. Detected technologies: {tech_names or 'unknown'}. "
-                "Respond ONLY with JSON of the form "
-                '{"usernames": ["..."], "passwords": ["..."]}. '
-                "usernames are bare local-parts or full identifiers; keep each list <= 8 items."
-            )
-            data = await asyncio.wait_for(AIClient().generate_json(prompt), timeout=20.0)
-            users = tuple(str(u).strip() for u in (data.get("usernames") or []) if str(u).strip())[:8]
-            passwords = tuple(str(p).strip() for p in (data.get("passwords") or []) if str(p).strip())[:8]
-            return users, passwords
-        except Exception as exc:  # noqa: BLE001 - enrichment is best-effort
-            logger.debug("AI credential enrichment skipped: %s", exc)
-            return (), ()
     async def _test_api_default_credentials(
         self,
         record: dict,
@@ -516,10 +470,10 @@ class AuthApiProbeMixin:
         """Probe a JSON API login flow for accepted default/weak credentials.
 
         Candidate identities are harvested from what the target reveals (observed
-        e-mails/JWT claims/own login domain) and crossed with a common weak-password
-        list; when AI analysis is enabled the lists are enriched. Verification is a
-        real login: an accepted credential is proven by a 2xx + auth-token response
-        that differs from the invalid-credential baseline. Bounded and idempotent.
+        e-mails/JWT claims/own login domain) and crossed with a deterministic
+        weak-password list. Verification is a real login: an accepted credential
+        is proven by a 2xx + auth-token response that differs from the
+        invalid-credential baseline. Bounded and idempotent.
         """
         from app.core.verification.verification_framework import HttpVerifier
 
@@ -544,9 +498,8 @@ class AuthApiProbeMixin:
             # address without guessing a domain (that would be a blind wordlist).
             return []
 
-        extra_users, extra_passwords = await self._ai_enrich_credentials(kwargs, domains)
         candidates = self._build_credential_candidates(
-            emails, usernames, domains, email_login, extra_users, extra_passwords
+            emails, usernames, domains, email_login
         )
         if not candidates:
             return []

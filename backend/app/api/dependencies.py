@@ -6,7 +6,9 @@ from app.config import get_settings
 from app.core.auth import AuthService, InvalidSessionError
 from app.core.invites import InviteService
 from app.core.invite_rate_limit import RedisInviteRateLimiter
+from shared.analysis_queue import AnalysisQueue, RedisAnalysisQueue
 from shared.database.repositories.audit_repository import AuditRepository
+from shared.database.repositories.analysis_job_repository import AnalysisJobRepository
 from shared.database.repositories.member_repository import MemberRepository
 from shared.database.repositories.notification_repository import NotificationRepository
 from shared.database.repositories.reverification_repository import ReverificationRepository
@@ -22,6 +24,8 @@ organization_repository = OrganizationRepository()
 audit_repository = AuditRepository()
 notification_repository = NotificationRepository()
 reverification_repository = ReverificationRepository()
+analysis_job_repository = AnalysisJobRepository()
+analysis_queue = RedisAnalysisQueue.from_settings(get_settings())
 auth_service = AuthService()
 invite_service = InviteService(RedisInviteRateLimiter.from_settings())
 
@@ -52,6 +56,14 @@ def get_notification_repository() -> NotificationRepository:
 
 def get_reverification_repository() -> ReverificationRepository:
     return reverification_repository
+
+
+def get_analysis_job_repository() -> AnalysisJobRepository:
+    return analysis_job_repository
+
+
+def get_analysis_queue() -> AnalysisQueue:
+    return analysis_queue
 
 
 def get_auth_service() -> AuthService:

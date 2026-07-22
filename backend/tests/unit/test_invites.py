@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from app.api.dependencies import get_auth_service, get_invite_service
 from app.api.routes import auth
+from app.config import get_settings
 from app.core import invites as invite_module
 from app.core.invites import (
     InvalidInviteError,
@@ -21,7 +22,6 @@ from app.core.invites import (
     build_invite_link,
     hash_invite_token,
 )
-from shared.config import get_infrastructure_settings
 from shared.models.invite import InviteEmailStatus, InviteState
 from shared.models.user import UserRole
 
@@ -42,31 +42,31 @@ def test_hash_invite_token_is_deterministic_and_hides_raw_token() -> None:
 
 def test_build_invite_link_uses_public_hostname(monkeypatch) -> None:
     monkeypatch.setenv("PUBLIC_HOSTNAME", "sentry.example.com")
-    get_infrastructure_settings.cache_clear()
+    get_settings.cache_clear()
     try:
         link = build_invite_link("abc123")
         assert link == "http://sentry.example.com/register?invite=abc123"
     finally:
-        get_infrastructure_settings.cache_clear()
+        get_settings.cache_clear()
 
 
 def test_build_invite_link_preserves_explicit_scheme(monkeypatch) -> None:
     monkeypatch.setenv("PUBLIC_HOSTNAME", "https://mypage.com")
-    get_infrastructure_settings.cache_clear()
+    get_settings.cache_clear()
     try:
         link = build_invite_link("tok")
         assert link == "https://mypage.com/register?invite=tok"
     finally:
-        get_infrastructure_settings.cache_clear()
+        get_settings.cache_clear()
 
 
 def test_build_invite_link_returns_none_without_hostname(monkeypatch) -> None:
     monkeypatch.setenv("PUBLIC_HOSTNAME", "")
-    get_infrastructure_settings.cache_clear()
+    get_settings.cache_clear()
     try:
         assert build_invite_link("tok") is None
     finally:
-        get_infrastructure_settings.cache_clear()
+        get_settings.cache_clear()
 
 
 class _Field:

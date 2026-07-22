@@ -115,6 +115,32 @@ def test_pdf_remediation_roadmap_keeps_full_remediation_text() -> None:
     assert "..." not in action_cell.getPlainText()
 
 
+def test_pdf_remediation_roadmap_excludes_suppressed_false_positive() -> None:
+    scan_data = {
+        "data": {
+            "vulnerabilities": [
+                {
+                    "vuln_type": "Suppressed XSS",
+                    "severity": "High",
+                    "is_false_positive": True,
+                    "ai_analysis": {"remediation": "Do not show this action."},
+                },
+                {
+                    "vuln_type": "Active SQL Injection",
+                    "severity": "Critical",
+                    "is_false_positive": False,
+                    "ai_analysis": {"remediation": "Use prepared statements."},
+                },
+            ]
+        }
+    }
+
+    text = _flowable_text(build_remediation_roadmap(scan_data, build_styles()))
+
+    assert "Active SQL Injection" in text
+    assert "Suppressed XSS" not in text
+
+
 def _roadmap_phase_of(elems, vuln_type: str) -> str | None:
     """Return the roadmap phase heading under which *vuln_type* is listed.
 
@@ -376,6 +402,36 @@ def test_pdf_detailed_findings_include_evidence_strength_and_auth_context() -> N
     assert "json_body_sqli" in text
     assert "Detector Verified" in text
     assert "Yes" in text
+
+
+def test_pdf_detailed_findings_show_false_positive_reviewer() -> None:
+    scan_data = {
+        "data": {
+            "vulnerabilities": [
+                {
+                    "vuln_type": "Reflected XSS",
+                    "category": "OwaspCategory.a05",
+                    "severity": "SeverityLevel.high",
+                    "cvss_score": 8.0,
+                    "review_status": "suppressed",
+                    "is_false_positive": True,
+                    "false_positive_reason": "Generic SPA fallback response.",
+                    "false_positive_marked_by_email": "analyst@example.test",
+                    "false_positive_marked_at": "2026-07-22T10:00:00+00:00",
+                    "location": {"url": "https://target.example/search"},
+                    "evidence": {},
+                    "ai_analysis": {},
+                }
+            ]
+        }
+    }
+
+    text = _flowable_text(build_detailed_findings(scan_data, build_styles()))
+
+    assert "Marked By" in text
+    assert "analyst@example.test" in text
+    assert "Review Reason" in text
+    assert "Generic SPA fallback response." in text
 
 
 def test_pdf_code_block_wraps_long_encoded_get_request_inside_available_width() -> None:

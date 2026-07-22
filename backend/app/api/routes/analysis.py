@@ -1,7 +1,11 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.dependencies import (
     get_audit_repository,
+    get_analysis_job_repository,
+    get_analysis_queue,
     get_current_user,
     get_member_repository,
     get_notification_repository,
@@ -11,21 +15,27 @@ from app.api.dependencies import (
     require_role,
 )
 from shared.database.repositories.audit_repository import AuditRepository
+from shared.database.repositories.analysis_job_repository import AnalysisJobRepository
 from shared.database.repositories.member_repository import MemberRepository
 from shared.database.repositories.notification_repository import NotificationRepository
 from shared.database.repositories.reverification_repository import ReverificationRepository
 from shared.database.repositories.scan_repository import ScanRepository
+from shared.finding_rollups import apply_finding_rollups
 from shared.models.audit import AuditAction
+from shared.models.analysis_job import AnalysisStatus
 from shared.models.notification import NotificationType
 from shared.models.reverification import ReverificationJob
+from shared.models.scan import ScanStatus
 from shared.models.user import User, UserRole
 from shared.models.vulnerability import FindingComment, RemediationStatus, Vulnerability
+from shared.analysis_queue import AnalysisQueue, AnalysisQueueError, AnalysisSignal
 from shared.scan_queue import ScanJob, ScanJobKind, ScanQueueError
 from shared.schemas.scan_schema import scan_auth_accounts_from_credentials
 from app.api.routes import scan as scan_routes
 from app.schemas.finding_schema import (
     AssignFindingRequest,
     CommentRequest,
+    FindingReviewRequest,
     RemediationRequest,
     ReverificationRequest,
 )
@@ -41,6 +51,119 @@ FINDING_CONTRIBUTOR_ROLES = (UserRole.owner, UserRole.admin, UserRole.analyst, U
 # sign off their own fix or accept the risk); everything up to and including
 # "fixed_pending_verification" is open to any contributor.
 TRIAGER_ONLY_REMEDIATION = {RemediationStatus.verified_fixed, RemediationStatus.wont_fix}
+
+
+def _analysis_conflict(code: str, message: str, analysis) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": code,
+            "message": message,
+            "analysis_status": getattr(analysis.status, "value", analysis.status),
+            "analysis_revision": analysis.revision,
+        },
+    )
+
+
+@router.post("/scans/{scan_id}/retry", status_code=status.HTTP_202_ACCEPTED)
+async def retry_scan_analysis(
+    scan_id: str,
+    scan_repository: ScanRepository = Depends(get_scan_repository),
+    analysis_repository: AnalysisJobRepository = Depends(
+        get_analysis_job_repository
+    ),
+    analysis_queue: AnalysisQueue = Depends(get_analysis_queue),
+    audit: AuditRepository = Depends(get_audit_repository),
+    current_user: User = Depends(require_role(*FINDING_TRIAGE_ROLES)),
+) -> dict:
+    scan = await scan_repository.get_in_org(scan_id, current_user.org_id)
+    if scan is None:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if scan.status != ScanStatus.completed or scan.analysis is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "analysis_not_retryable",
+                "message": "Analysis can be retried only for a completed scan with a failed current revision.",
+            },
+        )
+
+    current = scan.analysis
+    current_status = AnalysisStatus(current.status)
+    if current_status in {AnalysisStatus.queued, AnalysisStatus.running}:
+        raise _analysis_conflict(
+            "analysis_already_active",
+            "Analysis is already queued or running.",
+            current,
+        )
+    if current_status == AnalysisStatus.completed:
+        raise _analysis_conflict(
+            "analysis_already_completed",
+            "Completed analysis cannot be rerun through the retry endpoint.",
+            current,
+        )
+    if current_status != AnalysisStatus.failed or not current.current_job_id:
+        raise _analysis_conflict(
+            "analysis_not_retryable",
+            "The current analysis state is not retryable.",
+            current,
+        )
+
+    new_revision = current.revision + 1
+    job = await analysis_repository.create_manual_retry(
+        scan_id=scan_id,
+        org_id=current_user.org_id,
+        revision=new_revision,
+        finding_count=len(scan.vulnerabilities),
+        requested_by_user_id=str(current_user.id),
+        requested_by_email=current_user.email,
+    )
+    attached = await scan_repository.attach_retry_analysis_job(
+        scan_id=scan_id,
+        org_id=current_user.org_id,
+        previous_job_id=current.current_job_id,
+        previous_revision=current.revision,
+        job_id=str(job.id),
+        revision=new_revision,
+        queued_at=job.queued_at,
+    )
+    if not attached:
+        refreshed = await scan_repository.get_in_org(scan_id, current_user.org_id)
+        refreshed_analysis = getattr(refreshed, "analysis", current)
+        raise _analysis_conflict(
+            "analysis_already_active",
+            "Another request already changed the current analysis revision.",
+            refreshed_analysis,
+        )
+
+    signal_delivered = True
+    try:
+        await analysis_queue.enqueue(AnalysisSignal(analysis_job_id=str(job.id)))
+    except AnalysisQueueError:
+        signal_delivered = False
+
+    await audit.record(
+        org_id=current_user.org_id,
+        action=AuditAction.analysis_retry_created,
+        actor_user_id=str(current_user.id),
+        actor_email=current_user.email,
+        target_type="scan",
+        target_id=scan_id,
+        metadata={
+            "previous_revision": current.revision,
+            "new_revision": new_revision,
+            "analysis_job_id": str(job.id),
+        },
+    )
+    return json_response(
+        {
+            "job_id": str(job.id),
+            "revision": new_revision,
+            "status": AnalysisStatus.queued,
+            "signal_delivered": signal_delivered,
+        },
+        "analysis retry queued",
+    )
 
 
 def _find_vulnerability(scan, vulnerability_id: str) -> Vulnerability | None:
@@ -111,6 +234,103 @@ async def _load_scan_and_finding(repo: ScanRepository, scan_id: str, vulnerabili
     if vuln is None:
         raise HTTPException(status_code=404, detail="Vulnerability not found")
     return scan, vuln
+
+
+@router.put("/scans/{scan_id}/vulnerabilities/{vulnerability_id}/review")
+async def review_finding(
+    scan_id: str,
+    vulnerability_id: str,
+    payload: FindingReviewRequest,
+    repo: ScanRepository = Depends(get_scan_repository),
+    audit: AuditRepository = Depends(get_audit_repository),
+    notifications: NotificationRepository = Depends(get_notification_repository),
+    current_user: User = Depends(require_role(*FINDING_TRIAGE_ROLES)),
+) -> dict:
+    """Mark a finding as a false positive, or restore it to active review."""
+    scan, vulnerability = await _load_scan_and_finding(
+        repo, scan_id, vulnerability_id, current_user.org_id
+    )
+    previous_disposition = (
+        "false_positive" if vulnerability.is_false_positive else "active"
+    )
+    marked_at = datetime.now(timezone.utc)
+
+    if payload.disposition == "false_positive":
+        vulnerability.is_false_positive = True
+        vulnerability.false_positive_reason = payload.reason
+        vulnerability.false_positive_marked_by_user_id = str(current_user.id)
+        vulnerability.false_positive_marked_by_email = current_user.email
+        vulnerability.false_positive_marked_at = marked_at
+    else:
+        vulnerability.is_false_positive = False
+        vulnerability.false_positive_reason = None
+        vulnerability.false_positive_marked_by_user_id = None
+        vulnerability.false_positive_marked_by_email = None
+        vulnerability.false_positive_marked_at = None
+
+    vulnerability.refresh_review_status()
+    apply_finding_rollups(scan)
+    await scan.save()
+
+    await audit.record(
+        org_id=current_user.org_id,
+        action=AuditAction.finding_review_changed,
+        actor_user_id=str(current_user.id),
+        actor_email=current_user.email,
+        target_type="finding",
+        target_id=vulnerability.id,
+        metadata={
+            "scan_id": scan_id,
+            "vulnerability_id": vulnerability.id,
+            "previous_disposition": previous_disposition,
+            "new_disposition": payload.disposition,
+            "reason": payload.reason,
+        },
+    )
+
+    recipients = {
+        recipient
+        for recipient in (
+            vulnerability.assignee_user_id,
+            getattr(scan, "submitted_by_user_id", None),
+        )
+        if recipient and recipient != str(current_user.id)
+    }
+    action_label = (
+        "marked as a false positive"
+        if payload.disposition == "false_positive"
+        else "restored as an active finding"
+    )
+    event_key = marked_at.isoformat()
+    for recipient in recipients:
+        await notifications.create(
+            org_id=current_user.org_id,
+            recipient_user_id=recipient,
+            type=NotificationType.finding_review_changed,
+            title="Finding review changed",
+            message=f"{current_user.email} {action_label}: {vulnerability.vuln_type}.",
+            resource_type="finding",
+            resource_id=vulnerability.id,
+            metadata={
+                "scan_id": scan_id,
+                "disposition": payload.disposition,
+                "reason": payload.reason,
+            },
+            dedupe_key=(
+                f"finding-review:{current_user.org_id}:{scan_id}:"
+                f"{vulnerability.id}:{recipient}:{event_key}"
+            ),
+        )
+
+    return json_response(
+        {
+            "vulnerability": vulnerability.model_dump(mode="json"),
+            "statistics": scan.statistics.model_dump(mode="json"),
+            "risk_score": scan.overall_risk_score,
+            "risk_level": scan.overall_risk_level,
+        },
+        "finding review updated",
+    )
 
 
 @router.put("/scans/{scan_id}/vulnerabilities/{vulnerability_id}/assignment")

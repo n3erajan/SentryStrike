@@ -24,10 +24,11 @@ logger = logging.getLogger(__name__)
 
 async def run_retention_worker() -> None:
     """Initialise services, then run a purge pass on the configured interval forever."""
-    configure_logging()
-    await init_db()
+    settings = get_settings()
+    configure_logging(log_level=settings.log_level)
+    await init_db(settings)
 
-    interval = get_settings().retention_purge_interval_seconds
+    interval = settings.retention_purge_interval_seconds
     service = RetentionService()
     logger.info("retention worker started; purge interval=%ds", interval)
     try:

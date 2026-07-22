@@ -28,7 +28,6 @@ from app.core.invite_rate_limit import (
     RedisInviteRateLimiter,
 )
 from shared.database.repositories.organization_repository import OrganizationRepository
-from shared.config import get_infrastructure_settings
 from shared.models.invite import Invite, InviteEmailStatus, InviteState
 from shared.models.organization import Organization
 from shared.models.organization import DEFAULT_MEMBER_LIMIT
@@ -102,7 +101,7 @@ def build_invite_link(token: str) -> str | None:
     e.g. ``https://sentry.example.com/register?invite=<token>``. When the hostname
     is unset (local dev), returns None and callers surface the raw token instead.
     """
-    base = get_infrastructure_settings().public_base_url
+    base = get_settings().public_base_url
     if not base:
         return None
     return f"{base}/register?invite={token}"

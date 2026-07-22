@@ -15,14 +15,19 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import (
+    get_audit_repository,
     get_current_user,
     get_member_repository,
     get_notification_repository,
     get_scan_repository,
 )
 from app.api.routes import analysis
+from shared.finding_rollups import apply_finding_rollups
+from shared.models.scan import ReportMetadata, ScanStatistics
 from shared.models.user import UserRole
 from shared.models.vulnerability import (
+    Evidence,
+    EvidenceStrength,
     LocationInfo,
     OwaspCategory,
     RemediationStatus,
@@ -37,7 +42,12 @@ def _finding(vuln_id: str) -> Vulnerability:
         category=OwaspCategory.a05,
         vuln_type="Reflected XSS",
         severity=SeverityLevel.high,
+        cvss_score=8.0,
         location=LocationInfo(url="https://target.example/search", parameter="q"),
+        evidence=Evidence(
+            verified=True,
+            evidence_strength=EvidenceStrength.confirmed_exploit,
+        ),
     )
 
 
@@ -46,6 +56,12 @@ class FakeScan:
         self.id = scan_id
         self.org_id = org_id
         self.vulnerabilities = [_finding("vuln-1")]
+        self.submitted_by_user_id = "user-owner"
+        self.statistics = ScanStatistics()
+        self.report_metadata = ReportMetadata()
+        self.overall_risk_score = 0.0
+        self.overall_risk_level = "Info"
+        apply_finding_rollups(self)
         self.saved = False
 
     async def save(self) -> None:
@@ -96,6 +112,15 @@ class FakeNotificationRepository:
         return SimpleNamespace(**kwargs)
 
 
+class FakeAuditRepository:
+    def __init__(self) -> None:
+        self.entries: list[dict] = []
+
+    async def record(self, **kwargs):
+        self.entries.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+
 def _client(
     repo: FakeScanRepository,
     members: FakeMemberRepository,
@@ -103,12 +128,17 @@ def _client(
     user_id: str = "user-analyst",
     org_id: str = "org-1",
     role: UserRole = UserRole.analyst,
+    audit: FakeAuditRepository | None = None,
+    notifications: FakeNotificationRepository | None = None,
 ) -> TestClient:
     app = FastAPI()
     app.include_router(analysis.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.dependency_overrides[get_scan_repository] = lambda: repo
     app.dependency_overrides[get_member_repository] = lambda: members
-    app.dependency_overrides[get_notification_repository] = lambda: FakeNotificationRepository()
+    app.dependency_overrides[get_audit_repository] = lambda: audit or FakeAuditRepository()
+    app.dependency_overrides[get_notification_repository] = (
+        lambda: notifications or FakeNotificationRepository()
+    )
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=user_id, email=f"{user_id}@example.test", org_id=org_id, role=role
     )
@@ -117,6 +147,116 @@ def _client(
 
 def _repos():
     return FakeScanRepository(), FakeMemberRepository()
+
+
+# ---------------------------------------------------------------------------
+# Manual finding review
+# ---------------------------------------------------------------------------
+
+
+def test_triager_can_mark_false_positive_with_reviewer_and_rollups() -> None:
+    repo, members = _repos()
+    audit = FakeAuditRepository()
+    notifications = FakeNotificationRepository()
+    finding = repo.scans["scan-1"].vulnerabilities[0]
+    finding.assignee_user_id = "user-dev"
+    client = _client(
+        repo,
+        members,
+        audit=audit,
+        notifications=notifications,
+    )
+
+    response = client.put(
+        "/api/v1/analysis/scans/scan-1/vulnerabilities/vuln-1/review",
+        json={
+            "disposition": "false_positive",
+            "reason": "The endpoint returns the same SPA shell for every path.",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    reviewed = data["vulnerability"]
+    assert reviewed["is_false_positive"] is True
+    assert reviewed["review_status"] == "suppressed"
+    assert reviewed["false_positive_marked_by_user_id"] == "user-analyst"
+    assert reviewed["false_positive_marked_by_email"] == "user-analyst@example.test"
+    assert reviewed["false_positive_marked_at"] is not None
+    assert data["statistics"]["active_vulnerabilities"] == 0
+    assert data["statistics"]["suppressed_vulnerabilities"] == 1
+    assert data["statistics"]["severity_breakdown"]["high"] == 0
+    assert data["risk_score"] == 0.0
+    assert audit.entries[0]["metadata"]["new_disposition"] == "false_positive"
+    assert {entry["recipient_user_id"] for entry in notifications.entries} == {
+        "user-dev",
+        "user-owner",
+    }
+
+
+def test_triager_can_restore_false_positive_and_clear_current_reviewer() -> None:
+    repo, members = _repos()
+    client = _client(repo, members)
+    mark = client.put(
+        "/api/v1/analysis/scans/scan-1/vulnerabilities/vuln-1/review",
+        json={"disposition": "false_positive", "reason": "Not reproducible."},
+    )
+    assert mark.status_code == 200
+
+    response = client.put(
+        "/api/v1/analysis/scans/scan-1/vulnerabilities/vuln-1/review",
+        json={"disposition": "active", "reason": "Reproduced with a valid session."},
+    )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    restored = data["vulnerability"]
+    assert restored["is_false_positive"] is False
+    assert restored["review_status"] == "confirmed"
+    assert restored["false_positive_reason"] is None
+    assert restored["false_positive_marked_by_user_id"] is None
+    assert restored["false_positive_marked_by_email"] is None
+    assert restored["false_positive_marked_at"] is None
+    assert data["statistics"]["active_vulnerabilities"] == 1
+    assert data["statistics"]["suppressed_vulnerabilities"] == 0
+    assert data["statistics"]["severity_breakdown"]["high"] == 1
+    assert data["risk_score"] > 0
+
+
+def test_developer_cannot_change_finding_review() -> None:
+    repo, members = _repos()
+    client = _client(repo, members, user_id="user-dev", role=UserRole.developer)
+
+    response = client.put(
+        "/api/v1/analysis/scans/scan-1/vulnerabilities/vuln-1/review",
+        json={"disposition": "false_positive", "reason": "Not reproducible."},
+    )
+
+    assert response.status_code == 403
+
+
+def test_finding_review_on_foreign_scan_is_not_found() -> None:
+    repo, members = _repos()
+    client = _client(repo, members)
+
+    response = client.put(
+        "/api/v1/analysis/scans/scan-other/vulnerabilities/vuln-1/review",
+        json={"disposition": "false_positive", "reason": "Not reproducible."},
+    )
+
+    assert response.status_code == 404
+
+
+def test_finding_review_requires_non_blank_reason() -> None:
+    repo, members = _repos()
+    client = _client(repo, members)
+
+    response = client.put(
+        "/api/v1/analysis/scans/scan-1/vulnerabilities/vuln-1/review",
+        json={"disposition": "false_positive", "reason": "   "},
+    )
+
+    assert response.status_code == 422
 
 
 # ---------------------------------------------------------------------------

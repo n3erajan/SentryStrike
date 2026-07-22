@@ -1,8 +1,9 @@
 from beanie import init_beanie
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from shared.config import get_infrastructure_settings
+from shared.config import InfrastructureSettings
 from shared.models.audit import AuditLogEntry
+from shared.models.analysis_job import AnalysisJob
 from shared.models.cve import CveRecord
 from shared.models.invite import Invite
 from shared.models.notification import Notification
@@ -19,14 +20,13 @@ from shared.models.user import User, UserSession
 _client: AsyncIOMotorClient | None = None
 
 
-async def init_db() -> None:
+async def init_db(settings: InfrastructureSettings) -> None:
     """Open the MongoDB connection and register all Beanie document models."""
     global _client
-    settings = get_infrastructure_settings()
     _client = AsyncIOMotorClient(settings.mongodb_uri)
     await init_beanie(
         database=_client[settings.mongodb_db_name],
-        document_models=[Scan, CveRecord, User, UserSession, OastInteractionRecord, Organization, Invite, AuditLogEntry, Notification, ReverificationJob],
+        document_models=[Scan, AnalysisJob, CveRecord, User, UserSession, OastInteractionRecord, Organization, Invite, AuditLogEntry, Notification, ReverificationJob],
     )
 
 

@@ -5,7 +5,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.dependencies import get_current_user, invite_service
+from app.api.dependencies import analysis_queue, get_current_user, invite_service
 from app.api.routes import analysis, auth, health, notifications, oast, reports, scan, workspace
 from app.config import get_settings
 from app.core.exceptions import AppError
@@ -19,16 +19,18 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize infrastructure on startup and tear it down on shutdown."""
-    configure_logging()
-    await init_db()
+    settings = get_settings()
+    configure_logging(log_level=settings.log_level)
+    await init_db(settings)
 
-    scan_queue = RedisScanQueue.from_settings()
+    scan_queue = RedisScanQueue.from_settings(settings)
     scan.set_scan_queue(scan_queue)
     app.state.scan_queue = scan_queue
     try:
         yield
     finally:
         await invite_service.close()
+        await analysis_queue.close()
         await scan_queue.close()
         await close_db()
 

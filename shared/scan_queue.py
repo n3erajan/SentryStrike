@@ -8,7 +8,6 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from shared.config import get_infrastructure_settings
 from shared.models.scan import ScanAuthAccount
 from shared.schemas.scan_schema import ScanConfig
 
@@ -80,6 +79,17 @@ class ScanQueue(Protocol):
     async def close(self) -> None: ...
 
 
+class ScanQueueConfig(Protocol):
+    redis_url: str
+    scan_queue_name: str
+    scan_cancel_key_prefix: str
+    scan_cancel_ttl_seconds: int
+    worker_heartbeat_prefix: str
+    worker_heartbeat_ttl_seconds: int
+    scan_lease_key_prefix: str
+    scan_lease_ttl_seconds: int
+
+
 class RedisScanQueue:
     """Redis-backed implementation of the scan job queue.
 
@@ -114,9 +124,11 @@ class RedisScanQueue:
         self.cancel_channel = f"{self.cancel_key_prefix}:channel"
 
     @classmethod
-    def from_settings(cls) -> RedisScanQueue:
-        """Build a queue client from the shared infrastructure settings."""
-        settings = get_infrastructure_settings()
+    def from_settings(
+        cls,
+        settings: ScanQueueConfig,
+    ) -> RedisScanQueue:
+        """Build a queue client from the calling service's settings."""
         client = Redis.from_url(settings.redis_url, decode_responses=True)
         return cls(
             client,

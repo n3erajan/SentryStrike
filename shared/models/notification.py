@@ -11,8 +11,11 @@ class NotificationType(str, Enum):
     scan_cancelled = "scan_cancelled"
     finding_assigned = "finding_assigned"
     finding_commented = "finding_commented"
+    finding_review_changed = "finding_review_changed"
     remediation_status_changed = "remediation_status_changed"
     reverification_completed = "reverification_completed"
+    analysis_completed = "analysis_completed"
+    analysis_failed = "analysis_failed"
     member_role_changed = "member_role_changed"
 
 

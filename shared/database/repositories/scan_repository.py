@@ -4,7 +4,16 @@ from datetime import datetime, timezone
 
 from beanie import PydanticObjectId
 
-from shared.models.scan import CrawlMode, Scan, ScanAuthRole, ScanPhase, ScanStatus
+from shared.models.analysis_job import AnalysisStatus
+from shared.models.scan import (
+    CrawlMode,
+    Scan,
+    ScanAnalysisState,
+    ScanAuthRole,
+    ScanPhase,
+    ScanStatus,
+)
+from shared.models.vulnerability import AiAnalysis
 
 
 class ScanRepository:
@@ -104,6 +113,245 @@ class ScanRepository:
                     "vulnerabilities.$.reverification_job_ids": job_id,
                 },
                 "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+        return result.modified_count == 1
+
+    async def attach_initial_analysis_job(
+        self,
+        *,
+        scan_id: str,
+        org_id: str,
+        job_id: str,
+        revision: int,
+        queued_at: datetime,
+    ) -> bool:
+        """Attach revision 1 only while a completed scan has no analysis state."""
+        try:
+            oid = PydanticObjectId(scan_id)
+        except Exception:
+            return False
+        now = datetime.now(timezone.utc)
+        projection = ScanAnalysisState(
+            status=AnalysisStatus.queued,
+            current_job_id=job_id,
+            revision=revision,
+            progress=0,
+            message="Analysis queued",
+            queued_at=queued_at,
+            updated_at=now,
+        )
+        result = await Scan.get_motor_collection().update_one(
+            {
+                "_id": oid,
+                "org_id": org_id,
+                "status": ScanStatus.completed.value,
+                "$or": [
+                    {"analysis": {"$exists": False}},
+                    {"analysis": None},
+                ],
+            },
+            {
+                "$set": {
+                    "analysis": projection.model_dump(mode="python"),
+                    "updated_at": now,
+                }
+            },
+        )
+        return result.modified_count == 1
+
+    async def attach_retry_analysis_job(
+        self,
+        *,
+        scan_id: str,
+        org_id: str,
+        previous_job_id: str,
+        previous_revision: int,
+        job_id: str,
+        revision: int,
+        queued_at: datetime,
+    ) -> bool:
+        """CAS a specific failed current revision to one new queued revision."""
+        try:
+            oid = PydanticObjectId(scan_id)
+        except Exception:
+            return False
+        now = datetime.now(timezone.utc)
+        projection = ScanAnalysisState(
+            status=AnalysisStatus.queued,
+            current_job_id=job_id,
+            revision=revision,
+            progress=0,
+            message="Analysis queued",
+            queued_at=queued_at,
+            updated_at=now,
+        )
+        result = await Scan.get_motor_collection().update_one(
+            {
+                "_id": oid,
+                "org_id": org_id,
+                "status": ScanStatus.completed.value,
+                "analysis.current_job_id": previous_job_id,
+                "analysis.revision": previous_revision,
+                "analysis.status": AnalysisStatus.failed.value,
+            },
+            {
+                "$set": {
+                    "analysis": projection.model_dump(mode="python"),
+                    "updated_at": now,
+                }
+            },
+        )
+        return result.modified_count == 1
+
+    async def list_completed_without_analysis(self, limit: int = 100) -> list[Scan]:
+        """Return completed scans whose post-completion job handoff was interrupted."""
+        return await Scan.find(
+            {
+                "status": ScanStatus.completed.value,
+                "$or": [
+                    {"analysis": {"$exists": False}},
+                    {"analysis": None},
+                ],
+            }
+        ).limit(limit).to_list()
+
+    async def set_finding_analysis(
+        self,
+        *,
+        scan_id: str,
+        org_id: str,
+        finding_id: str,
+        current_job_id: str,
+        expected_revision: int,
+        lease_owner: str,
+        analysis: AiAnalysis,
+    ) -> bool:
+        """Replace only one finding's analyzer-owned projection."""
+        try:
+            oid = PydanticObjectId(scan_id)
+        except Exception:
+            return False
+        result = await Scan.get_motor_collection().update_one(
+            {
+                "_id": oid,
+                "org_id": org_id,
+                "analysis.current_job_id": current_job_id,
+                "analysis.revision": expected_revision,
+                "analysis.lease_owner": lease_owner,
+                "vulnerabilities.id": finding_id,
+            },
+            {
+                "$set": {
+                    "vulnerabilities.$[finding].ai_analysis": analysis.model_dump(
+                        mode="python"
+                    ),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+            array_filters=[{"finding.id": finding_id}],
+        )
+        return result.modified_count == 1
+
+    async def update_analysis_projection(
+        self,
+        *,
+        scan_id: str,
+        org_id: str,
+        current_job_id: str,
+        expected_revision: int,
+        status: AnalysisStatus,
+        progress: int,
+        message: str,
+        started_at: datetime | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        lease_owner: str | None = None,
+        expected_lease_owner: str | None = None,
+        clear_lease_owner: bool = False,
+    ) -> bool:
+        """Update current analysis state only when job and revision still match."""
+        try:
+            oid = PydanticObjectId(scan_id)
+        except Exception:
+            return False
+        now = datetime.now(timezone.utc)
+        fields = {
+            "analysis.status": status.value,
+            "analysis.progress": max(0, min(100, progress)),
+            "analysis.message": message,
+            "analysis.error_code": error_code,
+            "analysis.error_message": error_message,
+            "analysis.updated_at": now,
+            "updated_at": now,
+        }
+        if started_at is not None:
+            fields["analysis.started_at"] = started_at
+        if lease_owner is not None:
+            fields["analysis.lease_owner"] = lease_owner
+        elif clear_lease_owner:
+            fields["analysis.lease_owner"] = None
+        query = {
+            "_id": oid,
+            "org_id": org_id,
+            "analysis.current_job_id": current_job_id,
+            "analysis.revision": expected_revision,
+        }
+        if expected_lease_owner is not None:
+            query["analysis.lease_owner"] = expected_lease_owner
+        result = await Scan.get_motor_collection().update_one(
+            query,
+            {"$set": fields},
+        )
+        return result.modified_count == 1
+
+    async def complete_analysis_projection(
+        self,
+        *,
+        scan_id: str,
+        org_id: str,
+        current_job_id: str,
+        expected_revision: int,
+        lease_owner: str,
+        summary: str,
+        model: str,
+        prompt_version: str,
+        generated_by: str,
+        generated_at: datetime,
+    ) -> bool:
+        """Atomically publish report narrative and final readiness for one revision."""
+        try:
+            oid = PydanticObjectId(scan_id)
+        except Exception:
+            return False
+        now = datetime.now(timezone.utc)
+        result = await Scan.get_motor_collection().update_one(
+            {
+                "_id": oid,
+                "org_id": org_id,
+                "analysis.current_job_id": current_job_id,
+                "analysis.revision": expected_revision,
+                "analysis.lease_owner": lease_owner,
+            },
+            {
+                "$set": {
+                    "report_metadata.summary": summary,
+                    "report_metadata.generated_at": generated_at,
+                    "report_metadata.generated_by": generated_by,
+                    "report_metadata.ai_model": model,
+                    "report_metadata.prompt_version": prompt_version,
+                    "analysis.status": AnalysisStatus.completed.value,
+                    "analysis.progress": 100,
+                    "analysis.message": "Analysis completed",
+                    "analysis.model": model,
+                    "analysis.prompt_version": prompt_version,
+                    "analysis.error_code": None,
+                    "analysis.error_message": None,
+                    "analysis.completed_at": generated_at,
+                    "analysis.lease_owner": None,
+                    "analysis.updated_at": now,
+                    "updated_at": now,
+                }
             },
         )
         return result.modified_count == 1

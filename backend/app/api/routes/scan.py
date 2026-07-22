@@ -51,6 +51,7 @@ def _scan_summary(scan) -> dict:
         "progress": scan.progress,
         "current_phase": scan.current_phase,
         "phase_message": scan.phase_message,
+        "analysis": getattr(scan, "analysis", None),
         "authorization_confirmed": scan.authorization_confirmed,
         "authorization_confirmed_at": scan.authorization_confirmed_at,
         "created_at": scan.created_at,
@@ -227,6 +228,7 @@ async def get_scan_status(
         "started_at": scan.started_at,
         "eta_seconds": scan.eta_seconds,
         "error": scan.error_message,
+        "analysis": getattr(scan, "analysis", None),
         "updated_at": scan.updated_at,
     })
 

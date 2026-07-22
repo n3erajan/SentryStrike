@@ -72,7 +72,7 @@ def test_invite_owner_smtp_failure_is_recorded_and_returns_error(monkeypatch, ca
             sent.update(kwargs)
             raise RuntimeError("smtp unavailable")
 
-    async def no_op():
+    async def no_op(*_args):
         return None
 
     monkeypatch.setattr(cli, "init_db", no_op)
@@ -192,7 +192,7 @@ def test_invite_status_reports_delivery_and_owner_joined(monkeypatch, capsys) ->
         async def to_list(self):
             return [invite]
 
-    async def no_op():
+    async def no_op(*_args):
         return None
 
     async def find_user(*args):

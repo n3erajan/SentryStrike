@@ -113,6 +113,7 @@ class FakeScan:
         self.technology_stack = []
         self.vulnerabilities = []
         self.report_metadata = ReportMetadata(summary="Summary.")
+        self.analysis = None
         self.error_message = None
         self.saved = False
         self.deleted = False

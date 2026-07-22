@@ -1152,10 +1152,10 @@ def build_statistics(data: dict, styles: dict) -> list:
 
     # Top-level numbers
     top_data = [
-        ["Total URLs Crawled", "Total Vulnerabilities", "Risk Score"],
+        ["Total URLs Crawled", "Active Findings", "Risk Score"],
         [
             Paragraph(f'<font size="22"><b>{stats.get("total_urls_crawled", 0)}</b></font>', styles["center"]),
-            Paragraph(f'<font size="22"><b>{stats.get("total_vulnerabilities", 0)}</b></font>', styles["center"]),
+            Paragraph(f'<font size="22"><b>{stats.get("active_vulnerabilities", stats.get("total_vulnerabilities", 0))}</b></font>', styles["center"]),
             Paragraph(f'<font size="22"><b>{d.get("risk_score", 0):.1f}</b></font>', styles["center"]),
         ],
     ]
@@ -1175,6 +1175,15 @@ def build_statistics(data: dict, styles: dict) -> list:
         ("LINEABOVE",    (0, 0), (-1, 0),  2,   BRAND_RED),
     ]))
     elems.append(top_tbl)
+    suppressed_count = stats.get("suppressed_vulnerabilities", 0)
+    if suppressed_count:
+        elems.append(Spacer(1, 2*mm))
+        elems.append(Paragraph(
+            f"Suppressed false positives: <b>{suppressed_count}</b>. "
+            "They remain documented in the detailed findings but are excluded "
+            "from active severity, risk, and remediation totals.",
+            styles["body_sm"],
+        ))
     elems.append(Spacer(1, 5*mm))
 
     # Severity breakdown
@@ -1185,7 +1194,7 @@ def build_statistics(data: dict, styles: dict) -> list:
          Paragraph("Visual", styles["th"]),
          Paragraph("% of Total", styles["th"])],
     ]
-    total = stats.get("total_vulnerabilities", 1) or 1
+    total = stats.get("active_vulnerabilities", stats.get("total_vulnerabilities", 1)) or 1
     for sev_label, sev_key in [("Critical", "critical"), ("High", "high"),
                                 ("Medium", "medium"), ("Low", "low"), ("Info", "info")]:
         count = sev.get(sev_key, 0)
@@ -1215,7 +1224,7 @@ def build_statistics(data: dict, styles: dict) -> list:
     # Category breakdown
     elems.append(Spacer(1, 5*mm))
     elems += sub_header("Findings by OWASP Category", styles)
-    vulns = d.get("vulnerabilities", [])
+    vulns = d.get("active_vulnerabilities", d.get("vulnerabilities", []))
     cat_counts: dict[str, int] = {}
     for v in vulns:
         cat = _clean_category(v.get("category", "Unknown"))
@@ -1463,6 +1472,13 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
             detail_row("Detector Verified", _display_value(ev.get("verified"))),
             detail_row("Review Status", _clean_status(v.get("review_status") or "N/A")),
         ]
+        if v.get("is_false_positive"):
+            details.extend([
+                detail_row("False Positive", "Yes"),
+                detail_row("Marked By", v.get("false_positive_marked_by_email") or "N/A"),
+                detail_row("Marked At", _fmt_dt(v.get("false_positive_marked_at"))),
+                detail_row("Review Reason", v.get("false_positive_reason") or "N/A"),
+            ])
         det_tbl = Table(details, colWidths=[35*mm, None])
         det_tbl.setStyle(TableStyle([
             ("ROWBACKGROUNDS", (0, 0), (-1, -1), [LIGHT_BG, WHITE]),
@@ -1553,7 +1569,11 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
 
 def build_remediation_roadmap(data: dict, styles: dict) -> list:
     d = data.get("data", {})
-    vulns = d.get("vulnerabilities", [])
+    vulns = d.get("active_vulnerabilities") or [
+        vulnerability
+        for vulnerability in d.get("vulnerabilities", [])
+        if not vulnerability.get("is_false_positive", False)
+    ]
     elems = section_header("Remediation Roadmap", styles, "6")
     elems.append(Paragraph(
         "The following roadmap prioritises remediation actions by severity and exploitability. "

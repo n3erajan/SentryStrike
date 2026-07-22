@@ -44,7 +44,7 @@ def _member_limit(value: str) -> int:
 
 
 async def _invite_owner(email: str, org: str, member_limit: int) -> int:
-    await init_db()
+    await init_db(get_settings())
     try:
         if not 1 <= member_limit <= 10000:
             print("Error: member-limit must be between 1 and 10000.", file=sys.stderr)
@@ -155,7 +155,7 @@ def _email_check(to: str) -> int:
 
 async def _invite_status(email: str) -> int:
     """Report the latest invitation's email handoff and account-acceptance state."""
-    await init_db()
+    await init_db(get_settings())
     try:
         normalized = normalize_email(email)
         matches = (
@@ -196,7 +196,7 @@ async def _invite_status(email: str) -> int:
 
 
 async def _purge_retention() -> int:
-    await init_db()
+    await init_db(get_settings())
     try:
         summary = await RetentionService().purge_once()
         total = sum(summary.values())
@@ -210,7 +210,7 @@ async def _purge_retention() -> int:
 
 
 async def _set_member_limit(org_id: str, limit: int) -> int:
-    await init_db()
+    await init_db(get_settings())
     try:
         if not 1 <= limit <= 10000:
             print("Error: limit must be between 1 and 10000.", file=sys.stderr)
