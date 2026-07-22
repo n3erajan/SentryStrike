@@ -108,8 +108,12 @@ function useScanStatus(scanId) {
           pushLog("ok", "[complete] Report ready");
           stopPolling();
         } else if (scan.status === "failed") {
-          setError(scan.error || "The scan failed. Please try again.");
-          pushLog("warn", `[!] ${scan.error || "Scan failed"}`);
+          const failureMessage =
+            scan.error ||
+            scan.error_message ||
+            "The scan failed. Please try again.";
+          setError(failureMessage);
+          pushLog("warn", `[!] ${failureMessage}`);
           setCancelling(false);
           stopPolling();
         } else if (scan.status === "cancelled") {

@@ -714,6 +714,10 @@ textarea:focus-visible {
   min-width: 0;
   font: inherit;
 }
+.control select option {
+  background: var(--paper);
+  color: var(--ink);
+}
 .control textarea {
   resize: vertical;
   padding: 10px 0;
@@ -1515,7 +1519,7 @@ footer.public-footer {
   border: 1px solid var(--line);
   border-top: 0;
   padding: 8px 16px 16px;
-  background: oklch(98% 0.005 255);
+  background: var(--paper);
 }
 .advanced-panel h3 {
   font-size: 0.8rem;

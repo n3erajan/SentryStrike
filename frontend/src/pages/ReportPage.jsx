@@ -452,12 +452,6 @@ function ReportPage() {
               <b>{formatDateTime(authorization.confirmed_at)}</b>
             </div>
           )}
-          {authorization.text && (
-            <div className='kv'>
-              <span>Reference</span>
-              <b style={{ wordBreak: "break-word" }}>{authorization.text}</b>
-            </div>
-          )}
         </aside>
         <div className='reportbody'>
           <h2>

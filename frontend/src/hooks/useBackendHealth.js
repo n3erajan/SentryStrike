@@ -1,9 +1,7 @@
 import { useEffect, useState } from "react";
 import { getHealth } from "../services/health.js";
 
-// Health is shown in the persistent sidebar, but does not need scan-level
-// freshness. A one-minute cadence keeps the status useful without noisy calls.
-const POLL_INTERVAL_MS = 60000;
+const POLL_INTERVAL_MS = 15000;
 
 export function useBackendHealth({ intervalMs = POLL_INTERVAL_MS } = {}) {
   const [health, setHealth] = useState(null);

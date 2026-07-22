@@ -23,12 +23,28 @@ function coerce(field, raw) {
   return raw;
 }
 
+function configPlaceholder(field) {
+  if (field.defaultValue === undefined) return "Default";
+  return String(field.defaultValue);
+}
+
+function configFieldOutOfRange(field, value) {
+  if (value === "" || value === undefined || value === null) return false;
+  if (field.type !== "int" && field.type !== "float") return false;
+  return value < field.min || value > field.max;
+}
+
 function ConfigField({ field, value, onChange, disabled }) {
   const id = `cfg-${field.key}`;
   const descriptionId = `${id}-description`;
+  const errorId = `${id}-error`;
+  const outOfRange = configFieldOutOfRange(field, value);
   const commonProps = {
     id,
-    "aria-describedby": descriptionId,
+    "aria-describedby": outOfRange
+      ? `${descriptionId} ${errorId}`
+      : descriptionId,
+    "aria-invalid": outOfRange || undefined,
     value: value ?? "",
     onChange: (event) =>
       onChange(
@@ -49,10 +65,12 @@ function ConfigField({ field, value, onChange, disabled }) {
           </span>
         )}
       </label>
-      <div className='control'>
+      <div className={`control${outOfRange ? " error" : ""}`}>
         {field.type === "select" ? (
           <select {...commonProps}>
-            <option value=''>Default</option>
+            <option value=''>
+              {field.defaultLabel ? `Default: ${field.defaultLabel}` : "Default"}
+            </option>
             {field.options.map(([v, l]) => (
               <option key={v} value={v}>
                 {l}
@@ -68,13 +86,18 @@ function ConfigField({ field, value, onChange, disabled }) {
             max={field.max}
             step={field.step ?? (field.type === "int" ? 1 : "any")}
             maxLength={field.maxLength}
-            placeholder={field.placeholder || "Default"}
+            placeholder={configPlaceholder(field)}
           />
         )}
       </div>
       <p className='field-description' id={descriptionId}>
         {field.description}
       </p>
+      {outOfRange && (
+        <span className='field-error' id={errorId}>
+          Enter a value from {field.min} to {field.max}.
+        </span>
+      )}
     </div>
   );
 }
@@ -131,8 +154,8 @@ function CredentialAccount({ role, account, onField, disabled }) {
         onClick={() => setShowAdvanced((v) => !v)}
       >
         {showAdvanced
-          ? "Hide login-flow overrides"
-          : "Show login-flow overrides"}
+          ? "Hide session alternatives"
+          : "Use a cookie or header instead"}
       </button>
       {showAdvanced && (
         <div className='grid2'>
@@ -168,6 +191,12 @@ function CredentialAccount({ role, account, onField, disabled }) {
   );
 }
 
+function credentialPresent(account = {}) {
+  return Boolean(
+    (account.username && account.password) || account.cookie || account.header,
+  );
+}
+
 function ScanPage() {
   const navigate = useNavigate();
   const toast = useToast();
@@ -194,9 +223,17 @@ function ScanPage() {
   } = useScanForm();
   // Backend default is "verified"; reflect that as pre-selected in the UI.
   const scanMode = config.scan_mode || "verified";
-  const primary = credentials.main || {};
+  const credentialCount = CRED_ROLES.filter(({ key }) =>
+    credentialPresent(credentials[key]),
+  ).length;
+  const configValid = CONFIG_GROUPS.every((group) =>
+    group.fields.every(
+      (field) => !configFieldOutOfRange(field, config[field.key]),
+    ),
+  );
 
   async function handleStart() {
+    if (!configValid) return;
     const result = await startScan();
     if (result) {
       toast("Assessment started");
@@ -412,10 +449,8 @@ function ScanPage() {
             <div>
               <dt>Access</dt>
               <dd>
-                {primary.username
-                  ? credentials.second?.username
-                    ? "2 users"
-                    : "1 user"
+                {credentialCount
+                  ? `${credentialCount} test user${credentialCount === 1 ? "" : "s"}`
                   : "Public"}
               </dd>
             </div>
@@ -431,7 +466,7 @@ function ScanPage() {
           <button
             className='btn primary'
             onClick={handleStart}
-            disabled={!canStart}
+            disabled={!canStart || !configValid}
           >
             {submitting ? "Starting…" : "Start assessment"}
           </button>

@@ -26,14 +26,43 @@ function compact(obj) {
   return Object.keys(out).length ? out : undefined;
 }
 
+const CREDENTIAL_FIELDS = ["username", "password", "cookie", "header"];
+const CONFIG_FIELDS = [
+  "crawl_depth",
+  "crawl_max_urls",
+  "crawl_rate_limit_per_second",
+  "crawl_browser_mode",
+  "crawl_browser_max_interactions",
+  "crawl_browser_budget_seconds",
+  "scan_mode",
+  "blind_injection_timing_threshold",
+  "ssrf_inband_timing_delta_ms",
+  "scanner_concurrency",
+  "sensitive_paths_permutation_cap",
+  "xss_browser_dom_max_jobs",
+  "xss_browser_dom_budget_seconds",
+  "allow_secondary_provisioning",
+  "request_timeout_seconds",
+];
+
+function compactFields(obj, allowedFields) {
+  return compact(
+    Object.fromEntries(allowedFields.map((field) => [field, obj?.[field]])),
+  );
+}
+
 // Build the optional `credentials` block from up to three role accounts
 // (main/second/admin). Each account is a ScanAccountCredential; empty accounts
 // are dropped so we never send blank roles.
 function buildCredentials(credentials = {}) {
   const out = {};
   for (const role of ["main", "second", "admin"]) {
-    const account = compact(credentials[role]);
-    if (account) out[role] = account;
+    const account = compactFields(credentials[role], CREDENTIAL_FIELDS);
+    const populated =
+      (account?.username && account?.password) ||
+      account?.cookie ||
+      account?.header;
+    if (populated) out[role] = account;
   }
   return Object.keys(out).length ? out : undefined;
 }
@@ -52,7 +81,7 @@ export function createScan({
       crawl_mode: crawlMode,
       authorization_confirmed: authorizationConfirmed,
       credentials: buildCredentials(credentials),
-      config: compact(config),
+      config: compactFields(config, CONFIG_FIELDS),
     },
   });
 }

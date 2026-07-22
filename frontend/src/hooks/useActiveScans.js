@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { listScans } from "../services/scan.js";
 
+const POLL_INTERVAL_MS = 5000;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
 
-// Loads GET /scans once when the consuming page mounts and exposes only scans
-// that are still in flight. `refresh()` is available for an explicit reload
-// without creating background traffic while the user is elsewhere in the app.
-export function useActiveScans() {
+// Polls GET /scans on an interval and exposes the scans that are still in
+// flight (queued or running). Backs both the Active dashboard and the sidebar
+// count badge, so the user can watch every concurrent scan the backend is
+// running. `refresh()` forces an immediate re-fetch (e.g. right after starting
+// a new scan).
+export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
   const [scans, setScans] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -20,8 +23,7 @@ export function useActiveScans() {
     let stopped = false;
     const controller = new AbortController();
 
-    async function load() {
-      setLoading(true);
+    async function poll() {
       try {
         const data = await listScans({ limit: 100, signal: controller.signal });
         if (stopped) return;
@@ -36,12 +38,14 @@ export function useActiveScans() {
       }
     }
 
-    load();
+    poll();
+    const id = setInterval(poll, intervalMs);
     return () => {
       stopped = true;
       controller.abort();
+      clearInterval(id);
     };
-  }, [refreshToken]);
+  }, [intervalMs, refreshToken]);
 
   return { scans, loading, error, count: scans.length, refresh };
 }
