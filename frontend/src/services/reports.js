@@ -21,7 +21,12 @@ export async function downloadReportPdf(scanId) {
     throw new Error("Cannot reach the server to build the PDF.", { cause: err });
   }
   if (!response.ok) {
-    throw new Error(`Could not generate the PDF (${response.status}).`);
+    let message = `Could not generate the PDF (${response.status}).`;
+    try {
+      const payload = await response.json();
+      message = payload?.detail?.message || payload?.detail || payload?.message || message;
+    } catch { /* Keep the status fallback for non-JSON responses. */ }
+    throw new Error(message);
   }
   return response.blob();
 }

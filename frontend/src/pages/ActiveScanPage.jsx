@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ArrowRight, Check, Loader2, ShieldCheck } from "lucide-react";
 import { useScanStatus } from "../hooks/useScanStatus.js";
 import { SCAN_PHASES } from "../data/constants.js";
+import { useAuth } from "../context/AuthContext.jsx";
 
 const STATUS_LABEL = {
   queued: "Queued",
@@ -38,6 +39,7 @@ function timeStr(date) {
 }
 
 function ActiveScanPage() {
+  const { user } = useAuth();
   const { scanId } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
@@ -77,7 +79,7 @@ function ActiveScanPage() {
             {target || `Scan ${scanId}`} · started {formatDuration()}{" "}
           </p>
         </div>
-        {active ? (
+        {active && user?.role !== "viewer" ? (
           <button className='btn danger' onClick={cancel} disabled={cancelling}>
             {cancelling ? "Cancelling…" : "Cancel"}
           </button>
@@ -87,11 +89,11 @@ function ActiveScanPage() {
             View report
             <ArrowRight className='ico' />
           </Link>
-        ) : (
+        ) : user?.role !== "viewer" ? (
           <Link className='btn' to='/scan'>
             Start a new Scan
           </Link>
-        )}
+        ) : null}
       </div>
 
       <div className='summary'>

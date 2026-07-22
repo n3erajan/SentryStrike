@@ -1,6 +1,7 @@
 import { useNavigate } from "react-router-dom";
 import { ArrowUpRight, ShieldCheck } from "lucide-react";
 import { useActiveScans } from "../hooks/useActiveScans.js";
+import { useAuth } from "../context/AuthContext.jsx";
 
 function formatRelative(iso) {
   if (!iso) return "-";
@@ -16,6 +17,7 @@ function formatRelative(iso) {
 }
 
 function ActiveScansPage() {
+  const { user } = useAuth();
   const navigate = useNavigate();
   const { scans, loading, error } = useActiveScans();
 
@@ -39,9 +41,9 @@ function ActiveScansPage() {
             Create a new scan and its live phase, progress, and worker state
             will appear here.
           </p>
-          <button className='btn primary' onClick={() => navigate("/scan")}>
+          {user?.role !== "viewer" && <button className='btn primary' onClick={() => navigate("/scan")}>
             New Scan
-          </button>
+          </button>}
         </div>
       ) : (
         <div className='scans-table'>

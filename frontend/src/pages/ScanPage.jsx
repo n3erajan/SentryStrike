@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { ChevronDown } from "lucide-react";
 import { useScanForm } from "../hooks/useScan.js";
 import { useToast } from "../components/Toast.jsx";
+import { useAuth } from "../context/AuthContext.jsx";
 import {
   CONFIG_GROUPS,
   CRED_FIELDS,
@@ -198,6 +199,7 @@ function credentialPresent(account = {}) {
 }
 
 function ScanPage() {
+  const { user } = useAuth();
   const navigate = useNavigate();
   const toast = useToast();
   const [usersOpen, setUsersOpen] = useState(false);
@@ -212,6 +214,7 @@ function ScanPage() {
     touched,
     setTouched,
     config,
+    defaultsLoading,
     setConfigField,
     credentials,
     setCredentialField,
@@ -221,6 +224,14 @@ function ScanPage() {
     canStart,
     startScan,
   } = useScanForm();
+  if (user?.role === "viewer") {
+    return (
+      <div className='view'>
+        <div className='head'><div><h1>New Scan</h1><p>Your viewer role has read-only workspace access.</p></div></div>
+        <div className='empty-state'>Ask a workspace owner or admin to change your role before launching assessments.</div>
+      </div>
+    );
+  }
   // Backend default is "verified"; reflect that as pre-selected in the UI.
   const scanMode = config.scan_mode || "verified";
   const credentialCount = CRED_ROLES.filter(({ key }) =>
@@ -468,7 +479,7 @@ function ScanPage() {
             onClick={handleStart}
             disabled={!canStart || !configValid}
           >
-            {submitting ? "Starting…" : "Start assessment"}
+            {defaultsLoading ? "Loading defaults…" : submitting ? "Starting…" : "Start assessment"}
           </button>
         </aside>
       </div>

@@ -34,32 +34,41 @@ export function isAuthenticated() {
   return !!getToken();
 }
 
-async function authenticate(path, credentials, extras) {
-  const { email, password } = credentials;
+async function authenticate(path, credentials) {
   const data = await apiRequest(path, {
     method: "POST",
     auth: false,
-    body: { email, password },
+    body: credentials,
   });
   setToken(data.access_token);
-  const user = extras ? { ...data.user, ...extras } : data.user;
-  saveUser(user);
-  return user;
+  saveUser(data.user);
+  return data.user;
 }
 
 export function login(credentials) {
   return authenticate("/auth/login", credentials);
 }
 
-export function register({ email, password, fullName, company }) {
-  const extras = {};
-  if (fullName) extras.fullName = fullName;
-  if (company) extras.company = company;
-  return authenticate(
-    "/auth/register",
-    { email, password },
-    Object.keys(extras).length ? extras : null,
-  );
+export function previewInvite(inviteToken, signal) {
+  return apiRequest(`/auth/invite?token=${encodeURIComponent(inviteToken)}`, {
+    auth: false,
+    signal,
+  });
+}
+
+export function register({ email, password, fullName, inviteToken }) {
+  return authenticate("/auth/register", {
+    email,
+    password,
+    full_name: fullName,
+    invite_token: inviteToken,
+  });
+}
+
+export async function refreshCurrentUser() {
+  const user = await apiRequest("/auth/me");
+  saveUser(user);
+  return user;
 }
 
 export async function logout() {

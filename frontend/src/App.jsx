@@ -29,14 +29,14 @@ function App() {
       <Route element={<ProtectedRoute />}>
         <Route element={<AppLayout />}>
           <Route path='/home' element={<HomePage />} />
-          {/* <Route path='/apps' element={<AppsPage />} /> */}
+          <Route path='/apps' element={<AppsPage />} />
           <Route path='/scan' element={<ScanPage />} />
           <Route path='/active' element={<ActiveScansPage />} />
           <Route path='/active/:scanId' element={<ActiveScanPage />} />
           <Route path='/reports' element={<ReportsPage />} />
           <Route path='/report/:scanId' element={<ReportPage />} />
-          {/* <Route path='/team' element={<TeamPage />} /> */}
-          {/* <Route path='/settings' element={<SettingsPage />} /> */}
+          <Route path='/team' element={<TeamPage />} />
+          <Route path='/settings' element={<SettingsPage />} />
           <Route path='/history' element={<Navigate to='/reports' replace />} />
         </Route>
       </Route>

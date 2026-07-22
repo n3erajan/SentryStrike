@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useMemo,
+  useEffect,
   useState,
 } from "react";
 import {
@@ -10,6 +11,7 @@ import {
   login as loginService,
   register as registerService,
   logout as logoutService,
+  refreshCurrentUser,
 } from "../services/auth.js";
 
 // Shared auth state for the whole app. Hydrates synchronously from the token +
@@ -20,6 +22,12 @@ const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(getCurrentUser);
+
+  useEffect(() => {
+    if (!user) return;
+    refreshCurrentUser().then(setUser).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Validate cached profile once; request auth still guards every route.
 
   const login = useCallback(async (credentials) => {
     const authed = await loginService(credentials);

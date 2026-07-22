@@ -6,6 +6,7 @@ import { downloadReportPdf } from "../services/reports.js";
 import { saveBlob } from "../utils/helpers.js";
 import { useToast } from "../components/Toast.jsx";
 import { severityClass } from "../data/constants.js";
+import { useAuth } from "../context/AuthContext.jsx";
 
 function severityBand(level, score) {
   const lvl = (level || "").toString().toLowerCase();
@@ -40,6 +41,7 @@ function hostnameOf(url) {
 }
 
 function ReportsPage() {
+  const { user } = useAuth();
   const navigate = useNavigate();
   const toast = useToast();
   const [scans, setScans] = useState([]);
@@ -65,6 +67,7 @@ function ReportsPage() {
 
   useEffect(() => {
     const controller = new AbortController();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load(controller.signal);
     return () => controller.abort();
   }, [load]);
@@ -81,6 +84,7 @@ function ReportsPage() {
         score: Math.round(s.risk_score ?? 0),
         band: severityBand(s.risk_level, Math.round(s.risk_score ?? 0)),
         count: s.total_findings ?? s.finding_count ?? 0,
+        analysisStatus: s.analysis?.status || "not_requested",
       }))
       .filter((r) => (r.host + r.target).toLowerCase().includes(q));
   }, [scans, query]);
@@ -124,12 +128,12 @@ function ReportsPage() {
           <FileBarChart size={30} />
           <h2>No reports yet</h2>
           <p>Reports appear here after an assessment completes.</p>
-          <button
+          {user?.role !== "viewer" && <button
             className='btn primary'
             onClick={() => navigate("/scan")}
           >
             New Scan
-          </button>
+          </button>}
         </div>
       ) : (
         <div className='reports-table'>
@@ -167,9 +171,11 @@ function ReportsPage() {
                   aria-label='Download PDF'
                   onClick={(e) => {
                     e.stopPropagation();
-                    handleDownload(r.id);
+                    if (r.analysisStatus === "completed") handleDownload(r.id);
                   }}
                   disabled={busy === r.id}
+                  title={r.analysisStatus !== "completed" ? `AI analysis is ${r.analysisStatus.replaceAll("_", " ")}` : "Download PDF"}
+                  aria-disabled={r.analysisStatus !== "completed"}
                 >
                   <Download className='ico' />
                 </button>

@@ -30,6 +30,7 @@ function extractMessage(payload, status) {
     if (typeof payload.message === "string" && payload.message) return payload.message;
     const detail = payload.detail;
     if (typeof detail === "string" && detail) return detail;
+    if (detail && typeof detail.message === "string") return detail.message;
     // FastAPI validation errors: detail is an array of {loc, msg}.
     if (Array.isArray(detail) && detail.length) {
       const first = detail[0];
@@ -57,6 +58,7 @@ export async function apiRequest(path, { method = "GET", body, auth = true, sign
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
+      credentials: "include",
     });
   } catch (err) {
     if (err.name === "AbortError") throw err;

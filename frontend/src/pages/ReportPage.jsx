@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
-import { ChevronDown, Download, FileText } from "lucide-react";
+import { ChevronDown, Download, FileText, RefreshCw, Send } from "lucide-react";
 import { downloadReportPdf, getReport } from "../services/reports.js";
 import { downloadFile, saveBlob } from "../utils/helpers.js";
 import { SEVERITIES, SEVERITY_META, severityClass } from "../data/constants.js";
 import { useToast } from "../components/Toast.jsx";
+import { useAuth } from "../context/AuthContext.jsx";
+import { getScanDetails } from "../services/scan.js";
+import { listMembers } from "../services/workspace.js";
+import { addFindingComment, assignFinding, listReverifications, retryAnalysis, reverifyFinding, reviewFinding, updateRemediation } from "../services/analysis.js";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
@@ -17,18 +21,6 @@ function riskLine(score) {
   if (score >= 50) return "High risk. Fix critical issues before release.";
   if (score >= 25) return "Medium risk. Plan remediation next sprint.";
   return "Low risk. Monitor for regressions.";
-}
-
-function formatDate(iso) {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime())
-    ? "—"
-    : d.toLocaleDateString(undefined, {
-        month: "short",
-        day: "numeric",
-        year: "numeric",
-      });
 }
 
 // Full date + time for the report header (the scan timestamp).
@@ -103,7 +95,53 @@ function MetricTable({ title, rows }) {
 
 // A single finding row that expands to reveal the full backend detail:
 // location, CVSS vector, evidence snippets, and the AI analysis block.
-function Finding({ v }) {
+function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
+  const toast = useToast();
+  const triager = ["owner", "admin", "analyst"].includes(user?.role);
+  const contributor = triager || user?.role === "developer";
+  const [comment, setComment] = useState("");
+  const [busy, setBusy] = useState("");
+  const [jobs, setJobs] = useState([]);
+
+  useEffect(() => {
+    if (!finding.reverification_job_ids?.length) return;
+    const controller = new AbortController();
+    listReverifications(scanId, finding.id, controller.signal).then((d) => setJobs(d.items || [])).catch(() => {});
+    return () => controller.abort();
+  }, [scanId, finding.id, finding.reverification_job_ids?.length]);
+
+  async function mutate(key, action, message) {
+    setBusy(key);
+    try { await action(); toast(message); await onChanged(); }
+    catch (err) { toast(err.message || "Could not update the finding."); }
+    finally { setBusy(""); }
+  }
+  async function submitComment(e) {
+    e.preventDefault(); const body = comment.trim(); if (!body) return;
+    await mutate("comment", () => addFindingComment(scanId, finding.id, body), "Comment added"); setComment("");
+  }
+  function changeDisposition() {
+    const disposition = finding.is_false_positive ? "active" : "false_positive";
+    const reason = window.prompt(disposition === "active" ? "Why is this finding being restored?" : "Why is this a false positive?");
+    if (!reason?.trim()) return;
+    mutate("review", () => reviewFinding(scanId, finding.id, disposition, reason.trim()), disposition === "active" ? "Finding restored" : "Finding suppressed");
+  }
+
+  return <div className='collab-panel'>
+    <h4>Remediation workflow</h4>
+    <div className='collab-controls'>
+      <div className='field'><label>Assignee</label><div className='control'><select value={finding.assignee_user_id || ""} disabled={!triager || busy === "assign"} onChange={(e) => mutate("assign", () => assignFinding(scanId, finding.id, e.target.value), "Assignment updated")}><option value=''>Unassigned</option>{members.map((m) => <option key={m.id} value={m.id}>{m.full_name} ({m.email})</option>)}</select></div></div>
+      <div className='field'><label>Status</label><div className='control'><select value={finding.remediation_status || "open"} disabled={!contributor || busy === "status"} onChange={(e) => mutate("status", () => updateRemediation(scanId, finding.id, e.target.value), "Remediation status updated")}><option value='open'>Open</option><option value='in_progress'>In progress</option><option value='fixed_pending_verification'>Fixed, pending verification</option>{triager && <option value='verified_fixed'>Verified fixed</option>}{triager && <option value='wont_fix'>Won’t fix / risk accepted</option>}</select></div></div>
+    </div>
+    {triager && <div className='collab-actions'><button className='btn' onClick={changeDisposition} disabled={busy === "review"}>{finding.is_false_positive ? "Restore active finding" : "Mark false positive"}</button>{finding.verification_target && <button className='btn' disabled={busy === "reverify"} onClick={() => mutate("reverify", () => reverifyFinding(scanId, finding.id), "Re-verification queued")}><RefreshCw className='ico' />Re-verify</button>}</div>}
+    {finding.is_false_positive && <div className='review-note'><b>Suppressed as false positive</b><span>{finding.false_positive_reason}</span></div>}
+    {jobs.length > 0 && <div className='reverification-list'>{jobs.map((j) => <div key={j.id}><b>{titleCase(j.status)}</b><span>{j.outcome ? titleCase(j.outcome) : "Waiting for scanner"}</span><small>{formatDateTime(j.created_at)}</small></div>)}</div>}
+    <div className='comment-thread'>{(finding.comments || []).map((c) => <div className='comment' key={c.id}><div><b>{c.author_email}</b><small>{formatDateTime(c.created_at)}</small></div><p>{c.body}</p></div>)}</div>
+    {contributor && <form className='comment-form' onSubmit={submitComment}><div className='control'><input value={comment} maxLength={5000} onChange={(e) => setComment(e.target.value)} placeholder='Add a remediation comment…' /></div><button className='btn' disabled={!comment.trim() || busy === "comment"}><Send className='ico' />Comment</button></form>}
+  </div>;
+}
+
+function Finding({ v, scanId, user, members, onChanged }) {
   const [open, setOpen] = useState(false);
   const loc = v.location || {};
   const ev = v.evidence || {};
@@ -268,6 +306,13 @@ function Finding({ v }) {
               <p>{ai.false_positive_reasoning}</p>
             </div>
           )}
+          <FindingCollaboration
+            scanId={scanId}
+            finding={v}
+            user={user}
+            members={members}
+            onChanged={onChanged}
+          />
         </div>
       )}
     </article>
@@ -275,6 +320,7 @@ function Finding({ v }) {
 }
 
 function ReportPage() {
+  const { user } = useAuth();
   const { scanId } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
@@ -285,13 +331,20 @@ function ReportPage() {
   const [error, setError] = useState("");
   const [filter, setFilter] = useState("all");
   const [busy, setBusy] = useState("");
+  const [members, setMembers] = useState([]);
 
   const load = useCallback(
     async (signal) => {
       setLoading(true);
       setError("");
       try {
-        setReport(await getReport(scanId, signal));
+        const [reportData, scanData, memberData] = await Promise.all([
+          getReport(scanId, signal),
+          getScanDetails(scanId, signal),
+          listMembers(signal),
+        ]);
+        setReport({ ...scanData, ...reportData });
+        setMembers(memberData.items || []);
       } catch (err) {
         if (err.name !== "AbortError")
           setError(err.message || "Could not load the report.");
@@ -304,6 +357,7 @@ function ReportPage() {
 
   useEffect(() => {
     const controller = new AbortController();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load(controller.signal);
     return () => controller.abort();
   }, [load]);
@@ -328,6 +382,19 @@ function ReportPage() {
       setBusy("");
     }
   }, [scanId, toast]);
+
+  const handleRetryAnalysis = useCallback(async () => {
+    setBusy("analysis");
+    try {
+      await retryAnalysis(scanId);
+      toast("Analysis retry queued");
+      await load();
+    } catch (err) {
+      toast(err.message || "Could not retry analysis.");
+    } finally {
+      setBusy("");
+    }
+  }, [scanId, toast, load]);
 
   if (loading)
     return (
@@ -381,6 +448,12 @@ function ReportPage() {
   const coverageStr = Number.isFinite(coverage)
     ? `${Math.round(coverage)}%`
     : "—";
+  const analysis = report.analysis || {};
+  const analysisStatus = analysis.status || "not_requested";
+  const analysisComplete = analysisStatus === "completed";
+  const canRetryAnalysis =
+    analysisStatus === "failed" &&
+    ["owner", "admin", "analyst"].includes(user?.role);
 
   return (
     <div className='view'>
@@ -404,13 +477,25 @@ function ReportPage() {
           <button
             className='btn primary'
             onClick={handlePdf}
-            disabled={busy === "pdf"}
+            disabled={busy === "pdf" || !analysisComplete}
+            title={!analysisComplete ? "PDF is available after AI analysis completes" : undefined}
           >
             <Download className='ico' />
             {busy === "pdf" ? "Building PDF…" : "PDF"}
           </button>
         </div>
       </div>
+
+      {!analysisComplete && (
+        <div className={`analysis-banner ${analysisStatus}`}>
+          <div>
+            <b>AI analysis: {titleCase(analysisStatus)}</b>
+            <span>{analysis.message || analysis.error_message || "The deterministic scan report is available while enrichment continues."}</span>
+            {Number.isFinite(analysis.progress) && <small>{analysis.progress}% complete · revision {analysis.revision || 1}</small>}
+          </div>
+          {canRetryAnalysis && <button className='btn' onClick={handleRetryAnalysis} disabled={busy === "analysis"}><RefreshCw className='ico' />Retry analysis</button>}
+        </div>
+      )}
 
       <div className='reportgrid'>
         <aside className='scorebox'>
@@ -592,7 +677,7 @@ function ReportPage() {
           ) : (
             <div className='findings'>
               {filtered.map((v) => (
-                <Finding key={v.id} v={v} />
+                <Finding key={v.id} v={v} scanId={scanId} user={user} members={members} onChanged={load} />
               ))}
             </div>
           )}

@@ -1,6 +1,7 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { isValidUrl } from "../utils/helpers.js";
 import { createScan } from "../services/scan.js";
+import { getDefaultConfig } from "../services/workspace.js";
 
 // Form state + submission for a new scan. Polling and progress no longer live
 // here — once a scan is created the caller navigates to its own active-scan
@@ -18,6 +19,7 @@ function useScanForm() {
   // any key left blank/absent falls back to the backend default. `scan_mode`
   // is just another config key here.
   const [config, setConfig] = useState({});
+  const [defaultsLoading, setDefaultsLoading] = useState(true);
   const setConfigField = useCallback((key, value) => {
     setConfig((prev) => {
       if (value === "" || value === undefined || value === null) {
@@ -50,8 +52,21 @@ function useScanForm() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
+  useEffect(() => {
+    const controller = new AbortController();
+    getDefaultConfig(controller.signal)
+      .then((data) => setConfig(data.config || {}))
+      .catch((err) => {
+        if (err.name !== "AbortError") setError(err.message || "Could not load workspace scan defaults.");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDefaultsLoading(false);
+      });
+    return () => controller.abort();
+  }, []);
+
   const valid = isValidUrl(url);
-  const canStart = valid && consent && !submitting;
+  const canStart = valid && consent && !submitting && !defaultsLoading;
 
   // Creates the scan and returns its id. Returns null (and sets `error`) on
   // failure. Does NOT poll — the caller routes to the active-scan view.
@@ -90,6 +105,7 @@ function useScanForm() {
     setTouched,
     // advanced overrides
     config,
+    defaultsLoading,
     setConfigField,
     credentials,
     setCredentialField,

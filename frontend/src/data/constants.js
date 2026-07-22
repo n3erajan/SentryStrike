@@ -10,18 +10,19 @@ import {
 
 const NAV_ITEMS = [
   { to: "/home", label: "Home", Icon: Home, end: true },
-  // { to: "/apps", label: "Web applications", Icon: Boxes },
+  { to: "/apps", label: "Web applications", Icon: Boxes },
   { to: "/scan", label: "New Scan", Icon: ShieldPlus },
   { to: "/active", label: "Active scans", Icon: Activity, badge: "active" },
   { to: "/reports", label: "Reports", Icon: FileBarChart },
-  // { to: "/team", label: "Team", Icon: Users },
-  // { to: "/settings", label: "Settings", Icon: Settings },
+  { to: "/team", label: "Team", Icon: Users },
+  { to: "/settings", label: "Settings", Icon: Settings },
 ];
 
 const MOBILE_NAV = [
   { to: "/home", label: "Home", Icon: Home },
   { to: "/apps", label: "Apps", Icon: Boxes },
   { to: "/scan", label: "Assess", Icon: ShieldPlus },
+  { to: "/active", label: "Active scans", Icon: Activity, badge: "active" },
   { to: "/reports", label: "Reports", Icon: FileBarChart },
   { to: "/settings", label: "Settings", Icon: Settings },
 ];
@@ -87,7 +88,8 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_depth",
         label: "Crawl depth",
-        description: "Maximum number of link levels to follow from the target page.",
+        description:
+          "Maximum number of link levels to follow from the target page.",
         type: "int",
         min: 1,
         max: 10,
@@ -96,7 +98,8 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_max_urls",
         label: "Max URLs",
-        description: "Stops discovery after this many unique URLs have been collected.",
+        description:
+          "Stops discovery after this many unique URLs have been collected.",
         type: "int",
         min: 10,
         max: 5000,
@@ -116,7 +119,8 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_browser_mode",
         label: "Browser mode",
-        description: "Controls browser discovery for conventional sites. Detected SPAs always use the browser.",
+        description:
+          "Controls browser discovery for conventional sites. Detected SPAs always use the browser.",
         type: "select",
         defaultLabel: "Auto (detected SPAs)",
         options: [
@@ -128,7 +132,8 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_browser_max_interactions",
         label: "Browser interactions",
-        description: "Maximum clicks and form interactions whenever browser discovery runs, including detected SPAs.",
+        description:
+          "Maximum clicks and form interactions whenever browser discovery runs, including detected SPAs.",
         type: "int",
         min: 1,
         max: 200,
@@ -137,7 +142,8 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_browser_budget_seconds",
         label: "Browser budget",
-        description: "Maximum time reserved whenever browser discovery runs, including detected SPAs.",
+        description:
+          "Maximum time reserved whenever browser discovery runs, including detected SPAs.",
         type: "float",
         min: 10,
         max: 3600,
@@ -153,7 +159,8 @@ const CONFIG_GROUPS = [
       {
         key: "scanner_concurrency",
         label: "Concurrency",
-        description: "Maximum number of security checks that can run at the same time.",
+        description:
+          "Maximum number of security checks that can run at the same time.",
         type: "int",
         min: 1,
         max: 50,
@@ -162,7 +169,8 @@ const CONFIG_GROUPS = [
       {
         key: "request_timeout_seconds",
         label: "Request timeout",
-        description: "How long each request may wait before it is treated as timed out.",
+        description:
+          "How long each request may wait before it is treated as timed out.",
         type: "float",
         min: 1,
         max: 120,
@@ -172,7 +180,8 @@ const CONFIG_GROUPS = [
       {
         key: "sensitive_paths_permutation_cap",
         label: "Sensitive-path cap",
-        description: "Limits generated path variations used to find exposed resources.",
+        description:
+          "Limits generated path variations used to find exposed resources.",
         type: "int",
         min: 0,
         max: 2000,
@@ -187,7 +196,8 @@ const CONFIG_GROUPS = [
       {
         key: "blind_injection_timing_threshold",
         label: "Blind timing threshold",
-        description: "Minimum response-time confidence used for blind injection signals.",
+        description:
+          "Minimum response-time confidence used for blind injection signals.",
         type: "float",
         min: 0.1,
         max: 1,
@@ -197,7 +207,8 @@ const CONFIG_GROUPS = [
       {
         key: "ssrf_inband_timing_delta_ms",
         label: "SSRF timing delta",
-        description: "Minimum delay used to identify possible in-band SSRF behavior.",
+        description:
+          "Minimum delay used to identify possible in-band SSRF behavior.",
         type: "float",
         min: 100,
         max: 30000,
@@ -213,7 +224,8 @@ const CONFIG_GROUPS = [
       {
         key: "xss_browser_dom_max_jobs",
         label: "Max DOM jobs",
-        description: "Maximum browser jobs used to verify client-side XSS behavior.",
+        description:
+          "Maximum browser jobs used to verify client-side XSS behavior.",
         type: "int",
         min: 0,
         max: 100,
@@ -222,7 +234,8 @@ const CONFIG_GROUPS = [
       {
         key: "xss_browser_dom_budget_seconds",
         label: "DOM sweep budget",
-        description: "Maximum time reserved for the browser-driven DOM XSS sweep.",
+        description:
+          "Maximum time reserved for the browser-driven DOM XSS sweep.",
         type: "float",
         min: 0,
         max: 600,
@@ -257,19 +270,22 @@ const CRED_FIELDS = [
     label: "Username / email",
     type: "text",
     maxLength: 320,
-    description: "Account identifier used to sign in to the target application.",
+    description:
+      "Account identifier used to sign in to the target application.",
   },
   {
     key: "password",
     label: "Password",
     type: "password",
     maxLength: 512,
-    description: "Password for this test account; leave blank for session-only access.",
+    description:
+      "Password for this test account; leave blank for session-only access.",
   },
   {
     key: "cookie",
     label: "Cookie",
-    description: "Existing session cookies to attach when a login flow is unavailable.",
+    description:
+      "Existing session cookies to attach when a login flow is unavailable.",
     type: "text",
     maxLength: 8192,
     advanced: true,
@@ -278,7 +294,8 @@ const CRED_FIELDS = [
   {
     key: "header",
     label: "Header",
-    description: "Custom authentication header sent with requests for this account.",
+    description:
+      "Custom authentication header sent with requests for this account.",
     type: "text",
     maxLength: 8192,
     advanced: true,
