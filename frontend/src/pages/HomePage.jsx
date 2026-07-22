@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { listScans } from "../services/scan.js";
-import { useActiveScans } from "../hooks/useActiveScans.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import { displayName } from "../components/Sidebar.jsx";
 
@@ -33,7 +32,6 @@ function hostnameOf(url) {
 
 function HomePage() {
   const { user } = useAuth();
-  const { scans: active, count } = useActiveScans();
   const [scans, setScans] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -55,6 +53,10 @@ function HomePage() {
     return () => controller.abort();
   }, [load]);
 
+  const active = scans.filter(
+    (scan) => scan.status === "queued" || scan.status === "running",
+  );
+  const count = active.length;
   const completed = scans.filter((s) => s.status === "completed");
   const apps = new Set(completed.map((s) => hostnameOf(s.target_url))).size;
   const highRisk = completed.reduce(

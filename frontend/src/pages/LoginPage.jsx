@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { CheckCircle2, Loader2, Eye, EyeOff } from "lucide-react";
 import { useAuth } from "../context/AuthContext.jsx";
 import AuthBrand from "../components/AuthBrand.jsx";
+import ThemeToggle from "../components/ThemeToggle.jsx";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -40,10 +41,13 @@ function LoginPage() {
   return (
     <div className='auth-shell'>
       <div className='auth-left'>
-        <Link to='/' className='brand'>
-          <img className='mark-img' src='/shield.png' alt='SentryStrike' />
-          SentryStrike
-        </Link>
+        <div className='auth-header'>
+          <Link to='/' className='brand'>
+            <img className='mark-img' src='/shield.png' alt='SentryStrike' />
+            SentryStrike
+          </Link>
+          <ThemeToggle />
+        </div>
         <div className='auth-box'>
           <h1>Welcome back</h1>
           <p>Sign in to SentryStrike.</p>

@@ -4,6 +4,7 @@ import { Menu, Plus } from "lucide-react";
 import Sidebar, { displayName } from "./Sidebar.jsx";
 import { MOBILE_NAV, ROUTE_NAMES } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
+import ThemeToggle from "./ThemeToggle.jsx";
 
 function crumbFor(pathname) {
   if (pathname.startsWith("/active/")) return "Active scans / Live scan";
@@ -52,6 +53,7 @@ function AppLayout() {
             {displayName(user)} / <b>{crumbFor(location.pathname)}</b>
           </div>
           <div className='app-actions'>
+            <ThemeToggle />
             {!onScanPage && (
               <button className='btn primary' onClick={() => navigate("/scan")}>
                 <Plus className='ico' />

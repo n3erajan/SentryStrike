@@ -2,7 +2,6 @@ import { NavLink, useNavigate } from "react-router-dom";
 import { X, LogOut } from "lucide-react";
 import { NAV_ITEMS } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
-import { useActiveScans } from "../hooks/useActiveScans.js";
 import { useBackendHealth } from "../hooks/useBackendHealth.js";
 
 function displayName(user) {
@@ -21,7 +20,6 @@ function displayName(user) {
 function Sidebar({ open = false, onClose }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
-  const { count } = useActiveScans();
   const { health, loading: healthLoading, error: healthError } =
     useBackendHealth();
   const scannerCount = health?.active_scanners;
@@ -60,7 +58,7 @@ function Sidebar({ open = false, onClose }) {
         </button>
       </div>
       <nav className='app-nav' aria-label='Primary'>
-        {NAV_ITEMS.map(({ to, label, Icon, badge, end }) => (
+        {NAV_ITEMS.map(({ to, label, Icon, end }) => (
           <NavLink
             key={to}
             to={to}
@@ -70,9 +68,6 @@ function Sidebar({ open = false, onClose }) {
           >
             <Icon className='ico' />
             <span>{label}</span>
-            {badge === "active" && count > 0 && (
-              <span className='nav-badge'>{count}</span>
-            )}
           </NavLink>
         ))}
       </nav>

@@ -8,6 +8,7 @@ import {
   FileCheck2,
   Plus,
 } from "lucide-react";
+import ThemeToggle from "../components/ThemeToggle.jsx";
 
 const WORKFLOW = [
   {
@@ -465,6 +466,7 @@ function LandingPage() {
           <a href='#faq'>FAQ</a>
         </div>
         <div className='navactions'>
+          <ThemeToggle />
           <Link className='btn' to='/login'>
             Sign in
           </Link>

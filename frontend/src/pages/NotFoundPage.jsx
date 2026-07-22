@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import { ArrowLeft } from "lucide-react";
+import ThemeToggle from "../components/ThemeToggle.jsx";
 
 function NotFoundPage() {
   return (
@@ -14,6 +15,7 @@ function NotFoundPage() {
         fontFamily: '"DM Sans", system-ui, sans-serif',
       }}
     >
+      <ThemeToggle className='not-found-theme' />
       <div className='card' style={{ maxWidth: 520 }}>
         <img src='/shield.png' alt='SentryStrike' className='mark-img' />
         <span

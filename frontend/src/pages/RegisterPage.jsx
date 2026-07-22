@@ -3,6 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { CheckCircle2, Loader2, Eye, EyeOff } from "lucide-react";
 import { useAuth } from "../context/AuthContext.jsx";
 import AuthBrand from "../components/AuthBrand.jsx";
+import ThemeToggle from "../components/ThemeToggle.jsx";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -80,10 +81,13 @@ function RegisterPage() {
   return (
     <div className='auth-shell'>
       <div className='auth-left'>
-        <Link to='/' className='brand'>
-          <img src='/shield.png' alt='' className='mark-img' />
-          SentryStrike
-        </Link>
+        <div className='auth-header'>
+          <Link to='/' className='brand'>
+            <img src='/shield.png' alt='' className='mark-img' />
+            SentryStrike
+          </Link>
+          <ThemeToggle />
+        </div>
         <div className='auth-box'>
           <h1>Create your Account</h1>
           <p>Set up your company and run your first VAPT assessment.</p>

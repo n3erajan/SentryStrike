@@ -12,7 +12,7 @@ const NAV_ITEMS = [
   { to: "/home", label: "Home", Icon: Home, end: true },
   // { to: "/apps", label: "Web applications", Icon: Boxes },
   { to: "/scan", label: "New Scan", Icon: ShieldPlus },
-  { to: "/active", label: "Active scans", Icon: Activity, badge: "active" },
+  { to: "/active", label: "Active scans", Icon: Activity },
   { to: "/reports", label: "Reports", Icon: FileBarChart },
   // { to: "/team", label: "Team", Icon: Users },
   // { to: "/settings", label: "Settings", Icon: Settings },
