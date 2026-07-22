@@ -138,7 +138,7 @@ def test_progress_fraction_is_work_weighted_not_detector_count() -> None:
         scan, ScanPhase.vulnerability_detection, fraction, progress=40
     )
 
-    # Old count-based model would claim ~1/13 of ~35s. Remaining XSS + AI must
+    # Old count-based model would claim ~1/13 of ~35s. Remaining XSS work must
     # leave minutes on the clock once pace sees 25 units in 120s.
     assert eta is not None
     assert eta >= 300
@@ -154,9 +154,9 @@ def test_starting_eta_includes_crawl_and_detector_priors() -> None:
     )
 
     assert eta is not None
-    # CRAWL(150)+tech(5)+tls(3)+DETECTOR(480)+dedup(2)+AI(60)+risk(2)+report(8)
-    assert eta >= 700
-    assert eta < 900
+    # CRAWL(150)+tech(5)+tls(3)+DETECTOR(480)+dedup(2)+risk(2)
+    assert eta >= 630
+    assert eta < 700
 
 
 def test_last_heavy_detector_does_not_claim_tiny_eta() -> None:

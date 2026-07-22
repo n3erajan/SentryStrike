@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from app.core.detectors.attack_surface import AttackTarget
+from app.core.detectors.attack_surface import AttackTarget, PreparedAttackRequest
 from app.core.detectors.base_detector import Finding
 from app.core.verification.verification_framework import HttpVerifier
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
@@ -19,6 +19,19 @@ logger = logging.getLogger("app.core.detectors.access_control")
 
 
 class IdorMixin:
+    @staticmethod
+    def _reverification_request_evidence(request: PreparedAttackRequest) -> dict:
+        """Capture the exact non-secret request shape used to prove an IDOR."""
+        template: dict = {"replay_exact": True}
+        if request.json_body is not None:
+            template["json_body"] = request.json_body
+        elif request.data is not None:
+            template["form_body"] = request.data
+        return {
+            "request_url": request.url,
+            "request_template": template,
+        }
+
     async def _check_idor(
         self,
         urls: list[str],
@@ -172,6 +185,8 @@ class IdorMixin:
                                 "parameter_location": target.location.value,
                                 "source": target.source,
                                 "shared_identifiers": sorted(self._shared_identifiers(own_profile, second_profile)),
+                                "status_code": second_own_resp.status_code,
+                                **self._reverification_request_evidence(own_request),
                             },
                             verified=True,
                             verification_request_snippet=second_own_resp.request_snippet,
@@ -250,6 +265,8 @@ class IdorMixin:
                         "parameter_location": target.location.value,
                         "parent_path": target.parent_path,
                         "source": target.source,
+                        "status_code": auth_mod_resp.status_code,
+                        **self._reverification_request_evidence(mod_request),
                     },
                     verified=True,
                     verification_request_snippet=auth_mod_resp.request_snippet,
@@ -296,6 +313,8 @@ class IdorMixin:
                                 detection_evidence={
                                     "parameter_location": target.location.value,
                                     "source": target.source,
+                                    "status_code": auth_check_resp.status_code,
+                                    **self._reverification_request_evidence(mod_request),
                                 },
                                 verified=True,
                                 verification_request_snippet=auth_check_resp.request_snippet,

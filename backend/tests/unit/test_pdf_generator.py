@@ -115,6 +115,32 @@ def test_pdf_remediation_roadmap_keeps_full_remediation_text() -> None:
     assert "..." not in action_cell.getPlainText()
 
 
+def test_pdf_remediation_roadmap_excludes_suppressed_false_positive() -> None:
+    scan_data = {
+        "data": {
+            "vulnerabilities": [
+                {
+                    "vuln_type": "Suppressed XSS",
+                    "severity": "High",
+                    "is_false_positive": True,
+                    "ai_analysis": {"remediation": "Do not show this action."},
+                },
+                {
+                    "vuln_type": "Active SQL Injection",
+                    "severity": "Critical",
+                    "is_false_positive": False,
+                    "ai_analysis": {"remediation": "Use prepared statements."},
+                },
+            ]
+        }
+    }
+
+    text = _flowable_text(build_remediation_roadmap(scan_data, build_styles()))
+
+    assert "Active SQL Injection" in text
+    assert "Suppressed XSS" not in text
+
+
 def _roadmap_phase_of(elems, vuln_type: str) -> str | None:
     """Return the roadmap phase heading under which *vuln_type* is listed.
 
@@ -224,16 +250,17 @@ def test_pdf_detailed_findings_do_not_repeat_remediation_section() -> None:
     assert "REMEDIATION" not in labels
 
 
-def test_pdf_executive_summary_includes_owner_and_authorization_metadata() -> None:
+def test_pdf_executive_summary_includes_submitter_and_authorization_metadata() -> None:
     from app.utils.pdf_generator import build_executive_summary
 
     scan_data = {
         "data": {
             "scan_id": "scan-1",
             "generated_at": "2026-06-08T09:10:17",
+            "submitted_by_full_name": "Niuradaj Adhadh",
+            "submitted_by_email": "user@example.test",
             "executive_summary": "Summary.",
             "risk_score": 45.0,
-            "owner_email": "user@example.test",
             "authorization": {
                 "confirmed": True,
                 "confirmed_at": "2026-06-08T09:00:00",
@@ -245,6 +272,7 @@ def test_pdf_executive_summary_includes_owner_and_authorization_metadata() -> No
     text = _flowable_text(build_executive_summary(scan_data, build_styles()))
 
     assert "Submitted By" in text
+    assert "Niuradaj Adhadh user@example.test" in text
     assert "user@example.test" in text
     assert "Authorization Confirmed" in text
     assert "Yes" in text
@@ -376,6 +404,36 @@ def test_pdf_detailed_findings_include_evidence_strength_and_auth_context() -> N
     assert "Yes" in text
 
 
+def test_pdf_detailed_findings_show_false_positive_reviewer() -> None:
+    scan_data = {
+        "data": {
+            "vulnerabilities": [
+                {
+                    "vuln_type": "Reflected XSS",
+                    "category": "OwaspCategory.a05",
+                    "severity": "SeverityLevel.high",
+                    "cvss_score": 8.0,
+                    "review_status": "suppressed",
+                    "is_false_positive": True,
+                    "false_positive_reason": "Generic SPA fallback response.",
+                    "false_positive_marked_by_email": "analyst@example.test",
+                    "false_positive_marked_at": "2026-07-22T10:00:00+00:00",
+                    "location": {"url": "https://target.example/search"},
+                    "evidence": {},
+                    "ai_analysis": {},
+                }
+            ]
+        }
+    }
+
+    text = _flowable_text(build_detailed_findings(scan_data, build_styles()))
+
+    assert "Marked By" in text
+    assert "analyst@example.test" in text
+    assert "Review Reason" in text
+    assert "Generic SPA fallback response." in text
+
+
 def test_pdf_code_block_wraps_long_encoded_get_request_inside_available_width() -> None:
     styles = build_styles()
     request = (
@@ -399,6 +457,8 @@ def test_pdf_builds_with_full_long_response_snippet() -> None:
         "data": {
             "scan_id": "scan-1",
             "generated_at": "2026-06-08T09:10:17",
+            "submitted_by_full_name": "Niuradaj Adhadh",
+            "submitted_by_email": "user@example.test",
             "executive_summary": "Summary.",
             "statistics": {
                 "total_urls_crawled": 1,
@@ -455,6 +515,8 @@ def test_pdf_escapes_dynamic_markup_in_ai_text() -> None:
         "data": {
             "scan_id": "scan-markup",
             "generated_at": "2026-06-08T09:10:17",
+            "submitted_by_full_name": "Niuradaj Adhadh",
+            "submitted_by_email": "user@example.test",
             "executive_summary": "Summary with <raw> tag.",
             "statistics": {
                 "total_urls_crawled": 1,

@@ -4,7 +4,7 @@ import pymongo
 from beanie import Document, Indexed
 from pydantic import Field
 
-from shared.config import get_infrastructure_settings
+from shared.config import get_shared_document_settings
 
 
 class OastInteractionRecord(Document):
@@ -28,7 +28,7 @@ class OastInteractionRecord(Document):
             "interaction_id",
             pymongo.IndexModel(
                 [("received_at", pymongo.ASCENDING)],
-                expireAfterSeconds=get_infrastructure_settings().oast_interaction_ttl_seconds,
+                expireAfterSeconds=get_shared_document_settings().oast_interaction_ttl_seconds,
                 name="oast_ttl",
             ),
         ]

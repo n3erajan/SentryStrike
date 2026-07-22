@@ -3,12 +3,9 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from shared.config import get_infrastructure_settings
 
-
-def configure_logging() -> None:
-    settings = get_infrastructure_settings()
-    log_file = (settings.log_file or "").strip()
+def configure_logging(*, log_level: str, log_file: str | None = None) -> None:
+    log_file = (log_file or "").strip()
 
     # Windows consoles default to cp1252, which cannot encode symbols like "≥"
     # used in verifier log messages. Force UTF-8 so logging never crashes on
@@ -26,7 +23,7 @@ def configure_logging() -> None:
     )
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(settings.log_level.upper())
+    root_logger.setLevel(log_level.upper())
     root_logger.handlers.clear()
 
     console_handler = logging.StreamHandler()

@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -14,11 +13,13 @@ from app.core.detectors.crypto_failures import CryptoFailuresDetector
 from app.core.detectors.exception_handler import ExceptionHandlingDetector
 from app.core.detectors.security_headers import SecurityHeadersDetector
 from app.core.detectors.sensitive_paths import SensitivePathsDetector
-from app.core.scan_orchestration.progress import AI_PRIOR_PER_FINDING_S, _EtaState
+from app.core.scan_orchestration.progress import _EtaState
 from app.core.verification.verification_framework import FindingDeduplicator, TestPollutionFilter
 from app.utils.cvss_calculator import CvssCalculator
 from app.utils.scan_metrics import begin_request_counting, end_request_counting, snapshot_request_counts
 from app.core.request_governor import begin_governor, end_governor, denied_snapshot
+from shared.analysis_handoff import ensure_initial_analysis_job
+from shared.finding_rollups import apply_finding_rollups
 from shared.models.scan import CrawlMode, DetectorCoverageMetric, ScanPhase, ScanStatus
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 from shared.schemas.scan_schema import ScanConfig
@@ -591,70 +592,39 @@ class PipelineMixin:
             ]
             await self._set_phase_progress(scan, ScanPhase.deduplication, 1.0, f"Deduplication complete: {len(vulnerabilities)} finding(s)")
 
-            # Run AI analysis across all findings.
-            logger.info("phase 2 starting: analyzing %d findings", len(vulnerabilities))
-            self._eta_state.findings_count = len(vulnerabilities)
-            self._eta_state.ai_fraction = 0.0
-            self._eta_state.ai_remaining_s = None
-            if vulnerabilities and get_settings().ai_analysis_enabled:
-                self._eta_state.ai_total_s = len(vulnerabilities) * AI_PRIOR_PER_FINDING_S
-            else:
-                self._eta_state.ai_total_s = 1.0
-            await self._set_phase_progress(scan, ScanPhase.ai_analysis, 0.0, f"Analyzing {len(vulnerabilities)} finding(s)")
-            vulnerabilities = await self._analyze_all_findings(vulnerabilities, scan)
-
             # Sync severity labels from the deterministic CVSS score.
             for v in vulnerabilities:
                 severity_str = CvssCalculator.get_severity(v.cvss_score)
                 v.severity = SeverityLevel(severity_str)
-
-            # Apply advisory review labels from AI analysis. The AI may annotate
-            # findings as likely false positives or uncertain, but never changes
-            # the deterministic CVSS score, severity, or aggregate-risk membership.
-            self._apply_ai_review_statuses(vulnerabilities)
+                grade = self.evidence_grader.grade(v)
+                v.evidence.evidence_grade = grade.grade
+                v.evidence.evidence_grade_reason = grade.reason
+                v.evidence.proof_type = grade.proof_type
 
             vulnerabilities = self._compute_priority_ranks(vulnerabilities)
             vulnerabilities.sort(key=lambda v: v.cvss_score, reverse=True)
-            logger.info("phase 2 complete: analyzed %d findings", len(vulnerabilities))
+            logger.info("deterministic finding processing complete: %d findings", len(vulnerabilities))
 
             scan.vulnerabilities = vulnerabilities
             
             # Synthesise multi-step attack chains from individual findings.
             await self._set_phase_progress(scan, ScanPhase.risk_scoring, 0.0, "Calculating severity, evidence strength, and risk score")
             scan.report_metadata.attack_chains = self._synthesize_attack_chains(vulnerabilities)
-            scan.report_metadata.evidence_strength_breakdown = self._evidence_strength_breakdown(vulnerabilities)
-            scan.statistics.total_vulnerabilities = len(vulnerabilities)
-            scan.statistics.severity_breakdown.critical = len([v for v in vulnerabilities if v.severity.value == "Critical"])
-            scan.statistics.severity_breakdown.high = len([v for v in vulnerabilities if v.severity.value == "High"])
-            scan.statistics.severity_breakdown.medium = len([v for v in vulnerabilities if v.severity.value == "Medium"])
-            scan.statistics.severity_breakdown.low = len([v for v in vulnerabilities if v.severity.value == "Low"])
-            scan.statistics.severity_breakdown.info = len([v for v in vulnerabilities if v.severity.value == "Info"])
-
-            scan.overall_risk_score, scan.overall_risk_level = self._calculate_aggregate_risk(
-                vulnerabilities
-            )
+            apply_finding_rollups(scan)
             await self._set_phase_progress(scan, ScanPhase.risk_scoring, 1.0, "Risk scoring complete")
 
-            # Generate the narrative report from analysed findings.
-            logger.info("phase 3 starting: generating report")
-            await self._set_phase_progress(scan, ScanPhase.report_generation, 0.0, "Generating final report summary")
-            report = await self.ai_report.generate(scan)
-            scan.report_metadata.generated_at = datetime.now(timezone.utc)
-            _ai_settings = get_settings()
-            scan.report_metadata.ai_model = (
-                _ai_settings.ai_model if _ai_settings.ai_analysis_enabled else None
-            )
-            
-            # Extract summary: handle if AI returns dict instead of string
-            executive_summary = report.get("executive_summary", "")
-            if isinstance(executive_summary, dict):
-                # If dict, try to get 'summary' key or convert to JSON string
-                executive_summary = executive_summary.get("summary", json.dumps(executive_summary))
-            scan.report_metadata.summary = str(executive_summary) if executive_summary else "Report generated successfully."
-            
+            # Model-owned report fields remain empty until the analyzer publishes
+            # a completed analysis revision.
+            scan.report_metadata.generated_at = None
+            scan.report_metadata.generated_by = None
+            scan.report_metadata.ai_model = None
+            scan.report_metadata.prompt_version = None
+            scan.report_metadata.summary = None
+
             scan.completed_at = datetime.now(timezone.utc)
             await self._set_progress(scan, 100, ScanPhase.completed, "Scan completed", status=ScanStatus.completed)
-            logger.info("phase 3 complete: scan %s finished", scan_id)
+            await self._create_analysis_handoff(scan)
+            logger.info("deterministic scan %s completed", scan_id)
         except asyncio.CancelledError:
             scan.completed_at = datetime.now(timezone.utc)
             scan.error_message = "Scan cancelled by user"
@@ -664,3 +634,23 @@ class PipelineMixin:
             scan.error_message = str(exc)
             scan.completed_at = datetime.now(timezone.utc)
             await self._set_progress(scan, scan.progress, ScanPhase.failed, f"Scan failed: {exc}", status=ScanStatus.failed)
+
+    async def _create_analysis_handoff(self, scan) -> None:
+        """Create and signal revision 1 without changing completed scan status."""
+        analysis_repository = getattr(self, "analysis_repository", None)
+        analysis_queue = getattr(self, "analysis_queue", None)
+        if analysis_repository is None or analysis_queue is None:
+            logger.debug("analysis handoff is not configured for scan %s", scan.id)
+            return
+
+        try:
+            await ensure_initial_analysis_job(
+                scan,
+                scan_repository=self.repository,
+                analysis_repository=analysis_repository,
+                analysis_queue=analysis_queue,
+            )
+        except Exception:
+            # Completion is already durable. A reconciler can create/attach the
+            # missing job later; post-completion handoff failure must not fail scan.
+            logger.exception("failed to persist analysis handoff for scan %s", scan.id)

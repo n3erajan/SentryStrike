@@ -4,13 +4,30 @@ from fastapi import Depends, Header, HTTPException, Request, status
 
 from app.config import get_settings
 from app.core.auth import AuthService, InvalidSessionError
+from app.core.invites import InviteService
+from app.core.invite_rate_limit import RedisInviteRateLimiter
+from shared.analysis_queue import AnalysisQueue, RedisAnalysisQueue
+from shared.database.repositories.audit_repository import AuditRepository
+from shared.database.repositories.analysis_job_repository import AnalysisJobRepository
+from shared.database.repositories.member_repository import MemberRepository
+from shared.database.repositories.notification_repository import NotificationRepository
+from shared.database.repositories.reverification_repository import ReverificationRepository
+from shared.database.repositories.organization_repository import OrganizationRepository
 from shared.database.repositories.scan_repository import ScanRepository
-from shared.models.user import User
+from shared.models.user import User, UserRole
 
 # Module-level singletons wired once. FastAPI's Depends resolver calls the
 # factory functions below, which return these shared instances.
 scan_repository = ScanRepository()
+member_repository = MemberRepository()
+organization_repository = OrganizationRepository()
+audit_repository = AuditRepository()
+notification_repository = NotificationRepository()
+reverification_repository = ReverificationRepository()
+analysis_job_repository = AnalysisJobRepository()
+analysis_queue = RedisAnalysisQueue.from_settings(get_settings())
 auth_service = AuthService()
+invite_service = InviteService(RedisInviteRateLimiter.from_settings())
 
 
 def get_scan_repository() -> ScanRepository:
@@ -18,9 +35,45 @@ def get_scan_repository() -> ScanRepository:
     return scan_repository
 
 
+def get_member_repository() -> MemberRepository:
+    """FastAPI dependency: provide the shared MemberRepository singleton."""
+    return member_repository
+
+
+def get_organization_repository() -> OrganizationRepository:
+    """FastAPI dependency: provide the shared OrganizationRepository singleton."""
+    return organization_repository
+
+
+def get_audit_repository() -> AuditRepository:
+    """FastAPI dependency: provide the shared AuditRepository singleton."""
+    return audit_repository
+
+
+def get_notification_repository() -> NotificationRepository:
+    return notification_repository
+
+
+def get_reverification_repository() -> ReverificationRepository:
+    return reverification_repository
+
+
+def get_analysis_job_repository() -> AnalysisJobRepository:
+    return analysis_job_repository
+
+
+def get_analysis_queue() -> AnalysisQueue:
+    return analysis_queue
+
+
 def get_auth_service() -> AuthService:
     """FastAPI dependency: provide the shared AuthService singleton."""
     return auth_service
+
+
+def get_invite_service() -> InviteService:
+    """FastAPI dependency: provide the shared InviteService singleton."""
+    return invite_service
 
 
 def _bearer_token(authorization: str | None) -> str | None:
@@ -67,18 +120,22 @@ async def get_current_user(
         ) from exc
 
 
-def ensure_scan_exists(scan_id: str, repo: ScanRepository = Depends(get_scan_repository)):
-    """Return a dependency that verifies a scan exists by id.
+def require_role(*allowed: UserRole):
+    """Build a dependency that admits only members holding one of ``allowed`` roles.
 
-    Usage: ``Depends(ensure_scan_exists("some-id"))``. Raises 404 when
-    the scan is not found.
+    Resolves the authenticated user (401 if unauthenticated), then checks their
+    org role against the allow-list, raising 403 otherwise. Visibility is always
+    org-wide; this gates *actions* (e.g. launching a scan is everyone except a
+    viewer). Usage: ``Depends(require_role(UserRole.owner, UserRole.admin))``.
     """
 
-    async def _inner() -> object:
-        scan = await repo.get_by_id(scan_id)
-        if not scan:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
-        return scan
+    async def _inner(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to perform this action.",
+            )
+        return current_user
 
     return _inner
 

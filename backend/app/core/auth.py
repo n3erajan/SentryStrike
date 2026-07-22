@@ -21,20 +21,6 @@ class AuthError(Exception):
     message = "Authentication error"
 
 
-class RegistrationClosedError(AuthError):
-    """Registration is disabled via server configuration."""
-
-    status_code = 403
-    message = "Sorry, we currently don't take new users registration."
-
-
-class DuplicateUserError(AuthError):
-    """An account with the requested email already exists."""
-
-    status_code = 409
-    message = "An account with this email already exists."
-
-
 class InvalidCredentialsError(AuthError):
     """Email/password combination did not match a known account."""
 
@@ -119,20 +105,11 @@ def as_utc_naive(value: datetime | None) -> datetime | None:
 
 
 class AuthService:
-    """Application logic for user registration, login, session management, and logout."""
-    async def register(self, email: str, password: str) -> User:
-        settings = get_settings()
-        if not settings.allow_registration:
-            raise RegistrationClosedError()
+    """Application logic for user login, session management, and logout.
 
-        normalized_email = normalize_email(email)
-        existing = await User.find_one(User.email == normalized_email)
-        if existing is not None:
-            raise DuplicateUserError()
-
-        user = User(email=normalized_email, password_hash=hash_password(password))
-        await user.insert()
-        return user
+    Account creation lives in ``app.core.invites`` — registration is invite-only,
+    so there is no open ``register`` here.
+    """
 
     async def authenticate(self, email: str, password: str) -> User:
         normalized_email = normalize_email(email)

@@ -4,6 +4,7 @@ from enum import Enum
 from beanie import Document, Indexed
 from pydantic import BaseModel, Field
 
+from shared.models.analysis_job import AnalysisStatus
 from shared.models.vulnerability import TechnologyComponent, Vulnerability
 
 
@@ -81,6 +82,8 @@ class ScanStatistics(BaseModel):
 
     total_urls_crawled: int = 0
     total_vulnerabilities: int = 0
+    active_vulnerabilities: int = 0
+    suppressed_vulnerabilities: int = 0
     severity_breakdown: SeverityBreakdown = Field(default_factory=SeverityBreakdown)
 
 
@@ -170,8 +173,9 @@ class ReportMetadata(BaseModel):
     """Metadata about the generated report and coverage quality."""
 
     generated_at: datetime | None = None
-    generated_by: str = "ai"
+    generated_by: str | None = None
     ai_model: str | None = None
+    prompt_version: str | None = None
     summary: str | None = None
     attack_chains: list[AttackChain] = Field(default_factory=list)
     spa_api_coverage: SpaApiCoverage = Field(default_factory=SpaApiCoverage)
@@ -181,10 +185,34 @@ class ReportMetadata(BaseModel):
     detector_coverage: list[DetectorCoverageMetric] = Field(default_factory=list)
 
 
+class ScanAnalysisState(BaseModel):
+    status: AnalysisStatus
+    current_job_id: str | None = None
+    lease_owner: str | None = Field(default=None, exclude=True)
+    revision: int = Field(ge=1)
+    progress: int = Field(default=0, ge=0, le=100)
+    message: str
+    model: str | None = None
+    prompt_version: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class Scan(Document):
     target_url: Indexed(str)
-    owner_user_id: Indexed(str) | None = None
-    owner_email: str | None = None
+    org_id: Indexed(str)
+    # Who submitted the scan.
+    submitted_by_user_id: Indexed(str)
+    submitted_by_full_name: str
+    submitted_by_email: str
+    # Who cancelled it, if anyone (may differ from the submitter — any non-viewer
+    # org member can cancel a scan).
+    cancelled_by_user_id: str | None = None
+    cancelled_by_email: str | None = None
     crawl_mode: CrawlMode = CrawlMode.full
     status: ScanStatus = ScanStatus.queued
     progress: int = Field(default=0, ge=0, le=100)
@@ -211,15 +239,18 @@ class Scan(Document):
     vulnerabilities: list[Vulnerability] = Field(default_factory=list)
     site_title: str = ""
     report_metadata: ReportMetadata = Field(default_factory=ReportMetadata)
+    analysis: ScanAnalysisState | None = None
     error_message: str | None = None
 
     class Settings:
         name = "scans"
         indexes = [
             "target_url",
-            "owner_user_id",
+            "org_id",
+            "submitted_by_user_id",
             "status",
-            [("owner_user_id", 1), ("created_at", -1)],
+            [("org_id", 1), ("created_at", -1)],
+            [("submitted_by_user_id", 1), ("created_at", -1)],
             [("created_at", -1)],
         ]
 

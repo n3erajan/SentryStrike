@@ -1,20 +1,36 @@
 from functools import lru_cache
 
 from pydantic import Field, model_validator
+from pydantic_settings import SettingsConfigDict
 
-from shared.config import InfrastructureSettings
+from shared.config import (
+    AnalysisQueueSettings,
+    InfrastructureSettings,
+    PublicUrlSettings,
+    ScanQueueSettings,
+    service_env_files,
+)
 
 
-class ScannerSettings(InfrastructureSettings):
-    ai_base_url: str = Field(default="http://localhost:11434/v1", alias="AI_BASE_URL")
-    ai_model: str = Field(default="gemma4-e4b-8k", alias="AI_MODEL")
-    ai_api_key: str | None = Field(default=None, alias="AI_API_KEY")
-    ai_timeout_seconds: float = Field(default=120.0, alias="AI_TIMEOUT_SECONDS")
-    ai_max_retries: int = Field(default=3, alias="AI_MAX_RETRIES")
-    ai_batch_size: int = Field(default=1, alias="AI_BATCH_SIZE")
-    ai_analysis_enabled: bool = Field(default=True, alias="AI_ANALYSIS_ENABLED")
-    ai_json_mode: bool = Field(default=True, alias="AI_JSON_MODE")
-    ai_reasoning_effort: str | None = Field(default="none", alias="AI_REASONING_EFFORT")
+class ScannerSettings(
+    ScanQueueSettings,
+    AnalysisQueueSettings,
+    PublicUrlSettings,
+    InfrastructureSettings,
+):
+    model_config = SettingsConfigDict(
+        env_file=service_env_files("scanner"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    analysis_reconcile_interval_seconds: int = Field(
+        default=30,
+        ge=5,
+        alias="ANALYSIS_RECONCILE_INTERVAL_SECONDS",
+    )
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    log_file: str | None = Field(default=None, alias="LOG_FILE")
 
     crawl_depth: int = Field(default=3, alias="CRAWL_DEPTH")
     crawl_max_urls: int = Field(default=200, alias="CRAWL_MAX_URLS")
@@ -145,15 +161,12 @@ class ScannerSettings(InfrastructureSettings):
         default=0.7,
         alias="BLIND_INJECTION_TIMING_THRESHOLD",
     )
-    # The one knob most deployments need: the backend hostname (or full URL)
-    # the target can reach us at, e.g. "sentry.example.com" or
-    # "https://sentry.example.com". Both OAST URLs are derived from it using the
-    # backend's known route layout (/oast for callbacks, /oast/poll for polling).
-    # A bare hostname gets an http:// scheme. The two explicit URLs below are
-    # optional overrides for the one split topology that needs them (a host-run
-    # scanner probing a dockerized target, where the callback must resolve from
-    # inside the target container but polling resolves from the scanner host).
-    oast_hostname: str | None = Field(default=None, alias="OAST_HOSTNAME")
+    # OAST callback/poll URLs are derived from the shared PUBLIC_HOSTNAME using
+    # the backend's known route layout (/oast for callbacks, /oast/poll for
+    # polling). The two explicit URLs below are optional overrides for the one
+    # split topology that needs them (a host-run scanner probing a dockerized
+    # target, where the callback must resolve from inside the target container
+    # but polling resolves from the scanner host).
     oast_callback_base_url: str | None = Field(default=None, alias="OAST_CALLBACK_BASE_URL")
     oast_poll_url: str | None = Field(default=None, alias="OAST_POLL_URL")
     ssrf_oast_poll_attempts: int = Field(default=5, alias="SSRF_OAST_POLL_ATTEMPTS")
@@ -168,10 +181,8 @@ class ScannerSettings(InfrastructureSettings):
 
     @model_validator(mode="after")
     def _derive_oast_urls_from_hostname(self) -> "ScannerSettings":
-        base = (self.oast_hostname or "").strip().rstrip("/")
+        base = self.public_base_url
         if base:
-            if "://" not in base:
-                base = f"http://{base}"
             if not self.oast_callback_base_url:
                 self.oast_callback_base_url = f"{base}/oast"
             if not self.oast_poll_url:

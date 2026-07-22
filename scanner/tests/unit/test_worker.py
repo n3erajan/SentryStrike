@@ -4,9 +4,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.worker import process_scan_job
+from app import worker
+from app.worker import process_reverification_job, process_scan_job
+from shared.models.reverification import (
+    ReverificationEvidence,
+    ReverificationOutcome,
+    ReverificationStatus,
+)
 from shared.models.scan import ScanAuthAccount, ScanAuthRole, ScanPhase, ScanStatus
-from shared.scan_queue import ScanJob, ScanQueueError
+from shared.scan_queue import ScanJob, ScanJobKind, ScanQueueError
 from shared.schemas.scan_schema import ScanConfig
 
 
@@ -46,6 +52,53 @@ class FakeQueue:
 
     def publish_cancel(self, scan_id: str) -> None:
         self._cancel_channel.put_nowait(scan_id)
+
+
+@pytest.mark.asyncio
+async def test_reverification_job_runs_focused_executor_and_notifies_requester(
+    monkeypatch,
+) -> None:
+    verification = SimpleNamespace(
+        id="reverify-1",
+        status=ReverificationStatus.queued,
+        target=SimpleNamespace(url="https://target.example"),
+        org_id="org-1",
+        requested_by_user_id="user-analyst",
+        scan_id="scan-1",
+        vulnerability_id="vuln-1",
+        outcome=None,
+    )
+    repository = AsyncMock()
+    repository.get_by_id.return_value = verification
+
+    async def run_focused(target, accounts):
+        assert target is verification.target
+        assert accounts == []
+        return ReverificationOutcome.not_reproduced, [
+            ReverificationEvidence(
+                request_url=target.url,
+                request_method="GET",
+                status_code=200,
+                reason="proof absent",
+            )
+        ]
+
+    notifications = AsyncMock()
+    monkeypatch.setattr(worker, "run_focused_reverification", run_focused)
+    monkeypatch.setattr(worker, "NotificationRepository", lambda: notifications)
+
+    await process_reverification_job(
+        ScanJob(
+            kind=ScanJobKind.finding_reverification,
+            scan_id="scan-1",
+            reverification_job_id="reverify-1",
+        ),
+        repository=repository,
+    )
+
+    repository.mark_running.assert_awaited_once_with(verification)
+    repository.complete.assert_awaited_once()
+    notifications.create.assert_awaited_once()
 
 
 @pytest.mark.asyncio
