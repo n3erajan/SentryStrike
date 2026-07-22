@@ -20,7 +20,6 @@ class ScanRepository:
         owner_user_id: str,
         owner_email: str,
         authorization_confirmed: bool,
-        authorization_text: str | None = None,
         crawl_mode: CrawlMode = CrawlMode.full,
         auth_roles_provided: list[ScanAuthRole] | None = None,
     ) -> Scan:
@@ -32,7 +31,6 @@ class ScanRepository:
             crawl_mode=crawl_mode,
             status=ScanStatus.queued,
             authorization_confirmed=authorization_confirmed,
-            authorization_text=authorization_text,
             authorization_confirmed_at=now if authorization_confirmed else None,
             auth_roles_provided=auth_roles_provided or [],
         )
@@ -101,3 +99,42 @@ class ScanRepository:
         scan.updated_at = datetime.now(timezone.utc)
         await scan.save()
         return scan
+
+    async def reconcile_if_orphaned(self, scan: Scan, queue) -> Scan:
+        """Fail a scan whose worker has died, detected via a missing lease.
+
+        A running scan is backed by a short-TTL Redis lease that its worker
+        renews on a timer. If the worker crashes, the lease expires and the DB
+        is left showing ``running`` forever — the UI then polls indefinitely and
+        cancelling only sets a key no worker will read. This reconciles that
+        lazily at read time: a ``running`` scan with a provably-absent lease is
+        transitioned to ``failed`` with a clear message.
+
+        Fail-safe against Redis outages: the scan is only failed when the lease
+        is *positively confirmed absent* (Redis reachable, key missing). If the
+        lease check raises (Redis unavailable), we cannot distinguish a dead
+        worker from an unreachable Redis, so the scan is left untouched — a
+        transient Redis blip must never mass-fail live scans.
+
+        Only ``running`` scans are candidates. ``queued`` scans have no worker
+        (and no lease) yet, and terminal scans are already resolved.
+        """
+        if scan.status != ScanStatus.running:
+            return scan
+        try:
+            lease_alive = await queue.is_lease_alive(str(scan.id))
+        except Exception:
+            # Can't tell (Redis down / queue error) -> do not touch the scan.
+            return scan
+        if lease_alive:
+            return scan
+        return await self.update_status(
+            scan,
+            ScanStatus.failed,
+            current_phase=ScanPhase.failed,
+            phase_message="Scan worker stopped unexpectedly",
+            error_message=(
+                "Scan worker stopped unexpectedly; no active worker is "
+                "processing this scan."
+            ),
+        )

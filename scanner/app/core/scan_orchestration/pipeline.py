@@ -177,8 +177,8 @@ class PipelineMixin:
                 "browser_error": getattr(crawl_result, "browser_error", None),
                 "browser_forms": getattr(crawl_result, "browser_forms", []),
                 "oast_client": OastClient(
-                    (scan_config.oast_callback_base_url if scan_config else None) or oast_settings.oast_callback_base_url,
-                    (scan_config.oast_poll_url if scan_config else None) or oast_settings.oast_poll_url,
+                    oast_settings.oast_callback_base_url,
+                    oast_settings.oast_poll_url,
                     timeout_seconds=oast_settings.request_timeout_seconds,
                 ),
                 "scan_config": scan_config,

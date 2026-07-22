@@ -48,13 +48,6 @@ def _auth_accounts_from_payload(credentials: ScanCredentials | None) -> list[Sca
                 password=cred.password,
                 cookie=cred.cookie,
                 header=cred.header,
-                login_url=cred.login_url,
-                success_url=cred.success_url,
-                success_text=cred.success_text,
-                success_regex=cred.success_regex,
-                failure_text=cred.failure_text,
-                failure_regex=cred.failure_regex,
-                validation_url=cred.validation_url,
             )
         )
     return accounts
@@ -92,16 +85,17 @@ async def create_scan(
     repo: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    """Submit a new scan target and enqueue the job for processing."""
-    #Credentials are serialized into the Redis job as plaintext and removed
-    # atomically when a worker claims the job. MongoDB persists only role names.
+    """Submit a new scan target and enqueue the job for processing.
+
+    Credentials are serialized into the Redis job as plaintext and removed
+    atomically when a worker claims the job. MongoDB persists only role names.
+    """
     auth_accounts = _auth_accounts_from_payload(payload.credentials)
     scan = await repo.create(
         str(payload.target_url),
         owner_user_id=str(current_user.id),
         owner_email=current_user.email,
         authorization_confirmed=payload.authorization_confirmed,
-        authorization_text=payload.authorization_text,
         crawl_mode=payload.crawl_mode,
         auth_roles_provided=[account.role for account in auth_accounts],
     )
@@ -152,6 +146,11 @@ async def list_scans(
 ) -> dict:
     """Return a paginated list of scans owned by the authenticated user."""
     scans = await repo.list(skip=skip, limit=limit, owner_user_id=str(current_user.id))
+    # Flip any scan whose worker died (running in DB, no live lease) to failed so
+    # the list never shows a permanently "running" zombie. Best-effort: a Redis
+    # outage leaves the scan untouched rather than falsely failing it.
+    if scan_queue is not None:
+        scans = [await repo.reconcile_if_orphaned(scan, scan_queue) for scan in scans]
     payload = [_scan_summary(scan) for scan in scans]
     return json_response({"items": payload, "total": len(payload)})
 
@@ -166,6 +165,7 @@ async def get_scan_details(
     scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
+    scan = await repo.reconcile_if_orphaned(scan, scan_queue)
     data = scan.model_dump()
     data["id"] = str(scan.id)
     # Defensive: credentials are never persisted, but strip any legacy field.
@@ -183,6 +183,7 @@ async def get_scan_status(
     scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
+    scan = await repo.reconcile_if_orphaned(scan, scan_queue)
     return json_response({
         "id": str(scan.id),
         "status": scan.status,
@@ -206,6 +207,10 @@ async def cancel_scan(
     scan = await repo.get_owned_by_id(scan_id, str(current_user.id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
+    # A scan whose worker died is not really running: cancelling it should
+    # resolve the UI immediately rather than set a cancel key nobody reads.
+    if scan_queue is not None:
+        scan = await repo.reconcile_if_orphaned(scan, scan_queue)
     if scan.status in {ScanStatus.completed, ScanStatus.failed, ScanStatus.cancelled}:
         return json_response({"cancelled": False})
     if scan_queue is None:

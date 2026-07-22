@@ -29,41 +29,6 @@ class ScanAccountCredential(BaseModel):
         max_length=8192,
         description='Raw header string fallback, e.g. "Authorization: Bearer ...".',
     )
-    login_url: str | None = Field(
-        default=None,
-        max_length=2048,
-        description="Optional explicit login endpoint if it differs from the target root.",
-    )
-    success_url: str | None = Field(
-        default=None,
-        max_length=2048,
-        description="Optional URL that confirms a logged-in session (e.g. /dashboard).",
-    )
-    success_text: str | None = Field(
-        default=None,
-        max_length=256,
-        description="Optional text in the response body that confirms login success.",
-    )
-    success_regex: str | None = Field(
-        default=None,
-        max_length=512,
-        description="Optional regex matching a login-success signature in the response.",
-    )
-    failure_text: str | None = Field(
-        default=None,
-        max_length=256,
-        description="Optional text in the response body that indicates login failure.",
-    )
-    failure_regex: str | None = Field(
-        default=None,
-        max_length=512,
-        description="Optional regex matching a login-failure signature in the response.",
-    )
-    validation_url: str | None = Field(
-        default=None,
-        max_length=2048,
-        description="Optional protected URL used to verify an active session.",
-    )
 
     @property
     def is_populated(self) -> bool:
@@ -129,14 +94,6 @@ class ScanConfig(BaseModel):
         default=None, ge=100.0, le=30000.0,
         description="Min response-time delta (ms) between internal and external control for in-band SSRF detection.",
     )
-    oast_callback_base_url: str | None = Field(
-        default=None, max_length=2048,
-        description="OAST callback URL for out-of-band SSRF confirmation.",
-    )
-    oast_poll_url: str | None = Field(
-        default=None, max_length=2048,
-        description="OAST poll URL to retrieve callback results.",
-    )
     scanner_concurrency: int | None = Field(
         default=None, ge=1, le=50,
         description="Number of concurrent HTTP workers during scanning.",
@@ -194,11 +151,6 @@ class CreateScanRequest(BaseModel):
     crawl_mode: CrawlMode = CrawlMode.full
     authorization_confirmed: bool = Field(
         description="User confirms they are authorized to security test this target.",
-    )
-    authorization_text: str | None = Field(
-        default=None,
-        max_length=1000,
-        description="Optional authorization note, ticket, contract, or scope reference.",
     )
     credentials: ScanCredentials | None = Field(
         default=None,

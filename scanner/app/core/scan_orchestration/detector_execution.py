@@ -4,7 +4,6 @@ from app.config import get_settings
 from app.core.detectors.attack_planner import AttackPlanner
 from app.core.detectors.base_detector import Finding
 from shared.models.scan import DetectorCoverageMetric
-from shared.schemas.scan_schema import ScanConfig
 
 logger = logging.getLogger("app.core.scanner")
 
@@ -151,21 +150,14 @@ class DetectorExecutionMixin:
         if candidates_built == 0 and not findings:
             skipped_reasons["no_candidates_built"] = 1
 
-        scan_config: ScanConfig | None = crawl_context.get("scan_config")
         settings = get_settings()
         if detector_name == "access_control" and not (
             crawl_context.get("second_user_cookies") or crawl_context.get("second_user_headers")
         ):
             skipped_reasons["second_user_account_missing"] = 1
         if detector_name == "ssrf":
-            oast_callback = (
-                (scan_config.oast_callback_base_url if scan_config else None)
-                or settings.oast_callback_base_url
-            )
-            oast_poll = (
-                (scan_config.oast_poll_url if scan_config else None)
-                or settings.oast_poll_url
-            )
+            oast_callback = settings.oast_callback_base_url
+            oast_poll = settings.oast_poll_url
             if not (oast_callback and oast_poll):
                 # OAST-verified blind SSRF is unavailable, but the in-band differential
                 # fallback still runs (probable/unverified findings). Flag it as a

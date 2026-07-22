@@ -64,13 +64,6 @@ class ScanAuthAccount(BaseModel):
     password: str | None = None
     cookie: str | None = None
     header: str | None = None
-    login_url: str | None = None
-    success_url: str | None = None
-    success_text: str | None = None
-    success_regex: str | None = None
-    failure_text: str | None = None
-    failure_regex: str | None = None
-    validation_url: str | None = None
 
 
 class SeverityBreakdown(BaseModel):
@@ -198,7 +191,6 @@ class Scan(Document):
     current_phase: ScanPhase = ScanPhase.queued
     phase_message: str = "Scan queued"
     authorization_confirmed: bool = False
-    authorization_text: str | None = None
     authorization_confirmed_at: datetime | None = None
     # Non-secret marker only: which account roles were supplied for this scan
     # (e.g. ["main", "admin"]). The credentials themselves are never persisted.

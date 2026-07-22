@@ -47,7 +47,6 @@ def test_report_payload_exposes_evidence_and_coverage_metadata() -> None:
         owner_user_id="user-1",
         owner_email="user@example.test",
         authorization_confirmed=True,
-        authorization_text="Ticket SEC-123",
         authorization_confirmed_at=generated_at,
         technology_stack=[],
         vulnerabilities=[],
@@ -63,5 +62,4 @@ def test_report_payload_exposes_evidence_and_coverage_metadata() -> None:
     assert payload["owner_user_id"] == "user-1"
     assert payload["owner_email"] == "user@example.test"
     assert payload["authorization"]["confirmed"] is True
-    assert payload["authorization"]["text"] == "Ticket SEC-123"
     assert payload["scanner_limitations"] == SCANNER_LIMITATIONS
