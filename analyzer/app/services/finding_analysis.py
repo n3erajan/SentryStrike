@@ -19,6 +19,7 @@ from shared.models.vulnerability import (
     AiAnalysisStatus,
     Vulnerability,
     get_fp_ceiling,
+    get_fp_floor,
 )
 
 
@@ -46,40 +47,46 @@ def compute_fp_probability(
     proof_type: str | None = None,
     vuln_type: str | None = None,
 ) -> float:
-    """Calculate FP probability deterministically from universal generic semantic axes.
+    """Calculate FP probability deterministically from universal semantic axes.
 
     The axes evaluate:
-    - EVIDENTIAL_ALIGNMENT: Does the evidence directly support the specific claim of the finding?
-    - EXPLAINABLE_BY_NORMAL_BEHAVIOR: Is the response explainable as normal, intended application functionality?
-    - CAUSALLY_CONNECTED: Was the evidence causally triggered by the payload?
+    - EVIDENTIAL_ALIGNMENT: Does the evidence directly support the scanner's specific claim?
+    - SCANNER_CLAIM_CONTRADICTED: Does the evidence contradict the scanner's claim?
+    - CAUSALLY_CONNECTED: Was the evidence causally triggered by the scanner's payload?
     """
     norm_axes = {k.upper(): str(v).lower() for k, v in (axes or {}).items()}
 
-    alignment = norm_axes.get("EVIDENTIAL_ALIGNMENT") or norm_axes.get("PROOF_GENUINE")
-    explainable_normal = (
-        norm_axes.get("EXPLAINABLE_BY_NORMAL_BEHAVIOR")
-        or norm_axes.get("CONTENT_IS_DOCUMENTATION")
-        or norm_axes.get("ENDPOINT_INTENTIONALLY_PUBLIC")
-    )
-    causal = norm_axes.get("CAUSALLY_CONNECTED") or norm_axes.get("PROOF_CAUSALLY_CONNECTED")
+    alignment = norm_axes.get("EVIDENTIAL_ALIGNMENT", "uncertain")
+    contradicted = norm_axes.get("SCANNER_CLAIM_CONTRADICTED", "uncertain")
+    causal = norm_axes.get("CAUSALLY_CONNECTED", "uncertain")
 
-    # 1. Normal intended application behavior AND proof does not support claim -> Strong FP
-    if explainable_normal == "yes" and alignment in ("no", "uncertain"):
+    # ── Backward compat: map old axis names if present ──
+    if "EVIDENTIAL_ALIGNMENT" not in norm_axes:
+        alignment = norm_axes.get("PROOF_GENUINE", "uncertain")
+    if "SCANNER_CLAIM_CONTRADICTED" not in norm_axes:
+        # Old axis was inverted: EXPLAINABLE_BY_NORMAL_BEHAVIOR=yes meant "this is FP"
+        old = norm_axes.get("EXPLAINABLE_BY_NORMAL_BEHAVIOR") or norm_axes.get("CONTENT_IS_DOCUMENTATION")
+        if old:
+            contradicted = old
+
+    # 1. Evidence actively contradicts the scanner's claim → Strong FP
+    if contradicted == "yes" and alignment in ("no", "uncertain"):
         return 0.85
 
-    # 2. Explainable by normal application behavior -> Likely FP
-    if explainable_normal == "yes" and alignment != "yes":
+    # 2. Evidence contradicts claim but alignment is ambiguous → Likely FP
+    if contradicted == "yes":
         return 0.75
 
-    # 3. Not causally connected (pre-existing text/behavior) -> Likely FP
-    if causal == "no":
+    # 3. Not causally connected AND alignment is weak → Likely FP
+    #    (but only when causal connection is relevant — skip for "not_applicable")
+    if causal == "no" and alignment in ("no", "uncertain"):
         return 0.75
 
-    # 4. Proof directly aligns with claim AND is not normal intended behavior -> Confirmed TP
-    if alignment == "yes" and explainable_normal == "no":
+    # 4. Evidence aligns with claim AND nothing contradicts it → Confirmed TP
+    if alignment == "yes" and contradicted == "no":
         return 0.05
 
-    # 5. Proof aligns with claim -> Low FP probability
+    # 5. Evidence aligns with claim (contradiction uncertain) → Low FP
     if alignment == "yes":
         return 0.10
 
@@ -149,13 +156,15 @@ class FindingAnalysisService:
         )
         adjudication = FindingAdjudicationResponse.model_validate(adjudication_result.data)
 
-        # ── Deterministic Calibration & Ceiling Clamping ─────────────────────
+        # ── Deterministic Calibration & Floor/Ceiling Clamping ────────────────
         proof_type = vulnerability.evidence.proof_type or "heuristic"
         ceiling = get_fp_ceiling(proof_type)
+        floor = get_fp_floor(proof_type)
         raw_prob = compute_fp_probability(adjudication.fp_axes, proof_type, vuln_type=vulnerability.vuln_type)
 
-        # Clamp calculated probability to the evidence ceiling
-        fp_prob = min(raw_prob, ceiling)
+        # Clamp: ceiling prevents pessimism on strong proof, floor prevents
+        # overconfidence on weak proof (e.g. heuristic CVE lookups).
+        fp_prob = max(min(raw_prob, ceiling), floor)
 
         # Conservative default enforcement:
         # Require verdict == likely_false_positive AND fp_prob >= 0.50 AND non-empty reasoning to downgrade

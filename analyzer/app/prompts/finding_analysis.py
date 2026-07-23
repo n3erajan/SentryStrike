@@ -1,4 +1,4 @@
-FINDING_PROMPT_VERSION = "finding-v3-twopass"
+FINDING_PROMPT_VERSION = "finding-v4-twopass"
 
 
 # Pass 1: Enrichment prompt components (description, impact, remediation, exploitability)
@@ -45,30 +45,43 @@ _ENRICHMENT_SCHEMA = (
 # Pass 2: FP Adjudication prompt components (generic verification framing)
 _ADJUDICATION_ROLE_AND_TASK = (
     "You are an expert security triager performing false-positive adjudication for a DAST scanner.\n\n"
-    "TASK: You see what the HTTP response returned and what the detector claims it means. "
-    "Using your general understanding of web applications, determine whether the observed "
-    "response actually demonstrates the claimed vulnerability — or whether it is better explained "
-    "by normal application behavior (such as developer documentation, tutorial code blocks, "
-    "a static page explaining HTTP errors, or an intentionally public API endpoint).\n\n"
-    "GENERIC CAUSAL VERIFICATION PRINCIPLE:\n"
-    "Check evidential symmetry: Does the response make sense as a direct causal result of the "
-    "injected payload? Or was the matched text already present as static/pre-existing page content?\n\n"
-    "DEFAULT STANCE: Trust the scanner's detection UNLESS you find a concrete, specific "
-    "contradiction in the evidence. If you are unsure, mark 'uncertain' or 'confirmed'. "
-    "Reserve 'likely_false_positive' strictly for cases with clear, observable evidence that the "
-    "matched content is benign (e.g., page title proves it is a documentation page, identical "
-    "unauthenticated API response proves public data).\n\n"
+    "TASK: The scanner has reported a specific finding with a title and evidence.\n"
+    "Your job is to decide: does the evidence actually support the scanner's claim?\n\n"
+    "IMPORTANT DISTINCTION — 'Normal behavior' vs 'Security concern':\n"
+    "Some vulnerability classes (e.g. Exposed API Documentation, Debug Endpoints, Missing Headers, "
+    "Metrics Exposure) describe conditions where the application is working exactly as coded, "
+    "but that configuration itself IS the security problem. For these findings, the fact that "
+    "the endpoint serves its content 'normally' does NOT contradict the scanner's claim — "
+    "it SUPPORTS it. The scanner is claiming the exposure exists, and the response proves it does.\n\n"
+    "A finding is a false positive ONLY when the evidence does not actually demonstrate what "
+    "the scanner claims. For example:\n"
+    "- A page titled 'SQL Injection Tutorial' containing ' OR 1=1-- as example text triggers "
+    "the SQLi detector, but the matched text is educational content, not an actual injection result.\n"
+    "- Two API endpoints return identical public product data. The IDOR detector flags it, but "
+    "the data is intentionally public with no private fields.\n\n"
+    "DEFAULT STANCE: Trust the scanner's detection UNLESS the evidence specifically contradicts "
+    "the claim. If unsure, mark 'uncertain' or 'confirmed'.\n\n"
 )
 
 
 def _get_axes_definition(proof_type: str = "", vuln_type: str = "") -> str:
     """Return universal generic semantic axes for false-positive adjudication."""
     return (
-        "Evaluate these generic categorical axes (answer each with 'yes', 'no', or 'uncertain'):\n"
-        "- EVIDENTIAL_ALIGNMENT: Does the observed response directly demonstrate the specific security flaw or condition claimed by the finding title?\n"
-        "- EXPLAINABLE_BY_NORMAL_BEHAVIOR: Is the observed response better explained as normal, intended application functionality (or benign static content) rather than an unintended security vulnerability?\n"
-        "- CAUSALLY_CONNECTED: Did the scanner's payload or test request directly cause the security evidence, or was the matched text/behavior already pre-existing?\n\n"
+        "Evaluate these categorical axes (answer each with 'yes', 'no', or 'uncertain'):\n"
+        "- EVIDENTIAL_ALIGNMENT: Does the observed response directly demonstrate the specific "
+        "security flaw or condition claimed by the finding title?\n"
+        "- SCANNER_CLAIM_CONTRADICTED: Does the evidence show that the scanner's claim is wrong? "
+        "For example: the matched text is from a tutorial/educational page (not a real exploit), "
+        "or the 'leaked' data is intentionally public with no private fields. "
+        "Answer 'yes' ONLY if you can point to specific evidence that contradicts the claim. "
+        "The fact that an application serves content 'normally' does NOT contradict claims about "
+        "exposed documentation, missing headers, debug endpoints, or misconfigurations — "
+        "those findings assert that the normal behavior itself is the problem.\n"
+        "- CAUSALLY_CONNECTED: Did the scanner's payload or test request directly cause the "
+        "security-relevant evidence to appear, or was the content pre-existing? For findings "
+        "about exposure or misconfiguration (where no payload is used), answer 'not_applicable'.\n\n"
     )
+
 
 
 _ADJUDICATION_SCHEMA = (

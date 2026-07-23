@@ -57,21 +57,29 @@ def test_extract_page_title_and_code_blocks():
 
 
 def test_compute_fp_probability():
-    # SQLi on tutorial page case (proof does not support claim, explainable by normal educational content)
-    axes_sqli_doc = {"EVIDENTIAL_ALIGNMENT": "no", "EXPLAINABLE_BY_NORMAL_BEHAVIOR": "yes"}
+    # SQLi on tutorial page (evidence contradicts claim — matched text is educational, not real SQLi)
+    axes_sqli_doc = {"EVIDENTIAL_ALIGNMENT": "no", "SCANNER_CLAIM_CONTRADICTED": "yes", "CAUSALLY_CONNECTED": "no"}
     assert compute_fp_probability(axes_sqli_doc) == 0.85
 
-    # Exposed API Documentation case (proof directly supports claim, not normal intended app behavior)
-    axes_api_docs = {"EVIDENTIAL_ALIGNMENT": "yes", "EXPLAINABLE_BY_NORMAL_BEHAVIOR": "no"}
+    # Exposed API Documentation (evidence aligns with claim, nothing contradicts it)
+    axes_api_docs = {"EVIDENTIAL_ALIGNMENT": "yes", "SCANNER_CLAIM_CONTRADICTED": "no", "CAUSALLY_CONNECTED": "not_applicable"}
     assert compute_fp_probability(axes_api_docs) == 0.05
 
-    # Public API IDOR case (public product catalog, explainable as normal behavior)
-    axes_public_api = {"EVIDENTIAL_ALIGNMENT": "no", "EXPLAINABLE_BY_NORMAL_BEHAVIOR": "yes"}
+    # Public API IDOR (evidence contradicts — data is public, no private fields)
+    axes_public_api = {"EVIDENTIAL_ALIGNMENT": "no", "SCANNER_CLAIM_CONTRADICTED": "yes"}
     assert compute_fp_probability(axes_public_api) == 0.85
 
-    # Real SQL injection TP case
-    axes_tp = {"EVIDENTIAL_ALIGNMENT": "yes", "EXPLAINABLE_BY_NORMAL_BEHAVIOR": "no", "CAUSALLY_CONNECTED": "yes"}
+    # Real SQL injection TP (evidence aligns, nothing contradicts, causally triggered)
+    axes_tp = {"EVIDENTIAL_ALIGNMENT": "yes", "SCANNER_CLAIM_CONTRADICTED": "no", "CAUSALLY_CONNECTED": "yes"}
     assert compute_fp_probability(axes_tp) == 0.05
+
+    # Supply chain CVE (evidence aligns, nothing contradicts, but no dynamic exploit proof)
+    axes_cve = {"EVIDENTIAL_ALIGNMENT": "yes", "SCANNER_CLAIM_CONTRADICTED": "no", "CAUSALLY_CONNECTED": "uncertain"}
+    assert compute_fp_probability(axes_cve) == 0.05
+
+    # Debug/Metrics endpoint (evidence aligns, nothing contradicts, no payload needed)
+    axes_metrics = {"EVIDENTIAL_ALIGNMENT": "yes", "SCANNER_CLAIM_CONTRADICTED": "no", "CAUSALLY_CONNECTED": "not_applicable"}
+    assert compute_fp_probability(axes_metrics) == 0.05
 
 
 @pytest.mark.asyncio

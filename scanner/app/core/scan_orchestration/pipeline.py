@@ -63,11 +63,26 @@ class PipelineMixin:
             main_account = auth_accounts_by_role.get("main")
 
             await self._set_phase_progress(scan, ScanPhase.crawling, 0.0, "Crawling target and discovering attack surface")
+            
+            http_prior_s = self._eta_state.crawl_total_prior_s
+            browser_prior_s = 0.0
+            if getattr(scan_spider, "_should_run_browser", lambda x: False)(False) or (scan_config and scan_config.get_val("crawl_browser_mode", "auto") != "off"):
+                browser_prior_s = float(scan_config.get_val("crawl_browser_budget_seconds", 300.0) if scan_config else 300.0)
+            
+            total_prior_s = http_prior_s + browser_prior_s
+            if total_prior_s > 0:
+                self._eta_state.crawl_http_split = http_prior_s / total_prior_s
+                self._eta_state.crawl_browser_split = browser_prior_s / total_prior_s
+                self._eta_state.crawl_total_prior_s = total_prior_s
+                
+            async def _crawl_progress_callback(fraction: float) -> None:
+                await self._set_phase_progress(scan, ScanPhase.crawling, fraction, "Crawling target and discovering attack surface")
+
             if scan.crawl_mode == CrawlMode.single:
                 logger.info("single-path scan: skipping spider discovery for %s", scan.target_url)
                 crawl_result = await scan_spider.fetch_single(scan.target_url)
             else:
-                crawl_result = await scan_spider.crawl(scan.target_url, auth_override=main_account, scan_config=scan_config)
+                crawl_result = await scan_spider.crawl(scan.target_url, auth_override=main_account, scan_config=scan_config, progress_callback=_crawl_progress_callback)
 
             # Keep crawl results same-origin so active probes never leave the scan target.
             target_url = scan.target_url
@@ -99,6 +114,7 @@ class PipelineMixin:
             crawl_result.forms = self._scope_forms_to_origin(target_url, crawl_result.forms, is_same_origin)
 
             scan.statistics.total_urls_crawled = self._count_discovered_surface(crawl_result)
+            self._recompute_phase_weights(crawl_result)
             await self._set_phase_progress(scan, ScanPhase.crawling, 1.0, f"Crawl complete: {scan.statistics.total_urls_crawled} URL(s) discovered")
 
             root_html = getattr(crawl_result, "spa_root_html", "")
@@ -223,7 +239,10 @@ class PipelineMixin:
             }
             self._update_crawl_metadata(scan, crawl_result, crawl_context)
 
-            self._eta_state.measured_latency_ms = await self._measure_target_latency_ms(scan.target_url)
+            if getattr(crawl_result, "observed_mean_latency_ms", None) is not None:
+                self._eta_state.measured_latency_ms = crawl_result.observed_mean_latency_ms
+            else:
+                self._eta_state.measured_latency_ms = await self._measure_target_latency_ms(scan.target_url)
             work_units, detector_prior_s = self._estimate_detector_work(
                 attack_planner,
                 active_detectors,
@@ -266,6 +285,7 @@ class PipelineMixin:
             async def run_detector(detector) -> tuple[object, list[Finding], DetectorCoverageMetric]:
                 detector_name = self._detector_name(detector)
                 async with detector_semaphore:
+                    self._eta_state.detector_start_times[detector_name] = perf_counter()
                     try:
                         result = await detector.detect(
                             crawl_result.urls,
@@ -297,7 +317,43 @@ class PipelineMixin:
                 _governor_settings.scanner_per_detector_request_cap,
                 _governor_settings.scanner_per_parameter_request_cap,
             )
+            async def _detector_progress_ticker():
+                try:
+                    while True:
+                        await asyncio.sleep(3.0)
+                        governor_counts = denied_snapshot()
+                        if governor_counts:
+                            total_allowed = sum(sum(stats.values()) for source, stats in governor_counts.items() if source == "allowed")
+                            total_denied = sum(sum(stats.values()) for source, stats in governor_counts.items() if source != "allowed")
+                            if total_allowed > 0:
+                                self._eta_state.governor_denial_rate = total_denied / max(1, total_allowed)
+                                
+                        req_counts = snapshot_request_counts()
+                        active_work = 0.0
+                        for det_name, sent_reqs in req_counts.items():
+                            if det_name in self._eta_state.detector_start_times and det_name not in self._eta_state.detector_elapsed_s:
+                                expected = self._eta_state.detector_expected_requests.get(det_name, 1)
+                                fraction = min(1.0, max(0.0, sent_reqs / max(1, expected)))
+                                active_work += fraction * self._eta_state.detector_work_units.get(det_name, 0.0)
+                                
+                        self._eta_state.detector_completed_work = min(
+                            self._eta_state.detector_total_work,
+                            self._eta_state.detector_finished_work + active_work,
+                        )
+                        total_work = max(self._eta_state.detector_total_work, 1e-9)
+                        self._eta_state.detector_fraction = self._eta_state.detector_completed_work / total_work
+                        
+                        await self._set_phase_progress(
+                            scan,
+                            ScanPhase.vulnerability_detection,
+                            self._eta_state.detector_fraction,
+                            f"Detectors running... {len(findings)} raw finding(s)",
+                        )
+                except asyncio.CancelledError:
+                    pass
+
             try:
+                ticker_task = asyncio.create_task(_detector_progress_ticker())
                 # Run detectors concurrently but consume them as they finish so
                 # progress ticks on work completed (not detector headcount).
                 detector_total = max(1, len(active_detectors))
@@ -330,9 +386,14 @@ class PipelineMixin:
                             self._eta_state.detector_total_work - self._eta_state.detector_completed_work,
                         )
                         work = remaining_work / remaining_detectors
+                        
+                    if finished_name != "unknown" and finished_name in self._eta_state.detector_start_times:
+                        self._eta_state.detector_elapsed_s[finished_name] = perf_counter() - self._eta_state.detector_start_times[finished_name]
+                        
+                    self._eta_state.detector_finished_work += work
                     self._eta_state.detector_completed_work = min(
                         self._eta_state.detector_total_work,
-                        self._eta_state.detector_completed_work + work,
+                        self._eta_state.detector_finished_work,
                     )
                     total_work = max(self._eta_state.detector_total_work, 1e-9)
                     self._eta_state.detector_fraction = (
@@ -344,6 +405,9 @@ class PipelineMixin:
                         self._eta_state.detector_fraction,
                         f"Detectors {detector_done}/{detector_total} complete: {len(findings)} raw finding(s)",
                     )
+                    
+                if 'ticker_task' in locals() and not ticker_task.done():
+                    ticker_task.cancel()
 
                 exception_detector = next((detector for detector in scan_detectors if isinstance(detector, ExceptionHandlingDetector)), None)
                 if exception_detector is not None:
@@ -653,3 +717,29 @@ class PipelineMixin:
             # Completion is already durable. A reconciler can create/attach the
             # missing job later; post-completion handoff failure must not fail scan.
             logger.exception("failed to persist analysis handoff for scan %s", scan.id)
+
+    def _recompute_phase_weights(self, crawl_result: object) -> None:
+        if self._eta_state.phase_weights is not None:
+            return
+            
+        from app.core.scan_orchestration.progress import PHASE_WEIGHTS
+        new_weights = dict(PHASE_WEIGHTS)
+        
+        urls = len(getattr(crawl_result, "urls", []))
+        forms = len(getattr(crawl_result, "forms", []))
+        endpoints = len(getattr(crawl_result, "api_endpoints", []))
+        
+        surface_size = urls + forms * 2 + endpoints * 2
+        if surface_size > 500:
+            new_weights[ScanPhase.vulnerability_detection] = 70
+            new_weights[ScanPhase.crawling] = 12
+        elif surface_size < 10:
+            new_weights[ScanPhase.vulnerability_detection] = 20
+            new_weights[ScanPhase.crawling] = 50
+            
+        total = sum(new_weights.values())
+        if total != 100:
+            factor = 100.0 / max(1.0, total)
+            new_weights = {k: round(v * factor) for k, v in new_weights.items()}
+            
+        self._eta_state.phase_weights = new_weights

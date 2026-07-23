@@ -253,7 +253,7 @@ async def process_analysis_job(
 
     try:
         for vulnerability in scan.vulnerabilities:
-            logger.debug(
+            logger.info(
                 "analysis job %s analyzing finding %s (%s, %s) [%s/%s]",
                 job.id,
                 vulnerability.id,
@@ -268,6 +268,16 @@ async def process_analysis_job(
                 technology_stack=technology_stack,
             )
             analysis.analyzed_at = datetime.now(timezone.utc)
+            
+            logger.info(
+                "analysis job %s finished finding %s: verdict=%s (FP: %.2f) axes=%s",
+                job.id,
+                vulnerability.id,
+                analysis.verdict.value if analysis.verdict else "None",
+                analysis.false_positive_probability or 0.0,
+                analysis.fp_axes,
+            )
+            
             await applier.set_finding(
                 job,
                 worker_id=worker_id,

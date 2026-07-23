@@ -24,6 +24,16 @@ PHASE_WEIGHTS = {
     ScanPhase.risk_scoring: 2,
 }
 
+SINGLE_PAGE_PHASE_WEIGHTS = {
+    ScanPhase.initializing: 5,
+    ScanPhase.crawling: 5,
+    ScanPhase.technology_detection: 10,
+    ScanPhase.tls_analysis: 5,
+    ScanPhase.vulnerability_detection: 60,
+    ScanPhase.deduplication: 10,
+    ScanPhase.risk_scoring: 5,
+}
+
 DETECTOR_PAYLOADS_PER_TARGET: dict[str, int] = {
     "injection_sql_command": 20,
     "xss": 22,
@@ -93,6 +103,16 @@ class _EtaState:
     detector_total_work: float = 0.0
     detector_completed_work: float = 0.0
     detector_phase_started: float | None = None
+    crawl_http_split: float = 1.0
+    crawl_browser_split: float = 0.0
+    crawl_total_prior_s: float = CRAWL_PRIOR_S
+    eta_smooth_s: float | None = None
+    phase_weights: dict | None = None
+    governor_denial_rate: float = 0.0
+    detector_elapsed_s: dict[str, float] = field(default_factory=dict)
+    detector_start_times: dict[str, float] = field(default_factory=dict)
+    detector_expected_requests: dict[str, int] = field(default_factory=dict)
+    detector_finished_work: float = 0.0
     phase_order: tuple[ScanPhase, ...] = field(
         default_factory=lambda: (
             ScanPhase.initializing,
@@ -116,17 +136,37 @@ class ProgressMixin:
         *,
         status: ScanStatus = ScanStatus.running,
     ) -> None:
+        from shared.models.scan import CrawlMode
         order = list(self._eta_state.phase_order)
+        if self._eta_state.phase_weights is not None:
+            weights = self._eta_state.phase_weights
+        else:
+            weights = SINGLE_PAGE_PHASE_WEIGHTS if scan.crawl_mode == CrawlMode.single else PHASE_WEIGHTS
         try:
             phase_idx = order.index(phase)
-            base = sum(PHASE_WEIGHTS[p] for p in order[:phase_idx])
+            base = sum(weights[p] for p in order[:phase_idx])
         except (ValueError, KeyError):
             base = scan.progress
 
-        phase_weight = PHASE_WEIGHTS.get(phase, 0)
+        phase_weight = weights.get(phase, 0)
         pct = base + phase_weight * max(0.0, min(1.0, fraction))
-        progress = max(scan.progress, round(pct))
-        scan.eta_seconds = self._compute_eta_seconds(scan, phase, fraction, progress)
+        progress = min(100, max(scan.progress, round(pct)))
+        
+        computed_eta = self._compute_eta_seconds(scan, phase, fraction, progress)
+        if computed_eta is not None:
+            if self._eta_state.eta_smooth_s is None:
+                smoothed = float(computed_eta)
+            else:
+                alpha = 0.35
+                smoothed = alpha * float(computed_eta) + (1.0 - alpha) * self._eta_state.eta_smooth_s
+                if smoothed > self._eta_state.eta_smooth_s + 60.0:
+                    smoothed = self._eta_state.eta_smooth_s + 60.0
+            
+            self._eta_state.eta_smooth_s = max(0.0, smoothed)
+            scan.eta_seconds = round(self._eta_state.eta_smooth_s)
+        else:
+            scan.eta_seconds = None
+
         await self._set_progress(scan, progress, phase, message, status=status)
 
     def _compute_eta_seconds(
@@ -136,6 +176,7 @@ class ProgressMixin:
         fraction: float,
         progress: int,
     ) -> int | None:
+        from shared.models.scan import CrawlMode
         eta = self._eta_state
         clamped = max(0.0, min(1.0, fraction))
         order = list(eta.phase_order)
@@ -145,25 +186,28 @@ class ProgressMixin:
         except ValueError:
             phase_idx = -1
 
+        detector_prior_s = 60.0 if scan.crawl_mode == CrawlMode.single else DETECTOR_PENDING_PRIOR_S
+        crawl_prior_s = 10.0 if scan.crawl_mode == CrawlMode.single else eta.crawl_total_prior_s
+
         remaining = 0.0
         if phase == ScanPhase.vulnerability_detection and eta.detector_total_s is not None:
             remaining += self._detector_remaining_seconds()
         elif phase == ScanPhase.vulnerability_detection:
-            remaining += DETECTOR_PENDING_PRIOR_S * (1.0 - clamped)
+            remaining += detector_prior_s * (1.0 - clamped)
         elif phase == ScanPhase.crawling:
             if scan.started_at and progress > 5:
                 elapsed = _elapsed_utc_seconds(scan.started_at)
                 return max(0, round(elapsed * (100 - progress) / progress))
-            remaining += CRAWL_PRIOR_S * (1.0 - clamped)
+            remaining += crawl_prior_s * (1.0 - clamped)
         elif phase in SHORT_PHASE_PRIOR_S:
             remaining += SHORT_PHASE_PRIOR_S[phase] * (1.0 - clamped)
 
         if phase_idx >= 0:
             for future in order[phase_idx + 1 :]:
                 if future == ScanPhase.vulnerability_detection:
-                    remaining += eta.detector_total_s if eta.detector_total_s is not None else DETECTOR_PENDING_PRIOR_S
+                    remaining += eta.detector_total_s if eta.detector_total_s is not None else detector_prior_s
                 elif future == ScanPhase.crawling:
-                    remaining += CRAWL_PRIOR_S
+                    remaining += crawl_prior_s
                 else:
                     remaining += SHORT_PHASE_PRIOR_S.get(future, 0.0)
 
@@ -178,19 +222,49 @@ class ProgressMixin:
         total_work = eta.detector_total_work
         completed = min(eta.detector_completed_work, total_work)
         remaining_work = max(0.0, total_work - completed)
+        denial_inflation = 1.0 + (eta.governor_denial_rate * 0.5)
 
         if total_work <= 0:
-            return max(0.0, prior_total * (1.0 - eta.detector_fraction))
+            return max(0.0, prior_total * (1.0 - eta.detector_fraction) * denial_inflation)
 
-        prior_remaining = prior_total * (remaining_work / total_work)
         if remaining_work <= 0:
             return 0.0
 
+        observed_mean_pace = 0.0
+        if eta.detector_elapsed_s:
+            finished_time = sum(eta.detector_elapsed_s.values())
+            finished_work = sum(eta.detector_work_units.get(name, 0.0) for name in eta.detector_elapsed_s)
+            if finished_work > 0:
+                observed_mean_pace = finished_time / finished_work
+        
+        prior_pace = prior_total / total_work if total_work > 0 else 0.0
+        pace_factor = (observed_mean_pace / prior_pace) if (observed_mean_pace > 0 and prior_pace > 0) else 1.0
+        # Clamp pace_factor between 0.2 and 5.0 so ETA doesn't swing wildly
+        pace_factor = max(0.2, min(5.0, pace_factor))
+        
+        base_remaining = 0.0
+        for name, work in eta.detector_work_units.items():
+            if name not in eta.detector_elapsed_s:
+                prior_s_for_name = prior_total * (work / total_work) if total_work > 0 else 0.0
+                base_remaining += prior_s_for_name * pace_factor
+
         if completed > 0 and eta.detector_phase_started is not None:
             elapsed = max(0.001, perf_counter() - eta.detector_phase_started)
-            pace_remaining = remaining_work * (elapsed / completed)
-            return max(prior_remaining, pace_remaining)
-        return prior_remaining
+            live_pace = elapsed / completed
+            # Clamp live_pace to a maximum of 5x the prior_pace to prevent huge spikes
+            # from sparse ticker updates early in the run
+            if prior_pace > 0:
+                live_pace = min(live_pace, prior_pace * 5.0)
+            pace_remaining = remaining_work * live_pace
+            # Blend the live pace and base remaining to avoid the max() spike
+            if eta.detector_elapsed_s:
+                # If we have finished detectors, trust the pace_factor more
+                base_remaining = (base_remaining * 0.7) + (pace_remaining * 0.3)
+            else:
+                # If none finished, rely on the live pace but capped
+                base_remaining = pace_remaining
+            
+        return max(0.0, base_remaining * denial_inflation)
 
     def _estimate_detector_work(
         self,
@@ -208,6 +282,8 @@ class ProgressMixin:
             payloads = DETECTOR_PAYLOADS_PER_TARGET.get(name, DETECTOR_PAYLOADS_PER_TARGET["default"])
             weight = DETECTOR_COST_WEIGHT.get(name, DETECTOR_COST_WEIGHT["default"])
             raw_requests = min(max(0, targets) * max(1, payloads), max(1, per_detector_cap))
+            if hasattr(self, "_eta_state"):
+                self._eta_state.detector_expected_requests[name] = max(int(raw_requests), 1)
             work_units[name] = max(float(raw_requests), 1.0) * weight
 
         effective_latency_ms = max(
