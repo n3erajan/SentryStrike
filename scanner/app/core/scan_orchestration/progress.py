@@ -93,10 +93,6 @@ class _EtaState:
     detector_total_work: float = 0.0
     detector_completed_work: float = 0.0
     detector_phase_started: float | None = None
-    ai_total_s: float | None = None
-    ai_remaining_s: float | None = None
-    ai_fraction: float = 0.0
-    findings_count: int = 0
     phase_order: tuple[ScanPhase, ...] = field(
         default_factory=lambda: (
             ScanPhase.initializing,
@@ -154,17 +150,6 @@ class ProgressMixin:
             remaining += self._detector_remaining_seconds()
         elif phase == ScanPhase.vulnerability_detection:
             remaining += DETECTOR_PENDING_PRIOR_S * (1.0 - clamped)
-        elif phase == ScanPhase.ai_analysis:
-            if eta.ai_remaining_s is not None:
-                remaining += eta.ai_remaining_s
-            else:
-                ai_total = eta.ai_total_s
-                if ai_total is None and eta.findings_count:
-                    ai_total = eta.findings_count * AI_PRIOR_PER_FINDING_S
-                if ai_total is not None:
-                    remaining += ai_total * (1.0 - clamped)
-                else:
-                    remaining += SHORT_PHASE_PRIOR_S.get(phase, 0.0) * (1.0 - clamped)
         elif phase == ScanPhase.crawling:
             if scan.started_at and progress > 5:
                 elapsed = _elapsed_utc_seconds(scan.started_at)
@@ -179,13 +164,6 @@ class ProgressMixin:
                     remaining += eta.detector_total_s if eta.detector_total_s is not None else DETECTOR_PENDING_PRIOR_S
                 elif future == ScanPhase.crawling:
                     remaining += CRAWL_PRIOR_S
-                elif future == ScanPhase.ai_analysis:
-                    if eta.ai_total_s is not None:
-                        remaining += eta.ai_total_s
-                    elif eta.findings_count:
-                        remaining += eta.findings_count * AI_PRIOR_PER_FINDING_S
-                    else:
-                        remaining += AI_PENDING_PRIOR_S
                 else:
                     remaining += SHORT_PHASE_PRIOR_S.get(future, 0.0)
 

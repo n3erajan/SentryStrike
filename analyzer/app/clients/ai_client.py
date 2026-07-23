@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 
 import httpx
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderError(RuntimeError):
@@ -39,13 +42,35 @@ class AIClient:
 
     async def generate_json(self, prompt: str) -> ProviderResult:
         last_error: ProviderError | None = None
-        for _ in range(self.settings.ai_max_retries + 1):
+        attempts = self.settings.ai_max_retries + 1
+        for attempt in range(1, attempts + 1):
             try:
-                return await self._request(prompt)
+                result = await self._request(prompt)
+                logger.debug(
+                    "provider call ok (attempt %s/%s) request_id=%s tokens=in:%s/out:%s",
+                    attempt,
+                    attempts,
+                    result.request_id,
+                    result.input_tokens,
+                    result.output_tokens,
+                )
+                return result
             except ProviderError as exc:
                 last_error = exc
                 if not exc.retryable:
+                    logger.warning(
+                        "provider call failed non-retryably (%s): %s",
+                        exc.code,
+                        exc,
+                    )
                     raise
+                logger.warning(
+                    "provider call failed retryably (attempt %s/%s, %s): %s",
+                    attempt,
+                    attempts,
+                    exc.code,
+                    exc,
+                )
         if last_error is not None:
             raise last_error
         raise ProviderError("provider_error", "Provider request failed", retryable=True)

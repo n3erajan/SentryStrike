@@ -334,7 +334,6 @@ class PipelineMixin:
                         self._eta_state.detector_total_work,
                         self._eta_state.detector_completed_work + work,
                     )
-                    self._eta_state.findings_count = len(findings)
                     total_work = max(self._eta_state.detector_total_work, 1e-9)
                     self._eta_state.detector_fraction = (
                         self._eta_state.detector_completed_work / total_work
