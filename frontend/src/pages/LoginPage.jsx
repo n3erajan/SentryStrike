@@ -4,6 +4,7 @@ import { CheckCircle2, Loader2, Eye, EyeOff } from "lucide-react";
 import { useAuth } from "../context/AuthContext.jsx";
 import AuthBrand from "../components/AuthBrand.jsx";
 import ThemeToggle from "../components/ThemeToggle.jsx";
+import Tooltip from "../components/Tooltip.jsx";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -92,20 +93,22 @@ function LoginPage() {
                   onBlur={() => setTouched((v) => ({ ...v, password: true }))}
                   disabled={submitting}
                 />
-                <button
-                  type='button'
-                  className='pw-toggle'
-                  onClick={() => setShowPassword((v) => !v)}
-                  aria-label={showPassword ? "Hide password" : "Show password"}
-                  aria-pressed={showPassword}
-                  tabIndex={-1}
-                >
-                  {showPassword ? (
-                    <EyeOff className='ico' />
-                  ) : (
-                    <Eye className='ico' />
-                  )}
-                </button>
+                <Tooltip label={showPassword ? "Hide password" : "Show password"}>
+                  <button
+                    type='button'
+                    className='pw-toggle'
+                    onClick={() => setShowPassword((v) => !v)}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                    aria-pressed={showPassword}
+                    tabIndex={-1}
+                  >
+                    {showPassword ? (
+                      <EyeOff className='ico' />
+                    ) : (
+                      <Eye className='ico' />
+                    )}
+                  </button>
+                </Tooltip>
               </div>
               {touched.password && !passwordValid && (
                 <span className='field-error'>

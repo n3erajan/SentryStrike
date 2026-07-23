@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Bell, CheckCheck, Loader2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { getUnreadCount, listNotifications, markAllNotificationsRead, markNotificationRead } from "../services/notifications.js";
+import Tooltip from "./Tooltip.jsx";
 
 function targetFor(item) {
   const scanId = item.metadata?.scan_id || (item.resource_type === "scan" ? item.resource_id : null);
@@ -37,9 +38,11 @@ export default function NotificationsMenu() {
   }
 
   return <div className='notifications' ref={root}>
-    <button className='icon-btn notification-trigger' onClick={toggle} aria-label={`Notifications${count ? `, ${count} unread` : ""}`} aria-expanded={open}><Bell className='ico' />{count > 0 && <span>{count > 99 ? "99+" : count}</span>}</button>
+    <Tooltip label='Notifications'>
+      <button className='icon-btn notification-trigger' onClick={toggle} aria-label={`Notifications${count ? `, ${count} unread` : ""}`} aria-expanded={open}><Bell className='ico' />{count > 0 && <span>{count > 99 ? "99+" : count}</span>}</button>
+    </Tooltip>
     {open && <div className='notification-menu'><div className='notification-head'><b>Notifications</b><button className='text-btn' onClick={readAll} disabled={!count}><CheckCheck className='ico' />Mark all read</button></div>
-      <div className='notification-list'>{loading ? <div className='empty-state'><Loader2 className='ico spin' />Loading…</div> : items.length ? items.map((item) => <button key={item.id} className={`notification-item${item.read_at ? "" : " unread"}`} onClick={() => select(item)}><b>{item.title}</b><span>{item.message}</span><small>{new Date(item.created_at).toLocaleString()}</small></button>) : <div className='empty-state'>You’re all caught up.</div>}</div>
+      <div className='notification-list'>{loading ? <div className='empty-state'><Loader2 className='ico spin' />Loading…</div> : items.length ? items.map((item) => <button key={item.id} className={`notification-item${item.read_at ? "" : " unread"}`} onClick={() => select(item)}><b>{item.title}</b><span>{item.message}</span><small>{new Date(item.created_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}</small></button>) : <div className='empty-state'>You’re all caught up.</div>}</div>
     </div>}
   </div>;
 }

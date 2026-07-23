@@ -32,7 +32,7 @@ function AppsPage() {
     setLoading(true);
     setError("");
     try {
-      const data = await listScans({ limit: 200, signal });
+      const data = await listScans({ limit: 25, signal });
       setScans(Array.isArray(data?.items) ? data.items : []);
     } catch (err) {
       if (err.name !== "AbortError")
@@ -64,6 +64,7 @@ function AppsPage() {
           ts,
           id: s.id,
           score: Math.round(s.risk_score || 0),
+          siteTitle: s.site_title || "",
         });
       }
     }
@@ -104,7 +105,7 @@ function AppsPage() {
             const band = riskBand(a.score);
             return (
               <article key={a.host} className='card'>
-                <h2>{niceName(a.host)}</h2>
+                <h2>{a.siteTitle || niceName(a.host)}</h2>
                 <p>{a.host}</p>
                 <div className='cardfoot'>
                   <span className={band.cls}>

@@ -2,6 +2,7 @@ import { useNavigate } from "react-router-dom";
 import { ArrowUpRight, ShieldCheck } from "lucide-react";
 import { useActiveScans } from "../hooks/useActiveScans.js";
 import { useAuth } from "../context/AuthContext.jsx";
+import Tooltip from "../components/Tooltip.jsx";
 
 function formatRelative(iso) {
   if (!iso) return "-";
@@ -77,9 +78,11 @@ function ActiveScansPage() {
               <span>{Math.round(scan.progress || 0)}%</span>
               <span className='small'>{scan.phase_message || "Scanning"}</span>
               <span className='rowactions'>
-                <button aria-label='Open scan' type='button'>
-                  <ArrowUpRight className='ico' />
-                </button>
+                <Tooltip label='Open scan'>
+                  <button aria-label='Open scan' type='button'>
+                    <ArrowUpRight className='ico' />
+                  </button>
+                </Tooltip>
               </span>
             </article>
           ))}

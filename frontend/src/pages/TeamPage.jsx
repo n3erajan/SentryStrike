@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
-import { Loader2, MailPlus, Trash2, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Loader2, MailPlus, Search, Trash2, Users, X } from "lucide-react";
 import { useAuth } from "../context/AuthContext.jsx";
 import { useToast } from "../components/Toast.jsx";
+import Tooltip from "../components/Tooltip.jsx";
 import { cancelInvite, changeMemberRole, inviteMember, listInvites, listMembers, removeMember } from "../services/workspace.js";
 
 const ROLES = ["admin", "analyst", "developer", "viewer"];
@@ -17,6 +18,7 @@ function TeamPage() {
   const [seatInfo, setSeatInfo] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
   const [showInvite, setShowInvite] = useState(false);
   const [email, setEmail] = useState("");
   const [role, setRole] = useState("developer");
@@ -35,6 +37,11 @@ function TeamPage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
+
+  const rows = useMemo(() => {
+    const q = query.toLowerCase();
+    return members.filter((m) => (m.full_name + " " + m.email).toLowerCase().includes(q));
+  }, [members, query]);
 
   async function submitInvite(e) {
     e.preventDefault(); setBusy("invite");
@@ -62,24 +69,29 @@ function TeamPage() {
     finally { setBusy(""); }
   }
 
+  const seatLabel = `${seatInfo.occupied_seats ?? members.length} of ${seatInfo.member_limit ?? "—"} workspace seats occupied`;
+
   return <div className='view'>
-    <div className='head'><div><h1>Team</h1><p>{seatInfo.occupied_seats ?? members.length} of {seatInfo.member_limit ?? "—"} workspace seats occupied.</p></div>
+    <div className='head'><div><h1>Team</h1><p>{seatLabel}</p></div>
       {admin && <button className='btn primary' onClick={() => setShowInvite(true)} disabled={seatInfo.occupied_seats >= seatInfo.member_limit}><MailPlus className='ico' />Invite member</button>}
     </div>
     {error && <div className='auth-error'>{error}</div>}
-    {loading ? <div className='empty-state'><Loader2 className='ico spin' /> Loading team…</div> : <div className='team-table'>
+    {loading ? <div className='empty-state'><Loader2 className='ico spin' />Loading team…</div> : rows.length === 0 && !query && members.length === 0 ? (
+      <div className='empty-state'><Users size={30} /><h2>No team members</h2><p>Invite teammates to collaborate on security assessments.</p>{admin && <button className='btn primary' onClick={() => setShowInvite(true)}><MailPlus className='ico' />Invite member</button>}</div>
+    ) : <div className='team-table'>
+      <label className='search'><Search className='ico' /><input placeholder='Search members' value={query} onChange={(e) => setQuery(e.target.value)} /></label>
       <div className='team-head'><span>Member</span><span>Role</span><span>Joined</span><span>Status</span><span></span></div>
-      {members.map((m) => { const immutable = !admin || m.role === "owner" || m.id === user?.id; return <div key={m.id} className='team-row'>
+      {rows.length === 0 ? <div className='empty-state'>No members match your search.</div> : rows.map((m) => { const immutable = !admin || m.role === "owner" || m.id === user?.id; return <article key={m.id} className='team-row'>
         <div><b>{m.full_name}{m.id === user?.id ? " (you)" : ""}</b><div className='small'>{m.email}</div></div>
         <span>{immutable ? title(m.role) : <select value={m.role} disabled={busy === m.id} onChange={(e) => updateRole(m, e.target.value)}>{ROLES.map((r) => <option key={r} value={r}>{title(r)}</option>)}</select>}</span>
         <span>{date(m.created_at)}</span><span className={m.is_active ? "low" : "muted-text"}>● {m.is_active ? "Active" : "Inactive"}</span>
-        <span>{!immutable && <button className='icon-btn danger' onClick={() => remove(m)} aria-label={`Remove ${m.email}`}><Trash2 className='ico' /></button>}</span>
-      </div>; })}
+        <span className='rowactions'>{!immutable && <Tooltip label={`Remove ${m.email}`}><button className='icon-btn danger' onClick={() => remove(m)} aria-label={`Remove ${m.email}`}><Trash2 className='ico' /></button></Tooltip>}</span>
+      </article>; })}
     </div>}
 
-    {admin && invites.length > 0 && <div className='panel'><div className='panel-h'>Pending invitations</div><div className='panel-b compact-list'>{invites.map((i) => <div className='invite-row' key={i.id}><div><b>{i.email}</b><div className='small'>{title(i.role)} · expires {date(i.expires_at)}</div></div><span className='status-pill'>{title(i.email_delivery_status)}</span><button className='icon-btn' onClick={() => cancel(i)} disabled={busy === i.id} aria-label='Cancel invitation'><X className='ico' /></button></div>)}</div></div>}
+    {admin && invites.length > 0 && <div className='panel' style={{ marginTop: 20 }}><div className='panel-h'>Pending invitations</div><div className='panel-b compact-list'>{invites.map((i) => <div className='invite-row' key={i.id}><div><b>{i.email}</b><div className='small'>{title(i.role)} · expires {date(i.expires_at)}</div></div><span className='status-pill'>{title(i.email_delivery_status)}</span><Tooltip label='Cancel invitation'><button className='icon-btn' onClick={() => cancel(i)} disabled={busy === i.id} aria-label='Cancel invitation'><X className='ico' /></button></Tooltip></div>)}</div></div>}
 
-    {showInvite && <div className='modal-backdrop' onMouseDown={() => setShowInvite(false)}><div className='modal-card' onMouseDown={(e) => e.stopPropagation()}><button className='modal-close' onClick={() => setShowInvite(false)}><X className='ico' /></button><h2>Invite a teammate</h2><p className='muted-text'>The email address and role are locked into the invitation.</p><form onSubmit={submitInvite}><div className='field'><label>Work email</label><div className='control'><input type='email' required value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></div></div><div className='field'><label>Role</label><div className='control'><select value={role} onChange={(e) => setRole(e.target.value)}>{ROLES.map((r) => <option key={r} value={r}>{title(r)}</option>)}</select></div></div><button className='btn primary' disabled={busy === "invite"}>{busy === "invite" ? "Sending…" : "Send invitation"}</button></form></div></div>}
+    {showInvite && <div className='modal-backdrop' onMouseDown={() => setShowInvite(false)}><div className='modal-card' onMouseDown={(e) => e.stopPropagation()}><Tooltip label='Close'><button className='modal-close' onClick={() => setShowInvite(false)}><X className='ico' /></button></Tooltip><h2>Invite a teammate</h2><p className='muted-text'>The email address and role are locked into the invitation.</p><form onSubmit={submitInvite}><div className='field'><label>Work email</label><div className='control'><input type='email' required value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></div></div><div className='field'><label>Role</label><div className='control'><select value={role} onChange={(e) => setRole(e.target.value)}>{ROLES.map((r) => <option key={r} value={r}>{title(r)}</option>)}</select></div></div><button className='btn primary' disabled={busy === "invite"}>{busy === "invite" ? "Sending…" : "Send invitation"}</button></form></div></div>}
   </div>;
 }
 

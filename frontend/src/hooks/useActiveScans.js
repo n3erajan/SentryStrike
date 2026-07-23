@@ -25,7 +25,7 @@ export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
 
     async function poll() {
       try {
-        const data = await listScans({ limit: 100, signal: controller.signal });
+        const data = await listScans({ limit: 25, signal: controller.signal });
         if (stopped) return;
         const items = Array.isArray(data?.items) ? data.items : [];
         setScans(items.filter((s) => ACTIVE_STATUSES.has(s.status)));

@@ -1,3 +1,5 @@
+from datetime import timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.dependencies import (
@@ -296,6 +298,25 @@ async def cancel_invite(
     return json_response(_invite_response(invite), "invite cancelled")
 
 
+@router.get("")
+async def get_workspace(
+    orgs: OrganizationRepository = Depends(get_organization_repository),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Return the current workspace's metadata and settings."""
+    org = await orgs.get_by_id(current_user.org_id)
+    if org is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+    return json_response({
+        "id": str(org.id),
+        "name": org.name,
+        "member_limit": org.member_limit,
+        "occupied_seats": org.occupied_seats,
+        "retention_days": org.retention_days,
+        "created_at": org.created_at,
+    })
+
+
 @router.get("/audit-log")
 async def list_audit_log(
     skip: int = Query(default=0, ge=0),
@@ -314,7 +335,11 @@ async def list_audit_log(
             "target_type": entry.target_type,
             "target_id": entry.target_id,
             "metadata": entry.metadata,
-            "created_at": entry.created_at,
+            "created_at": (
+                entry.created_at.replace(tzinfo=timezone.utc).isoformat()
+                if entry.created_at and entry.created_at.tzinfo is None
+                else entry.created_at.isoformat() if entry.created_at else None
+            ),
         }
         for entry in entries
     ]

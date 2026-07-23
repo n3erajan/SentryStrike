@@ -7,6 +7,7 @@ import { saveBlob } from "../utils/helpers.js";
 import { useToast } from "../components/Toast.jsx";
 import { severityClass } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
+import Tooltip from "../components/Tooltip.jsx";
 
 function severityBand(level, score) {
   const lvl = (level || "").toString().toLowerCase();
@@ -54,7 +55,7 @@ function ReportsPage() {
     setLoading(true);
     setError("");
     try {
-      const data = await listScans({ limit: 100, signal });
+      const data = await listScans({ limit: 25, signal });
       const items = Array.isArray(data?.items) ? data.items : [];
       setScans(items.filter((s) => s.status === "completed"));
     } catch (err) {
@@ -166,19 +167,20 @@ function ReportsPage() {
               </span>
               <span>{r.count} findings</span>
               <span className='rowactions'>
-                <button
-                  type='button'
-                  aria-label='Download PDF'
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (r.analysisStatus === "completed") handleDownload(r.id);
-                  }}
-                  disabled={busy === r.id}
-                  title={r.analysisStatus !== "completed" ? `AI analysis is ${r.analysisStatus.replaceAll("_", " ")}` : "Download PDF"}
-                  aria-disabled={r.analysisStatus !== "completed"}
-                >
-                  <Download className='ico' />
-                </button>
+                <Tooltip label={r.analysisStatus !== "completed" ? `AI analysis: ${r.analysisStatus.replaceAll("_", " ")}` : "Download PDF"}>
+                  <button
+                    type='button'
+                    aria-label='Download PDF'
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (r.analysisStatus === "completed") handleDownload(r.id);
+                    }}
+                    disabled={busy === r.id}
+                    aria-disabled={r.analysisStatus !== "completed"}
+                  >
+                    <Download className='ico' />
+                  </button>
+                </Tooltip>
               </span>
             </article>
           ))}

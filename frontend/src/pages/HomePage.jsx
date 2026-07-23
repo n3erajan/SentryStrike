@@ -40,7 +40,7 @@ function HomePage() {
   const load = useCallback(async (signal) => {
     setLoading(true);
     try {
-      const data = await listScans({ limit: 100, signal });
+      const data = await listScans({ limit: 25, signal });
       setScans(Array.isArray(data?.items) ? data.items : []);
     } catch {
       /* handled quietly on Home */
@@ -96,7 +96,7 @@ function HomePage() {
         </div>
         <div className='stat'>
           <strong>{loading ? "—" : postureLetter(completed)}</strong>
-          <span>Security posture</span>
+          <span>Workspace Security posture</span>
         </div>
       </div>
 

@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { Outlet, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { Menu, Plus } from "lucide-react";
-import Sidebar, { displayName } from "./Sidebar.jsx";
+import Sidebar from "./Sidebar.jsx";
 import { MOBILE_NAV, ROUTE_NAMES } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
+import { getWorkspace } from "../services/workspace.js";
 import ThemeToggle from "./ThemeToggle.jsx";
 import NotificationsMenu from "./NotificationsMenu.jsx";
+import Tooltip from "./Tooltip.jsx";
 
 function crumbFor(pathname) {
   if (pathname.startsWith("/active/")) return "Active scans / Live scan";
@@ -22,6 +24,11 @@ function AppLayout() {
   const { user } = useAuth();
   const onScanPage = location.pathname === "/scan";
   const [menuOpen, setMenuOpen] = useState(false);
+  const [workspace, setWorkspace] = useState(null);
+
+  useEffect(() => {
+    getWorkspace().then(setWorkspace).catch(() => {});
+  }, []);
 
   // Close the mobile drawer whenever the route changes.
   useEffect(() => {
@@ -43,16 +50,18 @@ function AppLayout() {
       <main className='app-main'>
         <header className='app-top'>
           <div className='crumb'>
-            <button
-              type='button'
-              className='menu-btn'
-              aria-label='Open menu'
-              aria-expanded={menuOpen}
-              onClick={() => setMenuOpen(true)}
-            >
-              <Menu className='ico' />
-            </button>
-            {displayName(user)} / <b>{crumbFor(location.pathname)}</b>
+            <Tooltip label='Open menu'>
+              <button
+                type='button'
+                className='menu-btn'
+                aria-label='Open menu'
+                aria-expanded={menuOpen}
+                onClick={() => setMenuOpen(true)}
+              >
+                <Menu className='ico' />
+              </button>
+            </Tooltip>
+            {workspace?.name || "Workspace"} / <b>{crumbFor(location.pathname)}</b>
           </div>
           <div className='app-actions'>
             <NotificationsMenu />

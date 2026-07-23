@@ -1,13 +1,16 @@
+import { useEffect, useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { X, LogOut } from "lucide-react";
 import { NAV_ITEMS } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import { useActiveScans } from "../hooks/useActiveScans.js";
 import { useBackendHealth } from "../hooks/useBackendHealth.js";
+import { getWorkspace } from "../services/workspace.js";
+import Tooltip from "./Tooltip.jsx";
 
 function displayName(user) {
   if (!user) return "Signed in";
-  if (user.fullName) return user.fullName;
+  if (user.full_name) return user.full_name;
   const email = user.email || "";
   const handle = email.split("@")[0];
   if (!handle) return "Signed in";
@@ -24,6 +27,11 @@ function Sidebar({ open = false, onClose }) {
   const { count } = useActiveScans();
   const { health, loading: healthLoading, error: healthError } =
     useBackendHealth();
+  const [workspace, setWorkspace] = useState(null);
+
+  useEffect(() => {
+    getWorkspace().then(setWorkspace).catch(() => {});
+  }, []);
   const scannerCount = health?.active_scanners;
   const scannerStatusKnown = Number.isInteger(scannerCount) && !healthError;
   const scannersOnline = scannerStatusKnown && scannerCount > 0;
@@ -50,14 +58,16 @@ function Sidebar({ open = false, onClose }) {
           <img src='/shield.png' className='mark-img' alt='' />
           SentryStrike
         </NavLink>
-        <button
-          type='button'
-          className='side-close'
-          onClick={onClose}
-          aria-label='Close menu'
-        >
-          <X className='ico' />
-        </button>
+        <Tooltip label='Close menu'>
+          <button
+            type='button'
+            className='side-close'
+            onClick={onClose}
+            aria-label='Close menu'
+          >
+            <X className='ico' />
+          </button>
+        </Tooltip>
       </div>
       <nav className='app-nav' aria-label='Primary'>
         {NAV_ITEMS.map(({ to, label, Icon, badge, end }) => (
@@ -92,6 +102,7 @@ function Sidebar({ open = false, onClose }) {
       <div className='sidefoot'>
         <span>User</span>
         <b title={user?.email}>{displayName(user)}</b>
+        {workspace?.name && <span className='workspace-name'>{workspace.name}</span>}
 
         <button
           className='text-btn'

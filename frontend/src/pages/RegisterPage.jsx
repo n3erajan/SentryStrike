@@ -5,6 +5,7 @@ import { useAuth } from "../context/AuthContext.jsx";
 import { previewInvite } from "../services/auth.js";
 import AuthBrand from "../components/AuthBrand.jsx";
 import ThemeToggle from "../components/ThemeToggle.jsx";
+import Tooltip from "../components/Tooltip.jsx";
 
 function RegisterPage() {
   const { register } = useAuth();
@@ -75,7 +76,7 @@ function RegisterPage() {
                   <label htmlFor={f.id}>{f.label}</label>
                   <div className={`control${touched[f.key] && !f.valid ? " error" : ""}`}>
                     <input id={f.id} type={passwordField && showPassword ? "text" : f.type} autoComplete={f.autoComplete} value={f.value} onChange={(e) => f.set(e.target.value)} onBlur={() => setTouched((v) => ({ ...v, [f.key]: true }))} disabled={submitting} />
-                    {passwordField && <button type='button' className='pw-toggle' onClick={() => setShowPassword((v) => !v)} aria-label={showPassword ? "Hide password" : "Show password"}>{showPassword ? <EyeOff className='ico' /> : <Eye className='ico' />}</button>}
+                    {passwordField && <Tooltip label={showPassword ? "Hide password" : "Show password"}><button type='button' className='pw-toggle' onClick={() => setShowPassword((v) => !v)} aria-label={showPassword ? "Hide password" : "Show password"}>{showPassword ? <EyeOff className='ico' /> : <Eye className='ico' />}</button></Tooltip>}
                   </div>
                   {touched[f.key] && !f.valid && <span className='field-error'>{f.error}</span>}
                 </div>;

@@ -1,5 +1,6 @@
 import { Moon, Sun } from "lucide-react";
 import { useTheme } from "../context/ThemeContext.jsx";
+import Tooltip from "./Tooltip.jsx";
 
 function ThemeToggle({ className = "" }) {
   const { theme, toggleTheme } = useTheme();
@@ -7,16 +8,17 @@ function ThemeToggle({ className = "" }) {
   const label = dark ? "Switch to light mode" : "Switch to dark mode";
 
   return (
-    <button
-      type='button'
-      className={`theme-toggle${className ? ` ${className}` : ""}`}
-      onClick={toggleTheme}
-      aria-label={label}
-      title={label}
-      aria-pressed={dark}
-    >
-      {dark ? <Sun className='ico' /> : <Moon className='ico' />}
-    </button>
+    <Tooltip label={label}>
+      <button
+        type='button'
+        className={`theme-toggle${className ? ` ${className}` : ""}`}
+        onClick={toggleTheme}
+        aria-label={label}
+        aria-pressed={dark}
+      >
+        {dark ? <Sun className='ico' /> : <Moon className='ico' />}
+      </button>
+    </Tooltip>
   );
 }
 

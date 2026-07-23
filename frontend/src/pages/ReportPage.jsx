@@ -8,7 +8,16 @@ import { useToast } from "../components/Toast.jsx";
 import { useAuth } from "../context/AuthContext.jsx";
 import { getScanDetails } from "../services/scan.js";
 import { listMembers } from "../services/workspace.js";
-import { addFindingComment, assignFinding, listReverifications, retryAnalysis, reverifyFinding, reviewFinding, updateRemediation } from "../services/analysis.js";
+import {
+  addFindingComment,
+  assignFinding,
+  listReverifications,
+  retryAnalysis,
+  reverifyFinding,
+  reviewFinding,
+  updateRemediation,
+} from "../services/analysis.js";
+import ReasonDialog from "../components/ReasonDialog.jsx";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
@@ -102,43 +111,209 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
   const [comment, setComment] = useState("");
   const [busy, setBusy] = useState("");
   const [jobs, setJobs] = useState([]);
+  const [showReason, setShowReason] = useState(false);
 
   useEffect(() => {
     if (!finding.reverification_job_ids?.length) return;
     const controller = new AbortController();
-    listReverifications(scanId, finding.id, controller.signal).then((d) => setJobs(d.items || [])).catch(() => {});
+    listReverifications(scanId, finding.id, controller.signal)
+      .then((d) => setJobs(d.items || []))
+      .catch(() => {});
     return () => controller.abort();
   }, [scanId, finding.id, finding.reverification_job_ids?.length]);
 
   async function mutate(key, action, message) {
     setBusy(key);
-    try { await action(); toast(message); await onChanged(); }
-    catch (err) { toast(err.message || "Could not update the finding."); }
-    finally { setBusy(""); }
+    try {
+      await action();
+      toast(message);
+      await onChanged();
+    } catch (err) {
+      toast(err.message || "Could not update the finding.");
+    } finally {
+      setBusy("");
+    }
   }
   async function submitComment(e) {
-    e.preventDefault(); const body = comment.trim(); if (!body) return;
-    await mutate("comment", () => addFindingComment(scanId, finding.id, body), "Comment added"); setComment("");
+    e.preventDefault();
+    const body = comment.trim();
+    if (!body) return;
+    await mutate(
+      "comment",
+      () => addFindingComment(scanId, finding.id, body),
+      "Comment added",
+    );
+    setComment("");
   }
   function changeDisposition() {
+    setShowReason(true);
+  }
+  function handleReasonConfirm(reason) {
+    setShowReason(false);
     const disposition = finding.is_false_positive ? "active" : "false_positive";
-    const reason = window.prompt(disposition === "active" ? "Why is this finding being restored?" : "Why is this a false positive?");
-    if (!reason?.trim()) return;
-    mutate("review", () => reviewFinding(scanId, finding.id, disposition, reason.trim()), disposition === "active" ? "Finding restored" : "Finding suppressed");
+    mutate(
+      "review",
+      () => reviewFinding(scanId, finding.id, disposition, reason),
+      disposition === "active" ? "Finding restored" : "Finding suppressed",
+    );
   }
 
-  return <div className='collab-panel'>
-    <h4>Remediation workflow</h4>
-    <div className='collab-controls'>
-      <div className='field'><label>Assignee</label><div className='control'><select value={finding.assignee_user_id || ""} disabled={!triager || busy === "assign"} onChange={(e) => mutate("assign", () => assignFinding(scanId, finding.id, e.target.value), "Assignment updated")}><option value=''>Unassigned</option>{members.map((m) => <option key={m.id} value={m.id}>{m.full_name} ({m.email})</option>)}</select></div></div>
-      <div className='field'><label>Status</label><div className='control'><select value={finding.remediation_status || "open"} disabled={!contributor || busy === "status"} onChange={(e) => mutate("status", () => updateRemediation(scanId, finding.id, e.target.value), "Remediation status updated")}><option value='open'>Open</option><option value='in_progress'>In progress</option><option value='fixed_pending_verification'>Fixed, pending verification</option>{triager && <option value='verified_fixed'>Verified fixed</option>}{triager && <option value='wont_fix'>Won’t fix / risk accepted</option>}</select></div></div>
-    </div>
-    {triager && <div className='collab-actions'><button className='btn' onClick={changeDisposition} disabled={busy === "review"}>{finding.is_false_positive ? "Restore active finding" : "Mark false positive"}</button>{finding.verification_target && <button className='btn' disabled={busy === "reverify"} onClick={() => mutate("reverify", () => reverifyFinding(scanId, finding.id), "Re-verification queued")}><RefreshCw className='ico' />Re-verify</button>}</div>}
-    {finding.is_false_positive && <div className='review-note'><b>Suppressed as false positive</b><span>{finding.false_positive_reason}</span></div>}
-    {jobs.length > 0 && <div className='reverification-list'>{jobs.map((j) => <div key={j.id}><b>{titleCase(j.status)}</b><span>{j.outcome ? titleCase(j.outcome) : "Waiting for scanner"}</span><small>{formatDateTime(j.created_at)}</small></div>)}</div>}
-    <div className='comment-thread'>{(finding.comments || []).map((c) => <div className='comment' key={c.id}><div><b>{c.author_email}</b><small>{formatDateTime(c.created_at)}</small></div><p>{c.body}</p></div>)}</div>
-    {contributor && <form className='comment-form' onSubmit={submitComment}><div className='control'><input value={comment} maxLength={5000} onChange={(e) => setComment(e.target.value)} placeholder='Add a remediation comment…' /></div><button className='btn' disabled={!comment.trim() || busy === "comment"}><Send className='ico' />Comment</button></form>}
-  </div>;
+  return (
+    <>
+      <ReasonDialog
+        open={showReason}
+        title={
+          finding.is_false_positive
+            ? "Restore active finding"
+            : "Mark false positive"
+        }
+        label='Reason'
+        placeholder={
+          finding.is_false_positive
+            ? "Why is this finding being restored?"
+            : "Why is this a false positive?"
+        }
+        confirmLabel={
+          finding.is_false_positive ? "Restore finding" : "Suppress finding"
+        }
+        onConfirm={handleReasonConfirm}
+        onCancel={() => setShowReason(false)}
+      />
+      <div className='collab-panel'>
+      <h4>Remediation workflow</h4>
+      <div className='collab-controls'>
+        <div className='field'>
+          <label>Assignee</label>
+          <div className='control'>
+            <select
+              value={finding.assignee_user_id || ""}
+              disabled={!triager || busy === "assign"}
+              onChange={(e) =>
+                mutate(
+                  "assign",
+                  () => assignFinding(scanId, finding.id, e.target.value),
+                  "Assignment updated",
+                )
+              }
+            >
+              <option value=''>Unassigned</option>
+              {members.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.full_name} ({m.email})
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div className='field'>
+          <label>Status</label>
+          <div className='control'>
+            <select
+              value={finding.remediation_status || "open"}
+              disabled={!contributor || busy === "status"}
+              onChange={(e) =>
+                mutate(
+                  "status",
+                  () => updateRemediation(scanId, finding.id, e.target.value),
+                  "Remediation status updated",
+                )
+              }
+            >
+              <option value='open'>Open</option>
+              <option value='in_progress'>In progress</option>
+              <option value='fixed_pending_verification'>
+                Fixed, pending verification
+              </option>
+              {triager && (
+                <option value='verified_fixed'>Verified fixed</option>
+              )}
+              {triager && (
+                <option value='wont_fix'>Won’t fix / risk accepted</option>
+              )}
+            </select>
+          </div>
+        </div>
+      </div>
+      {triager && (
+        <div className='collab-actions'>
+          <button
+            className='btn'
+            onClick={changeDisposition}
+            disabled={busy === "review"}
+          >
+            {finding.is_false_positive
+              ? "Restore active finding"
+              : "Mark false positive"}
+          </button>
+          {finding.verification_target && (
+            <button
+              className='btn'
+              disabled={busy === "reverify"}
+              onClick={() =>
+                mutate(
+                  "reverify",
+                  () => reverifyFinding(scanId, finding.id),
+                  "Re-verification queued",
+                )
+              }
+            >
+              <RefreshCw className='ico' />
+              Re-verify
+            </button>
+          )}
+        </div>
+      )}
+      {finding.is_false_positive && (
+        <div className='review-note'>
+          <b>Suppressed as false positive</b>
+          <span>{finding.false_positive_reason}</span>
+        </div>
+      )}
+      {jobs.length > 0 && (
+        <div className='reverification-list'>
+          {jobs.map((j) => (
+            <div key={j.id}>
+              <b>{titleCase(j.status)}</b>
+              <span>
+                {j.outcome ? titleCase(j.outcome) : "Waiting for scanner"}
+              </span>
+              <small>{formatDateTime(j.created_at)}</small>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className='comment-thread'>
+        {(finding.comments || []).map((c) => (
+          <div className='comment' key={c.id}>
+            <div>
+              <b>{c.author_email}</b>
+              <small>{formatDateTime(c.created_at)}</small>
+            </div>
+            <p>{c.body}</p>
+          </div>
+        ))}
+      </div>
+      {contributor && (
+        <form className='comment-form' onSubmit={submitComment}>
+          <div className='control'>
+            <input
+              value={comment}
+              maxLength={5000}
+              onChange={(e) => setComment(e.target.value)}
+              placeholder='Add a remediation comment…'
+            />
+          </div>
+          <button
+            className='btn'
+            disabled={!comment.trim() || busy === "comment"}
+          >
+            <Send className='ico' />
+            Comment
+          </button>
+        </form>
+      )}
+    </div></>
+  );
 }
 
 function Finding({ v, scanId, user, members, onChanged }) {
@@ -334,9 +509,11 @@ function ReportPage() {
   const [members, setMembers] = useState([]);
 
   const load = useCallback(
-    async (signal) => {
-      setLoading(true);
-      setError("");
+    async (signal, { silent = false } = {}) => {
+      if (!silent) {
+        setLoading(true);
+        setError("");
+      }
       try {
         const [reportData, scanData, memberData] = await Promise.all([
           getReport(scanId, signal),
@@ -346,13 +523,16 @@ function ReportPage() {
         setReport({ ...scanData, ...reportData });
         setMembers(memberData.items || []);
       } catch (err) {
-        if (err.name !== "AbortError")
-          setError(err.message || "Could not load the report.");
+        if (err.name === "AbortError") return;
+        if (silent) toast(err.message || "Could not refresh the report.");
+        else setError(err.message || "Could not load the report.");
       } finally {
-        if (!signal || !signal.aborted) setLoading(false);
+        if (!signal || !signal.aborted) {
+          if (!silent) setLoading(false);
+        }
       }
     },
-    [scanId],
+    [scanId, toast],
   );
 
   useEffect(() => {
@@ -388,7 +568,7 @@ function ReportPage() {
     try {
       await retryAnalysis(scanId);
       toast("Analysis retry queued");
-      await load();
+      await load(undefined, { silent: true });
     } catch (err) {
       toast(err.message || "Could not retry analysis.");
     } finally {
@@ -466,7 +646,6 @@ function ReportPage() {
           <p className='mono' style={{ wordBreak: "break-all" }}>
             {targetUrl}
           </p>
-          <p> {crawlLabel(report.crawl_mode)}</p>
           <p>{formatDateTime(scanTime)} </p>
         </div>
         <div className='app-actions'>
@@ -478,7 +657,11 @@ function ReportPage() {
             className='btn primary'
             onClick={handlePdf}
             disabled={busy === "pdf" || !analysisComplete}
-            title={!analysisComplete ? "PDF is available after AI analysis completes" : undefined}
+            title={
+              !analysisComplete
+                ? "PDF is available after AI analysis completes"
+                : undefined
+            }
           >
             <Download className='ico' />
             {busy === "pdf" ? "Building PDF…" : "PDF"}
@@ -490,10 +673,28 @@ function ReportPage() {
         <div className={`analysis-banner ${analysisStatus}`}>
           <div>
             <b>AI analysis: {titleCase(analysisStatus)}</b>
-            <span>{analysis.message || analysis.error_message || "The deterministic scan report is available while enrichment continues."}</span>
-            {Number.isFinite(analysis.progress) && <small>{analysis.progress}% complete · revision {analysis.revision || 1}</small>}
+            <span>
+              {analysis.message ||
+                analysis.error_message ||
+                "The deterministic scan report is available while enrichment continues."}
+            </span>
+            {Number.isFinite(analysis.progress) && (
+              <small>
+                {analysis.progress}% complete · revision{" "}
+                {analysis.revision || 1}
+              </small>
+            )}
           </div>
-          {canRetryAnalysis && <button className='btn' onClick={handleRetryAnalysis} disabled={busy === "analysis"}><RefreshCw className='ico' />Retry analysis</button>}
+          {canRetryAnalysis && (
+            <button
+              className='btn'
+              onClick={handleRetryAnalysis}
+              disabled={busy === "analysis"}
+            >
+              <RefreshCw className='ico' />
+              Retry analysis
+            </button>
+          )}
         </div>
       )}
 
@@ -671,13 +872,18 @@ function ReportPage() {
         <div className='panel-h'>Detailed findings</div>
         <div className='panel-b'>
           {filtered.length === 0 ? (
-            <p className='muted-text'>
-              No findings for this severity.
-            </p>
+            <p className='muted-text'>No findings for this severity.</p>
           ) : (
             <div className='findings'>
               {filtered.map((v) => (
-                <Finding key={v.id} v={v} scanId={scanId} user={user} members={members} onChanged={load} />
+                <Finding
+                  key={v.id}
+                  v={v}
+                  scanId={scanId}
+                  user={user}
+                  members={members}
+                  onChanged={() => load(undefined, { silent: true })}
+                />
               ))}
             </div>
           )}

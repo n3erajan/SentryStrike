@@ -16,4 +16,5 @@ export const setDefaultConfig = (config) =>
 export const getRetention = (signal) => apiRequest("/workspace/retention", { signal });
 export const setRetention = (retentionDays) =>
   apiRequest("/workspace/retention", { method: "PUT", body: { retention_days: retentionDays } });
+export const getWorkspace = (signal) => apiRequest("/workspace", { signal });
 export const listAuditLog = (signal) => apiRequest("/workspace/audit-log?limit=100", { signal });

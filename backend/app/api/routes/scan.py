@@ -61,6 +61,7 @@ def _scan_summary(scan) -> dict:
         "total_urls_crawled": scan.statistics.total_urls_crawled,
         "started_at": scan.started_at,
         "completed_at": scan.completed_at,
+        "site_title": scan.site_title or "",
         "created_at": scan.created_at,
         "updated_at": scan.updated_at,
     }
