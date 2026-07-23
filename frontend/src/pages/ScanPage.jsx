@@ -70,7 +70,9 @@ function ConfigField({ field, value, onChange, disabled }) {
         {field.type === "select" ? (
           <select {...commonProps}>
             <option value=''>
-              {field.defaultLabel ? `Default: ${field.defaultLabel}` : "Default"}
+              {field.defaultLabel
+                ? `Default: ${field.defaultLabel}`
+                : "Default"}
             </option>
             {field.options.map(([v, l]) => (
               <option key={v} value={v}>
@@ -227,8 +229,16 @@ function ScanPage() {
   if (user?.role === "viewer") {
     return (
       <div className='view'>
-        <div className='head'><div><h1>New Scan</h1><p>Your viewer role has read-only workspace access.</p></div></div>
-        <div className='empty-state'>Ask a workspace owner or admin to change your role before launching assessments.</div>
+        <div className='head'>
+          <div>
+            <h1>New Scan</h1>
+            <p>Your viewer role has read-only workspace access.</p>
+          </div>
+        </div>
+        <div className='empty-state'>
+          Ask a workspace owner or admin to change your role before launching
+          assessments.
+        </div>
       </div>
     );
   }
@@ -354,9 +364,9 @@ function ScanPage() {
             aria-expanded={usersOpen}
             aria-controls='test-users-panel'
           >
-            Test users
+            Test users <span className='muted-text'>(optional)</span>
             <span className='advanced-toggle-hint'>
-              Optional accounts for authenticated and access-control testing
+              Accounts for authenticated and access-control testing
             </span>
             <ChevronDown className='ico chev' />
           </button>
@@ -403,7 +413,8 @@ function ScanPage() {
             onClick={() => setAdvancedOpen((v) => !v)}
             aria-expanded={advancedOpen}
           >
-            Advanced configuration
+            Advanced configuration{" "}
+            <span className='muted-text'>(optional)</span>
             <span className='advanced-toggle-hint'>
               Crawler, scanner, injection, and browser tuning
             </span>
@@ -479,7 +490,11 @@ function ScanPage() {
             onClick={handleStart}
             disabled={!canStart || !configValid}
           >
-            {defaultsLoading ? "Loading defaults…" : submitting ? "Starting…" : "Start assessment"}
+            {defaultsLoading
+              ? "Loading defaults…"
+              : submitting
+                ? "Starting…"
+                : "Start assessment"}
           </button>
         </aside>
       </div>

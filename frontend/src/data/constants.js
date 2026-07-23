@@ -22,7 +22,6 @@ const MOBILE_NAV = [
   { to: "/home", label: "Home", Icon: Home },
   { to: "/apps", label: "Apps", Icon: Boxes },
   { to: "/scan", label: "Assess", Icon: ShieldPlus },
-  { to: "/active", label: "Active scans", Icon: Activity, badge: "active" },
   { to: "/reports", label: "Reports", Icon: FileBarChart },
   { to: "/settings", label: "Settings", Icon: Settings },
 ];
