@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.dependencies import (
+    get_analysis_job_repository,
     get_audit_repository,
     get_current_user,
     get_notification_repository,
@@ -8,6 +9,7 @@ from app.api.dependencies import (
     json_response,
     require_role,
 )
+from shared.database.repositories.analysis_job_repository import AnalysisJobRepository
 from shared.database.repositories.audit_repository import AuditRepository
 from shared.database.repositories.scan_repository import ScanRepository
 from shared.database.repositories.notification_repository import NotificationRepository
@@ -63,6 +65,7 @@ async def _reconcile_and_notify(
     scan,
     repo: ScanRepository,
     notifications: NotificationRepository,
+    analysis_repo: AnalysisJobRepository | None = None,
 ):
     previous_status = scan.status
     scan = await repo.reconcile_if_orphaned(scan, scan_queue)
@@ -78,6 +81,9 @@ async def _reconcile_and_notify(
             metadata={"status": ScanStatus.failed.value, "target_url": scan.target_url},
             dedupe_key=f"scan-terminal:{scan.org_id}:{scan.id}:failed",
         )
+    if analysis_repo is None:
+        analysis_repo = AnalysisJobRepository()
+    scan = await repo.reconcile_analysis_if_orphaned(scan, analysis_repo)
     return scan
 
 
@@ -95,6 +101,19 @@ async def create_scan(
     atomically when a worker claims the job. MongoDB persists only role names.
     """
     auth_accounts = scan_auth_accounts_from_credentials(payload.credentials)
+    active = await repo.find_active_by_target(
+        org_id=current_user.org_id,
+        target_url=str(payload.target_url),
+    )
+    if active:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A scan for this target is already {active.status.value} "
+                f"(scan {active.id}). "
+                "Wait for it to complete or cancel it first."
+            ),
+        )
     scan = await repo.create(
         str(payload.target_url),
         org_id=current_user.org_id,
@@ -171,6 +190,7 @@ async def list_scans(
     limit: int = Query(default=20, ge=1, le=100),
     repo: ScanRepository = Depends(get_scan_repository),
     notifications: NotificationRepository = Depends(get_notification_repository),
+    analysis_repo: AnalysisJobRepository = Depends(get_analysis_job_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
     """Return a paginated list of scans for the caller's organization.
@@ -183,7 +203,9 @@ async def list_scans(
     # the list never shows a permanently "running" zombie. Best-effort: a Redis
     # outage leaves the scan untouched rather than falsely failing it.
     if scan_queue is not None:
-        scans = [await _reconcile_and_notify(scan, repo, notifications) for scan in scans]
+        scans = [await _reconcile_and_notify(scan, repo, notifications, analysis_repo) for scan in scans]
+    else:
+        scans = [await repo.reconcile_analysis_if_orphaned(scan, analysis_repo) for scan in scans]
     payload = [_scan_summary(scan) for scan in scans]
     return json_response({"items": payload, "total": len(payload)})
 
@@ -193,13 +215,14 @@ async def get_scan_details(
     scan_id: str,
     repo: ScanRepository = Depends(get_scan_repository),
     notifications: NotificationRepository = Depends(get_notification_repository),
+    analysis_repo: AnalysisJobRepository = Depends(get_analysis_job_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
     """Return full scan details including all vulnerabilities and metadata."""
     scan = await repo.get_in_org(scan_id, current_user.org_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
-    scan = await _reconcile_and_notify(scan, repo, notifications)
+    scan = await _reconcile_and_notify(scan, repo, notifications, analysis_repo)
     data = scan.model_dump()
     data["id"] = str(scan.id)
     # Defensive: credentials are never persisted, but strip any legacy field.
@@ -212,13 +235,14 @@ async def get_scan_status(
     scan_id: str,
     repo: ScanRepository = Depends(get_scan_repository),
     notifications: NotificationRepository = Depends(get_notification_repository),
+    analysis_repo: AnalysisJobRepository = Depends(get_analysis_job_repository),
     current_user: User = Depends(get_current_user),
 
 ) -> dict:
     scan = await repo.get_in_org(scan_id, current_user.org_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
-    scan = await _reconcile_and_notify(scan, repo, notifications)
+    scan = await _reconcile_and_notify(scan, repo, notifications, analysis_repo)
     return json_response({
         "id": str(scan.id),
         "status": scan.status,
@@ -238,6 +262,7 @@ async def cancel_scan(
     scan_id: str,
     repo: ScanRepository = Depends(get_scan_repository),
     notifications: NotificationRepository = Depends(get_notification_repository),
+    analysis_repo: AnalysisJobRepository = Depends(get_analysis_job_repository),
     audit: AuditRepository = Depends(get_audit_repository),
     current_user: User = Depends(require_role(*SCAN_ACTOR_ROLES)),
 ) -> dict:
@@ -252,7 +277,7 @@ async def cancel_scan(
     # A scan whose worker died is not really running: cancelling it should
     # resolve the UI immediately rather than set a cancel key nobody reads.
     if scan_queue is not None:
-        scan = await _reconcile_and_notify(scan, repo, notifications)
+        scan = await _reconcile_and_notify(scan, repo, notifications, analysis_repo)
     if scan.status in {ScanStatus.completed, ScanStatus.failed, ScanStatus.cancelled}:
         return json_response({"cancelled": False})
     if scan_queue is None:

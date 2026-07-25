@@ -61,7 +61,7 @@ async def test_reverification_job_runs_focused_executor_and_notifies_requester(
     verification = SimpleNamespace(
         id="reverify-1",
         status=ReverificationStatus.queued,
-        target=SimpleNamespace(url="https://target.example"),
+        target=SimpleNamespace(url="https://target.example", vuln_type=None),
         org_id="org-1",
         requested_by_user_id="user-analyst",
         scan_id="scan-1",
@@ -71,9 +71,10 @@ async def test_reverification_job_runs_focused_executor_and_notifies_requester(
     repository = AsyncMock()
     repository.get_by_id.return_value = verification
 
-    async def run_focused(target, accounts):
+    async def run_focused(target, accounts, *, vuln_type=None, category=None):
         assert target is verification.target
         assert accounts == []
+        assert vuln_type is None
         return ReverificationOutcome.not_reproduced, [
             ReverificationEvidence(
                 request_url=target.url,

@@ -31,6 +31,7 @@ from shared.models.vulnerability import FindingComment, RemediationStatus, Vulne
 from shared.analysis_queue import AnalysisQueue, AnalysisQueueError, AnalysisSignal
 from shared.scan_queue import ScanJob, ScanJobKind, ScanQueueError
 from shared.schemas.scan_schema import scan_auth_accounts_from_credentials
+from shared.reverification import CannotReverify, assert_reverify_allowed
 from app.api.routes import scan as scan_routes
 from app.schemas.finding_schema import (
     AssignFindingRequest,
@@ -494,6 +495,16 @@ async def create_finding_reverification(
             detail="This finding does not contain a replayable verification target.",
         )
     auth_accounts = scan_auth_accounts_from_credentials(payload.credentials)
+    try:
+        assert_reverify_allowed(
+            vulnerability,
+            auth_roles=[account.role for account in auth_accounts],
+        )
+    except CannotReverify as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.reason,
+        ) from exc
     job = await reverifications.create(
         org_id=current_user.org_id,
         scan_id=scan_id,

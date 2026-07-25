@@ -425,13 +425,102 @@ async def process_analysis_job(
             pass
 
 
+async def recover_expired_analysis_jobs(
+    job_repository: AnalysisJobRepository,
+    scan_repository: ScanRepository,
+) -> int:
+    """Find all running analysis jobs with expired leases and recover or fail them.
+
+    Called during worker startup. If a job has retries left (attempt < max_attempts),
+    resets it to ``queued`` so ``claim_next`` can pick it up. If retries are exhausted,
+    marks it terminally ``failed``. Reconciles the scan projection for each.
+    """
+    now = datetime.now(timezone.utc)
+    expired_jobs = await AnalysisJob.find(
+        {
+            "status": AnalysisStatus.running.value,
+            "lease_expires_at": {"$lt": now},
+        }
+    ).to_list()
+
+    recovered_count = 0
+    for job in expired_jobs:
+        try:
+            if job.attempt < job.max_attempts:
+                await AnalysisJob.get_motor_collection().update_one(
+                    {
+                        "_id": job.id,
+                        "status": AnalysisStatus.running.value,
+                    },
+                    {
+                        "$set": {
+                            "status": AnalysisStatus.queued.value,
+                            "lease_owner": None,
+                            "lease_expires_at": None,
+                            "next_attempt_at": None,
+                            "message": "Analysis queued (recovered from worker crash)",
+                            "updated_at": now,
+                        }
+                    },
+                )
+                await scan_repository.update_analysis_projection(
+                    scan_id=job.scan_id,
+                    org_id=job.org_id,
+                    current_job_id=str(job.id),
+                    expected_revision=job.revision,
+                    status=AnalysisStatus.queued,
+                    progress=job.progress,
+                    message="Analysis queued",
+                    clear_lease_owner=True,
+                )
+                logger.info(
+                    "recovered expired running analysis job %s (attempt %s/%s)",
+                    job.id,
+                    job.attempt,
+                    job.max_attempts,
+                )
+            else:
+                await job_repository.fail(
+                    job_id=str(job.id),
+                    worker_id=job.lease_owner or "expired-lease",
+                    error_code="analyzer_worker_crashed",
+                    error_message=(
+                        "Analyzer worker crashed or stopped unexpectedly; max retries exceeded."
+                    ),
+                )
+                await scan_repository.update_analysis_projection(
+                    scan_id=job.scan_id,
+                    org_id=job.org_id,
+                    current_job_id=str(job.id),
+                    expected_revision=job.revision,
+                    status=AnalysisStatus.failed,
+                    progress=job.progress,
+                    message="Analysis failed",
+                    error_code="analyzer_worker_crashed",
+                    error_message=(
+                        "Analyzer worker crashed or stopped unexpectedly; max retries exceeded."
+                    ),
+                    clear_lease_owner=True,
+                )
+                logger.warning(
+                    "terminally failed expired analysis job %s with exhausted retries",
+                    job.id,
+                )
+            recovered_count += 1
+        except Exception:
+            logger.exception("failed to recover expired analysis job %s", job.id)
+
+    return recovered_count
+
+
 async def run_worker() -> None:
     settings = get_settings()
     configure_logging(log_level=settings.log_level)
     await init_db(settings)
-    queue = RedisAnalysisQueue.from_settings(settings)
     job_repository = AnalysisJobRepository()
     scan_repository = ScanRepository()
+    await recover_expired_analysis_jobs(job_repository, scan_repository)
+    queue = RedisAnalysisQueue.from_settings(settings)
     member_repository = MemberRepository()
     notification_repository = NotificationRepository()
     client = AIClient()

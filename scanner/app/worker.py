@@ -258,7 +258,9 @@ async def process_reverification_job(
     await repository.mark_running(verification)
     try:
         outcome, evidence = await run_focused_reverification(
-            verification.target, job.auth_accounts
+            verification.target,
+            job.auth_accounts,
+            vuln_type=verification.target.vuln_type,
         )
         await repository.complete(verification, outcome=outcome, evidence=evidence)
         message = (

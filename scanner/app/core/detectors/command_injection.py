@@ -65,7 +65,14 @@ class CommandInjectionDetector(BaseDetector):
                         target=cand,
                     )
                     if result.is_vulnerable:
-                        return result.findings
+                        from app.reverification_strategies.common import (
+                            attach_attack_target_metadata,
+                        )
+
+                        return [
+                            attach_attack_target_metadata(finding, cand)
+                            for finding in result.findings
+                        ]
                 except Exception as e:
                     logger.error(
                         "Command injection verification failed for %s param %s: %s",

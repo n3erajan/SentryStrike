@@ -222,6 +222,9 @@ class FakeScanRepository:
             error_message="Scan worker stopped unexpectedly; no active worker is processing this scan.",
         )
 
+    async def reconcile_analysis_if_orphaned(self, scan: FakeScan, analysis_repo) -> FakeScan:
+        return scan
+
 
 def _client(
     repo: FakeScanRepository,

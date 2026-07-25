@@ -22,7 +22,6 @@ from shared.models.notification import NotificationType
 from shared.models.user import User, UserRole
 from app.schemas.workspace_schema import (
     ChangeRoleRequest,
-    DefaultConfigRequest,
     InviteMemberRequest,
     InviteResponse,
     MemberResponse,
@@ -322,40 +321,8 @@ async def list_audit_log(
 
 
 # --------------------------------------------------------------------------- #
-# Settings — default scan config & retention
+# Settings — retention
 # --------------------------------------------------------------------------- #
-
-
-@router.get("/default-config")
-async def get_default_config(
-    orgs: OrganizationRepository = Depends(get_organization_repository),
-    current_user: User = Depends(get_current_user),
-) -> dict:
-    """Return the workspace's stored default scan config blob. Any member may read.
-
-    The frontend fetches this to pre-fill the create-scan form; there is no
-    server-side merge — the submitter sends a fully resolved config.
-    """
-    org = await orgs.get_by_id(current_user.org_id)
-    if org is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-    return json_response({"config": org.default_scan_config})
-
-
-@router.put("/default-config")
-async def set_default_config(
-    payload: DefaultConfigRequest,
-    orgs: OrganizationRepository = Depends(get_organization_repository),
-    current_user: User = Depends(require_role(*WORKSPACE_ADMIN_ROLES)),
-) -> dict:
-    """Replace the workspace's default scan config blob. Owner/admin only."""
-    org = await orgs.get_by_id(current_user.org_id)
-    if org is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-    org = await orgs.set_default_scan_config(
-        org, payload.config.model_dump(mode="json", exclude_none=True)
-    )
-    return json_response({"config": org.default_scan_config}, "default config updated")
 
 
 @router.get("/retention")

@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum
+from urllib.parse import urlsplit, urlunsplit
+
+from typing import TYPE_CHECKING
 
 from beanie import PydanticObjectId
+
+if TYPE_CHECKING:
+    from shared.database.repositories.analysis_job_repository import AnalysisJobRepository
 
 from shared.models.analysis_job import AnalysisStatus
 from shared.models.scan import (
@@ -14,6 +21,18 @@ from shared.models.scan import (
     ScanStatus,
 )
 from shared.models.vulnerability import AiAnalysis
+
+
+def _normalize_target_url(url: str) -> str:
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    if netloc.endswith(":80") and scheme == "http":
+        netloc = netloc[:-3]
+    elif netloc.endswith(":443") and scheme == "https":
+        netloc = netloc[:-4]
+    path = "" if parsed.path == "/" else parsed.path
+    return urlunsplit((scheme, netloc, path, parsed.query, parsed.fragment))
 
 
 class ScanRepository:
@@ -37,8 +56,9 @@ class ScanRepository:
         auth_roles_provided: list[ScanAuthRole] | None = None,
     ) -> Scan:
         now = datetime.now(timezone.utc)
+        normalized_url = _normalize_target_url(target_url)
         scan = Scan(
-            target_url=target_url,
+            target_url=normalized_url,
             org_id=org_id,
             submitted_by_user_id=submitted_by_user_id,
             submitted_by_full_name=submitted_by_full_name,
@@ -80,6 +100,24 @@ class ScanRepository:
         repository operation.
         """
         return await Scan.find(Scan.org_id == org_id).sort(-Scan.created_at).skip(skip).limit(limit).to_list()
+
+    async def list_by_target_url(self, org_id: str, target_url: str, skip: int = 0, limit: int = 20) -> list[Scan]:
+        """List scans for a specific target URL in an organization, newest first."""
+        return (
+            await Scan.find(Scan.org_id == org_id, Scan.target_url == target_url)
+            .sort(-Scan.created_at)
+            .skip(skip)
+            .limit(limit)
+            .to_list()
+        )
+
+    async def find_active_by_target(self, org_id: str, target_url: str) -> Scan | None:
+        normalized = _normalize_target_url(target_url)
+        return await Scan.find_one(
+            Scan.org_id == org_id,
+            Scan.target_url == normalized,
+            Scan.status.in_([ScanStatus.queued, ScanStatus.running]),
+        )
 
     async def list_expired(self, org_id: str, cutoff: datetime) -> list[Scan]:
         """List an org's scans created strictly before ``cutoff`` (retention purge).
@@ -427,3 +465,72 @@ class ScanRepository:
                 "processing this scan."
             ),
         )
+
+    async def reconcile_analysis_if_orphaned(
+        self,
+        scan: Scan,
+        analysis_repo: AnalysisJobRepository,
+    ) -> Scan:
+        """Fail or sync scan analysis state if analyzer worker died or job finished.
+
+        Checks embedded ``ScanAnalysisState``. If status is ``running``:
+        1. Loads the current ``AnalysisJob`` by ``current_job_id``.
+        2. If the job's MongoDB lease (``lease_expires_at``) is expired, transitions
+           the scan projection to ``failed``.
+        3. If the job is already in a terminal state (completed/failed), syncs
+           the scan projection to match.
+        """
+        analysis_state = getattr(scan, "analysis", None)
+        if not analysis_state or analysis_state.status != AnalysisStatus.running:
+            return scan
+
+        job_id = analysis_state.current_job_id
+        if not job_id:
+            return scan
+
+        job = await analysis_repo.get_by_id(job_id)
+        if job is None:
+            return scan
+
+        now = datetime.now(timezone.utc)
+        job_status = job.status.value if isinstance(job.status, Enum) else job.status
+        if job_status == AnalysisStatus.running.value:
+            lease_expires_at = job.lease_expires_at
+            if lease_expires_at is not None:
+                if lease_expires_at.tzinfo is None:
+                    lease_expires_at = lease_expires_at.replace(tzinfo=timezone.utc)
+                if lease_expires_at < now:
+                    updated = await self.update_analysis_projection(
+                        scan_id=str(scan.id),
+                        org_id=scan.org_id,
+                        current_job_id=str(job.id),
+                        expected_revision=job.revision,
+                        status=AnalysisStatus.failed,
+                        progress=analysis_state.progress,
+                        message="Analyzer worker stopped unexpectedly",
+                        error_code="analyzer_worker_stopped",
+                        error_message="Analyzer worker stopped unexpectedly; lease expired.",
+                        clear_lease_owner=True,
+                    )
+                    if updated:
+                        refetched = await Scan.get(scan.id)
+                        return refetched or scan
+        elif job_status in (AnalysisStatus.completed.value, AnalysisStatus.failed.value):
+            target_status = AnalysisStatus(job_status)
+            updated = await self.update_analysis_projection(
+                scan_id=str(scan.id),
+                org_id=scan.org_id,
+                current_job_id=str(job.id),
+                expected_revision=job.revision,
+                status=target_status,
+                progress=job.progress,
+                message=job.message or ("Analysis completed" if target_status == AnalysisStatus.completed else "Analysis failed"),
+                error_code=job.error_code,
+                error_message=job.error_message,
+                clear_lease_owner=True,
+            )
+            if updated:
+                refetched = await Scan.get(scan.id)
+                return refetched or scan
+
+        return scan

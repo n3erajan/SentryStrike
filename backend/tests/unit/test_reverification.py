@@ -194,6 +194,60 @@ def test_triager_queues_focused_reverification_without_persisting_credentials() 
     assert scans.scan.saved is True
 
 
+def test_supply_chain_finding_is_rejected_before_queue() -> None:
+    client, scans, reverifications, queue = _client()
+    scans.scan.vulnerabilities[0] = Vulnerability(
+        id="vuln-1",
+        category=OwaspCategory.a03,
+        vuln_type="Vulnerable Component: jquery",
+        severity=SeverityLevel.high,
+        location=LocationInfo(url="https://target.example/"),
+        verification_target=VerificationTarget(
+            detector_id="supply_chain",
+            url="https://target.example/",
+            vuln_type="Vulnerable Component: jquery",
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/analysis/scans/scan-1/vulnerabilities/vuln-1/reverify",
+        json={},
+    )
+
+    assert response.status_code == 409
+    assert "full rescan" in response.json()["detail"].lower() or "fingerprint" in response.json()[
+        "detail"
+    ].lower()
+    assert queue.jobs == []
+    assert reverifications.created is None
+
+
+def test_idor_without_secondary_identity_is_rejected() -> None:
+    client, scans, _, queue = _client()
+    scans.scan.vulnerabilities[0] = Vulnerability(
+        id="vuln-1",
+        category=OwaspCategory.a01,
+        vuln_type="IDOR",
+        severity=SeverityLevel.high,
+        location=LocationInfo(url="https://target.example/api/items/2"),
+        verification_target=VerificationTarget(
+            detector_id="access_control",
+            url="https://target.example/api/items/2",
+            vuln_type="IDOR",
+            auth_context=AuthContext.authenticated,
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/analysis/scans/scan-1/vulnerabilities/vuln-1/reverify",
+        json={"credentials": {"main": {"cookie": "session=a"}}},
+    )
+
+    assert response.status_code == 409
+    assert "secondary" in response.json()["detail"].lower()
+    assert queue.jobs == []
+
+
 def test_reverification_history_is_readable_but_viewers_cannot_launch_jobs() -> None:
     client, _, reverifications, _ = _client()
     target = VerificationTarget(

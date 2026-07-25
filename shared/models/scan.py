@@ -252,6 +252,7 @@ class Scan(Document):
             [("org_id", 1), ("created_at", -1)],
             [("submitted_by_user_id", 1), ("created_at", -1)],
             [("created_at", -1)],
+            [("org_id", 1), ("target_url", 1), ("status", 1)],
         ]
 
     async def touch(self) -> None:

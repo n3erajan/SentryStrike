@@ -205,6 +205,7 @@ class FindingProcessingMixin:
                     str(control_payload) if control_payload is not None else None
                 ),
                 proof_type=getattr(finding, "detection_method", None),
+                vuln_type=finding.vuln_type,
                 auth_context=auth_context,
                 expected_response_snippet=(response_snippet or "")[:1000] or None,
                 expected_status_code=(

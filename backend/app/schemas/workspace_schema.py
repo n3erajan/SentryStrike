@@ -4,7 +4,6 @@ import re
 from pydantic import BaseModel, Field, field_validator
 
 from shared.models.user import UserRole
-from shared.schemas.scan_schema import ScanConfig
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -49,12 +48,6 @@ class ChangeRoleRequest(BaseModel):
         if value not in ASSIGNABLE_ROLES:
             raise ValueError("Role cannot be assigned. Ownership is fixed at onboarding.")
         return value
-
-
-class DefaultConfigRequest(BaseModel):
-    """Payload for replacing the workspace's stored default scan config blob."""
-
-    config: ScanConfig = Field(default_factory=ScanConfig)
 
 
 class RetentionRequest(BaseModel):

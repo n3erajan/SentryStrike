@@ -26,11 +26,6 @@ class Organization(Document):
     # Scan data older than this is eligible for the retention purge. Enforced to
     # never drop below ``MIN_RETENTION_DAYS`` on write for compliance.
     retention_days: int = 90
-    # A stored, ScanConfig-shaped convenience blob. The frontend fetches it to
-    # pre-fill the create-scan form; the submitter sends a fully resolved config.
-    # There is intentionally no server-side merge or fallback here — the
-    # scanner's built-in ScanConfig defaults remain the safety net.
-    default_scan_config: dict = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
