@@ -28,7 +28,9 @@ function AppLayout() {
   const [workspace, setWorkspace] = useState(null);
 
   useEffect(() => {
-    getWorkspace().then(setWorkspace).catch(() => {});
+    getWorkspace()
+      .then(setWorkspace)
+      .catch(() => {});
   }, []);
 
   // Close the mobile drawer whenever the route changes.
@@ -62,7 +64,11 @@ function AppLayout() {
                 <Menu className='ico' />
               </button>
             </Tooltip>
-            {workspace?.name || "Workspace"} / <b>{crumbFor(location.pathname)}</b>
+            <span className='workspace-label'>
+              {workspace?.name || "Workspace"} |
+            </span>
+            {""}
+            <b>{crumbFor(location.pathname)}</b>
           </div>
           <div className='app-actions'>
             <NotificationsMenu />

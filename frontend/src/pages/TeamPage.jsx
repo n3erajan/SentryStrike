@@ -3,6 +3,7 @@ import { Loader2, MailPlus, Search, Trash2, Users, X } from "lucide-react";
 import { useAuth } from "../context/AuthContext.jsx";
 import { useToast } from "../components/Toast.jsx";
 import Tooltip from "../components/Tooltip.jsx";
+import Select from "../components/Select.jsx";
 import { cancelInvite, changeMemberRole, inviteMember, listInvites, listMembers, removeMember } from "../services/workspace.js";
 
 const ROLES = ["admin", "analyst", "developer", "viewer"];
@@ -83,7 +84,7 @@ function TeamPage() {
       <div className='team-head'><span>Member</span><span>Role</span><span>Joined</span><span>Status</span><span></span></div>
       {rows.length === 0 ? <div className='empty-state'>No members match your search.</div> : rows.map((m) => { const immutable = !admin || m.role === "owner" || m.id === user?.id; return <article key={m.id} className='team-row'>
         <div><b>{m.full_name}{m.id === user?.id ? " (you)" : ""}</b><div className='small'>{m.email}</div></div>
-        <span>{immutable ? title(m.role) : <select value={m.role} disabled={busy === m.id} onChange={(e) => updateRole(m, e.target.value)}>{ROLES.map((r) => <option key={r} value={r}>{title(r)}</option>)}</select>}</span>
+        <span>{immutable ? title(m.role) : <Select value={m.role} onChange={(v) => updateRole(m, v)} disabled={busy === m.id} options={ROLES.map((r) => ({value: r, label: title(r)}))} />}</span>
         <span>{date(m.created_at)}</span><span className={m.is_active ? "low" : "muted-text"}>● {m.is_active ? "Active" : "Inactive"}</span>
         <span className='rowactions'>{!immutable && <Tooltip label={`Remove ${m.email}`}><button className='icon-btn danger' onClick={() => remove(m)} aria-label={`Remove ${m.email}`}><Trash2 className='ico' /></button></Tooltip>}</span>
       </article>; })}
@@ -91,7 +92,7 @@ function TeamPage() {
 
     {admin && invites.length > 0 && <div className='panel' style={{ marginTop: 20 }}><div className='panel-h'>Pending invitations</div><div className='panel-b compact-list'>{invites.map((i) => <div className='invite-row' key={i.id}><div><b>{i.email}</b><div className='small'>{title(i.role)} · expires {date(i.expires_at)}</div></div><span className='status-pill'>{title(i.email_delivery_status)}</span><Tooltip label='Cancel invitation'><button className='icon-btn' onClick={() => cancel(i)} disabled={busy === i.id} aria-label='Cancel invitation'><X className='ico' /></button></Tooltip></div>)}</div></div>}
 
-    {showInvite && <div className='modal-backdrop' onMouseDown={() => setShowInvite(false)}><div className='modal-card' onMouseDown={(e) => e.stopPropagation()}><Tooltip label='Close'><button className='modal-close' onClick={() => setShowInvite(false)}><X className='ico' /></button></Tooltip><h2>Invite a teammate</h2><p className='muted-text'>The email address and role are locked into the invitation.</p><form onSubmit={submitInvite}><div className='field'><label>Work email</label><div className='control'><input type='email' required value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></div></div><div className='field'><label>Role</label><div className='control'><select value={role} onChange={(e) => setRole(e.target.value)}>{ROLES.map((r) => <option key={r} value={r}>{title(r)}</option>)}</select></div></div><button className='btn primary' disabled={busy === "invite"}>{busy === "invite" ? "Sending…" : "Send invitation"}</button></form></div></div>}
+    {showInvite && <div className='modal-backdrop' onMouseDown={() => setShowInvite(false)}><div className='modal-card' onMouseDown={(e) => e.stopPropagation()}><Tooltip label='Close'><button className='modal-close' onClick={() => setShowInvite(false)}><X className='ico' /></button></Tooltip><h2>Invite a teammate</h2><p className='muted-text'>The email address and role are locked into the invitation.</p><form onSubmit={submitInvite}><div className='field'><label>Work email</label><div className='control'><input type='email' required value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></div></div><div className='field'><label>Role</label><div className='control'><Select value={role} onChange={setRole} options={ROLES.map((r) => ({value: r, label: title(r)}))} /></div></div><button className='btn primary' disabled={busy === "invite"}>{busy === "invite" ? "Sending…" : "Send invitation"}</button></form></div></div>}
   </div>;
 }
 

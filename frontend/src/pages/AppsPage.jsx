@@ -61,14 +61,24 @@ function ApplicationDialog({ app, onSave, onClose }) {
     <div className='modal-backdrop' onMouseDown={onClose}>
       <div
         className='modal-card modal-wide'
+        role='dialog'
+        aria-modal='true'
+        aria-labelledby='application-dialog-title'
         onMouseDown={(e) => e.stopPropagation()}
       >
         <Tooltip label='Close'>
-          <button className='modal-close' onClick={onClose}>
+          <button
+            type='button'
+            className='modal-close'
+            aria-label='Close application dialog'
+            onClick={onClose}
+          >
             <X className='ico' />
           </button>
         </Tooltip>
-        <h2>{app ? "Edit application" : "Add a web application"}</h2>
+        <h2 id='application-dialog-title'>
+          {app ? "Edit application" : "Add a web application"}
+        </h2>
         <p className='muted-text'>
           Applications group repeated assessments of the same target and hold
           the scan defaults used to prefill each new scan.
@@ -270,10 +280,11 @@ function AppsPage() {
                     <Tooltip label={`Start a scan of ${a.name}`}>
                       <button
                         type='button'
+                        className='scan-action'
                         aria-label={`Start a scan of ${a.name}`}
                         onClick={() => navigate(`/scan?app=${a.id}`)}
                       >
-                        <Plus className='ico' />
+                        Scan
                       </button>
                     </Tooltip>
                     <Tooltip label={`Edit ${a.name}`}>

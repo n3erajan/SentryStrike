@@ -35,6 +35,8 @@ function configValid(groups, config) {
   );
 }
 
+import Select from "./Select.jsx";
+
 function ConfigField({ field, value, onChange, disabled, idPrefix = "cfg" }) {
   const id = `${idPrefix}-${field.key}`;
   const descriptionId = `${id}-description`;
@@ -68,18 +70,15 @@ function ConfigField({ field, value, onChange, disabled, idPrefix = "cfg" }) {
       </label>
       <div className={`control${outOfRange ? " error" : ""}`}>
         {field.type === "select" ? (
-          <select {...commonProps}>
-            <option value=''>
-              {field.defaultLabel
-                ? `Default: ${field.defaultLabel}`
-                : "Default"}
-            </option>
-            {field.options.map(([v, l]) => (
-              <option key={v} value={v}>
-                {l}
-              </option>
-            ))}
-          </select>
+          <Select
+            value={value ?? ""}
+            onChange={(v) => onChange(field.key, v)}
+            disabled={disabled}
+            options={[
+              {value: "", label: field.defaultLabel ? `Default: ${field.defaultLabel}` : "Default"},
+              ...field.options.map(([v, l]) => ({value: v, label: l})),
+            ]}
+          />
         ) : (
           <input
             {...commonProps}
