@@ -189,6 +189,7 @@ class CreateScanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     target_url: HttpUrl
+    application_id: str | None = Field(default=None, min_length=1, max_length=64)
     crawl_mode: CrawlMode = CrawlMode.full
     authorization_confirmed: bool = Field(
         description="User confirms they are authorized to security test this target.",

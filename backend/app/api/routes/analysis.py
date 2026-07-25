@@ -151,6 +151,7 @@ async def retry_scan_analysis(
         target_type="scan",
         target_id=scan_id,
         metadata={
+            "target_url": scan.target_url,
             "previous_revision": current.revision,
             "new_revision": new_revision,
             "analysis_job_id": str(job.id),
@@ -282,7 +283,10 @@ async def review_finding(
         target_id=vulnerability.id,
         metadata={
             "scan_id": scan_id,
+            "target_url": scan.target_url,
             "vulnerability_id": vulnerability.id,
+            "finding_type": vulnerability.vuln_type,
+            "finding_severity": vulnerability.severity.value,
             "previous_disposition": previous_disposition,
             "new_disposition": payload.disposition,
             "reason": payload.reason,
@@ -486,7 +490,7 @@ async def create_finding_reverification(
     current_user: User = Depends(require_role(*FINDING_TRIAGE_ROLES)),
 ) -> dict:
     """Queue a focused replay of one finding's captured verification request."""
-    _, vulnerability = await _load_scan_and_finding(
+    scan, vulnerability = await _load_scan_and_finding(
         scans, scan_id, vulnerability_id, current_user.org_id
     )
     if vulnerability.verification_target is None:
@@ -554,7 +558,13 @@ async def create_finding_reverification(
         actor_email=current_user.email,
         target_type="reverification",
         target_id=str(job.id),
-        metadata={"scan_id": scan_id, "vulnerability_id": vulnerability_id},
+        metadata={
+            "scan_id": scan_id,
+            "target_url": scan.target_url,
+            "vulnerability_id": vulnerability_id,
+            "finding_type": vulnerability.vuln_type,
+            "finding_severity": vulnerability.severity.value,
+        },
     )
     return json_response(_reverification_response(job), "re-verification queued")
 

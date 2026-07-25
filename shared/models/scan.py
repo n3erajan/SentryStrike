@@ -204,6 +204,7 @@ class ScanAnalysisState(BaseModel):
 
 class Scan(Document):
     target_url: Indexed(str)
+    application_id: Indexed(str) | None = None
     org_id: Indexed(str)
     # Who submitted the scan.
     submitted_by_user_id: Indexed(str)
@@ -246,6 +247,7 @@ class Scan(Document):
         name = "scans"
         indexes = [
             "target_url",
+            "application_id",
             "org_id",
             "submitted_by_user_id",
             "status",

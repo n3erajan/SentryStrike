@@ -9,6 +9,7 @@ from app.api.dependencies import (
     get_member_repository,
     get_notification_repository,
     get_organization_repository,
+    get_scan_repository,
     json_response,
     require_role,
 )
@@ -18,6 +19,7 @@ from shared.database.repositories.audit_repository import AuditRepository
 from shared.database.repositories.member_repository import MemberRepository
 from shared.database.repositories.notification_repository import NotificationRepository
 from shared.database.repositories.organization_repository import OrganizationRepository
+from shared.database.repositories.scan_repository import ScanRepository
 from shared.models.audit import AuditAction
 from shared.models.invite import Invite, InviteEmailStatus
 from shared.models.notification import NotificationType
@@ -321,27 +323,64 @@ async def list_audit_log(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
     audit: AuditRepository = Depends(get_audit_repository),
+    scans: ScanRepository = Depends(get_scan_repository),
     current_user: User = Depends(require_role(*WORKSPACE_ADMIN_ROLES)),
 ) -> dict:
     """Return the org's audit-log entries, newest first. Owner/admin only."""
     entries = await audit.list_in_org(current_user.org_id, skip=skip, limit=limit)
-    items = [
-        {
-            "id": str(entry.id),
-            "action": entry.action.value,
-            "actor_user_id": entry.actor_user_id,
-            "actor_email": entry.actor_email,
-            "target_type": entry.target_type,
-            "target_id": entry.target_id,
-            "metadata": entry.metadata,
-            "created_at": (
-                entry.created_at.replace(tzinfo=timezone.utc).isoformat()
-                if entry.created_at and entry.created_at.tzinfo is None
-                else entry.created_at.isoformat() if entry.created_at else None
-            ),
-        }
-        for entry in entries
-    ]
+    scan_cache = {}
+    items = []
+    for entry in entries:
+        metadata = dict(entry.metadata or {})
+        scan_id = (
+            entry.target_id
+            if entry.target_type == "scan"
+            else metadata.get("scan_id")
+        )
+        scan = None
+        if scan_id:
+            if scan_id not in scan_cache:
+                scan_cache[scan_id] = await scans.get_in_org(
+                    scan_id, current_user.org_id
+                )
+            scan = scan_cache[scan_id]
+        if scan is not None:
+            metadata.setdefault("target_url", scan.target_url)
+            vulnerability_id = metadata.get("vulnerability_id")
+            if vulnerability_id and not metadata.get("finding_type"):
+                finding = next(
+                    (
+                        vulnerability
+                        for vulnerability in getattr(scan, "vulnerabilities", [])
+                        if vulnerability.id == vulnerability_id
+                    ),
+                    None,
+                )
+                if finding is not None:
+                    metadata["finding_type"] = finding.vuln_type
+                    metadata["finding_severity"] = getattr(
+                        finding.severity, "value", finding.severity
+                    )
+
+        items.append(
+            {
+                "id": str(entry.id),
+                "action": entry.action.value,
+                "actor_user_id": entry.actor_user_id,
+                "actor_email": entry.actor_email,
+                "target_type": entry.target_type,
+                "target_id": entry.target_id,
+                "metadata": metadata,
+                "resource_path": (
+                    f"/report/{scan_id}" if scan is not None else None
+                ),
+                "created_at": (
+                    entry.created_at.replace(tzinfo=timezone.utc).isoformat()
+                    if entry.created_at and entry.created_at.tzinfo is None
+                    else entry.created_at.isoformat() if entry.created_at else None
+                ),
+            }
+        )
     return json_response({"items": items, "total": len(items)})
 
 

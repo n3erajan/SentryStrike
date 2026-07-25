@@ -95,7 +95,14 @@ class FakeScanRepository:
             )
         ]
 
-    async def list_by_target_url(self, org_id: str, target_url: str, skip: int = 0, limit: int = 20):
+    async def list_by_application(
+        self,
+        org_id: str,
+        application_id: str,
+        target_url: str,
+        skip: int = 0,
+        limit: int = 20,
+    ):
         items = [s for s in self.scans if s.org_id == org_id and s.target_url == target_url]
         return items[skip : skip + limit]
 

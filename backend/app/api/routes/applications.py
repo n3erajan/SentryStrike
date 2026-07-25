@@ -131,8 +131,9 @@ async def list_application_scans(
     if app is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Application not found")
 
-    scan_list = await scans.list_by_target_url(
+    scan_list = await scans.list_by_application(
         org_id=current_user.org_id,
+        application_id=str(app.id),
         target_url=app.target_url,
         skip=skip,
         limit=limit,
