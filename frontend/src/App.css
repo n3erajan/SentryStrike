@@ -789,7 +789,7 @@ textarea:focus-visible {
   padding: 8px 6px;
   background: var(--dark2);
   border-radius: 5px;
-  font-size: 0.63rem;
+  font-size: 0.67rem;
   color: oklch(66% 0.03 255);
   text-align: center;
 }
@@ -1023,7 +1023,7 @@ textarea:focus-visible {
 .field-description {
   margin: 0;
   color: var(--muted);
-  font-size: 0.64rem;
+  font-size: 0.68rem;
   line-height: 1.45;
   text-wrap: pretty;
 }
@@ -1478,7 +1478,7 @@ footer.public-footer {
 .scanner-status-copy small {
   margin-top: 4px;
   color: var(--muted);
-  font-size: 0.62rem;
+  font-size: 0.66rem;
   font-variant-numeric: tabular-nums;
 }
 @keyframes scanner-pulse {
@@ -1502,7 +1502,7 @@ footer.public-footer {
   color: var(--muted);
 }
 .workspace-name {
-  font-size: 0.62rem;
+  font-size: 0.66rem;
   color: var(--muted);
   margin-top: 0px;
   overflow: hidden;
@@ -1691,7 +1691,7 @@ footer.public-footer {
 }
 .advanced-panel p.field-description {
   margin: 0;
-  font-size: 0.64rem;
+  font-size: 0.68rem;
 }
 .advanced-panel .panel-intro {
   max-width: 62ch;
@@ -2032,7 +2032,7 @@ footer.public-footer {
 .sev-tag {
   padding: 2px 8px;
   /* border-radius: 999px; */
-  font-size: 0.63rem;
+  font-size: 0.67rem;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -2454,7 +2454,7 @@ footer.public-footer {
 .verdict-tag {
   padding: 2px 8px;
   border-radius: 999px;
-  font-size: 0.63rem;
+  font-size: 0.67rem;
   font-weight: 700;
   letter-spacing: 0.03em;
   white-space: nowrap;
