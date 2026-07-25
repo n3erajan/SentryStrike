@@ -12,6 +12,7 @@ import Tooltip from "./Tooltip.jsx";
 function crumbFor(pathname) {
   if (pathname.startsWith("/active/")) return "Active scans / Live scan";
   if (pathname.startsWith("/report/")) return "Reports / Security report";
+  if (pathname.startsWith("/apps/")) return "Web applications / Application";
   for (const [route, name] of Object.entries(ROUTE_NAMES)) {
     if (pathname === route) return name;
   }

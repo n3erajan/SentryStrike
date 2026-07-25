@@ -3,6 +3,10 @@ import { SCAN_PHASES } from "../data/constants.js";
 import { getScanStatus, cancelScan } from "../services/scan.js";
 
 const POLL_INTERVAL_MS = 4000;
+// Once the scan itself is complete we keep polling for the analyzer's result,
+// but only for this many ticks (~10 min) so a stalled or disabled analyzer
+// doesn't leave the page polling indefinitely.
+const MAX_ANALYSIS_POLLS = 150;
 
 // Prefer the worker's named phase. The progress fallback keeps the view usable
 // with older scan records that predate current_phase.
@@ -17,18 +21,25 @@ function stageForProgress(progress, status, currentPhase) {
 
 // Polls one scan's backend-owned lifecycle. Terminal statuses stop polling;
 // cancellation remains pending until the scanner worker acknowledges it.
+//
+// AI enrichment runs in a separate analyzer worker after the scan itself
+// completes, so `analysis` keeps updating past the scan's terminal status —
+// polling continues until that reaches a terminal state too.
 function useScanStatus(scanId) {
   const [status, setStatus] = useState(null);
   const [progress, setProgress] = useState(0);
   const [phase, setPhase] = useState("queued");
   const [phaseMessage, setPhaseMessage] = useState("Scan queued");
   const [eta, setEta] = useState(null);
+  const [analysis, setAnalysis] = useState(null);
   const [logs, setLogs] = useState([]);
   const [error, setError] = useState("");
   const [cancelling, setCancelling] = useState(false);
 
   const logRef = useRef(null);
   const lastPhaseRef = useRef("");
+  const lastAnalysisRef = useRef("");
+  const analysisPollsRef = useRef(0);
   const doneRef = useRef(false);
 
   const stageIdx = stageForProgress(progress, status, phase);
@@ -63,6 +74,8 @@ function useScanStatus(scanId) {
     let id = null;
     const controller = new AbortController();
     lastPhaseRef.current = "";
+    lastAnalysisRef.current = "";
+    analysisPollsRef.current = 0;
     doneRef.current = false;
 
     function stopPolling() {
@@ -81,11 +94,13 @@ function useScanStatus(scanId) {
           typeof scan.progress === "number" ? scan.progress : 0;
         const nextPhase = scan.current_phase || "queued";
         const nextMessage = scan.phase_message || "Scan in progress";
+        const nextAnalysis = scan.analysis || null;
 
         setProgress(nextProgress);
         setStatus(scan.status);
         setPhase(nextPhase);
         setPhaseMessage(nextMessage);
+        setAnalysis(nextAnalysis);
         setEta(
           typeof scan.eta_seconds === "number" && scan.eta_seconds >= 0
             ? scan.eta_seconds
@@ -100,13 +115,44 @@ function useScanStatus(scanId) {
           pushLog("ok", `[phase] ${nextMessage}`);
         }
 
+        // The analyzer keeps working after the scan itself finishes, so log its
+        // transitions too rather than leaving the view apparently frozen.
+        const analysisStatus = nextAnalysis?.status || "";
+        if (analysisStatus && analysisStatus !== lastAnalysisRef.current) {
+          lastAnalysisRef.current = analysisStatus;
+          const analysisDone = analysisStatus === "completed";
+          const analysisFailed = analysisStatus === "failed";
+          if (analysisDone || analysisFailed || analysisStatus === "running") {
+            pushLog(
+              analysisFailed ? "warn" : "ok",
+              `[analysis] ${
+                nextAnalysis.message ||
+                nextAnalysis.error_message ||
+                `AI analysis ${analysisStatus}`
+              }`,
+            );
+          }
+        }
+        // Enrichment is still in flight; keep polling even once the scan is
+        // done. `not_requested` also counts as pending, because the analyzer
+        // handoff lands a moment after the scan flips to completed — but the
+        // post-completion polling is capped so a job that never gets enqueued
+        // (AI analysis disabled, analyzer down) doesn't poll forever.
+        const analysisTerminal = ["completed", "failed", "cancelled"].includes(
+          analysisStatus,
+        );
+
         if (scan.status === "completed" && !doneRef.current) {
           doneRef.current = true;
           setProgress(100);
           setEta(0);
           setCancelling(false);
           pushLog("ok", "[complete] Report ready");
-          stopPolling();
+        }
+        if (scan.status === "completed") {
+          if (analysisTerminal) stopPolling();
+          else if (++analysisPollsRef.current > MAX_ANALYSIS_POLLS)
+            stopPolling();
         } else if (scan.status === "failed") {
           const failureMessage =
             scan.error ||
@@ -154,6 +200,7 @@ function useScanStatus(scanId) {
     phaseMessage,
     stageIdx,
     eta,
+    analysis,
     logs,
     logRef,
     error,

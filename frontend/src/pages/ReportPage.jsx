@@ -18,6 +18,9 @@ import {
   updateRemediation,
 } from "../services/analysis.js";
 import ReasonDialog from "../components/ReasonDialog.jsx";
+import ReverifyCredentialsDialog from "../components/ReverifyCredentialsDialog.jsx";
+import Tooltip from "../components/Tooltip.jsx";
+import { reverifyAffordance } from "../utils/reverifyPolicy.js";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
@@ -83,6 +86,15 @@ function hostnameOf(url) {
   }
 }
 
+// The analyzer's two-pass adjudication answers these semantic axes, and the
+// false-positive probability is computed from them deterministically. Findings
+// analyzed before the two-pass split have no axes at all.
+const AXIS_LABELS = {
+  EVIDENTIAL_ALIGNMENT: "Evidence supports the claim",
+  SCANNER_CLAIM_CONTRADICTED: "Evidence contradicts the claim",
+  CAUSALLY_CONNECTED: "Payload caused the evidence",
+};
+
 // A borderless label/value table (same visual language as the reports and
 // active-scans tables): a bold header rule with thin horizontal row rules.
 function MetricTable({ title, rows }) {
@@ -112,6 +124,8 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
   const [busy, setBusy] = useState("");
   const [jobs, setJobs] = useState([]);
   const [showReason, setShowReason] = useState(false);
+  const [showCredentials, setShowCredentials] = useState(false);
+  const reverify = reverifyAffordance(finding);
 
   useEffect(() => {
     if (!finding.reverification_job_ids?.length) return;
@@ -157,6 +171,18 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
       disposition === "active" ? "Finding restored" : "Finding suppressed",
     );
   }
+  function queueReverification(credentials) {
+    setShowCredentials(false);
+    mutate(
+      "reverify",
+      () => reverifyFinding(scanId, finding.id, credentials),
+      "Re-verification queued",
+    );
+  }
+  function startReverification() {
+    if (reverify.needsCredentials) setShowCredentials(true);
+    else queueReverification(undefined);
+  }
 
   return (
     <>
@@ -178,6 +204,12 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
         }
         onConfirm={handleReasonConfirm}
         onCancel={() => setShowReason(false)}
+      />
+      <ReverifyCredentialsDialog
+        open={showCredentials}
+        reason={reverify.reason}
+        onConfirm={queueReverification}
+        onCancel={() => setShowCredentials(false)}
       />
       <div className='collab-panel'>
       <h4>Remediation workflow</h4>
@@ -245,22 +277,35 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
               ? "Restore active finding"
               : "Mark false positive"}
           </button>
-          {finding.verification_target && (
-            <button
-              className='btn'
-              disabled={busy === "reverify"}
-              onClick={() =>
-                mutate(
-                  "reverify",
-                  () => reverifyFinding(scanId, finding.id),
-                  "Re-verification queued",
-                )
-              }
-            >
-              <RefreshCw className='ico' />
-              Re-verify
-            </button>
-          )}
+          {finding.verification_target &&
+            (reverify.allowed ? (
+              <Tooltip
+                label={
+                  reverify.needsCredentials
+                    ? reverify.reason
+                    : "Replay this finding's captured request"
+                }
+              >
+                <button
+                  className='btn'
+                  disabled={busy === "reverify"}
+                  onClick={startReverification}
+                >
+                  <RefreshCw className='ico' />
+                  Re-verify
+                  {reverify.needsCredentials && "…"}
+                </button>
+              </Tooltip>
+            ) : (
+              // A disabled button swallows hover events in some browsers, so
+              // keep a native title as a fallback for the tooltip.
+              <Tooltip label={reverify.reason}>
+                <button className='btn' disabled title={reverify.reason}>
+                  <RefreshCw className='ico' />
+                  Re-verify
+                </button>
+              </Tooltip>
+            ))}
         </div>
       )}
       {finding.is_false_positive && (
@@ -334,6 +379,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
       : null;
   const isLikelyFp =
     sevKey(ai.verdict) === "likely_false_positive" || v.is_false_positive;
+  const fpAxes = Object.entries(ai.fp_axes || {});
 
   return (
     <article
@@ -479,6 +525,38 @@ function Finding({ v, scanId, user, members, onChanged }) {
             <div className='finding-block'>
               <h4>False-positive assessment</h4>
               <p>{ai.false_positive_reasoning}</p>
+            </div>
+          )}
+          {fpAxes.length > 0 && (
+            <div className='finding-block'>
+              <h4>Adjudication axes</h4>
+              <p className='field-description'>
+                The AI answers these semantic checks independently; the
+                false-positive likelihood above is then derived from them
+                deterministically.
+              </p>
+              <dl className='fp-axes'>
+                {fpAxes.map(([axis, verdict]) => (
+                  <div
+                    key={axis}
+                    className={
+                      axis === ai.decisive_axis ? "fp-axis decisive" : "fp-axis"
+                    }
+                  >
+                    <dt>{AXIS_LABELS[axis] || titleCase(axis)}</dt>
+                    <dd>{titleCase(verdict)}</dd>
+                  </div>
+                ))}
+              </dl>
+              {ai.decisive_axis && (
+                <p className='field-description'>
+                  Decisive axis:{" "}
+                  <b>
+                    {AXIS_LABELS[ai.decisive_axis] ||
+                      titleCase(ai.decisive_axis)}
+                  </b>
+                </p>
+              )}
             </div>
           )}
           <FindingCollaboration

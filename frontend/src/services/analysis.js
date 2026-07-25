@@ -1,4 +1,5 @@
 import { apiRequest } from "./apiClient.js";
+import { buildCredentials } from "./scan.js";
 
 const findingPath = (scanId, findingId) =>
   `/analysis/scans/${scanId}/vulnerabilities/${findingId}`;
@@ -19,7 +20,13 @@ export const reviewFinding = (scanId, findingId, disposition, reason) =>
   apiRequest(`${findingPath(scanId, findingId)}/review`, {
     method: "PUT", body: { disposition, reason },
   });
-export const reverifyFinding = (scanId, findingId) =>
-  apiRequest(`${findingPath(scanId, findingId)}/reverify`, { method: "POST", body: {} });
+// Access-control findings need a second/admin identity to re-prove; the
+// backend rejects the job with 409 otherwise. Credentials live only in the
+// Redis job payload, never in MongoDB.
+export const reverifyFinding = (scanId, findingId, credentials) =>
+  apiRequest(`${findingPath(scanId, findingId)}/reverify`, {
+    method: "POST",
+    body: { credentials: buildCredentials(credentials) ?? null },
+  });
 export const listReverifications = (scanId, findingId, signal) =>
   apiRequest(`${findingPath(scanId, findingId)}/reverifications`, { signal });

@@ -60,6 +60,9 @@ function severityClass(severity) {
   return "info";
 }
 
+// The scanner pipeline's phases, in order. AI enrichment is no longer part of
+// this list — it runs in the standalone analyzer worker after the scan
+// completes, and is reported separately through the scan's `analysis` state.
 const SCAN_PHASES = [
   { key: "queued", label: "Queued" },
   { key: "initializing", label: "Initializing" },
@@ -68,9 +71,7 @@ const SCAN_PHASES = [
   { key: "tls_analysis", label: "TLS analysis" },
   { key: "vulnerability_detection", label: "Vulnerability detection" },
   { key: "deduplication", label: "Deduplication" },
-  { key: "ai_analysis", label: "AI analysis" },
   { key: "risk_scoring", label: "Risk scoring" },
-  { key: "report_generation", label: "Report generation" },
 ];
 
 const SCAN_MODES = [

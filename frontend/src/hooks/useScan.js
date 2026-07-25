@@ -1,14 +1,18 @@
 import { useState, useCallback, useEffect } from "react";
 import { isValidUrl } from "../utils/helpers.js";
 import { createScan } from "../services/scan.js";
-import { getDefaultConfig } from "../services/workspace.js";
+import { getApplication } from "../services/applications.js";
 
 // Form state + submission for a new scan. Polling and progress no longer live
 // here — once a scan is created the caller navigates to its own active-scan
 // page (see ActiveScanPage / useScanStatus). `startScan` resolves to the new
 // scan_id (or null on failure), leaving the form intact so the user can queue
 // another scan immediately while the first one runs.
-function useScanForm() {
+//
+// `applicationId` is optional. When set, the target URL and config are seeded
+// from that application's stored defaults — the workspace-level default config
+// no longer exists; defaults live on the Application entity now.
+function useScanForm({ applicationId } = {}) {
   // Inputs required by the backend CreateScanRequest.
   const [url, setUrl] = useState("");
   const [crawlMode, setCrawlMode] = useState("full"); // full | single
@@ -17,9 +21,8 @@ function useScanForm() {
 
   // Optional per-scan ScanConfig overrides. Keyed by the backend field name;
   // any key left blank/absent falls back to the backend default. `scan_mode`
-  // is just another config key here.
+  // is just another config key here. Seeded from the selected application.
   const [config, setConfig] = useState({});
-  const [defaultsLoading, setDefaultsLoading] = useState(true);
   const setConfigField = useCallback((key, value) => {
     setConfig((prev) => {
       if (value === "" || value === undefined || value === null) {
@@ -51,20 +54,34 @@ function useScanForm() {
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  // True when the last submit failed because a scan for this target is already
+  // in flight (HTTP 409), so the view can render it as guidance not a failure.
+  const [conflict, setConflict] = useState(false);
 
+  // Seed the form from the chosen application. Clearing the selection leaves
+  // whatever the user has already typed alone — only an explicit pick rewrites
+  // the URL and config. `loadedApp` tracks which id the form currently
+  // reflects, so the loading flag is derived rather than set synchronously.
+  const [loadedApp, setLoadedApp] = useState("");
   useEffect(() => {
+    if (!applicationId) return undefined;
     const controller = new AbortController();
-    getDefaultConfig(controller.signal)
-      .then((data) => setConfig(data.config || {}))
+    getApplication(applicationId, controller.signal)
+      .then((app) => {
+        setUrl(app.target_url || "");
+        setConfig(app.default_scan_config || {});
+      })
       .catch((err) => {
-        if (err.name !== "AbortError") setError(err.message || "Could not load workspace scan defaults.");
+        if (err.name !== "AbortError")
+          setError(err.message || "Could not load this application's defaults.");
       })
       .finally(() => {
-        if (!controller.signal.aborted) setDefaultsLoading(false);
+        if (!controller.signal.aborted) setLoadedApp(applicationId);
       });
     return () => controller.abort();
-  }, []);
+  }, [applicationId]);
 
+  const defaultsLoading = Boolean(applicationId) && loadedApp !== applicationId;
   const valid = isValidUrl(url);
   const canStart = valid && consent && !submitting && !defaultsLoading;
 
@@ -75,6 +92,7 @@ function useScanForm() {
     if (!valid || !consent || submitting) return null;
 
     setError("");
+    setConflict(false);
     setSubmitting(true);
     try {
       const res = await createScan({
@@ -86,7 +104,10 @@ function useScanForm() {
       });
       return { scanId: res.scan_id, target: url };
     } catch (err) {
+      // 409 means a scan for this same target is already queued or running;
+      // the backend's message names it, so surface that verbatim.
       setError(err.message || "Could not start the scan.");
+      setConflict(err.status === 409);
       return null;
     } finally {
       setSubmitting(false);
@@ -112,6 +133,7 @@ function useScanForm() {
     // submission
     submitting,
     error,
+    conflict,
     valid,
     canStart,
     startScan,

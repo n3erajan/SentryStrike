@@ -8,6 +8,7 @@ import LoginPage from "./pages/LoginPage.jsx";
 import RegisterPage from "./pages/RegisterPage.jsx";
 import HomePage from "./pages/HomePage.jsx";
 import AppsPage from "./pages/AppsPage.jsx";
+import ApplicationPage from "./pages/ApplicationPage.jsx";
 import ScanPage from "./pages/ScanPage.jsx";
 import ActiveScansPage from "./pages/ActiveScansPage.jsx";
 import ActiveScanPage from "./pages/ActiveScanPage.jsx";
@@ -30,6 +31,7 @@ function App() {
         <Route element={<AppLayout />}>
           <Route path='/home' element={<HomePage />} />
           <Route path='/apps' element={<AppsPage />} />
+          <Route path='/apps/:appId' element={<ApplicationPage />} />
           <Route path='/scan' element={<ScanPage />} />
           <Route path='/active' element={<ActiveScansPage />} />
           <Route path='/active/:scanId' element={<ActiveScanPage />} />

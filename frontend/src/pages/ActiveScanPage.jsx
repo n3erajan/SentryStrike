@@ -13,6 +13,15 @@ const STATUS_LABEL = {
   cancelled: "Cancelled",
 };
 
+const ANALYSIS_LABEL = {
+  not_requested: "Queueing AI analysis",
+  queued: "AI analysis queued",
+  running: "AI analysis running",
+  completed: "AI analysis complete",
+  failed: "AI analysis failed",
+  cancelled: "AI analysis cancelled",
+};
+
 function formatEta(seconds) {
   if (!Number.isFinite(seconds) || seconds <= 0) return "—";
   if (seconds < 60) return `${Math.ceil(seconds)}s`;
@@ -50,6 +59,7 @@ function ActiveScanPage() {
     phaseMessage,
     stageIdx,
     eta,
+    analysis,
     logs,
     logRef,
     error,
@@ -58,6 +68,9 @@ function ActiveScanPage() {
     cancel,
   } = useScanStatus(scanId);
 
+  // The deterministic report is ready the moment the scan completes; AI
+  // enrichment continues in the analyzer worker, and the report page renders
+  // its own banner for that. So navigate as soon as the scan itself is done.
   useEffect(() => {
     if (status !== "completed") return undefined;
     const id = setTimeout(() => navigate(`/report/${scanId}`), 1200);
@@ -66,6 +79,9 @@ function ActiveScanPage() {
 
   const surfaces = Math.max(1, stageIdx * 20);
   const now = new Date();
+  const analysisStatus = analysis?.status;
+  const showAnalysis =
+    Boolean(analysisStatus) && status === "completed";
 
   return (
     <div className='view'>
@@ -122,6 +138,25 @@ function ActiveScanPage() {
       {error && (
         <div className='auth-error' style={{ marginBottom: 16 }}>
           {error}
+        </div>
+      )}
+
+      {showAnalysis && (
+        <div className={`analysis-banner ${analysisStatus}`}>
+          <div>
+            <b>{ANALYSIS_LABEL[analysisStatus] || "AI analysis"}</b>
+            <span>
+              {analysis.message ||
+                analysis.error_message ||
+                "Findings and the report are being enriched. The scan results are already available."}
+            </span>
+            {Number.isFinite(analysis.progress) && (
+              <small>
+                {analysis.progress}% complete · revision{" "}
+                {analysis.revision || 1}
+              </small>
+            )}
+          </div>
         </div>
       )}
 

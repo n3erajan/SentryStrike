@@ -51,10 +51,17 @@ function compactFields(obj, allowedFields) {
   );
 }
 
+// Strip a raw config object down to the fields the backend ScanConfig accepts.
+// Used for both per-scan overrides and an application's default_scan_config.
+export function compactScanConfig(config) {
+  return compactFields(config, CONFIG_FIELDS);
+}
+
 // Build the optional `credentials` block from up to three role accounts
 // (main/second/admin). Each account is a ScanAccountCredential; empty accounts
-// are dropped so we never send blank roles.
-function buildCredentials(credentials = {}) {
+// are dropped so we never send blank roles. Shared with the finding
+// re-verification endpoint, which accepts the same shape.
+export function buildCredentials(credentials = {}) {
   const out = {};
   for (const role of ["main", "second", "admin"]) {
     const account = compactFields(credentials[role], CREDENTIAL_FIELDS);
@@ -81,7 +88,7 @@ export function createScan({
       crawl_mode: crawlMode,
       authorization_confirmed: authorizationConfirmed,
       credentials: buildCredentials(credentials),
-      config: compactFields(config, CONFIG_FIELDS),
+      config: compactScanConfig(config),
     },
   });
 }

@@ -190,6 +190,26 @@
 .modal-card form > .btn {
   margin: 10px 0;
 }
+/* Wider variant for dialogs that embed a config grid or credential fields. */
+.modal-wide {
+  width: min(720px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+}
+.reverify-cred-role {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.reverify-cred-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+}
+.reverify-cred-head h3 {
+  font-size: 0.85rem;
+}
 .compact-list {
   display: grid;
   padding-block: 0 !important;
@@ -253,6 +273,40 @@
 .analysis-banner span,
 .analysis-banner small {
   color: var(--muted);
+}
+/* A blocked-but-recoverable submit (e.g. a scan already running for this
+   target) — guidance rather than the red failure treatment of .auth-error. */
+.scan-conflict {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--primary);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--primary) 6%, var(--surface, #fff));
+  font-size: 0.8rem;
+}
+.fp-axes {
+  display: grid;
+  gap: 2px;
+  margin-top: 10px;
+}
+.fp-axis {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.75rem;
+}
+.fp-axis:last-child {
+  border: 0;
+}
+.fp-axis dt {
+  color: var(--muted);
+}
+.fp-axis.decisive dt,
+.fp-axis.decisive dd {
+  color: var(--ink);
+  font-weight: 600;
 }
 .collab-panel {
   margin-top: 24px;

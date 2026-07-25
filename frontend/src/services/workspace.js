@@ -10,9 +10,6 @@ export const changeMemberRole = (userId, role) =>
   apiRequest(`/workspace/members/${userId}/role`, { method: "PATCH", body: { role } });
 export const removeMember = (userId) =>
   apiRequest(`/workspace/members/${userId}`, { method: "DELETE" });
-export const getDefaultConfig = (signal) => apiRequest("/workspace/default-config", { signal });
-export const setDefaultConfig = (config) =>
-  apiRequest("/workspace/default-config", { method: "PUT", body: { config } });
 export const getRetention = (signal) => apiRequest("/workspace/retention", { signal });
 export const setRetention = (retentionDays) =>
   apiRequest("/workspace/retention", { method: "PUT", body: { retention_days: retentionDays } });

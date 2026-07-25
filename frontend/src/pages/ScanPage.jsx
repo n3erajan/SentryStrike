@@ -1,109 +1,17 @@
-import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { ChevronDown } from "lucide-react";
 import { useScanForm } from "../hooks/useScan.js";
 import { useToast } from "../components/Toast.jsx";
 import { useAuth } from "../context/AuthContext.jsx";
+import ConfigField, { configValid } from "../components/ConfigField.jsx";
+import { listApplications } from "../services/applications.js";
 import {
   CONFIG_GROUPS,
   CRED_FIELDS,
   CRED_ROLES,
   SCAN_MODES,
 } from "../data/constants.js";
-
-function coerce(field, raw) {
-  if (raw === "") return "";
-  if (field.type === "int") {
-    const v = parseInt(raw, 10);
-    return Number.isNaN(v) ? "" : v;
-  }
-  if (field.type === "float") {
-    const v = parseFloat(raw);
-    return Number.isNaN(v) ? "" : v;
-  }
-  return raw;
-}
-
-function configPlaceholder(field) {
-  if (field.defaultValue === undefined) return "Default";
-  return String(field.defaultValue);
-}
-
-function configFieldOutOfRange(field, value) {
-  if (value === "" || value === undefined || value === null) return false;
-  if (field.type !== "int" && field.type !== "float") return false;
-  return value < field.min || value > field.max;
-}
-
-function ConfigField({ field, value, onChange, disabled }) {
-  const id = `cfg-${field.key}`;
-  const descriptionId = `${id}-description`;
-  const errorId = `${id}-error`;
-  const outOfRange = configFieldOutOfRange(field, value);
-  const commonProps = {
-    id,
-    "aria-describedby": outOfRange
-      ? `${descriptionId} ${errorId}`
-      : descriptionId,
-    "aria-invalid": outOfRange || undefined,
-    value: value ?? "",
-    onChange: (event) =>
-      onChange(
-        field.key,
-        field.type === "select"
-          ? event.target.value
-          : coerce(field, event.target.value),
-      ),
-    disabled,
-  };
-  return (
-    <div className='field'>
-      <label htmlFor={id}>
-        {field.label}
-        {field.unit && (
-          <span style={{ color: "var(--muted)", marginLeft: 4 }}>
-            ({field.unit})
-          </span>
-        )}
-      </label>
-      <div className={`control${outOfRange ? " error" : ""}`}>
-        {field.type === "select" ? (
-          <select {...commonProps}>
-            <option value=''>
-              {field.defaultLabel
-                ? `Default: ${field.defaultLabel}`
-                : "Default"}
-            </option>
-            {field.options.map(([v, l]) => (
-              <option key={v} value={v}>
-                {l}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <input
-            {...commonProps}
-            type={field.type === "text" ? "text" : "number"}
-            inputMode={field.type === "int" ? "numeric" : undefined}
-            min={field.min}
-            max={field.max}
-            step={field.step ?? (field.type === "int" ? 1 : "any")}
-            maxLength={field.maxLength}
-            placeholder={configPlaceholder(field)}
-          />
-        )}
-      </div>
-      <p className='field-description' id={descriptionId}>
-        {field.description}
-      </p>
-      {outOfRange && (
-        <span className='field-error' id={errorId}>
-          Enter a value from {field.min} to {field.max}.
-        </span>
-      )}
-    </div>
-  );
-}
 
 function CredentialAccount({ role, account, onField, disabled }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -204,6 +112,9 @@ function ScanPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const toast = useToast();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const applicationId = searchParams.get("app") || "";
+  const [apps, setApps] = useState([]);
   const [usersOpen, setUsersOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const {
@@ -222,10 +133,22 @@ function ScanPage() {
     setCredentialField,
     submitting,
     error,
+    conflict,
     valid,
     canStart,
     startScan,
-  } = useScanForm();
+  } = useScanForm({ applicationId });
+
+  // The picker is a convenience only — a scan can always be run against a raw
+  // URL, so a failed application fetch is silently ignored.
+  useEffect(() => {
+    const controller = new AbortController();
+    listApplications({ signal: controller.signal })
+      .then((data) => setApps(data.items || []))
+      .catch(() => {});
+    return () => controller.abort();
+  }, []);
+
   if (user?.role === "viewer") {
     return (
       <div className='view'>
@@ -247,14 +170,16 @@ function ScanPage() {
   const credentialCount = CRED_ROLES.filter(({ key }) =>
     credentialPresent(credentials[key]),
   ).length;
-  const configValid = CONFIG_GROUPS.every((group) =>
-    group.fields.every(
-      (field) => !configFieldOutOfRange(field, config[field.key]),
-    ),
-  );
+  const configIsValid = configValid(CONFIG_GROUPS, config);
+  const selectedApp = apps.find((a) => a.id === applicationId);
+
+  function selectApplication(nextId) {
+    if (nextId) setSearchParams({ app: nextId });
+    else setSearchParams({});
+  }
 
   async function handleStart() {
-    if (!configValid) return;
+    if (!configIsValid) return;
     const result = await startScan();
     if (result) {
       toast("Assessment started");
@@ -274,7 +199,10 @@ function ScanPage() {
       </div>
 
       {error && (
-        <div className='auth-error' style={{ margin: "0 0 16px" }}>
+        <div
+          className={conflict ? "scan-conflict" : "auth-error"}
+          style={{ margin: "0 0 16px" }}
+        >
           {error}
         </div>
       )}
@@ -283,6 +211,36 @@ function ScanPage() {
         <main>
           <section className='formsection'>
             <h3>Application URL</h3>
+            {apps.length > 0 && (
+              <div className='grid2'>
+                <div className='field wide'>
+                  <label htmlFor='scan-application'>Web application</label>
+                  <div className='control'>
+                    <select
+                      id='scan-application'
+                      value={applicationId}
+                      onChange={(e) => selectApplication(e.target.value)}
+                      disabled={submitting}
+                      aria-describedby='scan-application-description'
+                    >
+                      <option value=''>None — scan a one-off URL</option>
+                      {apps.map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {a.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <p
+                    className='field-description'
+                    id='scan-application-description'
+                  >
+                    Picking an application fills in its target URL and saved
+                    scan defaults. You can still edit both below.
+                  </p>
+                </div>
+              </div>
+            )}
             <div className='grid2'>
               <div className='field wide'>
                 <div
@@ -295,7 +253,7 @@ function ScanPage() {
                     value={url}
                     onChange={(e) => setUrl(e.target.value)}
                     onBlur={() => setTouched(true)}
-                    disabled={submitting}
+                    disabled={submitting || defaultsLoading}
                     aria-describedby='target-url-description'
                   />
                 </div>
@@ -305,8 +263,9 @@ function ScanPage() {
                   </span>
                 )}
                 <p className='field-description' id='target-url-description'>
-                  Enter the public or staging URL where the assessment should
-                  begin.
+                  {selectedApp
+                    ? `Loaded from ${selectedApp.name}. Edit it to scan a different path on this target.`
+                    : "Enter the public or staging URL where the assessment should begin."}
                 </p>
               </div>
             </div>
@@ -460,6 +419,12 @@ function ScanPage() {
         <aside className='review'>
           <h2>Assessment summary</h2>
           <dl>
+            {selectedApp && (
+              <div>
+                <dt>Application</dt>
+                <dd>{selectedApp.name}</dd>
+              </div>
+            )}
             <div>
               <dt>Standard</dt>
               <dd>OWASP 2025</dd>
@@ -488,7 +453,7 @@ function ScanPage() {
           <button
             className='btn primary'
             onClick={handleStart}
-            disabled={!canStart || !configValid}
+            disabled={!canStart || !configIsValid}
           >
             {defaultsLoading
               ? "Loading defaults…"
