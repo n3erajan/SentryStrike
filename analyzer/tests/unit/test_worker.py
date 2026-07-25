@@ -5,8 +5,8 @@ import pytest
 
 from app.clients.ai_client import ProviderError, ProviderResult
 from app.services.result_applier import ResultApplier, StaleAnalysisRevisionError
-from app.worker import _notify_analysis_terminal, process_analysis_job
-from shared.models.analysis_job import AnalysisStatus
+from app.worker import _notify_analysis_terminal, process_analysis_job, recover_expired_analysis_jobs
+from shared.models.analysis_job import AnalysisJob, AnalysisStatus
 from shared.models.notification import NotificationType
 from shared.models.scan import ReportMetadata, ScanStatistics, ScanStatus
 from shared.models.vulnerability import (
@@ -383,3 +383,69 @@ async def test_terminal_notification_uses_revision_recipient_dedupe_key(
         "revision": 1,
         "status": event,
     }
+
+
+@pytest.mark.asyncio
+async def test_recover_expired_analysis_jobs(monkeypatch) -> None:
+    job_with_retries = SimpleNamespace(
+        id="job-1",
+        scan_id="scan-1",
+        org_id="org-1",
+        revision=1,
+        attempt=1,
+        max_attempts=3,
+        progress=25,
+        lease_owner="dead-worker",
+    )
+    job_exhausted = SimpleNamespace(
+        id="job-2",
+        scan_id="scan-2",
+        org_id="org-1",
+        revision=1,
+        attempt=3,
+        max_attempts=3,
+        progress=75,
+        lease_owner="dead-worker",
+    )
+
+    class FakeFind:
+        def __init__(self, query):
+            self.query = query
+
+        async def to_list(self):
+            return [job_with_retries, job_exhausted]
+
+    class FakeMotorCollection:
+        def __init__(self):
+            self.updates = []
+
+        async def update_one(self, query, update):
+            self.updates.append((query, update))
+            return SimpleNamespace(modified_count=1)
+
+    fake_collection = FakeMotorCollection()
+
+    monkeypatch.setattr(AnalysisJob, "find", lambda query: FakeFind(query))
+    monkeypatch.setattr(AnalysisJob, "get_motor_collection", staticmethod(lambda: fake_collection))
+
+    fake_scan_repo = FakeScanRepository(_scan())
+    fake_job_repo = FakeJobRepository()
+
+    recovered = await recover_expired_analysis_jobs(fake_job_repo, fake_scan_repo)
+
+    assert recovered == 2
+    assert len(fake_collection.updates) == 1
+    query, update = fake_collection.updates[0]
+    assert query["_id"] == "job-1"
+    assert update["$set"]["status"] == "queued"
+
+    assert len(fake_job_repo.failures) == 1
+    assert fake_job_repo.failures[0]["job_id"] == "job-2"
+
+    assert len(fake_scan_repo.projection_updates) == 2
+    proj_1, proj_2 = fake_scan_repo.projection_updates
+    assert proj_1["scan_id"] == "scan-1"
+    assert proj_1["status"] == AnalysisStatus.queued
+    assert proj_2["scan_id"] == "scan-2"
+    assert proj_2["status"] == AnalysisStatus.failed
+

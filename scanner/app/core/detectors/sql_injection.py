@@ -22,6 +22,7 @@ from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.verification.sqli_verifier import SQLiVerifier
 from app.core.verification.verification_framework import FindingDeduplicator
+from app.reverification_strategies.common import attach_attack_target_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,8 @@ class SQLInjectionDetector(BaseDetector):
                     target=candidate,
                 )
 
+                for finding in result.findings:
+                    attach_attack_target_metadata(finding, candidate)
                 findings.extend(result.findings)
 
                 # Small delay between tests to be respectful

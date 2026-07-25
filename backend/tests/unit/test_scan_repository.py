@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -196,3 +196,159 @@ async def test_report_publication_and_readiness_are_one_revision_guarded_update(
     assert fields["report_metadata.summary"] == "Executive summary"
     assert fields["analysis.status"] == "completed"
     assert fields["analysis.completed_at"] == generated_at
+
+
+@pytest.mark.asyncio
+async def test_reconcile_analysis_if_orphaned_expired_lease(monkeypatch) -> None:
+    calls = []
+
+    class Collection:
+        async def update_one(self, query, update):
+            calls.append((query, update))
+            return SimpleNamespace(modified_count=1)
+
+    monkeypatch.setattr(Scan, "get_motor_collection", classmethod(lambda cls: Collection()))
+
+    scan_id = str(PydanticObjectId())
+    now = datetime.now(timezone.utc)
+    expired = now - timedelta(seconds=60)
+
+    scan = SimpleNamespace(
+        id=PydanticObjectId(scan_id),
+        org_id="org-1",
+        analysis=SimpleNamespace(
+            status="running",
+            current_job_id="job-1",
+            progress=25,
+            revision=1,
+        ),
+    )
+
+    job = SimpleNamespace(
+        id="job-1",
+        revision=1,
+        status="running",
+        lease_expires_at=expired,
+    )
+
+    class FakeAnalysisRepo:
+        async def get_by_id(self, job_id):
+            assert job_id == "job-1"
+            return job
+
+    refetched_scan = SimpleNamespace(id=scan.id, status="completed", analysis=SimpleNamespace(status="failed"))
+    async def fake_get(cls, oid):
+        return refetched_scan
+
+    monkeypatch.setattr(Scan, "get", classmethod(fake_get))
+
+    res = await ScanRepository().reconcile_analysis_if_orphaned(scan, FakeAnalysisRepo())
+    assert res == refetched_scan
+    assert len(calls) == 1
+    query, update = calls[0]
+    assert query["analysis.current_job_id"] == "job-1"
+    assert update["$set"]["analysis.status"] == "failed"
+    assert update["$set"]["analysis.error_code"] == "analyzer_worker_stopped"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_analysis_if_orphaned_naive_expired_lease(monkeypatch) -> None:
+    calls = []
+
+    class Collection:
+        async def update_one(self, query, update):
+            calls.append((query, update))
+            return SimpleNamespace(modified_count=1)
+
+    monkeypatch.setattr(Scan, "get_motor_collection", classmethod(lambda cls: Collection()))
+
+    scan_id = str(PydanticObjectId())
+    now = datetime.now(timezone.utc)
+    # Naive datetime returned from PyMongo/MongoDB
+    expired_naive = (now - timedelta(seconds=60)).replace(tzinfo=None)
+
+    scan = SimpleNamespace(
+        id=PydanticObjectId(scan_id),
+        org_id="org-1",
+        analysis=SimpleNamespace(
+            status="running",
+            current_job_id="job-1",
+            progress=25,
+            revision=1,
+        ),
+    )
+
+    job = SimpleNamespace(
+        id="job-1",
+        revision=1,
+        status="running",
+        lease_expires_at=expired_naive,
+    )
+
+    class FakeAnalysisRepo:
+        async def get_by_id(self, job_id):
+            return job
+
+    refetched_scan = SimpleNamespace(id=scan.id, status="completed", analysis=SimpleNamespace(status="failed"))
+    async def fake_get(cls, oid):
+        return refetched_scan
+
+    monkeypatch.setattr(Scan, "get", classmethod(fake_get))
+
+    res = await ScanRepository().reconcile_analysis_if_orphaned(scan, FakeAnalysisRepo())
+    assert res == refetched_scan
+    assert len(calls) == 1
+    query, update = calls[0]
+    assert update["$set"]["analysis.status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_analysis_if_orphaned_syncs_terminal_job(monkeypatch) -> None:
+    calls = []
+
+    class Collection:
+        async def update_one(self, query, update):
+            calls.append((query, update))
+            return SimpleNamespace(modified_count=1)
+
+    monkeypatch.setattr(Scan, "get_motor_collection", classmethod(lambda cls: Collection()))
+
+    scan_id = str(PydanticObjectId())
+    scan = SimpleNamespace(
+        id=PydanticObjectId(scan_id),
+        org_id="org-1",
+        analysis=SimpleNamespace(
+            status="running",
+            current_job_id="job-1",
+            progress=50,
+            revision=1,
+        ),
+    )
+
+    job = SimpleNamespace(
+        id="job-1",
+        revision=1,
+        status="completed",
+        progress=100,
+        message="Analysis completed",
+        error_code=None,
+        error_message=None,
+        lease_expires_at=None,
+    )
+
+    class FakeAnalysisRepo:
+        async def get_by_id(self, job_id):
+            return job
+
+    refetched_scan = SimpleNamespace(id=scan.id, status="completed", analysis=SimpleNamespace(status="completed"))
+    async def fake_get(cls, oid):
+        return refetched_scan
+
+    monkeypatch.setattr(Scan, "get", classmethod(fake_get))
+
+    res = await ScanRepository().reconcile_analysis_if_orphaned(scan, FakeAnalysisRepo())
+    assert res == refetched_scan
+    assert len(calls) == 1
+    query, update = calls[0]
+    assert update["$set"]["analysis.status"] == "completed"
+

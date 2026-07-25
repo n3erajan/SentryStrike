@@ -90,6 +90,15 @@ async def _record_failure(
                 error_message=str(error),
                 clear_lease_owner=True,
             )
+            logger.warning(
+                "analysis job %s retry scheduled (attempt %s/%s) after %s: %s; next attempt at %s",
+                job.id,
+                job.attempt,
+                job.max_attempts,
+                error.code,
+                error,
+                next_attempt_at.isoformat(),
+            )
             return False
 
     projection_failed = True
@@ -107,6 +116,14 @@ async def _record_failure(
         worker_id=worker_id,
         error_code=error.code,
         error_message=str(error),
+    )
+    logger.error(
+        "analysis job %s failed terminally (attempt %s/%s) with %s: %s",
+        job.id,
+        job.attempt,
+        job.max_attempts,
+        error.code,
+        error,
     )
     return projection_failed and job_failed
 
@@ -173,6 +190,12 @@ async def process_analysis_job(
 ) -> None:
     scan = await scan_repository.get_in_org(job.scan_id, job.org_id)
     if scan is None or scan.status != ScanStatus.completed:
+        logger.warning(
+            "analysis job %s not ready: scan=%s missing or not completed (status=%s)",
+            job.id,
+            job.scan_id,
+            getattr(scan, "status", None),
+        )
         await job_repository.fail(
             job_id=str(job.id),
             worker_id=worker_id,
@@ -186,6 +209,10 @@ async def process_analysis_job(
     try:
         await applier.mark_running(job, worker_id=worker_id, started_at=started_at)
     except StaleAnalysisRevisionError:
+        logger.warning(
+            "analysis job %s aborted before start: a newer revision is current",
+            job.id,
+        )
         await job_repository.fail(
             job_id=str(job.id),
             worker_id=worker_id,
@@ -214,14 +241,43 @@ async def process_analysis_job(
         technology.name for technology in scan.technology_stack
     ) or "Unknown"
 
+    logger.info(
+        "analysis job %s started: scan=%s target=%s findings=%s stack=%s source=%s",
+        job.id,
+        job.scan_id,
+        scan.target_url,
+        len(scan.vulnerabilities),
+        technology_stack,
+        publication_source,
+    )
+
     try:
         for vulnerability in scan.vulnerabilities:
+            logger.info(
+                "analysis job %s analyzing finding %s (%s, %s) [%s/%s]",
+                job.id,
+                vulnerability.id,
+                vulnerability.vuln_type,
+                vulnerability.severity.value,
+                analyzed + 1,
+                len(scan.vulnerabilities),
+            )
             analysis, provider_result = await finding_service.analyze(
                 vulnerability,
                 revision=job.revision,
                 technology_stack=technology_stack,
             )
             analysis.analyzed_at = datetime.now(timezone.utc)
+            
+            logger.info(
+                "analysis job %s finished finding %s: verdict=%s (FP: %.2f) axes=%s",
+                job.id,
+                vulnerability.id,
+                analysis.verdict.value if analysis.verdict else "None",
+                analysis.false_positive_probability or 0.0,
+                analysis.fp_axes,
+            )
+            
             await applier.set_finding(
                 job,
                 worker_id=worker_id,
@@ -252,6 +308,11 @@ async def process_analysis_job(
                 message=message,
             )
 
+        logger.info(
+            "analysis job %s findings done (%s analyzed); generating report summary",
+            job.id,
+            analyzed,
+        )
         summary, report_result = await report_service.analyze(scan)
         if report_result.request_id:
             provider_request_ids.append(report_result.request_id)
@@ -278,6 +339,16 @@ async def process_analysis_job(
         )
         if not completed:
             raise StaleAnalysisRevisionError("Analysis job lease was lost at completion")
+        logger.info(
+            "analysis job %s completed: scan=%s findings=%s model=%s tokens=in:%s/out:%s provider_calls=%s",
+            job.id,
+            job.scan_id,
+            analyzed,
+            publication_model,
+            input_tokens or 0,
+            output_tokens or 0,
+            len(provider_request_ids),
+        )
         await _notify_analysis_terminal(
             scan,
             job,
@@ -354,13 +425,102 @@ async def process_analysis_job(
             pass
 
 
+async def recover_expired_analysis_jobs(
+    job_repository: AnalysisJobRepository,
+    scan_repository: ScanRepository,
+) -> int:
+    """Find all running analysis jobs with expired leases and recover or fail them.
+
+    Called during worker startup. If a job has retries left (attempt < max_attempts),
+    resets it to ``queued`` so ``claim_next`` can pick it up. If retries are exhausted,
+    marks it terminally ``failed``. Reconciles the scan projection for each.
+    """
+    now = datetime.now(timezone.utc)
+    expired_jobs = await AnalysisJob.find(
+        {
+            "status": AnalysisStatus.running.value,
+            "lease_expires_at": {"$lt": now},
+        }
+    ).to_list()
+
+    recovered_count = 0
+    for job in expired_jobs:
+        try:
+            if job.attempt < job.max_attempts:
+                await AnalysisJob.get_motor_collection().update_one(
+                    {
+                        "_id": job.id,
+                        "status": AnalysisStatus.running.value,
+                    },
+                    {
+                        "$set": {
+                            "status": AnalysisStatus.queued.value,
+                            "lease_owner": None,
+                            "lease_expires_at": None,
+                            "next_attempt_at": None,
+                            "message": "Analysis queued (recovered from worker crash)",
+                            "updated_at": now,
+                        }
+                    },
+                )
+                await scan_repository.update_analysis_projection(
+                    scan_id=job.scan_id,
+                    org_id=job.org_id,
+                    current_job_id=str(job.id),
+                    expected_revision=job.revision,
+                    status=AnalysisStatus.queued,
+                    progress=job.progress,
+                    message="Analysis queued",
+                    clear_lease_owner=True,
+                )
+                logger.info(
+                    "recovered expired running analysis job %s (attempt %s/%s)",
+                    job.id,
+                    job.attempt,
+                    job.max_attempts,
+                )
+            else:
+                await job_repository.fail(
+                    job_id=str(job.id),
+                    worker_id=job.lease_owner or "expired-lease",
+                    error_code="analyzer_worker_crashed",
+                    error_message=(
+                        "Analyzer worker crashed or stopped unexpectedly; max retries exceeded."
+                    ),
+                )
+                await scan_repository.update_analysis_projection(
+                    scan_id=job.scan_id,
+                    org_id=job.org_id,
+                    current_job_id=str(job.id),
+                    expected_revision=job.revision,
+                    status=AnalysisStatus.failed,
+                    progress=job.progress,
+                    message="Analysis failed",
+                    error_code="analyzer_worker_crashed",
+                    error_message=(
+                        "Analyzer worker crashed or stopped unexpectedly; max retries exceeded."
+                    ),
+                    clear_lease_owner=True,
+                )
+                logger.warning(
+                    "terminally failed expired analysis job %s with exhausted retries",
+                    job.id,
+                )
+            recovered_count += 1
+        except Exception:
+            logger.exception("failed to recover expired analysis job %s", job.id)
+
+    return recovered_count
+
+
 async def run_worker() -> None:
     settings = get_settings()
     configure_logging(log_level=settings.log_level)
     await init_db(settings)
-    queue = RedisAnalysisQueue.from_settings(settings)
     job_repository = AnalysisJobRepository()
     scan_repository = ScanRepository()
+    await recover_expired_analysis_jobs(job_repository, scan_repository)
+    queue = RedisAnalysisQueue.from_settings(settings)
     member_repository = MemberRepository()
     notification_repository = NotificationRepository()
     client = AIClient()
@@ -368,6 +528,14 @@ async def run_worker() -> None:
     report_service = ReportAnalysisService(client)
     worker_id = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
     last_reconciliation = datetime.min.replace(tzinfo=timezone.utc)
+
+    logger.info(
+        "analyzer worker %s online: ai_analysis_enabled=%s model=%s poll=%ss",
+        worker_id,
+        settings.ai_analysis_enabled,
+        settings.ai_model if settings.ai_analysis_enabled else FALLBACK_MODEL,
+        settings.analysis_poll_seconds,
+    )
 
     try:
         while True:
@@ -401,6 +569,16 @@ async def run_worker() -> None:
                 )
             if job is None:
                 continue
+            logger.info(
+                "claimed analysis job %s scan=%s org=%s revision=%s attempt=%s/%s findings=%s",
+                job.id,
+                job.scan_id,
+                job.org_id,
+                job.revision,
+                job.attempt,
+                job.max_attempts,
+                job.finding_count,
+            )
             await process_analysis_job(
                 job,
                 worker_id=worker_id,

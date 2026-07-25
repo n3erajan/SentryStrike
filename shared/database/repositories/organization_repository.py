@@ -21,13 +21,6 @@ class OrganizationRepository:
         """List every organization (used by the retention purge to sweep each tenant)."""
         return await Organization.find_all().to_list()
 
-    async def set_default_scan_config(self, org: Organization, config: dict) -> Organization:
-        """Replace the stored default scan config blob."""
-        org.default_scan_config = config
-        org.updated_at = datetime.now(timezone.utc)
-        await org.save()
-        return org
-
     async def set_retention_days(self, org: Organization, days: int) -> Organization:
         """Update retention, enforcing the compliance floor of ``MIN_RETENTION_DAYS``."""
         org.retention_days = max(MIN_RETENTION_DAYS, days)

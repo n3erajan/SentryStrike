@@ -37,6 +37,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from shared.models.vulnerability import PROOF_CEILINGS, get_fp_ceiling
+
 if TYPE_CHECKING:
     from shared.models.vulnerability import Vulnerability
 
@@ -231,6 +233,82 @@ _STRUCTURAL_VULN_KEYWORDS: tuple[str, ...] = (
     "mfa",
     "rate limit",
     "password change",
+    "horizontal authorization bypass",
+    "vertical privilege bypass",
+    "privilege escalation",
+    "privilege bypass",
+    "mass assignment",
+    "access control",
+    "authorization bypass",
+    "forced browsing",
+)
+
+# Pattern-match methods — a regex hit on the response body could be a genuine
+# error, reflected payload, or normal page content. The AI must judge.
+_PATTERN_MATCH_METHODS: frozenset[str] = frozenset({
+    "observed_exception_evidence",
+    "path_bruteforce",
+    "api_response_reflection",
+    "content_type_bypass_response_evidence",
+    "double_extension_response_evidence",
+    "observed_response_content",
+    "path_content_fingerprint",
+    "observed_credential_disclosure",
+})
+
+_PATTERN_MATCH_KEYWORDS: tuple[str, ...] = (
+    "verbose error",
+    "exception handling",
+    "stack trace",
+    "error handling",
+    "credential",
+    "config disclosure",
+    "debug",
+    "metrics endpoint",
+)
+
+# Structural vuln types — the observation itself IS the proof (missing header,
+# TLS absence, admin path reachability, GET credentials, CSRF token absence,
+# brute-force absence, captcha absence, cookie attribute issues).
+_STRUCTURAL_VULN_KEYWORDS: tuple[str, ...] = (
+    "missing security header",
+    "weak content security policy",
+    "cors misconfiguration",
+    "missing cache-control",
+    "information disclosure in header",
+    "server banner",
+    "insecure transport",
+    "weak tls",
+    "ssl configuration",
+    "no tls configuration",
+    "no tls",
+    "credentials transmitted via http get",
+    "credential / token exposed",
+    "sensitive data in url",
+    "sensitive credential",
+    "password in get",
+    "credentials via get",
+    "insecure session cookie",
+    "cookie without secure flag",
+    "cookie attribute",
+    "admin / privileged endpoint",
+    "admin endpoint",
+    "privileged endpoint",
+    "well-known admin",
+    "sensitive path",
+    "admin panel",
+    "phpmyadmin",
+    "sensitive file exposure",
+    "authentication form may lack csrf",
+    "authentication form lacks csrf",
+    "mixed content",
+    "authentication endpoint served over plaintext",
+    "brute-force",
+    "brute force",
+    "captcha",
+    "mfa",
+    "rate limit",
+    "password change",
     "token enforcement",
     "jwt missing",
     "missing expiration",
@@ -264,6 +342,11 @@ _PROOF_CEILINGS: dict[str, float] = {
     "pattern_match": 1.00,
     "heuristic": 0.40,
 }
+
+def get_fp_ceiling(proof_type: str | None) -> float:
+    if not proof_type:
+        return 1.0
+    return _PROOF_CEILINGS.get(proof_type.lower(), 1.0)
 
 _PROOF_GRADE_LETTERS: dict[str, str] = {
     "active_output": "A",

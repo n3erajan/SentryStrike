@@ -7,6 +7,7 @@ from app.core.auth import AuthService, InvalidSessionError
 from app.core.invites import InviteService
 from app.core.invite_rate_limit import RedisInviteRateLimiter
 from shared.analysis_queue import AnalysisQueue, RedisAnalysisQueue
+from shared.database.repositories.application_repository import ApplicationRepository
 from shared.database.repositories.audit_repository import AuditRepository
 from shared.database.repositories.analysis_job_repository import AnalysisJobRepository
 from shared.database.repositories.member_repository import MemberRepository
@@ -21,6 +22,7 @@ from shared.models.user import User, UserRole
 scan_repository = ScanRepository()
 member_repository = MemberRepository()
 organization_repository = OrganizationRepository()
+application_repository = ApplicationRepository()
 audit_repository = AuditRepository()
 notification_repository = NotificationRepository()
 reverification_repository = ReverificationRepository()
@@ -43,6 +45,11 @@ def get_member_repository() -> MemberRepository:
 def get_organization_repository() -> OrganizationRepository:
     """FastAPI dependency: provide the shared OrganizationRepository singleton."""
     return organization_repository
+
+
+def get_application_repository() -> ApplicationRepository:
+    """FastAPI dependency: provide the shared ApplicationRepository singleton."""
+    return application_repository
 
 
 def get_audit_repository() -> AuditRepository:

@@ -1260,6 +1260,7 @@ class BrowserDiscoveryEngine:
         deadline: float | None = None,
         storage_state: dict | None = None,
         client_routes: list[str] | None = None,
+        progress_callback: Callable[[float], Awaitable[None]] | None = None,
     ) -> CrawlState:
         """Stream browser observations into ``state`` as they arrive.
 
@@ -1328,6 +1329,7 @@ class BrowserDiscoveryEngine:
                 deadline=deadline,
                 storage_state=storage_state,
                 client_routes=client_routes,
+                progress_callback=progress_callback,
             )
         finally:
             # A hard-deadline truncation cancels workers mid-``fill``, orphaning
@@ -1354,6 +1356,7 @@ class BrowserDiscoveryEngine:
         deadline: float | None = None,
         storage_state: dict | None = None,
         client_routes: list[str] | None = None,
+        progress_callback: Callable[[float], Awaitable[None]] | None = None,
     ) -> CrawlState:
         """Body of :meth:`crawl_into` (see its docstring). Split out so the loop
         exception handler that silences the benign ``TargetClosedError`` teardown
@@ -1915,6 +1918,22 @@ class BrowserDiscoveryEngine:
             worker_gather = asyncio.gather(
                 *[_worker(i) for i in range(num_workers)], return_exceptions=True
             )
+            
+            async def _progress_ticker():
+                if progress_callback is None:
+                    return
+                start_time = loop.time()
+                budget = (effective_deadline - start_time) if effective_deadline is not None else float(getattr(self.settings, "crawl_browser_budget_seconds", 300.0))
+                if budget <= 0:
+                    budget = 300.0
+                while not finished:
+                    elapsed = loop.time() - start_time
+                    fraction = min(elapsed / budget, 1.0)
+                    asyncio.create_task(progress_callback(fraction))
+                    await asyncio.sleep(5.0)
+                    
+            ticker_task = asyncio.create_task(_progress_ticker())
+            
             try:
                 if effective_deadline is not None:
                     # Pool watchdog. A worker stuck on an unbounded await (a
@@ -1945,6 +1964,7 @@ class BrowserDiscoveryEngine:
                 else:
                     await worker_gather
             finally:
+                ticker_task.cancel()
                 # Merge each worker's local state into the shared state. This runs
                 # in ``finally`` — even under a hard-timeout cancellation — so the
                 # per-worker partial observations (streamed into each ``wstate`` in

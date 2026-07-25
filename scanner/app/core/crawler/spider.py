@@ -4,6 +4,7 @@ import pathlib
 import re
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Callable, Awaitable
 from urllib import robotparser
 from urllib.parse import urlparse
 
@@ -103,6 +104,7 @@ class CrawlResult:
     button_mutations_fired: int = 0
     file_inputs_discovered: int = 0
     browser_forms: list[dict[str, object]] = field(default_factory=list)
+    observed_mean_latency_ms: float | None = None
 
 
 class WebSpider:
@@ -163,7 +165,7 @@ class WebSpider:
                 redacted[key] = redact_secret(value)
         return redacted
 
-    async def crawl(self, root_url: str, max_depth: int | None = None, auth_override=None, scan_config: ScanConfig | None = None) -> CrawlResult:
+    async def crawl(self, root_url: str, max_depth: int | None = None, auth_override=None, scan_config: ScanConfig | None = None, progress_callback: Callable[[float], Awaitable[None]] | None = None) -> CrawlResult:
         self._reset_scan_auth_state()
         self._auth_override = auth_override
         self._scan_config = scan_config
@@ -178,6 +180,7 @@ class WebSpider:
         forms: list[HtmlForm] = []
         discovered_urls: list[str] = []
         discovered_set: set[str] = set()
+        request_latencies: list[float] = []
         crawl_state = CrawlState()
         dead_routes: list[RouteCandidate] = []
         spa_detector = SpaFallbackDetector()
@@ -341,7 +344,11 @@ class WebSpider:
                     await rate_limit_sleep()
 
                     try:
+                        t_start = time.perf_counter()
                         response = await self._request_with_session_keeper(client, "GET", url)
+                        t_end = time.perf_counter()
+                        async with lock:
+                            request_latencies.append((t_end - t_start) * 1000.0)
                     except Exception as exc:
                         logger.warning("crawl failed for %s: %s", url, exc)
                         queue.task_done()
@@ -452,10 +459,20 @@ class WebSpider:
             try:
                 # Wait until queue is empty and all tasks are done, OR we reached max URLs
                 join_task = asyncio.create_task(queue.join())
+                last_progress_time = 0.0
                 while not join_task.done():
                     async with lock:
-                        if len(discovered_urls) >= effective_max_urls:
+                        current_discovered = len(discovered_urls)
+                        if current_discovered >= effective_max_urls:
                             break
+                        
+                    now = time.time()
+                    if progress_callback is not None and now - last_progress_time > 2.0:
+                        last_progress_time = now
+                        fraction = min(current_discovered / max(1, effective_max_urls), 1.0)
+                        # Fire and forget callback so it doesn't block the wait loop
+                        asyncio.create_task(progress_callback(fraction))
+                        
                     await asyncio.sleep(0.1)
                 
                 if not join_task.done():
@@ -485,7 +502,7 @@ class WebSpider:
                     and not getattr(route, "is_dead", False)
                     and route.url not in dead_urls
                 ]
-                await self._run_browser_discovery(crawl_state, root_url, browser_routes)
+                await self._run_browser_discovery(crawl_state, root_url, browser_routes, progress_callback)
 
         # Browser routes reconstructed from a dead hash route hold a real
         # server URL the HTTP worker never saw — a query-bearing endpoint
@@ -525,6 +542,10 @@ class WebSpider:
                 crawl_state.add_parameter(parameter)
         for parameter in ParamDiscovery.build_parameter_inventory(discovered_urls, forms, api_endpoints=crawl_state.api_endpoints):
             crawl_state.add_parameter(parameter)
+            
+        observed_mean_latency_ms = None
+        if request_latencies:
+            observed_mean_latency_ms = sum(request_latencies) / len(request_latencies)
 
         result = CrawlResult(
             urls=discovered_urls,
@@ -556,6 +577,7 @@ class WebSpider:
             button_mutations_fired=crawl_state.button_mutations_fired,
             file_inputs_discovered=crawl_state.file_inputs_discovered,
             browser_forms=list(crawl_state.browser_forms),
+            observed_mean_latency_ms=observed_mean_latency_ms,
         )
         self._log_crawl_inventory(root_url, result)
         return result
@@ -746,6 +768,7 @@ class WebSpider:
         crawl_state: CrawlState,
         root_url: str,
         routes: list[str],
+        progress_callback: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         """Run browser discovery, always merging partial results.
 
@@ -796,6 +819,7 @@ class WebSpider:
                 deadline=deadline,
                 storage_state=self._auth_storage_state,
                 client_routes=client_routes,
+                progress_callback=progress_callback,
             )
         )
         safety_timeout = budget + max(30.0, budget * 0.5)

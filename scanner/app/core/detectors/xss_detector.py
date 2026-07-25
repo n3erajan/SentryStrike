@@ -342,6 +342,13 @@ class XSSDetector(BaseDetector):
                     if job:
                         pending.append(job)
                 if result.is_vulnerable or pending:
+                    if result.is_vulnerable and target is not None:
+                        from app.reverification_strategies.common import (
+                            attach_attack_target_metadata,
+                        )
+
+                        for finding in result.findings:
+                            attach_attack_target_metadata(finding, target)
                     return result.findings if result.is_vulnerable else [], pending
             except Exception as e:
                 logger.error("XSS verification failed for %s param %s: %s", cand_url, param, e)

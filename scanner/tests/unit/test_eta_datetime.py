@@ -128,8 +128,6 @@ def test_progress_fraction_is_work_weighted_not_detector_count() -> None:
     orch._eta_state.detector_completed_work = 25.0  # lights done
     orch._eta_state.detector_total_s = 600.0
     orch._eta_state.detector_phase_started = perf_counter() - 120.0
-    orch._eta_state.findings_count = 10
-
     fraction = orch._eta_state.detector_completed_work / orch._eta_state.detector_total_work
     assert fraction < 0.1
 
@@ -172,7 +170,6 @@ def test_last_heavy_detector_does_not_claim_tiny_eta() -> None:
     # Lights finished in 60s — pace would understate XSS if we trusted it alone;
     # prior floor keeps remaining honest.
     orch._eta_state.detector_phase_started = perf_counter() - 60.0
-    orch._eta_state.findings_count = 40
 
     remaining = orch._detector_remaining_seconds()
     prior_share = 400.0 * (500.0 / 530.0)

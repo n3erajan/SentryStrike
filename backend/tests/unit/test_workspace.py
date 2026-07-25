@@ -110,7 +110,6 @@ class FakeOrg:
         self.id = org_id
         self.name = name
         self.retention_days = 90
-        self.default_scan_config: dict = {}
         self.member_limit = 10
         self.occupied_seats = 3 if org_id == "org-1" else 1
 
@@ -125,10 +124,6 @@ class FakeOrganizationRepository:
 
     async def get_by_id(self, org_id: str):
         return self.orgs.get(org_id)
-
-    async def set_default_scan_config(self, org: FakeOrg, config: dict) -> FakeOrg:
-        org.default_scan_config = config
-        return org
 
     async def set_retention_days(self, org: FakeOrg, days: int) -> FakeOrg:
         org.retention_days = max(MIN_RETENTION_DAYS, days)
@@ -526,54 +521,8 @@ def test_cannot_cancel_invite_in_another_org() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Settings — default config & retention
+# Settings — retention
 # ---------------------------------------------------------------------------
-
-
-def test_any_member_can_read_default_config() -> None:
-    members, orgs, invites = _repos()
-    orgs.orgs["org-1"].default_scan_config = {"crawl_depth": 3}
-    client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.viewer)
-
-    response = client.get("/api/v1/workspace/default-config")
-
-    assert response.status_code == 200
-    assert response.json()["data"]["config"] == {"crawl_depth": 3}
-
-
-def test_admin_can_replace_default_config() -> None:
-    members, orgs, invites = _repos()
-    client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.admin)
-
-    response = client.put("/api/v1/workspace/default-config", json={"config": {"scanner_concurrency": 8}})
-
-    assert response.status_code == 200
-    assert orgs.orgs["org-1"].default_scan_config == {"scanner_concurrency": 8}
-
-
-def test_default_config_rejects_unknown_or_out_of_range_fields() -> None:
-    members, orgs, invites = _repos()
-    client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.admin)
-
-    unknown = client.put(
-        "/api/v1/workspace/default-config", json={"config": {"concurrency": 8}}
-    )
-    out_of_range = client.put(
-        "/api/v1/workspace/default-config",
-        json={"config": {"scanner_concurrency": 500}},
-    )
-
-    assert unknown.status_code == 422
-    assert out_of_range.status_code == 422
-
-
-def test_viewer_cannot_replace_default_config() -> None:
-    members, orgs, invites = _repos()
-    client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.viewer)
-
-    response = client.put("/api/v1/workspace/default-config", json={"config": {"scanner_concurrency": 8}})
-
-    assert response.status_code == 403
 
 
 def test_retention_is_readable_by_any_member() -> None:
