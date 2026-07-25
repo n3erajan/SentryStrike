@@ -3,7 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { FileBarChart, Plus } from "lucide-react";
 import {
   getApplication,
-  listApplicationScans,
+  listAllApplicationScans,
 } from "../services/applications.js";
 import { severityClass } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
@@ -46,7 +46,7 @@ function ApplicationPage() {
       try {
         const [appData, scanData] = await Promise.all([
           getApplication(appId, signal),
-          listApplicationScans(appId, { signal }),
+          listAllApplicationScans(appId, { signal }),
         ]);
         setApp(appData);
         setScans(Array.isArray(scanData?.items) ? scanData.items : []);

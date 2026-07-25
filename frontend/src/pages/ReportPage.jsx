@@ -1,11 +1,20 @@
 import { useCallback, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
-import { ChevronDown, Download, FileText, RefreshCw, Send } from "lucide-react";
+import {
+  ChevronDown,
+  CircleOff,
+  Download,
+  FileText,
+  RefreshCw,
+  RotateCcw,
+  Send,
+} from "lucide-react";
 import { downloadReportPdf, getReport } from "../services/reports.js";
 import { downloadFile, saveBlob } from "../utils/helpers.js";
 import { SEVERITIES, SEVERITY_META, severityClass } from "../data/constants.js";
 import { useToast } from "../components/Toast.jsx";
 import { useAuth } from "../context/AuthContext.jsx";
+import Select from "../components/Select.jsx";
 import { getScanDetails } from "../services/scan.js";
 import { listMembers } from "../services/workspace.js";
 import {
@@ -217,66 +226,72 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
         <div className='field'>
           <label>Assignee</label>
           <div className='control'>
-            <select
+            <Select
               value={finding.assignee_user_id || ""}
               disabled={!triager || busy === "assign"}
-              onChange={(e) =>
+              onChange={(v) =>
                 mutate(
                   "assign",
-                  () => assignFinding(scanId, finding.id, e.target.value),
+                  () => assignFinding(scanId, finding.id, v),
                   "Assignment updated",
                 )
               }
-            >
-              <option value=''>Unassigned</option>
-              {members.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.full_name} ({m.email})
-                </option>
-              ))}
-            </select>
+              options={[
+                {value: "", label: "Unassigned"},
+                ...members.map((m) => ({value: m.id, label: `${m.full_name} (${m.email})`})),
+              ]}
+            />
           </div>
         </div>
         <div className='field'>
           <label>Status</label>
           <div className='control'>
-            <select
+            <Select
               value={finding.remediation_status || "open"}
               disabled={!contributor || busy === "status"}
-              onChange={(e) =>
+              onChange={(v) =>
                 mutate(
                   "status",
-                  () => updateRemediation(scanId, finding.id, e.target.value),
+                  () => updateRemediation(scanId, finding.id, v),
                   "Remediation status updated",
                 )
               }
-            >
-              <option value='open'>Open</option>
-              <option value='in_progress'>In progress</option>
-              <option value='fixed_pending_verification'>
-                Fixed, pending verification
-              </option>
-              {triager && (
-                <option value='verified_fixed'>Verified fixed</option>
-              )}
-              {triager && (
-                <option value='wont_fix'>Won’t fix / risk accepted</option>
-              )}
-            </select>
+              options={[
+                {value: "open", label: "Open"},
+                {value: "in_progress", label: "In progress"},
+                {value: "fixed_pending_verification", label: "Fixed, pending verification"},
+                ...(triager ? [{value: "verified_fixed", label: "Verified fixed"}] : []),
+                ...(triager ? [{value: "wont_fix", label: "Won't fix / risk accepted"}] : []),
+              ]}
+            />
           </div>
         </div>
       </div>
       {triager && (
-        <div className='collab-actions'>
-          <button
-            className='btn'
-            onClick={changeDisposition}
-            disabled={busy === "review"}
+        <div className='collab-actions' aria-label='Finding review actions'>
+          <Tooltip
+            label={
+              finding.is_false_positive
+                ? "Return this finding to the active workflow"
+                : "Suppress this finding after recording a reason"
+            }
           >
-            {finding.is_false_positive
-              ? "Restore active finding"
-              : "Mark false positive"}
-          </button>
+            <button
+              type='button'
+              className={`btn${finding.is_false_positive ? "" : " danger"}`}
+              onClick={changeDisposition}
+              disabled={busy === "review"}
+            >
+              {finding.is_false_positive ? (
+                <RotateCcw className='ico' />
+              ) : (
+                <CircleOff className='ico' />
+              )}
+              {finding.is_false_positive
+                ? "Restore active finding"
+                : "Mark false positive"}
+            </button>
+          </Tooltip>
           {finding.verification_target &&
             (reverify.allowed ? (
               <Tooltip
@@ -287,6 +302,7 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
                 }
               >
                 <button
+                  type='button'
                   className='btn'
                   disabled={busy === "reverify"}
                   onClick={startReverification}
@@ -300,7 +316,12 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
               // A disabled button swallows hover events in some browsers, so
               // keep a native title as a fallback for the tooltip.
               <Tooltip label={reverify.reason}>
-                <button className='btn' disabled title={reverify.reason}>
+                <button
+                  type='button'
+                  className='btn'
+                  disabled
+                  title={reverify.reason}
+                >
                   <RefreshCw className='ico' />
                   Re-verify
                 </button>

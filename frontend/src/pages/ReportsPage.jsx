@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Download, FileBarChart, Search } from "lucide-react";
-import { listScans } from "../services/scan.js";
+import { listAllScans } from "../services/scan.js";
+import { listApplications } from "../services/applications.js";
 import { downloadReportPdf } from "../services/reports.js";
 import { saveBlob } from "../utils/helpers.js";
 import { useToast } from "../components/Toast.jsx";
 import { severityClass } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import Tooltip from "../components/Tooltip.jsx";
+import Select from "../components/Select.jsx";
+import { belongsToApplication } from "../utils/reportFilters.js";
 
 function severityBand(level, score) {
   const lvl = (level || "").toString().toLowerCase();
@@ -46,18 +49,26 @@ function ReportsPage() {
   const navigate = useNavigate();
   const toast = useToast();
   const [scans, setScans] = useState([]);
+  const [applications, setApplications] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
+  const [applicationId, setApplicationId] = useState("");
   const [busy, setBusy] = useState("");
 
   const load = useCallback(async (signal) => {
     setLoading(true);
     setError("");
     try {
-      const data = await listScans({ limit: 25, signal });
-      const items = Array.isArray(data?.items) ? data.items : [];
+      const [scanData, applicationData] = await Promise.all([
+        listAllScans({ signal }),
+        listApplications({ limit: 100, signal }),
+      ]);
+      const items = Array.isArray(scanData?.items) ? scanData.items : [];
       setScans(items.filter((s) => s.status === "completed"));
+      setApplications(
+        Array.isArray(applicationData?.items) ? applicationData.items : [],
+      );
     } catch (err) {
       if (err.name !== "AbortError")
         setError(err.message || "Could not load reports.");
@@ -75,7 +86,14 @@ function ReportsPage() {
 
   const rows = useMemo(() => {
     const q = query.toLowerCase();
+    const selectedApplication = applications.find(
+      (application) => application.id === applicationId,
+    );
     return scans
+      .filter(
+        (scan) =>
+          !applicationId || belongsToApplication(scan, selectedApplication),
+      )
       .map((s) => ({
         id: s.id,
         target: s.target_url,
@@ -88,7 +106,7 @@ function ReportsPage() {
         analysisStatus: s.analysis?.status || "not_requested",
       }))
       .filter((r) => (r.host + r.target).toLowerCase().includes(q));
-  }, [scans, query]);
+  }, [scans, applications, query, applicationId]);
 
   async function handleDownload(id) {
     setBusy(id);
@@ -111,14 +129,32 @@ function ReportsPage() {
         </div>
       </div>
 
-      <label className='search'>
-        <Search className='ico' />
-        <input
-          placeholder='Search reports'
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-      </label>
+      <div className='reports-controls'>
+        <label className='search'>
+          <Search className='ico' />
+          <input
+            placeholder='Search reports'
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </label>
+        {applications.length > 0 && (
+          <div className='reports-app-filter'>
+            <Select
+              value={applicationId}
+              onChange={setApplicationId}
+              ariaLabel='Filter reports by web application'
+              options={[
+                { value: "", label: "All reports" },
+                ...applications.map((application) => ({
+                  value: application.id,
+                  label: application.name,
+                })),
+              ]}
+            />
+          </div>
+        )}
+      </div>
 
       {loading ? (
         <div className='empty-state'>Loading reports…</div>
@@ -127,11 +163,19 @@ function ReportsPage() {
       ) : rows.length === 0 ? (
         <div className='empty-state'>
           <FileBarChart size={30} />
-          <h2>No reports yet</h2>
-          <p>Reports appear here after an assessment completes.</p>
+          <h2>
+            {applicationId ? "No reports for this application" : "No reports yet"}
+          </h2>
+          <p>
+            {applicationId
+              ? "Completed assessments for this web application will appear here."
+              : "Reports appear here after an assessment completes."}
+          </p>
           {user?.role !== "viewer" && <button
             className='btn primary'
-            onClick={() => navigate("/scan")}
+            onClick={() =>
+              navigate(applicationId ? `/scan?app=${applicationId}` : "/scan")
+            }
           >
             New Scan
           </button>}

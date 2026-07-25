@@ -76,6 +76,7 @@ export function buildCredentials(credentials = {}) {
 
 export function createScan({
   targetUrl,
+  applicationId,
   crawlMode,
   authorizationConfirmed,
   credentials,
@@ -85,6 +86,7 @@ export function createScan({
     method: "POST",
     body: {
       target_url: targetUrl,
+      application_id: applicationId || undefined,
       crawl_mode: crawlMode,
       authorization_confirmed: authorizationConfirmed,
       credentials: buildCredentials(credentials),
@@ -95,6 +97,22 @@ export function createScan({
 
 export function listScans({ skip = 0, limit = 50, signal } = {}) {
   return apiRequest(`/scans?skip=${skip}&limit=${limit}`, { signal });
+}
+
+export async function listAllScans({ signal } = {}) {
+  const limit = 100;
+  const items = [];
+  let skip = 0;
+
+  while (true) {
+    const page = await listScans({ skip, limit, signal });
+    const pageItems = Array.isArray(page?.items) ? page.items : [];
+    items.push(...pageItems);
+    if (pageItems.length < limit) break;
+    skip += pageItems.length;
+  }
+
+  return { items, total: items.length };
 }
 
 export function getScanDetails(scanId, signal) {

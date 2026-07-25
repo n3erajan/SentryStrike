@@ -97,6 +97,7 @@ function useScanForm({ applicationId } = {}) {
     try {
       const res = await createScan({
         targetUrl: url,
+        applicationId,
         crawlMode,
         authorizationConfirmed: consent,
         config,
@@ -112,7 +113,7 @@ function useScanForm({ applicationId } = {}) {
     } finally {
       setSubmitting(false);
     }
-  }, [valid, consent, submitting, url, crawlMode, config, credentials]);
+  }, [valid, consent, submitting, url, applicationId, crawlMode, config, credentials]);
 
   return {
     // inputs

@@ -46,7 +46,7 @@ function useScanStatus(scanId) {
   const active = status === "queued" || status === "running" || status === null;
 
   const pushLog = useCallback((kind, text) => {
-    setLogs((prev) => [...prev, { kind, text }]);
+    setLogs((prev) => [...prev, { kind, text, time: Date.now() }]);
   }, []);
 
   const cancel = useCallback(async () => {

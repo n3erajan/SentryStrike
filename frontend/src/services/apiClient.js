@@ -76,8 +76,10 @@ export async function apiRequest(path, { method = "GET", body, auth = true, sign
   }
 
   if (!response.ok || (payload && payload.success === false)) {
-    const error = new Error(extractMessage(payload, response.status));
+    const msg = extractMessage(payload, response.status);
+    const error = new Error(msg);
     error.status = response.status;
+    error.responseBody = text || null;
     throw error;
   }
 

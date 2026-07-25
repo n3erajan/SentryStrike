@@ -4,6 +4,7 @@ import { ChevronDown } from "lucide-react";
 import { useScanForm } from "../hooks/useScan.js";
 import { useToast } from "../components/Toast.jsx";
 import { useAuth } from "../context/AuthContext.jsx";
+import Select from "../components/Select.jsx";
 import ConfigField, { configValid } from "../components/ConfigField.jsx";
 import { listApplications } from "../services/applications.js";
 import {
@@ -19,19 +20,10 @@ function CredentialAccount({ role, account, onField, disabled }) {
   const advanced = CRED_FIELDS.filter((f) => f.advanced);
 
   return (
-    <section style={{ borderTop: "1px solid var(--line)", padding: "15px 0" }}>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "baseline",
-          gap: 10,
-        }}
-      >
-        <h3 style={{ fontSize: "0.85rem" }}>{role.label}</h3>
-        <p style={{ fontSize: "0.65rem", color: "var(--muted)" }}>
-          {role.desc}
-        </p>
+    <section className='credential-account'>
+      <div className='credential-account-head'>
+        <h3>{role.label}</h3>
+        <p>{role.desc}</p>
       </div>
       <div className='grid2'>
         {basic.map((f) => (
@@ -216,20 +208,15 @@ function ScanPage() {
                 <div className='field wide'>
                   <label htmlFor='scan-application'>Web application</label>
                   <div className='control'>
-                    <select
-                      id='scan-application'
+                    <Select
                       value={applicationId}
-                      onChange={(e) => selectApplication(e.target.value)}
+                      onChange={selectApplication}
                       disabled={submitting}
-                      aria-describedby='scan-application-description'
-                    >
-                      <option value=''>None — scan a one-off URL</option>
-                      {apps.map((a) => (
-                        <option key={a.id} value={a.id}>
-                          {a.name}
-                        </option>
-                      ))}
-                    </select>
+                      options={[
+                        { value: "", label: "None - scan a one-off URL" },
+                        ...apps.map((a) => ({ value: a.id, label: a.name })),
+                      ]}
+                    />
                   </div>
                   <p
                     className='field-description'
@@ -323,7 +310,9 @@ function ScanPage() {
             aria-expanded={usersOpen}
             aria-controls='test-users-panel'
           >
-            Test users <span className='muted-text'>(optional)</span>
+            <span className='advanced-toggle-title'>
+              Test users <span className='muted-text'>(optional)</span>
+            </span>
             <span className='advanced-toggle-hint'>
               Accounts for authenticated and access-control testing
             </span>
@@ -372,8 +361,10 @@ function ScanPage() {
             onClick={() => setAdvancedOpen((v) => !v)}
             aria-expanded={advancedOpen}
           >
-            Advanced configuration{" "}
-            <span className='muted-text'>(optional)</span>
+            <span className='advanced-toggle-title'>
+              Advanced configuration{" "}
+              <span className='muted-text'>(optional)</span>
+            </span>
             <span className='advanced-toggle-hint'>
               Crawler, scanner, injection, and browser tuning
             </span>

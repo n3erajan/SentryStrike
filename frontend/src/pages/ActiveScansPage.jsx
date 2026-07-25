@@ -1,6 +1,9 @@
 import { useNavigate } from "react-router-dom";
 import { ArrowUpRight, ShieldCheck } from "lucide-react";
-import { useActiveScans } from "../hooks/useActiveScans.js";
+import {
+  isAnalysisPending,
+  useActiveScans,
+} from "../hooks/useActiveScans.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import Tooltip from "../components/Tooltip.jsx";
 
@@ -55,37 +58,45 @@ function ActiveScansPage() {
             <span>Phase</span>
             <span></span>
           </div>
-          {scans.map((scan) => (
-            <article
-              key={scan.id}
-              className='scans-row'
-              onClick={() =>
-                navigate(`/active/${scan.id}`, {
-                  state: { target: scan.target_url },
-                })
-              }
-            >
-              <div>
-                <div className='rowtitle'>{scan.target_url}</div>
-                <div className='small'>
-                  {scan.crawl_mode === "single" ? "Single page" : "Full site"} ·{" "}
-                  {formatRelative(scan.created_at)}
+          {scans.map((scan) => {
+            const analysisPending = isAnalysisPending(scan);
+            const displayStatus = analysisPending ? "incomplete" : scan.status;
+            const displayPhase = analysisPending
+              ? "AI analysis"
+              : scan.phase_message || "Scanning";
+
+            return (
+              <article
+                key={scan.id}
+                className='scans-row'
+                onClick={() =>
+                  navigate(`/active/${scan.id}`, {
+                    state: { target: scan.target_url },
+                  })
+                }
+              >
+                <div>
+                  <div className='rowtitle'>{scan.target_url}</div>
+                  <div className='small'>
+                    {scan.crawl_mode === "single" ? "Single page" : "Full site"} ·{" "}
+                    {formatRelative(scan.created_at)}
+                  </div>
                 </div>
-              </div>
-              <span className={`status-pill ${scan.status}`}>
-                {scan.status}
-              </span>
-              <span>{Math.round(scan.progress || 0)}%</span>
-              <span className='small'>{scan.phase_message || "Scanning"}</span>
-              <span className='rowactions'>
-                <Tooltip label='Open scan'>
-                  <button aria-label='Open scan' type='button'>
-                    <ArrowUpRight className='ico' />
-                  </button>
-                </Tooltip>
-              </span>
-            </article>
-          ))}
+                <span className={`status-pill ${displayStatus}`}>
+                  {displayStatus}
+                </span>
+                <span>{Math.round(scan.progress || 0)}%</span>
+                <span className='small'>{displayPhase}</span>
+                <span className='rowactions'>
+                  <Tooltip label='Open scan'>
+                    <button aria-label='Open scan' type='button'>
+                      <ArrowUpRight className='ico' />
+                    </button>
+                  </Tooltip>
+                </span>
+              </article>
+            );
+          })}
         </div>
       )}
     </div>

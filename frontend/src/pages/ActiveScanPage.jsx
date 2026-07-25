@@ -32,19 +32,16 @@ function formatEta(seconds) {
   return rem ? `${hours}h ${rem}m` : `${hours}h`;
 }
 
-function formatDuration(iso) {
-  if (!iso) return "";
-  const start = new Date(iso).getTime();
-  if (Number.isNaN(start)) return "";
-  const diff = Math.max(0, Date.now() - start);
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins} minutes ago`;
-  return `${Math.floor(mins / 60)}h ago`;
-}
-
 function timeStr(date) {
   return date.toTimeString().slice(0, 8);
+}
+
+function hostnameOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url || "target";
+  }
 }
 
 function ActiveScanPage() {
@@ -78,7 +75,6 @@ function ActiveScanPage() {
   }, [status, scanId, navigate]);
 
   const surfaces = Math.max(1, stageIdx * 20);
-  const now = new Date();
   const analysisStatus = analysis?.status;
   const showAnalysis =
     Boolean(analysisStatus) && status === "completed";
@@ -90,9 +86,9 @@ function ActiveScanPage() {
       </button>
       <div className='head'>
         <div>
-          <h1>Assessing {target ? new URL(target).hostname : "target"}</h1>
+          <h1>Assessing {target ? hostnameOf(target) : "target"}</h1>
           <p>
-            {target || `Scan ${scanId}`} · started {formatDuration()}{" "}
+            {target || `Scan ${scanId}`}
           </p>
         </div>
         {active && user?.role !== "viewer" ? (
@@ -204,7 +200,7 @@ function ActiveScanPage() {
                         : ""
                   }
                 >
-                  [{timeStr(now)}] {line.text}
+                  [{timeStr(new Date(line.time))}] {line.text}
                 </div>
               ))
             ) : (

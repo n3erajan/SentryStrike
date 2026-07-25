@@ -3,12 +3,25 @@ import { listScans } from "../services/scan.js";
 
 const POLL_INTERVAL_MS = 5000;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
+const ANALYSIS_ACTIVE = new Set(["queued", "running"]);
+
+export function isAnalysisPending(scan) {
+  return (
+    scan.status === "completed" &&
+    ANALYSIS_ACTIVE.has(scan.analysis?.status)
+  );
+}
+
+export function isActive(scan) {
+  if (ACTIVE_STATUSES.has(scan.status)) return true;
+  return isAnalysisPending(scan);
+}
 
 // Polls GET /scans on an interval and exposes the scans that are still in
-// flight (queued or running). Backs both the Active dashboard and the sidebar
-// count badge, so the user can watch every concurrent scan the backend is
-// running. `refresh()` forces an immediate re-fetch (e.g. right after starting
-// a new scan).
+// flight (queued or running) or completed but still running AI analysis.
+// Backs both the Active dashboard and the sidebar count badge, so the user
+// can watch every concurrent scan. `refresh()` forces an immediate re-fetch
+// (e.g. right after starting a new scan).
 export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
   const [scans, setScans] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -28,7 +41,7 @@ export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
         const data = await listScans({ limit: 25, signal: controller.signal });
         if (stopped) return;
         const items = Array.isArray(data?.items) ? data.items : [];
-        setScans(items.filter((s) => ACTIVE_STATUSES.has(s.status)));
+        setScans(items.filter(isActive));
         setError("");
       } catch (err) {
         if (stopped || err.name === "AbortError") return;
