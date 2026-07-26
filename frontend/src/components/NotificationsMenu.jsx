@@ -1,5 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Bell, CheckCheck, Loader2, X } from "lucide-react";
+import {
+  Ban,
+  Bell,
+  CheckCheck,
+  CheckCircle2,
+  ClipboardCheck,
+  Loader2,
+  MessageSquare,
+  ShieldCheck,
+  UserCheck,
+  Users,
+  X,
+  XCircle,
+} from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import {
   getUnreadCount,
@@ -10,6 +23,37 @@ import {
 import Tooltip from "./Tooltip.jsx";
 
 const PAGE_SIZE = 15;
+
+/* Icon + accent per backend NotificationType; unknown types fall back
+   to a neutral bell. */
+const TYPE_META = {
+  scan_completed: { Icon: CheckCircle2, tone: "good" },
+  scan_failed: { Icon: XCircle, tone: "bad" },
+  analysis_failed: { Icon: XCircle, tone: "bad" },
+  scan_cancelled: { Icon: Ban, tone: "muted" },
+  finding_assigned: { Icon: UserCheck, tone: "brand" },
+  finding_commented: { Icon: MessageSquare, tone: "brand" },
+  finding_review_changed: { Icon: ClipboardCheck, tone: "warn" },
+  remediation_status_changed: { Icon: ClipboardCheck, tone: "warn" },
+  reverification_completed: { Icon: ShieldCheck, tone: "good" },
+  analysis_completed: { Icon: ShieldCheck, tone: "good" },
+  member_role_changed: { Icon: Users, tone: "muted" },
+};
+
+function typeMeta(type) {
+  return TYPE_META[type] || { Icon: Bell, tone: "muted" };
+}
+
+function timeAgo(iso) {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  const s = Math.max(0, (Date.now() - then) / 1000);
+  if (s < 45) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  if (s < 604800) return `${Math.round(s / 86400)}d ago`;
+  return new Date(iso).toLocaleDateString(undefined, { dateStyle: "medium" });
+}
 
 function targetFor(item) {
   const scanId =
@@ -52,6 +96,18 @@ export default function NotificationsMenu() {
     return () => document.removeEventListener("mousedown", outside);
   }, []);
 
+  const loadMore = useCallback(async () => {
+    setLoadingMore(true);
+    try {
+      const batch = await listNotifications({ skip: items.length, limit: PAGE_SIZE });
+      const newItems = batch.items || [];
+      setItems((prev) => [...prev, ...newItems]);
+      if (newItems.length < PAGE_SIZE) setExhausted(true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [items.length]);
+
   useEffect(() => {
     if (!open) return;
     const sentinel = sentinelRef.current;
@@ -66,19 +122,7 @@ export default function NotificationsMenu() {
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [open, loadingMore, exhausted]);
-
-  async function loadMore() {
-    setLoadingMore(true);
-    try {
-      const batch = await listNotifications({ skip: items.length, limit: PAGE_SIZE });
-      const newItems = batch.items || [];
-      setItems((prev) => [...prev, ...newItems]);
-      if (newItems.length < PAGE_SIZE) setExhausted(true);
-    } finally {
-      setLoadingMore(false);
-    }
-  }
+  }, [open, loadingMore, exhausted, loadMore]);
 
   async function toggle() {
     const next = !open;
@@ -160,22 +204,35 @@ export default function NotificationsMenu() {
               </div>
             ) : items.length ? (
               <>
-                {items.map((item) => (
-                  <button
-                    key={item.id}
-                    className={`notification-item${item.read_at ? "" : " unread"}`}
-                    onClick={() => select(item)}
-                  >
-                    <b>{item.title}</b>
-                    <span>{item.message}</span>
-                    <small>
-                      {new Date(item.created_at).toLocaleString(undefined, {
-                        dateStyle: "medium",
-                        timeStyle: "short",
-                      })}
-                    </small>
-                  </button>
-                ))}
+                {items.map((item) => {
+                  const { Icon, tone } = typeMeta(item.type);
+                  return (
+                    <button
+                      key={item.id}
+                      className={`notification-item${item.read_at ? "" : " unread"}`}
+                      onClick={() => select(item)}
+                    >
+                      <span className={`notif-ico tone-${tone}`}>
+                        <Icon className='ico' />
+                      </span>
+                      <span className='notif-body'>
+                        <span className='notif-top'>
+                          <b>{item.title}</b>
+                          <small
+                            title={new Date(item.created_at).toLocaleString(
+                              undefined,
+                              { dateStyle: "medium", timeStyle: "short" },
+                            )}
+                          >
+                            {timeAgo(item.created_at)}
+                          </small>
+                          {!item.read_at && <i className='notif-dot' />}
+                        </span>
+                        <span className='notif-msg'>{item.message}</span>
+                      </span>
+                    </button>
+                  );
+                })}
                 <span ref={sentinelRef} />
                 {loadingMore && (
                   <div className='empty-state'>

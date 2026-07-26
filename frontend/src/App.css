@@ -137,26 +137,94 @@
   width: 100%;
   padding: 13px 16px;
   display: grid;
-  gap: 4px;
+  grid-template-columns: 34px 1fr;
+  gap: 12px;
+  align-items: start;
   border: 0;
   border-bottom: 1px solid var(--line);
   background: transparent;
   color: inherit;
   text-align: left;
   cursor: pointer;
-}
-.notification-item.unread {
-  background: color-mix(in srgb, var(--brand) 10%, transparent);
+  transition: background 0.16s var(--ease);
 }
 .notification-item:hover {
   background: var(--soft);
 }
-.notification-item span {
-  font-size: 13px;
-  line-height: 1.4;
+.notif-ico {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  margin-top: 1px;
 }
-.notification-item small {
+.notif-ico .ico {
+  width: 17px;
+  height: 17px;
+}
+.notif-ico.tone-good {
+  background: color-mix(in srgb, var(--good) 14%, transparent);
+  color: var(--good);
+}
+.notif-ico.tone-bad {
+  background: color-mix(in srgb, var(--bad) 13%, transparent);
+  color: var(--bad);
+}
+.notif-ico.tone-warn {
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+  color: color-mix(in srgb, var(--warn) 72%, var(--ink));
+}
+.notif-ico.tone-brand {
+  background: var(--brandsoft);
+  color: var(--brand);
+}
+.notif-ico.tone-muted {
+  background: var(--soft);
+  color: var(--sub);
+}
+.notif-body {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.notif-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.notif-top b {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.notification-item.unread .notif-top b {
+  font-weight: 750;
+}
+.notif-top small {
+  margin-left: auto;
+  flex-shrink: 0;
   color: var(--muted);
+  font-size: 11px;
+}
+.notif-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--brand);
+}
+.notif-msg {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--sub);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .modal-backdrop {
   position: fixed;
@@ -1049,7 +1117,7 @@ textarea:focus-visible {
   overflow: hidden;
 }
 .hero-copy {
-  animation: enter 0.7s var(--ease);
+  min-width: 0;
 }
 .eyebrow {
   display: inline-flex;
@@ -1251,9 +1319,6 @@ textarea:focus-visible {
   background: var(--bad);
 }
 .ticker-wrap {
-  display: flex;
-  align-items: center;
-  gap: 28px;
   overflow: hidden;
   padding: 17px clamp(18px, 6vw, 96px);
   background: var(--paper);
@@ -1261,13 +1326,14 @@ textarea:focus-visible {
   margin-top: -1px;
 }
 .ticker-label {
+  display: block;
   white-space: nowrap;
   color: var(--muted);
   font-size: 0.67rem;
+  margin-bottom: 12px;
 }
 .ticker {
   display: flex;
-  gap: 42px;
   min-width: max-content;
   animation: ticker 22s linear infinite;
   color: var(--sub);
@@ -1278,6 +1344,9 @@ textarea:focus-visible {
   display: flex;
   gap: 8px;
   align-items: center;
+  /* Spacing lives on each item (not flex gap) so the strip's width is
+     exactly 2x one copy and the -50% loop wraps seamlessly. */
+  margin-right: 42px;
 }
 
 .public-section {
@@ -1363,7 +1432,6 @@ textarea:focus-visible {
 }
 .workflow-pane.active {
   display: block;
-  animation: enter 0.35s var(--ease);
 }
 .mock-browser {
   border: 1px solid var(--line);
@@ -1507,10 +1575,16 @@ textarea:focus-visible {
   text-align: left;
   padding: 0 8px;
   font-weight: 650;
+  position: relative;
+  transition: color 0.2s var(--ease);
 }
 .owasp-nav button.active {
-  background: var(--dark2);
   color: var(--light);
+}
+.owasp-nav .tab-pill {
+  position: absolute;
+  inset: 0;
+  background: var(--dark2);
 }
 .owasp-detail {
   padding-top: 24px;
@@ -1559,10 +1633,22 @@ textarea:focus-visible {
   padding: 0 14px;
   color: var(--sub);
   font-weight: 650;
+  position: relative;
+  transition: color 0.2s var(--ease);
 }
 .roles button.active {
-  background: var(--ink);
   color: var(--paper);
+  border-color: var(--ink);
+}
+.roles .tab-pill {
+  position: absolute;
+  inset: -1px;
+  border-radius: 999px;
+  background: var(--ink);
+}
+.tab-label {
+  position: relative;
+  z-index: 1;
 }
 .role-pane {
   display: none;
@@ -1572,7 +1658,23 @@ textarea:focus-visible {
 }
 .role-pane.active {
   display: grid;
-  animation: enter 0.35s var(--ease);
+}
+/* Stage stacks the animated pane on top of an invisible copy of every
+   pane, so the container always keeps the tallest pane's height and
+   switching tabs never shifts the content below — at any width. */
+.pane-stage {
+  display: grid;
+}
+.pane-stage > * {
+  grid-area: 1 / 1;
+}
+.pane-sizer {
+  visibility: hidden;
+  pointer-events: none;
+  display: grid;
+}
+.pane-sizer > * {
+  grid-area: 1 / 1;
 }
 .role-copy h3 {
   font-size: clamp(2rem, 4vw, 3.3rem);
@@ -1691,7 +1793,7 @@ textarea:focus-visible {
 }
 .cta .btn {
   background: var(--on-brand);
-  color: var(--brand2);
+  color: var(--brand);
   border-color: var(--on-brand);
 }
 footer.public-footer {
@@ -3122,10 +3224,17 @@ footer.public-footer {
   }
   .owasp-nav {
     display: flex;
-    overflow: auto;
+    flex-wrap: wrap;
+    gap: 7px;
   }
   .owasp-nav button {
-    min-width: 185px;
+    min-height: 40px;
+    border: 1px solid oklch(38% 0.04 255);
+    border-radius: 999px;
+    padding: 0 14px;
+  }
+  .owasp-nav .tab-pill {
+    border-radius: 999px;
   }
   .orbit {
     width: 440px;
@@ -3133,7 +3242,7 @@ footer.public-footer {
   }
 }
 
-@media (max-width: 700px) {
+@media (max-width: 800px) {
   .notification-menu {
     position: fixed;
     inset: 0;
@@ -3169,7 +3278,8 @@ footer.public-footer {
     height: 64px;
     padding: 0 14px;
   }
-  .navactions .btn:first-child {
+  /* Collapse the brand to its logo mark so both auth buttons fit. */
+  .public-nav .brand-name {
     display: none;
   }
   .hero {

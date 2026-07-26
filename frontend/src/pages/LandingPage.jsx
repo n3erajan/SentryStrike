@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { MotionConfig, motion } from "motion/react";
 import {
   BadgeCheck,
   ArrowUpRight,
@@ -9,6 +10,16 @@ import {
   Plus,
 } from "lucide-react";
 import ThemeToggle from "../components/ThemeToggle.jsx";
+import {
+  AnimatedWords,
+  Reveal,
+  StaggerGroup,
+  StaggerItem,
+  SwitchPane,
+} from "../components/motion/primitives.jsx";
+import { SPRING, fadeUp } from "../components/motion/tokens.js";
+
+const MotionLink = motion.create(Link);
 
 const WORKFLOW = [
   {
@@ -453,11 +464,12 @@ function LandingPage() {
   const d = OWASP[owasp];
 
   return (
-    <div className='landing'>
+    <MotionConfig reducedMotion='user'>
+      <div className='landing'>
       <nav className='public-nav'>
         <div className='brand'>
           <img src='/sentrystrike-logo.svg' className='mark-img' alt='' />
-          SentryStrike
+          <span className='brand-name'>SentryStrike</span>
         </div>
         <div className='navlinks'>
           <a href='#platform'>Platform</a>
@@ -467,35 +479,58 @@ function LandingPage() {
         </div>
         <div className='navactions'>
           <ThemeToggle />
-          <Link className='btn' to='/login'>
+          <MotionLink className='btn' to='/login' whileTap={{ scale: 0.97 }}>
             Sign in
-          </Link>
-          <Link className='btn primary' to='/register'>
+          </MotionLink>
+          <MotionLink
+            className='btn primary'
+            to='/register'
+            whileTap={{ scale: 0.97 }}
+          >
             Start a scan
-          </Link>
+          </MotionLink>
         </div>
       </nav>
       <main>
         <section className='hero'>
-          <div className='hero-copy'>
-            <span className='eyebrow'>
+          <motion.div
+            className='hero-copy'
+            initial='hidden'
+            animate='visible'
+            variants={{
+              hidden: {},
+              visible: { transition: { staggerChildren: 0.08 } },
+            }}
+          >
+            <motion.span className='eyebrow' variants={fadeUp}>
               <BadgeCheck className='ico' />
               Evidence-driven DAST
-            </span>
-            <h1>Find what your web app exposes.</h1>
-            <p>
+            </motion.span>
+            <AnimatedWords
+              text='Find what your web app exposes.'
+              delay={0.12}
+            />
+            <motion.p variants={fadeUp}>
               SentryStrike scans public and authenticated routes, verifies
               findings, and shows your team what to fix.
-            </p>
-            <div className='hero-actions'>
-              <Link className='btn primary' to='/register'>
+            </motion.p>
+            <motion.div className='hero-actions' variants={fadeUp}>
+              <MotionLink
+                className='btn primary'
+                to='/register'
+                whileTap={{ scale: 0.97 }}
+              >
                 Start a scan
-              </Link>
-              <a className='btn' href='#platform'>
+              </MotionLink>
+              <motion.a
+                className='btn'
+                href='#platform'
+                whileTap={{ scale: 0.97 }}
+              >
                 See how it works
-              </a>
-            </div>
-            <div className='trust'>
+              </motion.a>
+            </motion.div>
+            <motion.div className='trust' variants={fadeUp}>
               <span>
                 <LockKeyhole className='ico' />
                 Credentials kept in memory
@@ -508,12 +543,18 @@ function LandingPage() {
                 <FileCheck2 className='ico' />
                 PDF reports
               </span>
-            </div>
-          </div>
-          <ScanPreview />
+            </motion.div>
+          </motion.div>
+          <motion.div
+            initial={{ opacity: 0, x: 28, filter: "blur(5px)" }}
+            animate={{ opacity: 1, x: 0, filter: "blur(0px)" }}
+            transition={{ ...SPRING, duration: 0.7, delay: 0.25 }}
+          >
+            <ScanPreview />
+          </motion.div>
         </section>
 
-        <div className='ticker-wrap'>
+        <Reveal className='ticker-wrap'>
           <span className='ticker-label'>Built for</span>
           <div className='ticker'>
             {[
@@ -529,104 +570,152 @@ function LandingPage() {
               <span key={`${s}-${i}`}>{s}</span>
             ))}
           </div>
-        </div>
+        </Reveal>
 
         <section className='public-section' id='platform'>
-          <div className='section-head'>
-            <h2>A scan you can follow.</h2>
-            <p>
+          <StaggerGroup className='section-head'>
+            <StaggerItem as='h2'>A scan you can follow.</StaggerItem>
+            <StaggerItem as='p'>
               Set the target and scope. SentryStrike handles discovery,
               testing, and reporting.
-            </p>
-          </div>
+            </StaggerItem>
+          </StaggerGroup>
           <div className='workflow'>
-            <div className='steps'>
+            <StaggerGroup className='steps'>
               {WORKFLOW.map((s, i) => (
-                <button
+                <StaggerItem
                   key={s.id}
+                  as='button'
                   type='button'
                   className={`step${workflow === s.id ? " active" : ""}`}
                   onClick={() => setWorkflow(s.id)}
+                  whileTap={{ scale: 0.99 }}
                 >
                   <b>{String(i + 1).padStart(2, "0")}</b>
                   <div>
                     <h3>{s.title}</h3>
                     <p>{s.desc}</p>
                   </div>
-                </button>
+                </StaggerItem>
               ))}
-            </div>
-            <div className='workflow-visual'>
-              <WorkflowVisual id={workflow} />
-            </div>
+            </StaggerGroup>
+            <Reveal className='workflow-visual' delay={0.1}>
+              <SwitchPane id={workflow}>
+                <WorkflowVisual id={workflow} />
+              </SwitchPane>
+            </Reveal>
           </div>
         </section>
 
         <section className='public-section dark-section' id='owasp'>
-          <div className='section-head'>
-            <h2>Coverage you can inspect.</h2>
-            <p>
+          <StaggerGroup className='section-head'>
+            <StaggerItem as='h2'>Coverage you can inspect.</StaggerItem>
+            <StaggerItem as='p'>
               See what ran, what was skipped, and why. Missing coverage is never
               treated as a pass.
-            </p>
-          </div>
+            </StaggerItem>
+          </StaggerGroup>
           <div className='owasp'>
-            <div className='owasp-nav'>
+            <StaggerGroup className='owasp-nav'>
               {Object.entries(OWASP).map(([key, entry]) => (
-                <button
+                <StaggerItem
                   key={key}
+                  as='button'
                   type='button'
-                  className={owasp === key ? "active" : undefined}
+                  className={`tab-btn${owasp === key ? " active" : ""}`}
                   onClick={() => setOwasp(key)}
+                  whileTap={{ scale: 0.98 }}
                 >
-                  {entry.nav}
-                </button>
+                  {owasp === key && (
+                    <motion.span
+                      layoutId='owasp-pill'
+                      className='tab-pill'
+                      transition={SPRING}
+                    />
+                  )}
+                  <span className='tab-label'>{entry.nav}</span>
+                </StaggerItem>
               ))}
-            </div>
-            <div className='owasp-detail' key={owasp}>
-              <span>{d.label}</span>
-              <h3>{d.title}</h3>
-              <p>{d.p}</p>
-              <div className='chips'>
-                {d.chips.map((c) => (
-                  <i key={c}>{c}</i>
+            </StaggerGroup>
+            <div className='pane-stage'>
+              <div className='pane-sizer' aria-hidden='true'>
+                {Object.values(OWASP).map((entry) => (
+                  <div key={entry.label} className='owasp-detail'>
+                    <span>{entry.label}</span>
+                    <h3>{entry.title}</h3>
+                    <p>{entry.p}</p>
+                    <div className='chips'>
+                      {entry.chips.map((c) => (
+                        <i key={c}>{c}</i>
+                      ))}
+                    </div>
+                  </div>
                 ))}
               </div>
+              <SwitchPane id={owasp} className='owasp-detail'>
+                <span>{d.label}</span>
+                <h3>{d.title}</h3>
+                <p>{d.p}</p>
+                <div className='chips'>
+                  {d.chips.map((c) => (
+                    <i key={c}>{c}</i>
+                  ))}
+                </div>
+              </SwitchPane>
             </div>
           </div>
         </section>
 
         <section className='public-section' id='teams'>
-          <div className='section-head'>
-            <h2>One report, useful at every level.</h2>
-            <p>
+          <StaggerGroup className='section-head'>
+            <StaggerItem as='h2'>One report, useful at every level.</StaggerItem>
+            <StaggerItem as='p'>
               Each role gets the detail it needs without losing the underlying
               evidence.
-            </p>
-          </div>
-          <div className='roles'>
+            </StaggerItem>
+          </StaggerGroup>
+          <StaggerGroup className='roles'>
             {Object.entries(ROLES).map(([key, entry]) => (
-              <button
+              <StaggerItem
                 key={key}
+                as='button'
                 type='button'
-                className={role === key ? "active" : undefined}
+                className={`tab-btn${role === key ? " active" : ""}`}
                 onClick={() => setRole(key)}
+                whileTap={{ scale: 0.96 }}
               >
-                {entry.nav}
-              </button>
+                {role === key && (
+                  <motion.span
+                    layoutId='role-pill'
+                    className='tab-pill'
+                    transition={SPRING}
+                  />
+                )}
+                <span className='tab-label'>{entry.nav}</span>
+              </StaggerItem>
             ))}
-          </div>
-          <div className='role-pane active' key={role}>
-            <RolePane role={role} />
+          </StaggerGroup>
+          <div className='pane-stage'>
+            <div className='pane-sizer' aria-hidden='true'>
+              {Object.keys(ROLES).map((key) => (
+                <div key={key} className='role-pane active'>
+                  <RolePane role={key} />
+                </div>
+              ))}
+            </div>
+            <SwitchPane id={role} className='role-pane active'>
+              <RolePane role={role} />
+            </SwitchPane>
           </div>
         </section>
 
         <section className='public-section' id='faq'>
-          <div className='faq'>
-            <h2>Common questions</h2>
+          <StaggerGroup className='faq'>
+            <StaggerItem as='h2'>Common questions</StaggerItem>
             {FAQS.map(([q, a], i) => (
-              <article
+              <StaggerItem
                 key={q}
+                as='article'
                 className={`faq-item${openFaq === i ? " open" : ""}`}
               >
                 <button
@@ -643,26 +732,33 @@ function LandingPage() {
                     <p>{a}</p>
                   </div>
                 </div>
-              </article>
+              </StaggerItem>
             ))}
-          </div>
+          </StaggerGroup>
         </section>
 
         <section className='cta'>
-          <div>
+          <Reveal>
             <h2>Scan an authorized web app.</h2>
             <p>Start with a URL. Add test accounts when you need authenticated coverage.</p>
-          </div>
-          <Link className='btn' to='/register'>
-            Create account
-          </Link>
+          </Reveal>
+          <Reveal delay={0.12}>
+            <MotionLink
+              className='btn'
+              to='/register'
+              whileTap={{ scale: 0.97 }}
+            >
+              Create account
+            </MotionLink>
+          </Reveal>
         </section>
       </main>
       <footer className='public-footer'>
         <span>Copyright © {new Date().getFullYear()} SentryStrike</span>
         <span>Authorized security testing only</span>
       </footer>
-    </div>
+      </div>
+    </MotionConfig>
   );
 }
 
