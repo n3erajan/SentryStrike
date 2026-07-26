@@ -1,110 +1,132 @@
-# Sentry Strike Backend
+# SentryStrike Backend
 
-Production-oriented backend for an intelligent web vulnerability scanner aligned to OWASP Top 10 categories, with AI-assisted analysis via local Ollama.
+The backend is SentryStrike's authenticated control plane. It exposes the FastAPI REST API, manages organizations and sessions, persists scan and collaboration state in MongoDB, coordinates Redis-backed work queues, and generates PDF reports.
 
-## Features
+Scanning and AI analysis run in separate workers; API requests enqueue durable work instead of performing long-running assessments in the web process.
 
-- Async REST API powered by FastAPI
-- MongoDB persistence with Motor + Beanie ODM
-- Modular scanning engine with crawler and detector pipeline
-- OWASP detector coverage for access control, injection, crypto, auth, misconfiguration, supply chain, and exception leakage
-- Local LLM integration through Ollama (default model: qwen2.5-coder:7b-instruct-q4_K_M)
-- AI prioritization, false-positive filtering, remediation guidance, and report synthesis
-- JSON and PDF report generation
-- Unit and integration test suite
+## Responsibilities
 
-## Project Layout
+- Invite-only registration and HttpOnly session-cookie authentication
+- Tenant isolation and role-based authorization for owners, admins, analysts, and viewers
+- Web application inventory and scan lifecycle management
+- Finding triage, assignments, comments, remediation decisions, and re-verification requests
+- Notifications, audit history, membership, invitations, and retention settings
+- JSON report projection and PDF generation
+- Public OAST callback collection for blind verification
+- Scanner heartbeat reporting through the health endpoint
 
-- backend/app/main.py: API app entrypoint
-- backend/app/core/scanner.py: end-to-end scan orchestrator
-- backend/app/core/crawler/: crawling utilities
-- backend/app/core/detectors/: detector implementations
-- backend/app/analyzers/: AI analysis pipeline
-- backend/app/integrations/: external integrations (tech, CVE, SSL)
-- backend/app/models/: Beanie document and nested models
-- backend/app/database/: DB connection + repositories
-- backend/app/api/routes/: REST endpoints
-- backend/tests/: tests
+## Stack
 
-## Requirements
+- Python 3.12
+- FastAPI and Uvicorn
+- Pydantic settings and schemas
+- Beanie and Motor for MongoDB
+- Redis for scan and analysis signaling
+- ReportLab for PDF generation
 
-- Python 3.10+
-- MongoDB 6+
-- Ollama running locally or reachable by network
+## Run locally
 
-## Setup
+From the repository root, install the shared package and backend dependencies:
 
-1. Create and activate environment
-   - Windows PowerShell:
-     - python -m venv .venv
-     - .\.venv\Scripts\Activate.ps1
-2. Install dependencies
-   - pip install -r requirements.txt
-3. Configure environment
-   - copy .env.example .env
-   - Update MONGODB_URI and OLLAMA_BASE_URL as needed
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+python -m pip install -r backend/requirements-dev.txt
+cp backend/.env.example backend/.env
+```
 
-## Run
+The backend also reads the root `.env`. Start MongoDB and Redis, configure SMTP in `backend/.env`, then run:
 
-- uvicorn app.main:app --host 0.0.0.0 --port 8000
+```bash
+cd backend
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-## Docker
+Open <http://localhost:8000/docs> for the generated OpenAPI interface. Health is available at <http://localhost:8000/api/v1/health>.
 
-- docker compose up --build
-- API will be available at http://localhost:8000
+## API groups
 
-Open API docs:
+All application endpoints use the `/api/v1` prefix.
 
-- http://localhost:8000/docs
+| Prefix | Purpose |
+| --- | --- |
+| `/auth` | Invitation preview, registration, login, logout, and current user |
+| `/applications` | Workspace application inventory and application scan history |
+| `/scans` | Submission, listing, detail, status, and cancellation |
+| `/analysis` | Finding detail, review, assignment, comments, remediation, retry, and re-verification |
+| `/reports` | Report data and PDF download |
+| `/workspace` | Workspace profile, members, invitations, audit log, and retention |
+| `/notifications` | Notification listing, unread count, and read state |
+| `/health` | API status and active scanner count |
 
-## Main Endpoints
+The OAST routes live at `/oast`, outside `/api/v1`, and are intentionally unauthenticated so tested targets can call back. Interaction IDs are validated before data is stored.
 
-- POST /api/v1/scans: create scan
-- GET /api/v1/scans: list scans
-- GET /api/v1/scans/{scan_id}: scan details
-- GET /api/v1/scans/{scan_id}/status: scan status
-- POST /api/v1/scans/{scan_id}/cancel: cancel scan
-- GET /api/v1/analysis/scans/{scan_id}/vulnerabilities: list vulnerabilities
-- GET /api/v1/analysis/scans/{scan_id}/vulnerabilities/{vulnerability_id}: vulnerability detail
-- GET /api/v1/reports/{scan_id}: report data
-- POST /api/v1/reports/{scan_id}/generate: generate AI report
-- GET /api/v1/reports/{scan_id}/pdf: download PDF report
-- GET /api/v1/health
+## Response and authentication model
 
-## Scan Workflow
+Most JSON endpoints return:
 
-1. Client submits target URL
-2. Scan is created with queued status
-3. Background task runs crawler
-4. Passive checks and technology detection execute
-5. Active detectors run in parallel
-6. CVE enrichment and AI analysis execute
-7. Findings and report metadata are stored
-8. Status moves to completed or failed
+```json
+{
+  "success": true,
+  "message": "optional status message",
+  "data": {}
+}
+```
+
+Login and registration set an HttpOnly session cookie. Production deployments should use HTTPS with `AUTH_COOKIE_SECURE=true`, a restrictive `CORS_ORIGINS` list, and an appropriate `AUTH_COOKIE_SAMESITE` value.
+
+## Management CLI
+
+Run commands from `backend/` with the repository virtual environment active.
+
+```bash
+python -m app.cli invite-owner --email owner@example.com --org "Example Security" --member-limit 10
+python -m app.cli invite-status --email owner@example.com
+python -m app.cli email-check --to operator@example.com
+python -m app.cli set-member-limit --org-id <organization-id> --limit 25
+python -m app.cli purge-retention
+```
+
+Owner onboarding is deliberately CLI-only. The first accepted owner invitation creates the workspace and owner account together.
 
 ## Configuration
 
-All key behavior is controlled via environment variables in .env:
+Start with [`../.env.example`](../.env.example) for MongoDB, Redis, queues, and public-host settings, then [`./.env.example`](.env.example) for backend-specific values.
 
-- App: APP_ENV, APP_DEBUG, APP_HOST, APP_PORT
-- DB: MONGODB_URI, MONGODB_DB_NAME
-- AI: OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_SECONDS
-- Scanner: CRAWL_DEPTH, CRAWL_MAX_URLS, CRAWL_RATE_LIMIT_PER_SECOND, REQUEST_TIMEOUT_SECONDS
-- Integrations: NVD_API_URL, NVD_API_KEY, CVE_CACHE_TTL_SECONDS
-- Logging: LOG_LEVEL, LOG_FILE
+Important production settings include:
 
-## Testing
+- `CORS_ORIGINS`
+- `AUTH_SESSION_TTL_HOURS`, `AUTH_COOKIE_SECURE`, and `AUTH_COOKIE_SAMESITE`
+- `EMAIL_SMTP_HOST`, `EMAIL_SMTP_USER`, and `EMAIL_SMTP_PASSWORD`
+- invitation lifetime and rate-limit settings
+- `RETENTION_PURGE_INTERVAL_SECONDS`
 
-- pytest -q
-- pytest --cov=app --cov-report=term-missing
+Gmail SMTP requires both a username and app password. Settings validation fails fast when only one credential is supplied or Gmail is selected without credentials.
 
-## Deployment Notes
+## Project structure
 
-- Use production-grade MongoDB credentials and network policies
-- Run API behind reverse proxy (Nginx/Traefik) with TLS
-- Restrict scan target ranges for legal and safety boundaries
-- Configure Ollama host according to deployment topology
+```text
+app/
+├── api/routes/       FastAPI routers
+├── core/             Auth, invitations, email, errors, and retention
+├── schemas/          Request and response models
+├── utils/            PDF generation
+├── cli.py            Vendor management commands
+├── config.py         Backend settings
+├── main.py           FastAPI application and lifespan wiring
+└── retention_worker.py
+```
 
-## Ethical and Legal Use
+Database models, repositories, and queue implementations are shared from [`../shared`](../shared/README.md).
 
-Only scan systems you own or are authorized to test.
+## Tests
+
+```bash
+python -m pytest backend/tests
+python -m pytest backend/tests/unit
+python -m pytest backend/tests/integration
+python -m pytest backend/tests --cov=backend/app --cov-report=term-missing
+```
+
+Run commands from the repository root so both `backend` and `shared` imports resolve consistently.

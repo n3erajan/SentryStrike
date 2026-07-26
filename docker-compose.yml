@@ -1,0 +1,139 @@
+# SentryStrike production stack.
+#
+# Bring up:   docker compose up -d --build
+# Logs:       docker compose logs -f backend scanner analyzer
+# Tear down:  docker compose down           (add -v to also drop the mongo volume)
+#
+# Shared deployment config comes from the root .env. Each service may override
+# it with its own .env; committed .env.example files are documentation only.
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Vite bakes VITE_API_URL at BUILD time. The default relative path works
+        # because nginx proxies /api/ to the backend on the shared network, so a
+        # single-origin deploy needs no override. Set this only when the API is
+        # served from a different origin.
+        VITE_API_URL: ${VITE_API_URL:-/api/v1}
+    ports:
+      - "${FRONTEND_PORT:-80}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
+      - path: backend/.env
+        required: false
+    environment:
+      MONGODB_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  scanner:
+    build:
+      context: .
+      dockerfile: scanner/Dockerfile
+    env_file:
+      - path: .env
+        required: false
+      - path: scanner/.env
+        required: false
+    environment:
+      MONGODB_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379/0
+      OAST_CALLBACK_BASE_URL: ${OAST_CALLBACK_BASE_URL:-http://host.docker.internal:${BACKEND_PORT:-8000}/oast}
+      OAST_POLL_URL: ${OAST_POLL_URL:-http://backend:8000/oast/poll}
+    volumes:
+      - scanner_logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # The worker keeps a Redis heartbeat key while alive; a passing redis PING
+      # from inside the container confirms the process can reach its queue.
+      test: ["CMD", "python", "-c", "import redis,os; redis.Redis.from_url(os.environ['REDIS_URL']).ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  analyzer:
+    build:
+      context: .
+      dockerfile: analyzer/Dockerfile
+    env_file:
+      - path: .env
+        required: false
+      - path: analyzer/.env
+        required: false
+    environment:
+      MONGODB_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379/0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Process liveness is independent of provider readiness. Invalid provider
+      # configuration fails durable jobs visibly without restarting the worker.
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "quit(db.runCommand({ ping: 1 }).ok ? 0 : 2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  mongo_data:
+  scanner_logs:
