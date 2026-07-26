@@ -47,6 +47,7 @@ class ScanRepository:
         self,
         target_url: str,
         *,
+        application_id: str | None = None,
         org_id: str,
         submitted_by_user_id: str,
         submitted_by_full_name: str,
@@ -59,6 +60,7 @@ class ScanRepository:
         normalized_url = _normalize_target_url(target_url)
         scan = Scan(
             target_url=normalized_url,
+            application_id=application_id,
             org_id=org_id,
             submitted_by_user_id=submitted_by_user_id,
             submitted_by_full_name=submitted_by_full_name,
@@ -103,8 +105,38 @@ class ScanRepository:
 
     async def list_by_target_url(self, org_id: str, target_url: str, skip: int = 0, limit: int = 20) -> list[Scan]:
         """List scans for a specific target URL in an organization, newest first."""
+        normalized_url = _normalize_target_url(target_url)
         return (
-            await Scan.find(Scan.org_id == org_id, Scan.target_url == target_url)
+            await Scan.find(Scan.org_id == org_id, Scan.target_url == normalized_url)
+            .sort(-Scan.created_at)
+            .skip(skip)
+            .limit(limit)
+            .to_list()
+        )
+
+    async def list_by_application(
+        self,
+        org_id: str,
+        application_id: str,
+        target_url: str,
+        skip: int = 0,
+        limit: int = 20,
+    ) -> list[Scan]:
+        """List linked scans plus legacy URL-matched scans for an application."""
+        normalized_url = _normalize_target_url(target_url)
+        return (
+            await Scan.find(
+                {
+                    "org_id": org_id,
+                    "$or": [
+                        {"application_id": application_id},
+                        {
+                            "application_id": {"$in": [None, ""]},
+                            "target_url": normalized_url,
+                        },
+                    ],
+                }
+            )
             .sort(-Scan.created_at)
             .skip(skip)
             .limit(limit)
@@ -114,9 +146,11 @@ class ScanRepository:
     async def find_active_by_target(self, org_id: str, target_url: str) -> Scan | None:
         normalized = _normalize_target_url(target_url)
         return await Scan.find_one(
-            Scan.org_id == org_id,
-            Scan.target_url == normalized,
-            Scan.status.in_([ScanStatus.queued, ScanStatus.running]),
+            {
+                "org_id": org_id,
+                "target_url": normalized,
+                "status": {"$in": [ScanStatus.queued.value, ScanStatus.running.value]},
+            }
         )
 
     async def list_expired(self, org_id: str, cutoff: datetime) -> list[Scan]:

@@ -54,6 +54,7 @@ def _finding(vuln_id: str) -> Vulnerability:
 class FakeScan:
     def __init__(self, scan_id: str, org_id: str) -> None:
         self.id = scan_id
+        self.target_url = "https://target.example"
         self.org_id = org_id
         self.vulnerabilities = [_finding("vuln-1")]
         self.submitted_by_user_id = "user-owner"
@@ -140,7 +141,11 @@ def _client(
         lambda: notifications or FakeNotificationRepository()
     )
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
-        id=user_id, email=f"{user_id}@example.test", org_id=org_id, role=role
+        id=user_id,
+        full_name=f"{user_id} Full Name",
+        email=f"{user_id}@example.test",
+        org_id=org_id,
+        role=role,
     )
     return TestClient(app)
 
@@ -348,6 +353,7 @@ def test_contributor_can_comment() -> None:
     assert response.status_code == 201
     data = response.json()["data"]
     assert data["author_user_id"] == "user-dev"
+    assert data["author_full_name"] == "user-dev Full Name"
     assert data["body"] == "Reproduced on staging; patching the sink."
     assert len(repo.scans["scan-1"].vulnerabilities[0].comments) == 1
 

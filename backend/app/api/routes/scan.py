@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.dependencies import (
     get_analysis_job_repository,
+    get_application_repository,
     get_audit_repository,
     get_current_user,
     get_notification_repository,
@@ -10,6 +11,7 @@ from app.api.dependencies import (
     require_role,
 )
 from shared.database.repositories.analysis_job_repository import AnalysisJobRepository
+from shared.database.repositories.application_repository import ApplicationRepository
 from shared.database.repositories.audit_repository import AuditRepository
 from shared.database.repositories.scan_repository import ScanRepository
 from shared.database.repositories.notification_repository import NotificationRepository
@@ -44,6 +46,7 @@ def _scan_summary(scan) -> dict:
     """Project a Scan document to its list-view representation."""
     return {
         "id": str(scan.id),
+        "application_id": getattr(scan, "application_id", None),
         "target_url": scan.target_url,
         "submitted_by_user_id": scan.submitted_by_user_id,
         "submitted_by_full_name": scan.submitted_by_full_name,
@@ -56,6 +59,14 @@ def _scan_summary(scan) -> dict:
         "analysis": getattr(scan, "analysis", None),
         "authorization_confirmed": scan.authorization_confirmed,
         "authorization_confirmed_at": scan.authorization_confirmed_at,
+        "risk_score": scan.overall_risk_score,
+        "risk_level": scan.overall_risk_level,
+        "total_findings": scan.statistics.total_vulnerabilities,
+        "severity_breakdown": scan.statistics.severity_breakdown.model_dump(mode="json"),
+        "total_urls_crawled": scan.statistics.total_urls_crawled,
+        "started_at": scan.started_at,
+        "completed_at": scan.completed_at,
+        "site_title": scan.site_title or "",
         "created_at": scan.created_at,
         "updated_at": scan.updated_at,
     }
@@ -91,6 +102,7 @@ async def _reconcile_and_notify(
 async def create_scan(
     payload: CreateScanRequest,
     repo: ScanRepository = Depends(get_scan_repository),
+    apps: ApplicationRepository = Depends(get_application_repository),
     notifications: NotificationRepository = Depends(get_notification_repository),
     audit: AuditRepository = Depends(get_audit_repository),
     current_user: User = Depends(require_role(*SCAN_ACTOR_ROLES)),
@@ -101,6 +113,11 @@ async def create_scan(
     atomically when a worker claims the job. MongoDB persists only role names.
     """
     auth_accounts = scan_auth_accounts_from_credentials(payload.credentials)
+    application_id = payload.application_id
+    if application_id is not None:
+        application = await apps.get_in_org(application_id, current_user.org_id)
+        if application is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Application not found")
     active = await repo.find_active_by_target(
         org_id=current_user.org_id,
         target_url=str(payload.target_url),
@@ -116,6 +133,7 @@ async def create_scan(
         )
     scan = await repo.create(
         str(payload.target_url),
+        application_id=application_id,
         org_id=current_user.org_id,
         submitted_by_user_id=str(current_user.id),
         submitted_by_full_name=current_user.full_name,

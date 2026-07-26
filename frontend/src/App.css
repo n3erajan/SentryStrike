@@ -318,6 +318,7 @@
 .pagination {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   margin-top: 20px;
 }
@@ -538,7 +539,21 @@
 }
 .comment p {
   margin: 7px 0 0;
+  font-size: 0.82rem;
   white-space: pre-wrap;
+}
+.comment-author {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.comment-name {
+  font-weight: 600;
+  font-size: 0.82rem;
+}
+.comment-email {
+  font-size: 0.72rem;
+  opacity: 0.65;
 }
 .comment-form {
   display: grid;

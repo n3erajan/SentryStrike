@@ -21,6 +21,7 @@ from app.api.dependencies import (
     get_member_repository,
     get_notification_repository,
     get_organization_repository,
+    get_scan_repository,
 )
 from app.api.routes import workspace
 from app.core.invites import InviteThrottleError, WorkspaceMemberLimitError
@@ -50,6 +51,12 @@ class FakeNotificationRepository:
     async def create(self, **kwargs):
         self.entries.append(kwargs)
         return SimpleNamespace(**kwargs)
+
+
+class FakeScanRepository:
+    async def get_in_org(self, scan_id: str, org_id: str):
+        _ = scan_id, org_id
+        return None
 
 
 class FakeMember:
@@ -115,6 +122,7 @@ class FakeOrg:
         self.retention_days = 90
         self.member_limit = 10
         self.occupied_seats = 3 if org_id == "org-1" else 1
+        self.created_at = datetime(2026, 7, 21, 9, 10, 17, tzinfo=timezone.utc)
 
 
 class FakeOrganizationRepository:
@@ -127,6 +135,10 @@ class FakeOrganizationRepository:
 
     async def get_by_id(self, org_id: str):
         return self.orgs.get(org_id)
+
+    async def set_name(self, org: FakeOrg, name: str) -> FakeOrg:
+        org.name = name
+        return org
 
     async def set_retention_days(self, org: FakeOrg, days: int) -> FakeOrg:
         org.retention_days = max(MIN_RETENTION_DAYS, days)
@@ -225,6 +237,7 @@ def _client(
     app.dependency_overrides[get_invite_service] = lambda: invites
     app.dependency_overrides[get_audit_repository] = lambda: audit
     app.dependency_overrides[get_notification_repository] = lambda: FakeNotificationRepository()
+    app.dependency_overrides[get_scan_repository] = lambda: FakeScanRepository()
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=user_id, email=f"{user_id}@example.test", org_id=org_id, role=role
     )
@@ -233,6 +246,46 @@ def _client(
 
 def _repos():
     return FakeMemberRepository(), FakeOrganizationRepository(), FakeInviteService()
+
+
+def test_workspace_metadata_is_readable_by_any_member() -> None:
+    members, orgs, invites = _repos()
+    client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.viewer)
+
+    response = client.get("/api/v1/workspace")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "id": "org-1",
+        "name": "Acme Corp",
+        "member_limit": 10,
+        "occupied_seats": 3,
+        "retention_days": 90,
+        "created_at": "2026-07-21T09:10:17Z",
+    }
+
+
+def test_owner_can_rename_workspace_and_action_is_audited() -> None:
+    members, orgs, invites = _repos()
+    audit = FakeAuditRepository()
+    client = _client(members=members, orgs=orgs, invites=invites, audit=audit)
+
+    response = client.put("/api/v1/workspace", json={"name": "Security Team"})
+
+    assert response.status_code == 200
+    assert response.json()["data"]["name"] == "Security Team"
+    assert orgs.orgs["org-1"].name == "Security Team"
+    assert audit.entries[0]["action"] == AuditAction.workspace_renamed
+    assert audit.entries[0]["metadata"] == {"from": "Acme Corp", "to": "Security Team"}
+
+
+def test_admin_cannot_rename_workspace() -> None:
+    members, orgs, invites = _repos()
+    client = _client(members=members, orgs=orgs, invites=invites, role=UserRole.admin)
+
+    response = client.put("/api/v1/workspace", json={"name": "Security Team"})
+
+    assert response.status_code == 403
 
 
 # ---------------------------------------------------------------------------

@@ -81,6 +81,7 @@ class FakeApplicationRepository:
 
 class FakeScanRepository:
     def __init__(self) -> None:
+        self.requested_application_id: str | None = None
         self.scans = [
             SimpleNamespace(
                 id="scan-1",
@@ -98,7 +99,15 @@ class FakeScanRepository:
             )
         ]
 
-    async def list_by_target_url(self, org_id: str, target_url: str, skip: int = 0, limit: int = 20):
+    async def list_by_application(
+        self,
+        org_id: str,
+        application_id: str,
+        target_url: str,
+        skip: int = 0,
+        limit: int = 20,
+    ):
+        self.requested_application_id = application_id
         items = [s for s in self.scans if s.org_id == org_id and s.target_url == target_url]
         return items[skip : skip + limit]
 
@@ -218,3 +227,4 @@ def test_list_application_scans() -> None:
     items = resp.json()["data"]["items"]
     assert len(items) == 1
     assert items[0]["id"] == "scan-1"
+    assert scan_repo.requested_application_id == "app-1"

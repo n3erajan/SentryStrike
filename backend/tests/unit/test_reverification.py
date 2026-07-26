@@ -27,6 +27,7 @@ from shared.scan_queue import ScanJobKind
 class FakeScan:
     def __init__(self, org_id: str = "org-1") -> None:
         self.id = "scan-1"
+        self.target_url = "https://target.example"
         self.org_id = org_id
         self.vulnerabilities = [
             Vulnerability(

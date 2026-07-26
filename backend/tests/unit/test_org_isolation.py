@@ -15,6 +15,7 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import (
+    get_application_repository,
     get_audit_repository,
     get_current_user,
     get_notification_repository,
@@ -43,6 +44,13 @@ class FakeNotificationRepository:
     async def create(self, **kwargs):
         self.entries.append(kwargs)
         return SimpleNamespace(**kwargs)
+
+
+class FakeApplicationRepository:
+    async def get_in_org(self, application_id: str, org_id: str):
+        if application_id != "app-owned" or org_id != "org-1":
+            return None
+        return SimpleNamespace(id=application_id, org_id=org_id)
 
 
 class FakeScanQueue:
@@ -90,6 +98,7 @@ class FakeScan:
     ) -> None:
         self.id = scan_id
         self.target_url = "https://target.example"
+        self.application_id = None
         self.org_id = org_id
         self.submitted_by_user_id = submitted_by_user_id
         self.submitted_by_full_name = submitted_by_full_name
@@ -110,8 +119,10 @@ class FakeScan:
         self.updated_at = datetime(2026, 6, 8, 9, 10, 17, tzinfo=timezone.utc)
         self.statistics = ScanStatistics(total_urls_crawled=1, total_vulnerabilities=0)
         self.overall_risk_score = 0.0
+        self.overall_risk_level = "Info"
         self.technology_stack = []
         self.vulnerabilities = []
+        self.site_title = ""
         self.report_metadata = ReportMetadata(summary="Summary.")
         self.analysis = None
         self.error_message = None
@@ -166,6 +177,7 @@ class FakeScanRepository:
             kwargs["submitted_by_full_name"],
         )
         created.target_url = target_url
+        created.application_id = kwargs.get("application_id")
         created.authorization_confirmed = kwargs["authorization_confirmed"]
         self.scans[str(created.id)] = created
         return created
@@ -179,6 +191,10 @@ class FakeScanRepository:
         if item is None or item.org_id != org_id:
             return None
         return item
+
+    async def find_active_by_target(self, org_id: str, target_url: str):
+        _ = org_id, target_url
+        return None
 
     async def update_status(
         self,
@@ -237,6 +253,7 @@ def _client(
     app.include_router(analysis.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(reports.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.dependency_overrides[get_scan_repository] = lambda: repo
+    app.dependency_overrides[get_application_repository] = lambda: FakeApplicationRepository()
     app.dependency_overrides[get_audit_repository] = lambda: FakeAuditRepository()
     app.dependency_overrides[get_notification_repository] = lambda: FakeNotificationRepository()
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
@@ -304,6 +321,44 @@ def test_create_scan_binds_org_submitter_and_authorization_metadata() -> None:
     assert repo.created_kwargs["submitted_by_email"] == "user-1@example.test"
     assert repo.created_kwargs["authorization_confirmed"] is True
     assert scan_queue.queued == ["scan-new"]
+
+
+def test_create_scan_accepts_and_persists_org_application_id() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue())
+    client = _client(repo)
+
+    response = client.post(
+        "/api/v1/scans",
+        json={
+            "target_url": "https://target.example",
+            "application_id": "app-owned",
+            "authorization_confirmed": True,
+        },
+    )
+
+    assert response.status_code == 202
+    assert repo.created_kwargs["application_id"] == "app-owned"
+    assert repo.scans["scan-new"].application_id == "app-owned"
+
+
+def test_create_scan_rejects_application_outside_callers_org() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue())
+    client = _client(repo)
+
+    response = client.post(
+        "/api/v1/scans",
+        json={
+            "target_url": "https://target.example",
+            "application_id": "app-other",
+            "authorization_confirmed": True,
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Application not found"
+    assert repo.created_kwargs is None
 
 
 def test_create_scan_marks_scan_failed_when_queue_is_unavailable() -> None:

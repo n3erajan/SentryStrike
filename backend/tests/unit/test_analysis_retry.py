@@ -24,6 +24,7 @@ class FakeScanRepository:
         self.attach = attach
         self.scan = SimpleNamespace(
             id="scan-1",
+            target_url="https://target.example",
             org_id="org-1",
             status=ScanStatus.completed,
             analysis=ScanAnalysisState(

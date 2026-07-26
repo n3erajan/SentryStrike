@@ -362,7 +362,10 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
         {(finding.comments || []).map((c) => (
           <div className='comment' key={c.id}>
             <div>
-              <b>{c.author_email}</b>
+              <div className='comment-author'>
+                <span className='comment-name'>{c.author_full_name || c.author_email}</span>
+                {c.author_full_name && <span className='comment-email'>{c.author_email}</span>}
+              </div>
               <small>{formatDateTime(c.created_at)}</small>
             </div>
             <p>{c.body}</p>
