@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   ChevronDown,
   CircleOff,
+  Copy,
   Download,
   FileText,
   RefreshCw,
@@ -10,7 +11,7 @@ import {
   Send,
 } from "lucide-react";
 import { downloadReportPdf, getReport } from "../services/reports.js";
-import { downloadFile, saveBlob } from "../utils/helpers.js";
+import { copyToClipboard, downloadFile, saveBlob } from "../utils/helpers.js";
 import { SEVERITIES, SEVERITY_META, severityClass } from "../data/constants.js";
 import { useToast } from "../components/Toast.jsx";
 import { useAuth } from "../context/AuthContext.jsx";
@@ -30,6 +31,7 @@ import ReasonDialog from "../components/ReasonDialog.jsx";
 import ReverifyCredentialsDialog from "../components/ReverifyCredentialsDialog.jsx";
 import Tooltip from "../components/Tooltip.jsx";
 import { reverifyAffordance } from "../utils/reverifyPolicy.js";
+import { httpSnippetToCurl } from "../utils/httpToCurl.js";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
@@ -95,14 +97,7 @@ function hostnameOf(url) {
   }
 }
 
-// The analyzer's two-pass adjudication answers these semantic axes, and the
-// false-positive probability is computed from them deterministically. Findings
-// analyzed before the two-pass split have no axes at all.
-const AXIS_LABELS = {
-  EVIDENTIAL_ALIGNMENT: "Evidence supports the claim",
-  SCANNER_CLAIM_CONTRADICTED: "Evidence contradicts the claim",
-  CAUSALLY_CONNECTED: "Payload caused the evidence",
-};
+
 
 // A borderless label/value table (same visual language as the reports and
 // active-scans tables): a bold header rule with thin horizontal row rules.
@@ -269,29 +264,6 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
       </div>
       {triager && (
         <div className='collab-actions' aria-label='Finding review actions'>
-          <Tooltip
-            label={
-              finding.is_false_positive
-                ? "Return this finding to the active workflow"
-                : "Suppress this finding after recording a reason"
-            }
-          >
-            <button
-              type='button'
-              className={`btn${finding.is_false_positive ? "" : " danger"}`}
-              onClick={changeDisposition}
-              disabled={busy === "review"}
-            >
-              {finding.is_false_positive ? (
-                <RotateCcw className='ico' />
-              ) : (
-                <CircleOff className='ico' />
-              )}
-              {finding.is_false_positive
-                ? "Restore active finding"
-                : "Mark false positive"}
-            </button>
-          </Tooltip>
           {finding.verification_target &&
             (reverify.allowed ? (
               <Tooltip
@@ -303,30 +275,52 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
               >
                 <button
                   type='button'
-                  className='btn'
+                  className='finding-action finding-action-reverify'
                   disabled={busy === "reverify"}
                   onClick={startReverification}
                 >
-                  <RefreshCw className='ico' />
-                  Re-verify
-                  {reverify.needsCredentials && "…"}
+                  <RefreshCw className={`ico${busy === "reverify" ? " spin" : ""}`} />
+                  {busy === "reverify" ? "Queuing…" : "Re-verify"}
+                  {busy !== "reverify" && reverify.needsCredentials && "…"}
                 </button>
               </Tooltip>
             ) : (
-              // A disabled button swallows hover events in some browsers, so
-              // keep a native title as a fallback for the tooltip.
               <Tooltip label={reverify.reason}>
                 <button
                   type='button'
-                  className='btn'
+                  className='finding-action finding-action-reverify'
                   disabled
-                  title={reverify.reason}
                 >
                   <RefreshCw className='ico' />
                   Re-verify
                 </button>
               </Tooltip>
             ))}
+          <Tooltip
+            label={
+              finding.is_false_positive
+                ? "Return this finding to the active workflow"
+                : "Suppress this finding after recording a reason"
+            }
+          >
+            <button
+              type='button'
+              className={`finding-action${finding.is_false_positive ? "" : " finding-action-danger"}`}
+              onClick={changeDisposition}
+              disabled={busy === "review"}
+            >
+              {finding.is_false_positive ? (
+                <RotateCcw className='ico' />
+              ) : (
+                <CircleOff className='ico' />
+              )}
+              {busy === "review"
+                ? "Updating…"
+                : finding.is_false_positive
+                  ? "Restore finding"
+                  : "Mark false positive"}
+            </button>
+          </Tooltip>
         </div>
       )}
       {finding.is_false_positive && (
@@ -336,17 +330,33 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
         </div>
       )}
       {jobs.length > 0 && (
-        <div className='reverification-list'>
-          {jobs.map((j) => (
-            <div key={j.id}>
-              <b>{titleCase(j.status)}</b>
-              <span>
-                {j.outcome ? titleCase(j.outcome) : "Waiting for scanner"}
-              </span>
-              <small>{formatDateTime(j.created_at)}</small>
-            </div>
-          ))}
-        </div>
+        <section className='reverification-history'>
+          <div className='reverification-history-head'>
+            <h4>Reverification history</h4>
+            <span className='mono'>
+              {jobs.length} {jobs.length === 1 ? "attempt" : "attempts"}
+            </span>
+          </div>
+          <ol className='reverification-list'>
+            {jobs.map((j) => (
+              <li key={j.id}>
+                <span
+                  className='reverification-marker'
+                  data-status={sevKey(j.status)}
+                  data-outcome={sevKey(j.outcome)}
+                  aria-hidden='true'
+                />
+                <div className='reverification-result'>
+                  <strong>
+                    {j.outcome ? titleCase(j.outcome) : "Waiting for scanner"}
+                  </strong>
+                  <span>{titleCase(j.status)}</span>
+                </div>
+                <time dateTime={j.created_at}>{formatDateTime(j.created_at)}</time>
+              </li>
+            ))}
+          </ol>
+        </section>
       )}
       <div className='comment-thread'>
         {(finding.comments || []).map((c) => (
@@ -383,6 +393,7 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
 }
 
 function Finding({ v, scanId, user, members, onChanged }) {
+  const toast = useToast();
   const [open, setOpen] = useState(false);
   const loc = v.location || {};
   const ev = v.evidence || {};
@@ -400,8 +411,6 @@ function Finding({ v, scanId, user, members, onChanged }) {
       : null;
   const isLikelyFp =
     sevKey(ai.verdict) === "likely_false_positive" || v.is_false_positive;
-  const fpAxes = Object.entries(ai.fp_axes || {});
-
   return (
     <article
       className={`finding${open ? " open" : ""}${isLikelyFp ? " dimmed" : ""}`}
@@ -474,7 +483,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
             )}
             {fpPercent !== null && (
               <div className='kv-cell'>
-                <span>False-positive likelihood</span>
+                <span>AI false-positive likelihood</span>
                 <b>{fpPercent}%</b>
               </div>
             )}
@@ -508,7 +517,43 @@ function Finding({ v, scanId, user, members, onChanged }) {
           {ev.request_snippet && (
             <div className='finding-block'>
               <h4>Request</h4>
-              <pre>{ev.request_snippet}</pre>
+              <div className='finding-request-code'>
+                <pre>{ev.request_snippet}</pre>
+                <Tooltip label='Copy as cURL' side='left'>
+                  <button
+                    type='button'
+                    className='finding-copy-button'
+                    aria-label='Copy request as cURL'
+                    onClick={async (e) => {
+                      e.stopPropagation()
+                      const curl = httpSnippetToCurl(ev.request_snippet, {
+                        baseUrl: url || undefined,
+                        curlExe: navigator.userAgent.includes('Windows') ? 'curl.exe' : 'curl',
+                      })
+                      if (!curl) {
+                        toast('Could not build cURL from this request.')
+                        return
+                      }
+                      try {
+                        await copyToClipboard(curl)
+                        toast(
+                          curl.includes('<YOUR_')
+                            ? 'cURL copied — replace <YOUR_…> placeholders with your own session'
+                            : 'cURL copied',
+                        )
+                      } catch {
+                        toast('Could not copy cURL')
+                      }
+                    }}
+                  >
+                    <Copy className='ico' />
+                  </button>
+                </Tooltip>
+              </div>
+              <p className='finding-curl-hint'>
+                Auth values are placeholders. Paste your own session; expired or
+                one-time tokens may not reproduce.
+              </p>
             </div>
           )}
           {ev.response_snippet && (
@@ -524,16 +569,22 @@ function Finding({ v, scanId, user, members, onChanged }) {
               <p>{ai.business_impact}</p>
             </div>
           )}
-          {ai.remediation && (
-            <div className='finding-block'>
-              <h4>Remediation</h4>
-              <p>{ai.remediation}</p>
-            </div>
-          )}
           {ai.exploitability_reasoning && (
             <div className='finding-block'>
               <h4>Exploitability reasoning</h4>
               <p>{ai.exploitability_reasoning}</p>
+            </div>
+          )}
+          {ai.false_positive_reasoning && (
+            <div className='finding-block'>
+              <h4>AI false-positive reasoning</h4>
+              <p>{ai.false_positive_reasoning}</p>
+            </div>
+          )}
+          {ai.remediation && (
+            <div className='finding-block'>
+              <h4>Remediation</h4>
+              <p>{ai.remediation}</p>
             </div>
           )}
           {ai.evidence_grade_reason && (
@@ -542,44 +593,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
               <p>{ai.evidence_grade_reason}</p>
             </div>
           )}
-          {ai.false_positive_reasoning && (
-            <div className='finding-block'>
-              <h4>False-positive assessment</h4>
-              <p>{ai.false_positive_reasoning}</p>
-            </div>
-          )}
-          {fpAxes.length > 0 && (
-            <div className='finding-block'>
-              <h4>Adjudication axes</h4>
-              <p className='field-description'>
-                The AI answers these semantic checks independently; the
-                false-positive likelihood above is then derived from them
-                deterministically.
-              </p>
-              <dl className='fp-axes'>
-                {fpAxes.map(([axis, verdict]) => (
-                  <div
-                    key={axis}
-                    className={
-                      axis === ai.decisive_axis ? "fp-axis decisive" : "fp-axis"
-                    }
-                  >
-                    <dt>{AXIS_LABELS[axis] || titleCase(axis)}</dt>
-                    <dd>{titleCase(verdict)}</dd>
-                  </div>
-                ))}
-              </dl>
-              {ai.decisive_axis && (
-                <p className='field-description'>
-                  Decisive axis:{" "}
-                  <b>
-                    {AXIS_LABELS[ai.decisive_axis] ||
-                      titleCase(ai.decisive_axis)}
-                  </b>
-                </p>
-              )}
-            </div>
-          )}
+
           <FindingCollaboration
             scanId={scanId}
             finding={v}
@@ -640,6 +654,22 @@ function ReportPage() {
     load(controller.signal);
     return () => controller.abort();
   }, [load]);
+
+  // Poll for AI analysis progress when it isn't terminal yet.
+  const pollTimer = useRef(null);
+  const status = report?.analysis?.status;
+  useEffect(() => {
+    if (!status || status === "completed" || status === "failed") return;
+    pollTimer.current = setInterval(() => {
+      load(undefined, { silent: true });
+    }, 5000);
+    return () => {
+      if (pollTimer.current) {
+        clearInterval(pollTimer.current);
+        pollTimer.current = null;
+      }
+    };
+  }, [status, load]);
 
   const handleJson = useCallback(() => {
     if (report)
@@ -752,20 +782,17 @@ function ReportPage() {
             <FileText className='ico' />
             JSON
           </button>
-          <button
-            className='btn primary'
-            onClick={handlePdf}
-            disabled={busy === "pdf" || !analysisComplete}
-            title={
-              !analysisComplete
-                ? "PDF is available after AI analysis completes"
-                : undefined
-            }
-          >
-            <Download className='ico' />
-            {busy === "pdf" ? "Building PDF…" : "PDF"}
-          </button>
-        </div>
+          <Tooltip label={!analysisComplete ? "PDF is available after AI analysis completes" : ""}>
+            <button
+              className='btn primary'
+              onClick={handlePdf}
+              disabled={busy === "pdf" || !analysisComplete}
+            >
+              <Download className='ico' />
+              {busy === "pdf" ? "Building PDF…" : "PDF"}
+            </button>
+          </Tooltip>
+          </div>
       </div>
 
       {!analysisComplete && (

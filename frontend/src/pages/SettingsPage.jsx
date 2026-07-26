@@ -5,12 +5,31 @@ import { useAuth } from "../context/AuthContext.jsx";
 import { useToast } from "../components/Toast.jsx";
 import {
   getRetention,
+  getWorkspace,
   listAuditLog,
   setRetention,
+  updateWorkspace,
 } from "../services/workspace.js";
 
 const title = (v) =>
   (v || "").replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase());
+
+function pages(current, total) {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
+  const always = [1, total];
+  const around = [current - 1, current, current + 1].filter(
+    (p) => p > 1 && p < total,
+  );
+  const set = new Set([...always, ...around]);
+  const result = [];
+  let prev = 0;
+  for (const p of [...set].sort((a, b) => a - b)) {
+    if (p - prev > 1) result.push("…");
+    result.push(p);
+    prev = p;
+  }
+  return result;
+}
 
 function siteLabel(url) {
   if (!url) return "the scan target";
@@ -56,24 +75,41 @@ function SettingsPage() {
   const { user } = useAuth();
   const toast = useToast();
   const admin = ["owner", "admin"].includes(user?.role);
+  const isOwner = user?.role === "owner";
+  const [workspaceName, setWorkspaceName] = useState("");
   const [retention, setRetentionDays] = useState(90);
+  const PAGE_SIZE = 15;
   const [audit, setAudit] = useState([]);
+  const [auditTotal, setAuditTotal] = useState(0);
+  const [auditPage, setAuditPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+
+  const loadAudit = useCallback(async (page) => {
+    const skip = (page - 1) * PAGE_SIZE;
+    const data = await listAuditLog(skip, PAGE_SIZE);
+    setAudit(data.items || []);
+    setAuditTotal(data.total || 0);
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      setRetentionDays((await getRetention()).retention_days);
-      if (admin) setAudit((await listAuditLog()).items || []);
+      const [ws, ret] = await Promise.all([
+        getWorkspace(),
+        getRetention(),
+      ]);
+      setWorkspaceName(ws.name);
+      setRetentionDays(ret.retention_days);
+      if (admin) await loadAudit(1);
     } catch (err) {
       setError(err.message || "Could not load workspace settings.");
     } finally {
       setLoading(false);
     }
-  }, [admin]);
+  }, [admin, loadAudit]);
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
@@ -82,7 +118,18 @@ function SettingsPage() {
   async function save() {
     setSaving(true);
     try {
-      setRetentionDays((await setRetention(Number(retention))).retention_days);
+      const requests = [];
+      requests.push(
+        setRetention(Number(retention)).then((r) => setRetentionDays(r.retention_days)),
+      );
+      if (isOwner) {
+        requests.push(
+          updateWorkspace({ name: workspaceName }).then((r) =>
+            setWorkspaceName(r.name),
+          ),
+        );
+      }
+      await Promise.all(requests);
       toast("Workspace settings saved");
     } catch (err) {
       toast(err.message || "Could not save settings.");
@@ -96,7 +143,7 @@ function SettingsPage() {
       <div className='head'>
         <div>
           <h1>Settings</h1>
-          <p>Workspace retention and audit history.</p>
+          <p>Workspace settings and audit history.</p>
         </div>
         {admin && (
           <button
@@ -127,6 +174,19 @@ function SettingsPage() {
                 <div className='control'>
                   <input value={title(user?.role)} readOnly />
                 </div>
+              </div>
+            </div>
+          </section>
+          <section className='formsection'>
+            <h2>Workspace</h2>
+            <div className='field settings-short'>
+              <label>Workspace name</label>
+              <div className='control'>
+                <input
+                  value={workspaceName}
+                  onChange={(e) => setWorkspaceName(e.target.value)}
+                  readOnly={!isOwner}
+                />
               </div>
             </div>
           </section>
@@ -185,6 +245,49 @@ function SettingsPage() {
                   </p>
                 )}
               </div>
+              {auditTotal > PAGE_SIZE && (
+                <div className='pagination'>
+                  <button
+                    className='btn page-btn'
+                    disabled={auditPage <= 1}
+                    onClick={() => {
+                      const p = auditPage - 1;
+                      setAuditPage(p);
+                      loadAudit(p);
+                    }}
+                  >
+                    ‹ Prev
+                  </button>
+                  {pages(auditPage, Math.ceil(auditTotal / PAGE_SIZE)).map(
+                    (p, i) =>
+                      p === "…" ? (
+                        <span key={`ellipsis-${i}`} className='page-ellipsis'>…</span>
+                      ) : (
+                        <button
+                          key={p}
+                          className={`btn page-btn${p === auditPage ? " active" : ""}`}
+                          onClick={() => {
+                            setAuditPage(p);
+                            loadAudit(p);
+                          }}
+                        >
+                          {p}
+                        </button>
+                      ),
+                  )}
+                  <button
+                    className='btn page-btn'
+                    disabled={auditPage >= Math.ceil(auditTotal / PAGE_SIZE)}
+                    onClick={() => {
+                      const p = auditPage + 1;
+                      setAuditPage(p);
+                      loadAudit(p);
+                    }}
+                  >
+                    Next ›
+                  </button>
+                </div>
+              )}
             </section>
           )}
         </div>

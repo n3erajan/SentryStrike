@@ -42,7 +42,7 @@ function RegisterPage() {
     event.preventDefault();
     setTouched({ fullName: true, password: true, confirmPassword: true });
     if (!canSubmit) return;
-    setError(""); setSubmitting(true);
+    setSubmitting(true);
     try {
       await register({ email: invite.email, password, fullName, inviteToken });
       navigate("/home", { replace: true });
@@ -60,13 +60,12 @@ function RegisterPage() {
   return (
     <div className='auth-shell'>
       <div className='auth-left'>
-        <div className='auth-header'><Link to='/' className='brand'><img src='/shield.png' alt='' className='mark-img' />SentryStrike</Link><ThemeToggle /></div>
+        <div className='auth-header'><Link to='/' className='brand'><img src='/sentrystrike-logo.svg' alt='' className='mark-img' />SentryStrike</Link><ThemeToggle /></div>
         <div className='auth-box'>
           <h1>Join your workspace</h1>
           <p>{invite ? <>You were invited to <b>{invite.org_name}</b> as <b>{invite.role}</b>.</> : "Use the invitation link sent by your workspace administrator."}</p>
           {inviteState === "loading" && <div className='empty-state'><Loader2 className='ico spin' /> Validating invitation…</div>}
           {inviteState === "missing" && <div className='auth-error'>Registration is invite-only. Ask a workspace owner or admin for an invitation.</div>}
-          {error && <div className='auth-error'>{error}</div>}
           {inviteState === "valid" && (
             <form onSubmit={handleSubmit} noValidate style={{ marginTop: 26 }}>
               <div className='field'><label>Work email</label><div className='control'><input value={invite.email} readOnly /><CheckCircle2 className='ico' style={{ color: "var(--good)" }} /></div></div>
@@ -81,7 +80,8 @@ function RegisterPage() {
                   {touched[f.key] && !f.valid && <span className='field-error'>{f.error}</span>}
                 </div>;
               })}
-              <button className='btn primary' type='submit' disabled={!canSubmit}>{submitting ? <><Loader2 className='ico spin' />Creating account</> : "Accept invite and join"}</button>
+              {error && <div className='auth-error'>{error}</div>}
+              <button className='btn primary' type='submit' disabled={!canSubmit}>{submitting && <Loader2 className='ico spin' />}Accept invite and join</button>
             </form>
           )}
           <div className='auth-switch'>Already registered? <Link className='text-btn' to='/login'>Sign in</Link></div>

@@ -456,7 +456,7 @@ function LandingPage() {
     <div className='landing'>
       <nav className='public-nav'>
         <div className='brand'>
-          <img src='/shield.png' className='mark-img' alt='' />
+          <img src='/sentrystrike-logo.svg' className='mark-img' alt='' />
           SentryStrike
         </div>
         <div className='navlinks'>

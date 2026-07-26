@@ -112,9 +112,8 @@ function ApplicationPage() {
           <FileBarChart size={30} />
           <h2>No scans recorded for this application</h2>
           <p>
-            Scans are matched to an application by their exact target URL, so
-            assessments started from a different URL for the same site will not
-            appear here. Start a scan from this page to keep it linked.
+            Scans appear here when launched from this application page or
+            when the application is selected during scan creation.
           </p>
           {user?.role !== "viewer" && (
             <button

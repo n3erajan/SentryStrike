@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { listScans } from "../services/scan.js";
+import { listApplications } from "../services/applications.js";
 import { useActiveScans } from "../hooks/useActiveScans.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import { displayName } from "../components/Sidebar.jsx";
@@ -35,13 +36,18 @@ function HomePage() {
   const { user } = useAuth();
   const { scans: active, count } = useActiveScans();
   const [scans, setScans] = useState([]);
+  const [appCount, setAppCount] = useState(null);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async (signal) => {
     setLoading(true);
     try {
-      const data = await listScans({ limit: 25, signal });
-      setScans(Array.isArray(data?.items) ? data.items : []);
+      const [scanData, appData] = await Promise.all([
+        listScans({ limit: 25, signal }),
+        listApplications({ limit: 1, signal }),
+      ]);
+      setScans(Array.isArray(scanData?.items) ? scanData.items : []);
+      setAppCount(appData?.total ?? null);
     } catch {
       /* handled quietly on Home */
     } finally {
@@ -57,8 +63,15 @@ function HomePage() {
   }, [load]);
 
   const completed = scans.filter((s) => s.status === "completed");
-  const apps = new Set(completed.map((s) => hostnameOf(s.target_url))).size;
-  const highRisk = completed.reduce(
+  const latestPerApp = Object.values(
+    completed.reduce((map, s) => {
+      const key = s.application_id || s.target_url;
+      if (!map[key] || new Date(s.created_at) > new Date(map[key].created_at))
+        map[key] = s;
+      return map;
+    }, {}),
+  );
+  const highRisk = latestPerApp.reduce(
     (sum, s) =>
       sum +
       ((s.severity_breakdown?.critical ?? 0) +
@@ -81,7 +94,7 @@ function HomePage() {
 
       <div className='summary'>
         <div className='stat'>
-          <strong>{loading ? "—" : apps}</strong>
+          <strong>{loading ? "—" : appCount ?? "—"}</strong>
           <span>Web applications</span>
         </div>
         <div className='stat'>
@@ -95,7 +108,7 @@ function HomePage() {
           <span>High-risk findings</span>
         </div>
         <div className='stat'>
-          <strong>{loading ? "—" : postureLetter(completed)}</strong>
+          <strong>{loading ? "—" : postureLetter(latestPerApp)}</strong>
           <span>Workspace Security posture</span>
         </div>
       </div>
@@ -103,7 +116,7 @@ function HomePage() {
       <div className='app-grid'>
         {latestCompleted && (
           <article className='card'>
-            <h2>{hostnameOf(latestCompleted.target_url)} report ready</h2>
+            <h2>{latestCompleted.application_name || latestCompleted.site_title || hostnameOf(latestCompleted.target_url)} report ready</h2>
             <p>
               {Math.round(latestCompleted.risk_score || 0)}/100 · review
               verified findings and remediation.

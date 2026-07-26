@@ -15,9 +15,13 @@ function NotFoundPage() {
         fontFamily: '"DM Sans", system-ui, sans-serif',
       }}
     >
-      <ThemeToggle className='not-found-theme' />
+      <div className='not-found-theme'><ThemeToggle /></div>
       <div className='card' style={{ maxWidth: 520 }}>
-        <img src='/shield.png' alt='SentryStrike' className='mark-img' />
+        <img
+          src='/sentrystrike-logo.svg'
+          alt='SentryStrike'
+          className='mark-img not-found-logo'
+        />
         <span
           className='mono'
           style={{

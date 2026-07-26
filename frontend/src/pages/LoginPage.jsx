@@ -27,7 +27,6 @@ function LoginPage() {
     event.preventDefault();
     setTouched({ email: true, password: true });
     if (!emailValid || !passwordValid) return;
-    setError("");
     setSubmitting(true);
     try {
       await login({ email, password });
@@ -44,7 +43,7 @@ function LoginPage() {
       <div className='auth-left'>
         <div className='auth-header'>
           <Link to='/' className='brand'>
-            <img className='mark-img' src='/shield.png' alt='SentryStrike' />
+            <img className='mark-img' src='/sentrystrike-logo.svg' alt='SentryStrike' />
             SentryStrike
           </Link>
           <ThemeToggle />
@@ -53,7 +52,6 @@ function LoginPage() {
           <h1>Welcome back</h1>
           <p>Sign in to SentryStrike.</p>
           <form onSubmit={handleSubmit} noValidate style={{ marginTop: 26 }}>
-            {error && <div className='auth-error'>{error}</div>}
             <div className='field'>
               <label htmlFor='login-email'>Email</label>
               <div
@@ -116,18 +114,15 @@ function LoginPage() {
                 </span>
               )}
             </div>
+            {error && <div className='auth-error'>{error}</div>}
             <button className='btn primary' type='submit' disabled={!canSubmit}>
-              {submitting ? (
-                <>
-                  <Loader2
-                    className='ico'
-                    style={{ animation: "spin 1s linear infinite" }}
-                  />
-                  Signing in
-                </>
-              ) : (
-                "Sign in"
+              {submitting && (
+                <Loader2
+                  className='ico'
+                  style={{ animation: "spin 1s linear infinite" }}
+                />
               )}
+              Sign in
             </button>
           </form>
           <div className='auth-switch'>

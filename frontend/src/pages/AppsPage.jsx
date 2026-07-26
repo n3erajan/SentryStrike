@@ -270,7 +270,7 @@ function AppsPage() {
           {apps.map((a) => (
             <article key={a.id} className='card'>
               <h2>{a.name}</h2>
-              <p className='mono'>{hostnameOf(a.target_url)}</p>
+              <p className='mono' style={{ wordBreak: "break-all" }}>{a.target_url}</p>
               <div className='cardfoot'>
                 <Link className='text-btn' to={`/apps/${a.id}`}>
                   Scan history

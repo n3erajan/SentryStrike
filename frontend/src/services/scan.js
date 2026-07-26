@@ -100,7 +100,7 @@ export function listScans({ skip = 0, limit = 50, signal } = {}) {
 }
 
 export async function listAllScans({ signal } = {}) {
-  const limit = 100;
+  const limit = 50;
   const items = [];
   let skip = 0;
 

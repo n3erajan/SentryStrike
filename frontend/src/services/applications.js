@@ -52,6 +52,20 @@ export function listApplicationScans(appId, { skip = 0, limit = 50, signal } = {
   });
 }
 
+export async function listAllApplications({ signal } = {}) {
+  const limit = 50;
+  const items = [];
+  let skip = 0;
+  while (true) {
+    const page = await listApplications({ skip, limit, signal });
+    const pageItems = Array.isArray(page?.items) ? page.items : [];
+    items.push(...pageItems);
+    if (pageItems.length < limit) break;
+    skip += pageItems.length;
+  }
+  return { items, total: items.length };
+}
+
 export async function listAllApplicationScans(appId, { signal } = {}) {
   const limit = 100;
   const items = [];

@@ -5,9 +5,10 @@ import { useAuth } from "../context/AuthContext.jsx";
 // we bounce to /login, remembering where the user was headed so login can send
 // them back. Renders the nested routes via <Outlet /> otherwise.
 function ProtectedRoute() {
-  const { user } = useAuth();
+  const { user, loading } = useAuth();
   const location = useLocation();
 
+  if (loading) return null;
   if (!user) {
     return <Navigate to='/login' replace state={{ from: location }} />;
   }
@@ -17,7 +18,8 @@ function ProtectedRoute() {
 // Inverse gate for the landing / login / register screens: a signed-in user is
 // sent straight into the app instead of seeing them again.
 export function PublicOnlyRoute() {
-  const { user } = useAuth();
+  const { user, loading } = useAuth();
+  if (loading) return null;
   if (user) {
     return <Navigate to='/home' replace />;
   }

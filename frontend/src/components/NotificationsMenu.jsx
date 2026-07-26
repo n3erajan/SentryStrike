@@ -9,6 +9,8 @@ import {
 } from "../services/notifications.js";
 import Tooltip from "./Tooltip.jsx";
 
+const PAGE_SIZE = 15;
+
 function targetFor(item) {
   const scanId =
     item.metadata?.scan_id ||
@@ -22,10 +24,13 @@ function targetFor(item) {
 export default function NotificationsMenu() {
   const navigate = useNavigate();
   const root = useRef(null);
+  const sentinelRef = useRef(null);
   const [open, setOpen] = useState(false);
   const [count, setCount] = useState(0);
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [exhausted, setExhausted] = useState(false);
 
   const refreshCount = useCallback(
     () =>
@@ -47,13 +52,45 @@ export default function NotificationsMenu() {
     return () => document.removeEventListener("mousedown", outside);
   }, []);
 
+  useEffect(() => {
+    if (!open) return;
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting && !loadingMore && !exhausted) {
+          loadMore();
+        }
+      },
+      { rootMargin: "100px" },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [open, loadingMore, exhausted]);
+
+  async function loadMore() {
+    setLoadingMore(true);
+    try {
+      const batch = await listNotifications({ skip: items.length, limit: PAGE_SIZE });
+      const newItems = batch.items || [];
+      setItems((prev) => [...prev, ...newItems]);
+      if (newItems.length < PAGE_SIZE) setExhausted(true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
   async function toggle() {
     const next = !open;
     setOpen(next);
     if (next) {
       setLoading(true);
+      setExhausted(false);
       try {
-        setItems((await listNotifications()).items || []);
+        const batch = await listNotifications({ skip: 0, limit: PAGE_SIZE });
+        const firstPage = batch.items || [];
+        setItems(firstPage);
+        if (firstPage.length < PAGE_SIZE) setExhausted(true);
       } finally {
         setLoading(false);
       }
@@ -122,22 +159,34 @@ export default function NotificationsMenu() {
                 Loading…
               </div>
             ) : items.length ? (
-              items.map((item) => (
-                <button
-                  key={item.id}
-                  className={`notification-item${item.read_at ? "" : " unread"}`}
-                  onClick={() => select(item)}
-                >
-                  <b>{item.title}</b>
-                  <span>{item.message}</span>
-                  <small>
-                    {new Date(item.created_at).toLocaleString(undefined, {
-                      dateStyle: "medium",
-                      timeStyle: "short",
-                    })}
-                  </small>
-                </button>
-              ))
+              <>
+                {items.map((item) => (
+                  <button
+                    key={item.id}
+                    className={`notification-item${item.read_at ? "" : " unread"}`}
+                    onClick={() => select(item)}
+                  >
+                    <b>{item.title}</b>
+                    <span>{item.message}</span>
+                    <small>
+                      {new Date(item.created_at).toLocaleString(undefined, {
+                        dateStyle: "medium",
+                        timeStyle: "short",
+                      })}
+                    </small>
+                  </button>
+                ))}
+                <span ref={sentinelRef} />
+                {loadingMore && (
+                  <div className='empty-state'>
+                    <Loader2 className='ico spin' />
+                    Loading more…
+                  </div>
+                )}
+                {exhausted && items.length > PAGE_SIZE && (
+                  <div className='empty-state small'>All notifications loaded</div>
+                )}
+              </>
             ) : (
               <div className='empty-state'>You’re all caught up.</div>
             )}

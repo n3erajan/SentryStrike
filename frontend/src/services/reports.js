@@ -2,20 +2,19 @@
 //
 //   GET  /reports/{id}           -> full report payload (see reports.py)
 //   GET  /reports/{id}/pdf       -> application/pdf attachment
-import { apiRequest, API_BASE, getToken } from "./apiClient.js";
+import { apiRequest, API_BASE } from "./apiClient.js";
 
 export function getReport(scanId, signal) {
   return apiRequest(`/reports/${scanId}`, { signal });
 }
 
 // The PDF endpoint returns raw bytes rather than the JSON envelope, so we
-// fetch it directly (still sending the bearer token) and hand back a Blob.
+// fetch it directly (the HttpOnly session cookie authenticates automatically).
 export async function downloadReportPdf(scanId) {
-  const token = getToken();
   let response;
   try {
     response = await fetch(`${API_BASE}/reports/${scanId}/pdf`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      credentials: "include",
     });
   } catch (err) {
     throw new Error("Cannot reach the server to build the PDF.", { cause: err });

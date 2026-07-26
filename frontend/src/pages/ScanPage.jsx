@@ -213,7 +213,7 @@ function ScanPage() {
                       onChange={selectApplication}
                       disabled={submitting}
                       options={[
-                        { value: "", label: "None - scan a one-off URL" },
+                        { value: "", label: "None" },
                         ...apps.map((a) => ({ value: a.id, label: a.name })),
                       ]}
                     />

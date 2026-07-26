@@ -1,74 +1,52 @@
 // Auth service — talks to the backend `/auth/*` routes via apiClient.
 //
-// Contract (branch: backend, mounted under /api/v1):
-//   POST /auth/register { email, password } -> 201 { user, access_token, token_type, expires_at }
-//   POST /auth/login    { email, password } ->     { user, access_token, token_type, expires_at }
-//   POST /auth/logout                        ->     { logged_out: true }
-//   GET  /auth/me                            ->     { id, email, created_at }
+// Authentication is handled by an HttpOnly session cookie set by the backend
+// on login/register and cleared on logout. The frontend never touches the token
+// — no localStorage, no bearer header management.
 //
-// The backend also sets an httponly session cookie, but we authenticate with
-// the returned bearer token so the client works regardless of cross-origin
-// cookie rules.
-import { apiRequest, getToken, setToken, clearToken } from "./apiClient.js";
-
-const USER_KEY = "sentrystrike_user";
-
-function saveUser(user) {
-  if (user) localStorage.setItem(USER_KEY, JSON.stringify(user));
-}
-
-function clearUser() {
-  localStorage.removeItem(USER_KEY);
-}
+// Contract (mounted under /api/v1):
+//   POST /auth/register  { email, password, full_name, invite_token } -> 201 { user } + set-cookie
+//   POST /auth/login     { email, password }                          ->     { user } + set-cookie
+//   POST /auth/logout                                                 ->     { logged_out: true } + clear-cookie
+//   GET  /auth/me                                                     ->     { id, email, ... }
+//   GET  /auth/invite    ?token                                       ->     { email, role, org_name }
+import { apiRequest } from "./apiClient.js";
 
 export function getCurrentUser() {
-  try {
-    const raw = localStorage.getItem(USER_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 export function isAuthenticated() {
-  return !!getToken();
+  return false;
 }
 
-async function authenticate(path, credentials) {
-  const data = await apiRequest(path, {
+export async function login(credentials) {
+  const data = await apiRequest("/auth/login", {
     method: "POST",
-    auth: false,
     body: credentials,
   });
-  setToken(data.access_token);
-  saveUser(data.user);
   return data.user;
 }
 
-export function login(credentials) {
-  return authenticate("/auth/login", credentials);
-}
-
 export function previewInvite(inviteToken, signal) {
-  return apiRequest(`/auth/invite?token=${encodeURIComponent(inviteToken)}`, {
-    auth: false,
-    signal,
-  });
+  return apiRequest(`/auth/invite?token=${encodeURIComponent(inviteToken)}`, { signal });
 }
 
-export function register({ email, password, fullName, inviteToken }) {
-  return authenticate("/auth/register", {
-    email,
-    password,
-    full_name: fullName,
-    invite_token: inviteToken,
+export async function register({ email, password, fullName, inviteToken }) {
+  const data = await apiRequest("/auth/register", {
+    method: "POST",
+    body: {
+      email,
+      password,
+      full_name: fullName,
+      invite_token: inviteToken,
+    },
   });
+  return data.user;
 }
 
 export async function refreshCurrentUser() {
-  const user = await apiRequest("/auth/me");
-  saveUser(user);
-  return user;
+  return await apiRequest("/auth/me");
 }
 
 export async function logout() {
@@ -77,6 +55,4 @@ export async function logout() {
   } catch {
     // Ignore network/session errors — we clear local state regardless.
   }
-  clearToken();
-  clearUser();
 }

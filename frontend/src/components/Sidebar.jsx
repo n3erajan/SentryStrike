@@ -55,7 +55,7 @@ function Sidebar({ open = false, onClose }) {
     <aside className={`side${open ? " open" : ""}`}>
       <div className='side-top'>
         <NavLink to='/home' className='brand' onClick={onClose}>
-          <img src='/shield.png' className='mark-img' alt='' />
+          <img src='/sentrystrike-logo.svg' className='mark-img' alt='' />
           SentryStrike
         </NavLink>
         <Tooltip label='Close menu'>

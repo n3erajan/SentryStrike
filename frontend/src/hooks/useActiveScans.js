@@ -34,6 +34,7 @@ export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
 
   useEffect(() => {
     let stopped = false;
+    let timer = null;
     const controller = new AbortController();
 
     async function poll() {
@@ -41,8 +42,13 @@ export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
         const data = await listScans({ limit: 25, signal: controller.signal });
         if (stopped) return;
         const items = Array.isArray(data?.items) ? data.items : [];
-        setScans(items.filter(isActive));
+        const active = items.filter(isActive);
+        setScans(active);
         setError("");
+        if (!active.length && timer) {
+          clearInterval(timer);
+          timer = null;
+        }
       } catch (err) {
         if (stopped || err.name === "AbortError") return;
         setError(err.message || "Could not load active scans.");
@@ -52,11 +58,11 @@ export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
     }
 
     poll();
-    const id = setInterval(poll, intervalMs);
+    timer = setInterval(poll, intervalMs);
     return () => {
       stopped = true;
       controller.abort();
-      clearInterval(id);
+      if (timer) clearInterval(timer);
     };
   }, [intervalMs, refreshToken]);
 

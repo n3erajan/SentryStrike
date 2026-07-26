@@ -14,4 +14,7 @@ export const getRetention = (signal) => apiRequest("/workspace/retention", { sig
 export const setRetention = (retentionDays) =>
   apiRequest("/workspace/retention", { method: "PUT", body: { retention_days: retentionDays } });
 export const getWorkspace = (signal) => apiRequest("/workspace", { signal });
-export const listAuditLog = (signal) => apiRequest("/workspace/audit-log?limit=100", { signal });
+export const updateWorkspace = (payload) =>
+  apiRequest("/workspace", { method: "PUT", body: payload });
+export const listAuditLog = (skip = 0, limit = 50, signal) =>
+  apiRequest(`/workspace/audit-log?skip=${skip}&limit=${limit}`, { signal });
