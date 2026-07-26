@@ -1,21 +1,21 @@
 function AuthBrand({ mode = "login" }) {
   const register = mode === "register";
   const heading = register
-    ? "Your first report starts with one URL."
-    : "Security progress your team can see.";
+    ? "Start with the app you need to test."
+    : "Keep your security work in one place.";
   const sub = register
-    ? "Run verified assessments and give each stakeholder the detail they need."
-    : "Keep every application, assessment, report, and retest in one place.";
+    ? "Run an authorized scan and get evidence your team can review."
+    : "Track apps, scans, findings, and fixes from one workspace.";
   const proof = register
     ? [
         ["Standard", "OWASP Top 10 2025"],
-        ["Access", "Public and authenticated"],
-        ["Output", "Shareable PDF reports"],
+        ["Coverage", "Public and authenticated"],
+        ["Reports", "UI and PDF"],
       ]
     : [
-        ["Applications", "Portfolio-level posture"],
-        ["Reports", "Executive and developer views"],
-        ["History", "Compare progress over time"],
+        ["Applications", "Saved targets and history"],
+        ["Findings", "Evidence and fix status"],
+        ["Reports", "Results your team can share"],
       ];
 
   return (

@@ -268,6 +268,8 @@ async def get_scan_status(
         "current_phase": scan.current_phase,
         "phase_message": scan.phase_message,
         "started_at": scan.started_at,
+        "target_url": scan.target_url,
+        "site_title": scan.site_title or "",
         "eta_seconds": scan.eta_seconds,
         "error": scan.error_message,
         "analysis": getattr(scan, "analysis", None),

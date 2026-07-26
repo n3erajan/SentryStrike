@@ -48,10 +48,10 @@ function riskLine(score) {
 
 // Full date + time for the report header (the scan timestamp).
 function formatDateTime(iso) {
-  if (!iso) return "—";
+  if (!iso) return "N/A";
   const d = new Date(iso);
   return Number.isNaN(d.getTime())
-    ? "—"
+    ? "N/A"
     : d.toLocaleString(undefined, {
         year: "numeric",
         month: "short",
@@ -74,7 +74,7 @@ function severityBand(score) {
 
 function titleCase(value) {
   const s = (value || "").toString().replace(/[_-]+/g, " ").trim();
-  return s ? s.charAt(0).toUpperCase() + s.slice(1) : "—";
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : "N/A";
 }
 
 // The AI verdict (confirmed | uncertain | likely_false_positive) is the model's
@@ -216,7 +216,7 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
         onCancel={() => setShowCredentials(false)}
       />
       <div className='collab-panel'>
-      <h4>Remediation workflow</h4>
+      <h4>Fix and review</h4>
       <div className='collab-controls'>
         <div className='field'>
           <label>Assignee</label>
@@ -401,7 +401,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
   const loc = v.location || {};
   const ev = v.evidence || {};
   const ai = v.ai_analysis || {};
-  const cvss = Number.isFinite(v.cvss_score) ? v.cvss_score.toFixed(1) : "—";
+  const cvss = Number.isFinite(v.cvss_score) ? v.cvss_score.toFixed(1) : "N/A";
   const url = loc.url || "";
   const params =
     loc.parameters && loc.parameters.length
@@ -451,7 +451,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
             {params && (
               <div className='kv-cell'>
                 <span>Parameter(s)</span>
-                <b className='mono'>{params}</b>
+                <b>{params}</b>
               </div>
             )}
             <div className='kv-cell'>
@@ -486,7 +486,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
             )}
             {fpPercent !== null && (
               <div className='kv-cell'>
-                <span>AI false-positive likelihood</span>
+                <span>AI false-positive estimate</span>
                 <b>{fpPercent}%</b>
               </div>
             )}
@@ -506,7 +506,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
 
           {ai.description && (
             <div className='finding-block'>
-              <h4>What this is</h4>
+              <h4>Finding</h4>
               <p>{ai.description}</p>
             </div>
           )}
@@ -541,7 +541,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
                         await copyToClipboard(curl)
                         toast(
                           curl.includes('<YOUR_')
-                            ? 'cURL copied — replace <YOUR_…> placeholders with your own session'
+                            ? 'cURL copied. Replace <YOUR_…> placeholders with your own session.'
                             : 'cURL copied',
                         )
                       } catch {
@@ -574,13 +574,13 @@ function Finding({ v, scanId, user, members, onChanged }) {
           )}
           {ai.exploitability_reasoning && (
             <div className='finding-block'>
-              <h4>Exploitability reasoning</h4>
+              <h4>Why this may be exploitable</h4>
               <p>{ai.exploitability_reasoning}</p>
             </div>
           )}
           {ai.false_positive_reasoning && (
             <div className='finding-block'>
-              <h4>AI false-positive reasoning</h4>
+              <h4>AI false-positive review</h4>
               <p>{ai.false_positive_reasoning}</p>
             </div>
           )}
@@ -592,7 +592,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
           )}
           {ai.evidence_grade_reason && (
             <div className='finding-block'>
-              <h4>Evidence grade reasoning</h4>
+              <h4>Why this evidence grade</h4>
               <p>{ai.evidence_grade_reason}</p>
             </div>
           )}
@@ -759,7 +759,7 @@ function ReportPage() {
     report.report_metadata?.coverage_percent;
   const coverageStr = Number.isFinite(coverage)
     ? `${Math.round(coverage)}%`
-    : "—";
+    : "N/A";
   const analysis = report.analysis || {};
   const analysisStatus = analysis.status || "not_requested";
   const analysisComplete = analysisStatus === "completed";
@@ -769,8 +769,8 @@ function ReportPage() {
 
   return (
     <div className='view'>
-      <button className='back' onClick={() => navigate("/reports")}>
-        ← All reports
+      <button className='back' onClick={() => navigate(-1)}>
+        ← Back
       </button>
       <div className='head'>
         <div>
@@ -805,7 +805,7 @@ function ReportPage() {
             <span>
               {analysis.message ||
                 analysis.error_message ||
-                "The deterministic scan report is available while enrichment continues."}
+                "Analyzing findings and preparing the final report."}
             </span>
             {Number.isFinite(analysis.progress) && (
               <small>
@@ -841,7 +841,7 @@ function ReportPage() {
           </div>
           <div className='kv'>
             <span>URLs crawled</span>
-            <b>{stats.total_urls_crawled ?? "—"}</b>
+            <b>{stats.total_urls_crawled ?? "N/A"}</b>
           </div>
           <div className='kv'>
             <span>Crawl scope</span>
@@ -869,9 +869,9 @@ function ReportPage() {
           )}
         </aside>
         <div className='reportbody'>
-          <h2>
-            {report.executive_summary?.split("\n")[0] || "Assessment complete."}
-          </h2>
+          <p style={{ fontWeight: 400, fontSize: "0.88rem", lineHeight: 1.3, maxWidth: "none", color: "var(--ink)" }}>
+            {report.executive_summary?.split("\n")[0] || "Scan complete."}
+          </p>
           <p>
             {report.executive_summary?.split("\n").slice(1).join(" ") ||
               "Verified findings and coverage details are shown below."}
@@ -906,7 +906,7 @@ function ReportPage() {
           title='Scan coverage'
           rows={[
             ["Crawl scope", crawlLabel(report.crawl_mode)],
-            ["URLs crawled", stats.total_urls_crawled ?? "—"],
+            ["URLs crawled", stats.total_urls_crawled ?? "N/A"],
             ["Auth state", titleCase(authCov.state) || "Unauthenticated"],
             ["Authed URLs", authCov.authenticated_url_count ?? 0],
             [

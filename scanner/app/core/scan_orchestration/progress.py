@@ -337,6 +337,15 @@ class ProgressMixin:
         *,
         status: ScanStatus = ScanStatus.running,
     ) -> None:
+        # Background crawl/detector progress reporters may already be queued when
+        # cancellation completes. They must never resurrect a terminal scan by
+        # writing their default ``running`` status afterward.
+        if status == ScanStatus.running and scan.status in {
+            ScanStatus.completed,
+            ScanStatus.failed,
+            ScanStatus.cancelled,
+        }:
+            return
         scan.status = status
         scan.progress = progress
         scan.current_phase = phase

@@ -128,7 +128,7 @@ function LoginPage() {
           <div className='auth-switch'>
             No account?{" "}
             <Link className='text-btn' to='/register'>
-              Create Account
+              Create account
             </Link>
           </div>
         </div>

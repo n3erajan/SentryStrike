@@ -43,9 +43,9 @@ function crawlLabel(mode) {
 }
 
 function formatDate(iso) {
-  if (!iso) return "—";
+  if (!iso) return "N/A";
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
+  if (Number.isNaN(d.getTime())) return "N/A";
   return d.toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
@@ -132,12 +132,12 @@ function ReportsPage() {
 
   async function handleDownload(id) {
     setBusy(id);
-    toast("PDF generation started");
+    toast("Building PDF");
     try {
       const blob = await downloadReportPdf(id);
       saveBlob(blob, `sentrystrike-${id}.pdf`);
     } catch (err) {
-      toast(err.message || "PDF failed");
+      toast(err.message || "Could not build the PDF.");
     } finally {
       setBusy("");
     }
@@ -147,7 +147,7 @@ function ReportsPage() {
     <div className='view'>
       <div className='head'>
         <div>
-          <h1>Assessment reports</h1>
+          <h1>Reports</h1>
         </div>
       </div>
 
@@ -190,8 +190,8 @@ function ReportsPage() {
           </h2>
           <p>
             {applicationId
-              ? "Completed assessments for this web application will appear here."
-              : "Reports appear here after an assessment completes."}
+              ? "Completed scans of this app will appear here."
+              : "Reports appear here after a scan and its analysis finish."}
           </p>
           {user?.role !== "viewer" && <button
             className='btn primary'
@@ -199,7 +199,7 @@ function ReportsPage() {
               navigate(applicationId ? `/scan?app=${applicationId}` : "/scan")
             }
           >
-            New Scan
+            New scan
           </button>}
         </div>
       ) : (

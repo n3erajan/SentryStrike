@@ -11,7 +11,7 @@ import {
 const NAV_ITEMS = [
   { to: "/home", label: "Home", Icon: Home, end: true },
   { to: "/apps", label: "Web applications", Icon: Boxes },
-  { to: "/scan", label: "New Scan", Icon: ShieldPlus },
+  { to: "/scan", label: "New scan", Icon: ShieldPlus },
   { to: "/active", label: "Active scans", Icon: Activity, badge: "active" },
   { to: "/reports", label: "Reports", Icon: FileBarChart },
   { to: "/team", label: "Team", Icon: Users },
@@ -29,7 +29,7 @@ const MOBILE_NAV = [
 const ROUTE_NAMES = {
   "/home": "Home",
   "/apps": "Web applications",
-  "/scan": "New Scan",
+  "/scan": "New scan",
   "/active": "Active scans",
   "/reports": "Reports",
   "/team": "Team",
@@ -75,15 +75,15 @@ const SCAN_PHASES = [
 ];
 
 const SCAN_MODES = [
-  ["verified", "Verified", "Only evidence-verified findings"],
-  ["heuristic", "Heuristic", "Adds strong heuristic matches"],
-  ["aggressive", "Aggressive", "Widest checks, more noise"],
+  ["verified", "Verified", "Report findings backed by verification"],
+  ["heuristic", "Heuristic", "Include strong signals that need review"],
+  ["aggressive", "Aggressive", "Run the broadest checks; expect more noise"],
 ];
 
 const CONFIG_GROUPS = [
   {
     title: "Crawler",
-    blurb: "How far and how fast SentryStrike discovers pages.",
+    blurb: "Control how far and how quickly the crawler explores the app.",
     fields: [
       {
         key: "crawl_depth",
@@ -99,7 +99,7 @@ const CONFIG_GROUPS = [
         key: "crawl_max_urls",
         label: "Max URLs",
         description:
-          "Stops discovery after this many unique URLs have been collected.",
+          "Stop after collecting this many unique URLs.",
         type: "int",
         min: 10,
         max: 5000,
@@ -108,7 +108,7 @@ const CONFIG_GROUPS = [
       {
         key: "crawl_rate_limit_per_second",
         label: "Rate limit",
-        description: "Caps requests per second to reduce load on the target.",
+        description: "Limit requests per second to reduce load on the target.",
         type: "float",
         min: 0.5,
         max: 100,
@@ -120,7 +120,7 @@ const CONFIG_GROUPS = [
         key: "crawl_browser_mode",
         label: "Browser mode",
         description:
-          "Controls browser discovery for conventional sites. Detected SPAs always use the browser.",
+          "Choose when to use browser discovery. Detected SPAs always use it.",
         type: "select",
         defaultLabel: "Auto (detected SPAs)",
         options: [
@@ -133,7 +133,7 @@ const CONFIG_GROUPS = [
         key: "crawl_browser_max_interactions",
         label: "Browser interactions",
         description:
-          "Maximum clicks and form interactions whenever browser discovery runs, including detected SPAs.",
+          "Limit clicks and form interactions during browser discovery.",
         type: "int",
         min: 1,
         max: 200,
@@ -143,7 +143,7 @@ const CONFIG_GROUPS = [
         key: "crawl_browser_budget_seconds",
         label: "Browser budget",
         description:
-          "Maximum time reserved whenever browser discovery runs, including detected SPAs.",
+          "Limit the time spent on browser discovery.",
         type: "float",
         min: 10,
         max: 3600,
@@ -154,13 +154,13 @@ const CONFIG_GROUPS = [
   },
   {
     title: "Scanner engine",
-    blurb: "Throughput and timeouts for the active probing phase.",
+    blurb: "Set concurrency and timeouts for active checks.",
     fields: [
       {
         key: "scanner_concurrency",
         label: "Concurrency",
         description:
-          "Maximum number of security checks that can run at the same time.",
+          "Limit how many security checks can run at once.",
         type: "int",
         min: 1,
         max: 50,
@@ -170,7 +170,7 @@ const CONFIG_GROUPS = [
         key: "request_timeout_seconds",
         label: "Request timeout",
         description:
-          "How long each request may wait before it is treated as timed out.",
+          "Mark a request as timed out after this long.",
         type: "float",
         min: 1,
         max: 120,
@@ -181,7 +181,7 @@ const CONFIG_GROUPS = [
         key: "sensitive_paths_permutation_cap",
         label: "Sensitive-path cap",
         description:
-          "Limits generated path variations used to find exposed resources.",
+          "Limit path variations used to find exposed resources.",
         type: "int",
         min: 0,
         max: 2000,
@@ -191,13 +191,13 @@ const CONFIG_GROUPS = [
   },
   {
     title: "Injection & SSRF",
-    blurb: "Timing thresholds used to verify blind injection and SSRF signals.",
+    blurb: "Set the timing thresholds used for blind injection and SSRF checks.",
     fields: [
       {
         key: "blind_injection_timing_threshold",
         label: "Blind timing threshold",
         description:
-          "Minimum response-time confidence used for blind injection signals.",
+          "Minimum timing confidence for a blind injection signal.",
         type: "float",
         min: 0.1,
         max: 1,
@@ -208,7 +208,7 @@ const CONFIG_GROUPS = [
         key: "ssrf_inband_timing_delta_ms",
         label: "SSRF timing delta",
         description:
-          "Minimum delay used to identify possible in-band SSRF behavior.",
+          "Minimum delay for a possible in-band SSRF signal.",
         type: "float",
         min: 100,
         max: 30000,
@@ -219,13 +219,13 @@ const CONFIG_GROUPS = [
   },
   {
     title: "DOM XSS sweep",
-    blurb: "Budget for the browser-driven client-side reflection sweep.",
+    blurb: "Set limits for browser-based DOM XSS checks.",
     fields: [
       {
         key: "xss_browser_dom_max_jobs",
         label: "Max DOM jobs",
         description:
-          "Maximum browser jobs used to verify client-side XSS behavior.",
+          "Limit browser jobs used to verify client-side XSS.",
         type: "int",
         min: 0,
         max: 100,
@@ -235,7 +235,7 @@ const CONFIG_GROUPS = [
         key: "xss_browser_dom_budget_seconds",
         label: "DOM sweep budget",
         description:
-          "Maximum time reserved for the browser-driven DOM XSS sweep.",
+          "Limit the time spent on DOM XSS checks.",
         type: "float",
         min: 0,
         max: 600,
@@ -250,17 +250,17 @@ const CRED_ROLES = [
   {
     key: "main",
     label: "Primary user",
-    desc: "Authenticates the crawl and acts as the authed baseline.",
+    desc: "Signs in for the crawl and provides the authenticated baseline.",
   },
   {
     key: "second",
     label: "Second user",
-    desc: "A second regular user — proves horizontal IDOR.",
+    desc: "A second standard user for horizontal access checks.",
   },
   {
     key: "admin",
     label: "Admin user",
-    desc: "A privileged user — proves vertical privilege escalation.",
+    desc: "A privileged user for vertical access checks.",
   },
 ];
 
@@ -271,7 +271,7 @@ const CRED_FIELDS = [
     type: "text",
     maxLength: 320,
     description:
-      "Account identifier used to sign in to the target application.",
+      "The account name used to sign in to the target app.",
   },
   {
     key: "password",
@@ -279,13 +279,13 @@ const CRED_FIELDS = [
     type: "password",
     maxLength: 512,
     description:
-      "Password for this test account; leave blank for session-only access.",
+      "The test account password. Leave it blank when using a cookie or header.",
   },
   {
     key: "cookie",
     label: "Cookie",
     description:
-      "Existing session cookies to attach when a login flow is unavailable.",
+      "Existing session cookies to use instead of a login flow.",
     type: "text",
     maxLength: 8192,
     advanced: true,
@@ -295,7 +295,7 @@ const CRED_FIELDS = [
     key: "header",
     label: "Header",
     description:
-      "Custom authentication header sent with requests for this account.",
+      "An authentication header to send with this account's requests.",
     type: "text",
     maxLength: 8192,
     advanced: true,

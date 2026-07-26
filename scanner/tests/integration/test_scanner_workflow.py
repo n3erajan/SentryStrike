@@ -1,3 +1,4 @@
+import asyncio
 import threading
 import time
 from datetime import datetime, timezone
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.core.scanner import ScanOrchestrator
+from app.core.crawler.spider import TargetUnreachableError
 from app.core.detectors.base_detector import Finding
 from shared.models.scan import CrawlMode, ScanPhase, ScanStatus
 from shared.models.vulnerability import OwaspCategory, SeverityLevel, TechnologyComponent
@@ -215,6 +217,77 @@ async def test_scanner_workflow_completes() -> None:
     assert [signal.model_dump() for signal in analysis_queue.signals] == [
         {"analysis_job_id": "analysis-job-1"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_scanner_workflow_reports_unreachable_target() -> None:
+    scan = FakeScan()
+    repository = FakeRepo(scan)
+
+    class UnreachableSpider(FakeSpider):
+        async def crawl(self, _: str, **kwargs):
+            raise TargetUnreachableError(
+                "Target is unreachable: example.com (connection timed out)"
+            )
+
+    class UnexpectedTechDetector:
+        async def detect(self, _: str, **kwargs):
+            raise AssertionError("technology detection must not run")
+
+    orchestrator = ScanOrchestrator(repository)
+    orchestrator.spider = UnreachableSpider()
+    orchestrator.technology_detector = UnexpectedTechDetector()
+
+    await orchestrator.run_scan("mock-id")
+
+    assert scan.status == ScanStatus.failed
+    assert scan.current_phase == ScanPhase.failed
+    assert scan.error_message == (
+        "Target is unreachable: example.com (connection timed out)"
+    )
+    assert scan.phase_message == (
+        "Scan failed: Target is unreachable: example.com (connection timed out)"
+    )
+    assert scan.vulnerabilities == []
+
+
+@pytest.mark.asyncio
+async def test_cancelling_detection_does_not_leave_progress_ticker_running() -> None:
+    scan = FakeScan()
+    repository = FakeRepo(scan)
+    detector_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    class BlockingDetector:
+        async def detect(self, urls, forms, **kwargs):
+            detector_started.set()
+            await never_finish.wait()
+            return []
+
+    orchestrator = ScanOrchestrator(repository)
+    orchestrator.spider = FakeSpider()
+    orchestrator.technology_detector = FakeTechDetector()
+    orchestrator.cve_service = FakeCveService()
+    orchestrator.ssl_analyzer = FakeSsl()
+    orchestrator.detectors = [BlockingDetector()]
+    orchestrator.supply_chain_detector = FakeDetector()
+
+    scan_task = asyncio.create_task(orchestrator.run_scan("mock-id"))
+    await asyncio.wait_for(detector_started.wait(), timeout=1)
+    scan_task.cancel()
+    await asyncio.wait_for(scan_task, timeout=1)
+
+    assert scan.status == ScanStatus.cancelled
+    assert scan.current_phase == ScanPhase.cancelled
+    assert scan.error_message == "Scan cancelled by user"
+    assert not any(
+        any(
+            name in repr(task.get_coro())
+            for name in ("_detector_progress_ticker", "run_detector")
+        )
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() and not task.done()
+    )
 
 
 @pytest.mark.asyncio

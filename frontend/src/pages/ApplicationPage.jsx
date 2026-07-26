@@ -20,9 +20,9 @@ function severityBand(level, score) {
 }
 
 function formatDate(iso) {
-  if (!iso) return "—";
+  if (!iso) return "N/A";
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
+  if (Number.isNaN(d.getTime())) return "N/A";
   return d.toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
@@ -110,11 +110,8 @@ function ApplicationPage() {
       {scans.length === 0 ? (
         <div className='empty-state'>
           <FileBarChart size={30} />
-          <h2>No scans recorded for this application</h2>
-          <p>
-            Scans appear here when launched from this application page or
-            when the application is selected during scan creation.
-          </p>
+          <h2>No scans yet</h2>
+          <p>Start a scan to build this app's history.</p>
           {user?.role !== "viewer" && (
             <button
               className='btn primary'
@@ -164,7 +161,7 @@ function ApplicationPage() {
                       </span>
                     </>
                   ) : (
-                    <span className='small'>—</span>
+                    <span className='small'>N/A</span>
                   )}
                 </span>
                 <span className={`status-pill ${s.status}`}>{s.status}</span>

@@ -8,7 +8,7 @@ import { cancelInvite, changeMemberRole, inviteMember, listInvites, listMembers,
 
 const ROLES = ["admin", "analyst", "developer", "viewer"];
 const title = (v) => (v || "").replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase());
-const date = (v) => v ? new Date(v).toLocaleDateString() : "—";
+const date = (v) => v ? new Date(v).toLocaleDateString() : "N/A";
 
 function TeamPage() {
   const { user } = useAuth();
@@ -70,7 +70,7 @@ function TeamPage() {
     finally { setBusy(""); }
   }
 
-  const seatLabel = `${seatInfo.occupied_seats ?? members.length} of ${seatInfo.member_limit ?? "—"} workspace seats occupied`;
+  const seatLabel = `${seatInfo.occupied_seats ?? members.length} of ${seatInfo.member_limit ?? "N/A"} seats used`;
 
   return <div className='view'>
     <div className='head'><div><h1>Team</h1><p>{seatLabel}</p></div>
@@ -78,7 +78,7 @@ function TeamPage() {
     </div>
     {error && <div className='auth-error'>{error}</div>}
     {loading ? <div className='empty-state'><Loader2 className='ico spin' />Loading team…</div> : rows.length === 0 && !query && members.length === 0 ? (
-      <div className='empty-state'><Users size={30} /><h2>No team members</h2><p>Invite teammates to collaborate on security assessments.</p>{admin && <button className='btn primary' onClick={() => setShowInvite(true)}><MailPlus className='ico' />Invite member</button>}</div>
+      <div className='empty-state'><Users size={30} /><h2>No team members</h2><p>Invite people who need access to this workspace.</p>{admin && <button className='btn primary' onClick={() => setShowInvite(true)}><MailPlus className='ico' />Invite member</button>}</div>
     ) : <div className='team-table'>
       <label className='search'><Search className='ico' /><input placeholder='Search members' value={query} onChange={(e) => setQuery(e.target.value)} /></label>
       <div className='team-head'><span>Member</span><span>Role</span><span>Joined</span><span>Status</span><span></span></div>
@@ -92,7 +92,7 @@ function TeamPage() {
 
     {admin && invites.length > 0 && <div className='panel' style={{ marginTop: 20 }}><div className='panel-h'>Pending invitations</div><div className='panel-b compact-list'>{invites.map((i) => <div className='invite-row' key={i.id}><div><b>{i.email}</b><div className='small'>{title(i.role)} · expires {date(i.expires_at)}</div></div><span className='status-pill'>{title(i.email_delivery_status)}</span><Tooltip label='Cancel invitation'><button className='icon-btn' onClick={() => cancel(i)} disabled={busy === i.id} aria-label='Cancel invitation'><X className='ico' /></button></Tooltip></div>)}</div></div>}
 
-    {showInvite && <div className='modal-backdrop' onMouseDown={() => setShowInvite(false)}><div className='modal-card' onMouseDown={(e) => e.stopPropagation()}><Tooltip label='Close'><button className='modal-close' onClick={() => setShowInvite(false)}><X className='ico' /></button></Tooltip><h2>Invite a teammate</h2><p className='muted-text'>The email address and role are locked into the invitation.</p><form onSubmit={submitInvite}><div className='field'><label>Work email</label><div className='control'><input type='email' required value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></div></div><div className='field'><label>Role</label><div className='control'><Select value={role} onChange={setRole} options={ROLES.map((r) => ({value: r, label: title(r)}))} /></div></div><button className='btn primary' disabled={busy === "invite"}>{busy === "invite" ? "Sending…" : "Send invitation"}</button></form></div></div>}
+    {showInvite && <div className='modal-backdrop' onMouseDown={() => setShowInvite(false)}><div className='modal-card' onMouseDown={(e) => e.stopPropagation()}><Tooltip label='Close'><button className='modal-close' onClick={() => setShowInvite(false)}><X className='ico' /></button></Tooltip><h2>Invite a teammate</h2><p className='muted-text'>Choose their email and workspace role.</p><form onSubmit={submitInvite}><div className='field'><label>Work email</label><div className='control'><input type='email' required value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></div></div><div className='field'><label>Role</label><div className='control'><Select value={role} onChange={setRole} options={ROLES.map((r) => ({value: r, label: title(r)}))} /></div></div><button className='btn primary' disabled={busy === "invite"}>{busy === "invite" ? "Sending…" : "Send invitation"}</button></form></div></div>}
   </div>;
 }
 

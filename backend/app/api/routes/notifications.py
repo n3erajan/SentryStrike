@@ -1,3 +1,5 @@
+from datetime import timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.dependencies import get_current_user, get_notification_repository, json_response
@@ -12,6 +14,14 @@ router = APIRouter(prefix="/notifications", tags=["notifications"])
 def _notification_response(notification: Notification) -> dict:
     data = notification.model_dump(mode="json")
     data["id"] = str(notification.id)
+    # MongoDB returns naive UTC datetimes; if the ISO string lacks a
+    # timezone suffix the browser interprets it as local time.  Ensure the
+    # frontend sees an explicit UTC marker so it can convert to the user's
+    # local timezone.
+    for field in ("created_at", "read_at"):
+        val = data.get(field)
+        if isinstance(val, str) and not val.endswith("Z") and "+" not in val:
+            data[field] = val + "Z"
     return data
 
 

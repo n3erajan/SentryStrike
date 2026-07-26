@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 # way. Imported above and re-exported here for existing references.
 
 
+class TargetUnreachableError(RuntimeError):
+    """Raised when the scanner cannot establish an HTTP connection to the target."""
+
+
 @dataclass
 class FormInput:
     """A single input field within an HTML form."""
@@ -227,8 +231,6 @@ class WebSpider:
 
         await safe_enqueue(root_url, 0, RouteSource.html, 100)
 
-        robots = await self._load_robots(root_url)
-
         effective_timeout = self._scan_config.get_val("request_timeout_seconds", self.settings.request_timeout_seconds) if self._scan_config else self.settings.request_timeout_seconds
         async with create_scan_client(
             timeout=effective_timeout,
@@ -236,16 +238,16 @@ class WebSpider:
             headers={"User-Agent": "SentryStrikeScanner/1.0"},
             event_hooks={"response": [make_httpx_response_logger("crawler", "crawl")]},
         ) as client:
-            # Perform authentication if configured
+            root_response = await self._confirm_target_reachable(client, root_url)
+            if "text/html" in root_response.headers.get("content-type", ""):
+                spa_detector.configure_root(root_url, root_response.text)
+                spa_root_html = root_response.text
+                self._is_spa = self._is_spa or spa_detector.root_looks_like_spa()
+
+            # Reachability is established before authentication or discovery so a
+            # dead target fails once instead of timing out across every candidate.
             await self._authenticate_session(client, root_url)
-            try:
-                root_response = await client.get(root_url)
-                if "text/html" in root_response.headers.get("content-type", ""):
-                    spa_detector.configure_root(root_url, root_response.text)
-                    spa_root_html = root_response.text
-                    self._is_spa = self._is_spa or spa_detector.root_looks_like_spa()
-            except Exception as exc:
-                logger.debug("failed to prefetch root shell for SPA fallback detection: %s", exc)
+            robots = await self._load_robots(root_url)
 
             # 1. Parse Sitemap directives from robots.txt if possible
             sitemap_urls = []
@@ -470,8 +472,7 @@ class WebSpider:
                     if progress_callback is not None and now - last_progress_time > 2.0:
                         last_progress_time = now
                         fraction = min(current_discovered / max(1, effective_max_urls), 1.0)
-                        # Fire and forget callback so it doesn't block the wait loop
-                        asyncio.create_task(progress_callback(fraction))
+                        await progress_callback(fraction)
                         
                     await asyncio.sleep(0.1)
                 
@@ -659,13 +660,13 @@ class WebSpider:
             headers={"User-Agent": "SentryStrikeScanner/1.0"},
             event_hooks={"response": [make_httpx_response_logger("crawler", "fetch_single")]},
         ) as client:
+            await self._confirm_target_reachable(client, target_url)
             await self._authenticate_session(client, target_url)
 
             try:
                 response = await self._request_with_session_keeper(client, "GET", target_url)
-            except Exception as exc:
-                logger.warning("fetch_single failed for %s: %s", target_url, exc)
-                return CrawlResult(urls=[], forms=[], session_cookies=self.session_cookies)
+            except httpx.RequestError as exc:
+                raise self._target_unreachable_error(target_url, exc) from exc
 
             if response.status_code in {200, 301, 302, 403}:
                 discovered_urls.append(target_url)
@@ -691,6 +692,31 @@ class WebSpider:
         )
         self._log_crawl_inventory(target_url, result)
         return result
+
+    async def _confirm_target_reachable(
+        self,
+        client: httpx.AsyncClient,
+        target_url: str,
+    ) -> httpx.Response:
+        """Return the target's response or fail before any scan work begins."""
+        try:
+            return await client.get(target_url, follow_redirects=False)
+        except httpx.RequestError as exc:
+            raise self._target_unreachable_error(target_url, exc) from exc
+
+    @staticmethod
+    def _target_unreachable_error(
+        target_url: str,
+        exc: httpx.RequestError,
+    ) -> TargetUnreachableError:
+        target = urlparse(target_url).netloc or target_url
+        if isinstance(exc, httpx.TimeoutException):
+            reason = "connection timed out"
+        elif isinstance(exc, httpx.ConnectError):
+            reason = "could not establish a connection"
+        else:
+            reason = str(exc).strip() or "network request failed"
+        return TargetUnreachableError(f"Target is unreachable: {target} ({reason})")
 
     async def _inspect_javascript_asset(self, client, script_url: str, root_url: str, crawl_state: CrawlState, enqueue_fn, depth: int) -> None:
         if script_url in crawl_state.assets:

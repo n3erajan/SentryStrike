@@ -41,12 +41,9 @@ function ActiveScansPage() {
         <div className='empty-state'>
           <ShieldCheck size={30} />
           <h2>No scans are running</h2>
-          <p>
-            Create a new scan and its live phase, progress, and worker state
-            will appear here.
-          </p>
+          <p>New scans appear here while they run.</p>
           {user?.role !== "viewer" && <button className='btn primary' onClick={() => navigate("/scan")}>
-            New Scan
+            New scan
           </button>}
         </div>
       ) : (

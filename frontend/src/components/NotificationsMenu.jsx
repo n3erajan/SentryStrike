@@ -188,7 +188,7 @@ export default function NotificationsMenu() {
                 )}
               </>
             ) : (
-              <div className='empty-state'>You’re all caught up.</div>
+              <div className='empty-state'>No unread notifications.</div>
             )}
           </div>
         </div>

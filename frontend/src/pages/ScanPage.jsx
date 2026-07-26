@@ -146,13 +146,12 @@ function ScanPage() {
       <div className='view'>
         <div className='head'>
           <div>
-            <h1>New Scan</h1>
-            <p>Your viewer role has read-only workspace access.</p>
+            <h1>New scan</h1>
+            <p>Viewers cannot start scans.</p>
           </div>
         </div>
         <div className='empty-state'>
-          Ask a workspace owner or admin to change your role before launching
-          assessments.
+          Ask a workspace owner or admin to change your role.
         </div>
       </div>
     );
@@ -174,7 +173,7 @@ function ScanPage() {
     if (!configIsValid) return;
     const result = await startScan();
     if (result) {
-      toast("Assessment started");
+      toast("Scan started");
       navigate(`/active/${result.scanId}`, {
         state: { target: result.target },
       });
@@ -185,8 +184,8 @@ function ScanPage() {
     <div className='view'>
       <div className='head'>
         <div>
-          <h1>New Scan</h1>
-          <p>Configure an OWASP Top 10 2025 VAPT assessment.</p>
+          <h1>New scan</h1>
+          <p>Choose a target and how deeply to test it.</p>
         </div>
       </div>
 
@@ -202,7 +201,7 @@ function ScanPage() {
       <div className='formlayout'>
         <main>
           <section className='formsection'>
-            <h3>Application URL</h3>
+            <h3>Target</h3>
             {apps.length > 0 && (
               <div className='grid2'>
                 <div className='field wide'>
@@ -222,14 +221,14 @@ function ScanPage() {
                     className='field-description'
                     id='scan-application-description'
                   >
-                    Picking an application fills in its target URL and saved
-                    scan defaults. You can still edit both below.
+                    Select a saved app to load its URL and scan defaults.
                   </p>
                 </div>
               </div>
             )}
             <div className='grid2'>
               <div className='field wide'>
+                <label htmlFor='target-url'>URL</label>
                 <div
                   className={`control${touched && url && !valid ? " error" : ""}`}
                 >
@@ -251,8 +250,8 @@ function ScanPage() {
                 )}
                 <p className='field-description' id='target-url-description'>
                   {selectedApp
-                    ? `Loaded from ${selectedApp.name}. Edit it to scan a different path on this target.`
-                    : "Enter the public or staging URL where the assessment should begin."}
+                    ? `Loaded from ${selectedApp.name}. You can edit the path for this scan.`
+                    : "Enter the public or staging URL where the scan should begin."}
                 </p>
               </div>
             </div>
@@ -322,8 +321,8 @@ function ScanPage() {
           {usersOpen && (
             <div className='advanced-panel users-panel' id='test-users-panel'>
               <p className='panel-intro'>
-                Add up to three dedicated test accounts to improve authenticated
-                coverage. Do not use personal or production credentials.
+                Add dedicated test accounts for authenticated and access-control
+                checks. Do not use personal or production credentials.
               </p>
               {CRED_ROLES.map((role) => (
                 <CredentialAccount
@@ -348,8 +347,8 @@ function ScanPage() {
                   disabled={submitting}
                 />
                 <span>
-                  Auto-provision a throwaway second identity for horizontal IDOR
-                  testing when none is supplied.
+                  Create a temporary second user for horizontal access checks
+                  when none is supplied.
                 </span>
               </label>
             </div>
@@ -366,7 +365,7 @@ function ScanPage() {
               <span className='muted-text'>(optional)</span>
             </span>
             <span className='advanced-toggle-hint'>
-              Crawler, scanner, injection, and browser tuning
+              Crawl limits, timeouts, and verification thresholds
             </span>
             <ChevronDown className='ico chev' />
           </button>
@@ -408,7 +407,7 @@ function ScanPage() {
         </main>
 
         <aside className='review'>
-          <h2>Assessment summary</h2>
+          <h2>Scan summary</h2>
           <dl>
             {selectedApp && (
               <div>
@@ -450,7 +449,7 @@ function ScanPage() {
               ? "Loading defaults…"
               : submitting
                 ? "Starting…"
-                : "Start assessment"}
+                : "Start scan"}
           </button>
         </aside>
       </div>

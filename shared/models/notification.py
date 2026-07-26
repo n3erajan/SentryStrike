@@ -30,7 +30,10 @@ class Notification(Document):
     resource_type: str | None = None
     resource_id: str | None = None
     metadata: dict = Field(default_factory=dict)
-    dedupe_key: Indexed(str, unique=True)
+    # Idempotency is enforced by NotificationRepository's deterministic document
+    # id. Keep this index for lookup without claiming a uniqueness constraint that
+    # existing deployments may not have installed.
+    dedupe_key: Indexed(str)
     read_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

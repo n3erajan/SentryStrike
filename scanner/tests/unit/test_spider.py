@@ -8,7 +8,7 @@ import httpx
 
 from app.core.crawler import spider as spider_module
 from app.core.crawler.models import CrawlState, RequestObservation
-from app.core.crawler.spider import AuthReplayState, WebSpider
+from app.core.crawler.spider import AuthReplayState, TargetUnreachableError, WebSpider
 from app.core.detectors.sensitive_paths import SensitivePathsDetector
 
 
@@ -18,6 +18,39 @@ def _disable_real_browser(monkeypatch):
     guarantee). Dynamic-discovery behaviour is covered via mocks. Tests can
     still opt in by overriding these env vars and clearing the settings cache."""
     monkeypatch.setenv("CRAWL_BROWSER_MODE", "never")
+
+
+@pytest.mark.asyncio
+async def test_reachability_check_accepts_any_http_response() -> None:
+    async def respond(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        response = await WebSpider()._confirm_target_reachable(
+            client,
+            "https://example.test/",
+        )
+
+    assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_reachability_check_reports_connection_failure() -> None:
+    async def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("All connection attempts failed", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as client:
+        with pytest.raises(
+            TargetUnreachableError,
+            match=(
+                r"^Target is unreachable: example\.test "
+                r"\(could not establish a connection\)$"
+            ),
+        ):
+            await WebSpider()._confirm_target_reachable(
+                client,
+                "https://example.test/",
+            )
 
 
 @pytest.mark.asyncio
@@ -43,6 +76,7 @@ async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch
             deadline=None,
             storage_state=None,
             client_routes=None,
+            progress_callback=None,
         ):
             # Stream a partial observation, mark availability, then blow up —
             # simulating a timeout/exception mid-run.
@@ -109,6 +143,7 @@ async def test_run_browser_discovery_degrades_when_playwright_unavailable(monkey
             deadline=None,
             storage_state=None,
             client_routes=None,
+            progress_callback=None,
         ):
             state.browser_available = False
             state.browser_error = "Playwright import failed: boom"

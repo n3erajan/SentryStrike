@@ -11,12 +11,12 @@ const ROLES = [
   {
     key: "second",
     label: "Second user",
-    desc: "A second regular user — proves horizontal IDOR.",
+    desc: "A second standard user for horizontal access checks.",
   },
   {
     key: "admin",
     label: "Admin user",
-    desc: "A privileged user — proves vertical privilege escalation.",
+    desc: "A privileged user for vertical access checks.",
   },
 ];
 
@@ -115,8 +115,8 @@ export default function ReverifyCredentialsDialog({
             </section>
           ))}
           <p className='field-description'>
-            Supply at least one account. Use dedicated test credentials — never
-            personal or production ones.
+            Add at least one dedicated test account. Do not use personal or
+            production credentials.
           </p>
           <button className='btn primary' type='submit' disabled={!ready}>
             Queue re-verification

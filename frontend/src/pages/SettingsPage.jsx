@@ -143,7 +143,7 @@ function SettingsPage() {
       <div className='head'>
         <div>
           <h1>Settings</h1>
-          <p>Workspace settings and audit history.</p>
+          <p>Manage your workspace and review recent activity.</p>
         </div>
         {admin && (
           <button
@@ -193,8 +193,8 @@ function SettingsPage() {
           <section className='formsection'>
             <h2>Data retention</h2>
             <p className='muted-text'>
-              Completed scan data is eligible for deletion after this period.
-              The compliance minimum is 30 days.
+              Completed scan data can be deleted after this period. The minimum
+              is 30 days.
             </p>
             <div className='field settings-short'>
               <label>Retention days</label>
@@ -241,7 +241,7 @@ function SettingsPage() {
                   ))
                 ) : (
                   <p className='muted-text'>
-                    No audited workspace activity yet.
+                    No workspace activity yet.
                   </p>
                 )}
               </div>

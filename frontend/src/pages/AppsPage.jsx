@@ -80,8 +80,7 @@ function ApplicationDialog({ app, onSave, onClose }) {
           {app ? "Edit application" : "Add a web application"}
         </h2>
         <p className='muted-text'>
-          Applications group repeated assessments of the same target and hold
-          the scan defaults used to prefill each new scan.
+          Save the target URL and defaults you want to reuse for future scans.
         </p>
         <form onSubmit={submit}>
           <div className='field'>
@@ -124,7 +123,7 @@ function ApplicationDialog({ app, onSave, onClose }) {
             Default scan configuration{" "}
             <span className='muted-text'>(optional)</span>
             <span className='advanced-toggle-hint'>
-              Prefills every scan of this application
+              Used to prefill new scans of this app
             </span>
             <ChevronDown className='ico chev' />
           </button>
@@ -233,7 +232,7 @@ function AppsPage() {
       <div className='head'>
         <div>
           <h1>Web applications</h1>
-          <p>Track security posture across production and staging.</p>
+          <p>Save targets and keep their scan history together.</p>
         </div>
         {canManage && (
           <button className='btn primary' onClick={() => setDialog({ app: null })}>
@@ -252,8 +251,7 @@ function AppsPage() {
           <Boxes size={30} />
           <h2>No applications yet</h2>
           <p>
-            Add a web application to save its target URL and scan defaults, and
-            to keep every assessment of it in one place.
+            Add an app to save its target URL, defaults, and scan history.
           </p>
           {canManage && (
             <button

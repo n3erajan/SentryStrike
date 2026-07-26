@@ -76,7 +76,7 @@ function AppLayout() {
             {!onScanPage && user?.role !== "viewer" && (
               <button className='btn primary' onClick={() => navigate("/scan")}>
                 <Plus className='ico' />
-                New Scan
+                New scan
               </button>
             )}
           </div>

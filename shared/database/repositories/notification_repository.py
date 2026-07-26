@@ -1,9 +1,20 @@
+import hashlib
 from datetime import datetime, timezone
 
 from beanie import PydanticObjectId
 from pymongo.errors import DuplicateKeyError
 
 from shared.models.notification import Notification, NotificationType
+
+
+def _dedupe_document_id(
+    org_id: str,
+    recipient_user_id: str,
+    dedupe_key: str,
+) -> PydanticObjectId:
+    """Map one logical notification to one MongoDB document id."""
+    identity = "\0".join((org_id, recipient_user_id, dedupe_key)).encode()
+    return PydanticObjectId(hashlib.sha256(identity).hexdigest()[:24])
 
 
 class NotificationRepository:
@@ -22,7 +33,16 @@ class NotificationRepository:
         resource_id: str | None = None,
         metadata: dict | None = None,
     ) -> Notification:
+        existing = await Notification.find_one(
+            Notification.dedupe_key == dedupe_key,
+            Notification.org_id == org_id,
+            Notification.recipient_user_id == recipient_user_id,
+        )
+        if existing is not None:
+            return existing
+
         notification = Notification(
+            id=_dedupe_document_id(org_id, recipient_user_id, dedupe_key),
             org_id=org_id,
             recipient_user_id=recipient_user_id,
             type=type,

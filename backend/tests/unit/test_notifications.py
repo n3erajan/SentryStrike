@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.api.dependencies import get_current_user, get_notification_repository
 from app.api.routes import notifications
+from shared.database.repositories.notification_repository import _dedupe_document_id
 from shared.models.notification import NotificationType
 
 
@@ -105,3 +106,16 @@ def test_mark_read_and_read_all_use_scoped_repository_operations() -> None:
     assert marked.json()["data"]["read_at"] is not None
     assert all_marked.json()["data"]["updated"] == 3
     assert missing.status_code == 404
+
+
+def test_notification_dedupe_id_is_stable_and_recipient_scoped() -> None:
+    first = _dedupe_document_id("org-1", "user-1", "scan-terminal:scan-1:failed")
+    repeated = _dedupe_document_id("org-1", "user-1", "scan-terminal:scan-1:failed")
+    other_recipient = _dedupe_document_id(
+        "org-1",
+        "user-2",
+        "scan-terminal:scan-1:failed",
+    )
+
+    assert first == repeated
+    assert first != other_recipient

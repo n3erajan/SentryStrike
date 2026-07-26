@@ -1929,7 +1929,7 @@ class BrowserDiscoveryEngine:
                 while not finished:
                     elapsed = loop.time() - start_time
                     fraction = min(elapsed / budget, 1.0)
-                    asyncio.create_task(progress_callback(fraction))
+                    await progress_callback(fraction)
                     await asyncio.sleep(5.0)
                     
             ticker_task = asyncio.create_task(_progress_ticker())
@@ -1965,6 +1965,7 @@ class BrowserDiscoveryEngine:
                     await worker_gather
             finally:
                 ticker_task.cancel()
+                await asyncio.gather(ticker_task, return_exceptions=True)
                 # Merge each worker's local state into the shared state. This runs
                 # in ``finally`` — even under a hard-timeout cancellation — so the
                 # per-worker partial observations (streamed into each ``wstate`` in

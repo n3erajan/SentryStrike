@@ -31,8 +31,10 @@ export function AuthProvider({ children }) {
   }, [navigate]);
 
   useEffect(() => {
-    setOnUnauthorized(clearSession);
-    refreshCurrentUser().then(setUser).catch(() => {}).finally(() => setLoading(false));
+    refreshCurrentUser().then(setUser).catch(() => {}).finally(() => {
+      setOnUnauthorized(clearSession);
+      setLoading(false);
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

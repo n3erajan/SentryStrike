@@ -352,15 +352,19 @@ class PipelineMixin:
                 except asyncio.CancelledError:
                     pass
 
+            ticker_task: asyncio.Task | None = None
+            detector_tasks: list[asyncio.Task] = []
             try:
                 ticker_task = asyncio.create_task(_detector_progress_ticker())
+                detector_tasks = [
+                    asyncio.create_task(run_detector(detector))
+                    for detector in active_detectors
+                ]
                 # Run detectors concurrently but consume them as they finish so
                 # progress ticks on work completed (not detector headcount).
                 detector_total = max(1, len(active_detectors))
                 detector_done = 0
-                for coro in asyncio.as_completed(
-                    [run_detector(detector) for detector in active_detectors]
-                ):
+                for coro in asyncio.as_completed(detector_tasks):
                     result = await coro
                     detector_done += 1
                     finished_name = "unknown"
@@ -406,9 +410,6 @@ class PipelineMixin:
                         f"Detectors {detector_done}/{detector_total} complete: {len(findings)} raw finding(s)",
                     )
                     
-                if 'ticker_task' in locals() and not ticker_task.done():
-                    ticker_task.cancel()
-
                 exception_detector = next((detector for detector in scan_detectors if isinstance(detector, ExceptionHandlingDetector)), None)
                 if exception_detector is not None:
                     observed_exception_findings = exception_detector.findings_from_observed_evidence(findings, target_url=scan.target_url)
@@ -494,6 +495,14 @@ class PipelineMixin:
                 detector_request_counts = snapshot_request_counts()
                 detector_denied_counts = denied_snapshot()
             finally:
+                for detector_task in detector_tasks:
+                    if not detector_task.done():
+                        detector_task.cancel()
+                if detector_tasks:
+                    await asyncio.gather(*detector_tasks, return_exceptions=True)
+                if ticker_task is not None:
+                    ticker_task.cancel()
+                    await asyncio.gather(ticker_task, return_exceptions=True)
                 end_request_counting()
                 end_governor()
             self._apply_detector_request_counts(

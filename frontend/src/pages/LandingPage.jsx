@@ -13,18 +13,18 @@ import ThemeToggle from "../components/ThemeToggle.jsx";
 const WORKFLOW = [
   {
     id: "provide",
-    title: "Provide the application",
-    desc: "Add URL, confirm authorization, set crawl scope, and optional test users.",
+    title: "Set the target",
+    desc: "Enter a URL, choose the scope, and add test accounts if needed.",
   },
   {
     id: "scan",
-    title: "Perform VAPT",
-    desc: "Map routes, replay workflows, and test OWASP controls.",
+    title: "Run the scan",
+    desc: "Map the app and test the routes, inputs, and sessions it exposes.",
   },
   {
     id: "report",
-    title: "Act on the report",
-    desc: "Review risk, evidence, remediation, and coverage.",
+    title: "Review the results",
+    desc: "Triage findings, assign fixes, and export the report.",
   },
 ];
 
@@ -32,8 +32,8 @@ const OWASP = {
   a01: {
     nav: "A01 Access Control",
     label: "A01 · BROKEN ACCESS CONTROL",
-    title: "Test what each identity can reach.",
-    p: "Compare unauthenticated, normal-user, secondary-user, and administrator access to verify horizontal and vertical authorization failures.",
+    title: "Check what each user can access.",
+    p: "Compare public, standard, secondary, and admin sessions to find horizontal and vertical access failures.",
     chips: [
       "IDOR / BOLA",
       "Privilege escalation",
@@ -44,43 +44,43 @@ const OWASP = {
   a02: {
     nav: "A02 Misconfiguration",
     label: "A02 · SECURITY MISCONFIGURATION",
-    title: "Find dangerous defaults and exposed surfaces.",
-    p: "Inspect headers, sensitive paths, directory listings, and backup files.",
+    title: "Find unsafe defaults and exposed files.",
+    p: "Check headers, sensitive paths, directory listings, and backup files.",
     chips: ["Security headers", "Sensitive paths", "Error disclosure"],
   },
   a03: {
     nav: " A03 Supply Chain",
     label: "A03 · SOFTWARE SUPPLY CHAIN FAILURES",
-    title: "Identify vulnerable dependencies.",
-    p: "Cross-reference detected components and versions against known CVEs via NVD.",
+    title: "Find known risks in dependencies.",
+    p: "Match detected components and versions against CVEs from the NVD.",
     chips: ["Dependency CVEs", "Version exposure"],
   },
   a04: {
     nav: "A04 Cryptographic",
     label: "A04 · CRYPTOGRAPHIC FAILURES",
-    title: "Inspect transport security.",
-    p: "Analyze HTTPS, TLS configuration, certificates, and visible cryptographic weaknesses.",
+    title: "Check HTTPS and TLS.",
+    p: "Inspect certificates, protocol support, and visible cryptographic weaknesses.",
     chips: ["TLS analysis", "Certificates", "HTTPS enforcement"],
   },
   a05: {
     nav: "A05 Injection",
     label: "A05 · INJECTION",
-    title: "Verify input-driven execution.",
-    p: "Test SQL/NoSQL injection, XSS, command injection, file inclusion, and upload.",
+    title: "Test how the app handles input.",
+    p: "Probe for SQL and NoSQL injection, XSS, command injection, file inclusion, and unsafe uploads.",
     chips: ["SQLi / NoSQLi", "XSS", "Command injection", "SSRF"],
   },
   a07: {
     nav: "A07 Authentication",
     label: "A07 · AUTHENTICATION FAILURES",
-    title: "Test sessions and login boundaries.",
-    p: "Evaluate authentication workflows, sessions, CSRF protection, and role boundaries.",
+    title: "Test login and session controls.",
+    p: "Check authentication flows, session handling, CSRF protection, and role boundaries.",
     chips: ["Session validation", "Auth bypass", "JWT validation"],
   },
   a10: {
     nav: "A10 Exceptional Conditions",
     label: "A10 · MISHANDLING OF EXCEPTIONAL CONDITIONS",
-    title: "Inspect error handling and failures.",
-    p: "Surface stack traces, verbose errors, and debug pages that leak internals.",
+    title: "Check what errors reveal.",
+    p: "Look for stack traces, verbose errors, and debug pages that expose internal details.",
     chips: ["Stack traces", "Error disclosure", "Debug pages"],
   },
 };
@@ -88,33 +88,33 @@ const OWASP = {
 const ROLES = {
   owner: {
     nav: "Business owner",
-    title: "Make release decisions with confidence.",
-    desc: "See customer impact, business risk, priorities, and progress without decoding scanner output.",
+    title: "See what could block a release.",
+    desc: "Get the risk, likely impact, and current remediation status without reading raw scanner output.",
     items: [
-      "Security score and release recommendation",
+      "Risk score and release guidance",
       "Plain-language impact",
-      "Prioritized action plan",
+      "Fix status",
     ],
   },
   developer: {
     nav: "Developer",
-    title: "Go from finding to fix.",
-    desc: "Inspect endpoints, payloads, masked evidence, reproduction details, and remediation.",
+    title: "Get enough detail to fix it.",
+    desc: "See the affected endpoint, payload, evidence, and recommended fix.",
     items: [
       "Exact endpoint and parameter",
       "Request and response evidence",
       "CVSS and exploitability",
-      "Focused remediation",
+      "Suggested fix",
     ],
   },
   security: {
     nav: "Security team",
-    title: "Judge coverage, not just findings.",
-    desc: "Review authentication context, evidence strength, coverage quality, attack chains, and limitations.",
+    title: "Review what the scan covered.",
+    desc: "Check authentication context, evidence strength, skipped tests, and scan limits.",
     items: [
       "SPA and API coverage",
-      "Authenticated target verification",
-      "Skipped-reason visibility",
+      "Authenticated coverage",
+      "Reasons tests were skipped",
       "Evidence strength breakdown",
     ],
   },
@@ -127,11 +127,11 @@ const FAQS = [
   ],
   [
     "Does this replace a human penetration test?",
-    "No. It automates repeatable VAPT coverage. Threat modeling, business logic, insecure design, and monitoring review still benefit from skilled human testing.",
+    "No. It automates repeatable DAST checks. Threat modeling, source review, and complex business logic still need skilled human testing.",
   ],
   [
     "Can teams compare past reports?",
-    "Every completed assessment is saved and listed under Reports, and each application shows its latest security score. Side-by-side comparison of past reports is on the roadmap.",
+    "Yes. Reports keeps every completed scan, and each application page shows its scan history and latest score.",
   ],
 ];
 
@@ -189,7 +189,7 @@ function ScanPreview() {
       </div>
       <div className='scan-card'>
         <div className='scan-head'>
-          <b>Interactive scan preview</b>
+          <b>Scan preview</b>
           <span>
             <i className='live' />
             <span>{state}</span>
@@ -256,15 +256,15 @@ function WorkflowVisual({ id }) {
             <i />
           </div>
           <div className='mock-body'>
-            <h3>New Scan</h3>
+            <h3>New scan</h3>
             <div className='field'>
-              <label>Application URL</label>
+              <label>Target URL</label>
               <div className='control'>
                 <input defaultValue='https://example.com' readOnly />
               </div>
             </div>
             <div className='field'>
-              <label>Crawl Scope</label>
+              <label>Crawl scope</label>
               <div className='control'>
                 <input defaultValue='Full Site' readOnly />
               </div>
@@ -284,7 +284,7 @@ function WorkflowVisual({ id }) {
   if (id === "scan") {
     return (
       <div className='workflow-pane active'>
-        <h3 style={{ fontSize: "0.98rem" }}>Live application coverage</h3>
+        <h3 style={{ fontSize: "0.98rem" }}>Live scan coverage</h3>
         <div className='coverage'>
           <div className='coverage-row'>
             <span>Routes discovered</span>
@@ -357,7 +357,7 @@ function RolePane({ role }) {
         </div>
         <div className='report-preview'>
           <div className='report-preview-head'>
-            <b>Developer evidence</b>
+            <b>Finding evidence</b>
             <span>Confirmed exploit</span>
           </div>
           <pre
@@ -471,7 +471,7 @@ function LandingPage() {
             Sign in
           </Link>
           <Link className='btn primary' to='/register'>
-            Start assessment
+            Start a scan
           </Link>
         </div>
       </nav>
@@ -480,34 +480,33 @@ function LandingPage() {
           <div className='hero-copy'>
             <span className='eyebrow'>
               <BadgeCheck className='ico' />
-              OWASP Top 10 2025 VAPT
+              Evidence-driven DAST
             </span>
-            <h1>Know what your web app exposes.</h1>
+            <h1>Find what your web app exposes.</h1>
             <p>
-              SentryStrike turns an application URL into verified
-              vulnerabilities, clear business risk, developer evidence, and a
-              report your team can act on.
+              SentryStrike scans public and authenticated routes, verifies
+              findings, and shows your team what to fix.
             </p>
             <div className='hero-actions'>
               <Link className='btn primary' to='/register'>
-                Assess your web app
+                Start a scan
               </Link>
               <a className='btn' href='#platform'>
-                Explore the platform
+                See how it works
               </a>
             </div>
             <div className='trust'>
               <span>
                 <LockKeyhole className='ico' />
-                Credentials never stored
+                Credentials kept in memory
               </span>
               <span>
                 <CheckCircle2 className='ico' />
-                Verified evidence
+                Evidence-backed findings
               </span>
               <span>
                 <FileCheck2 className='ico' />
-                Business-ready reports
+                PDF reports
               </span>
             </div>
           </div>
@@ -534,10 +533,10 @@ function LandingPage() {
 
         <section className='public-section' id='platform'>
           <div className='section-head'>
-            <h2>From URL to security decision.</h2>
+            <h2>A scan you can follow.</h2>
             <p>
-              A guided workflow makes VAPT approachable for businesses without
-              hiding the technical depth developers need.
+              Set the target and scope. SentryStrike handles discovery,
+              testing, and reporting.
             </p>
           </div>
           <div className='workflow'>
@@ -565,10 +564,10 @@ function LandingPage() {
 
         <section className='public-section dark-section' id='owasp'>
           <div className='section-head'>
-            <h2>OWASP Top 10 2025, with honest coverage.</h2>
+            <h2>Coverage you can inspect.</h2>
             <p>
-              Automated categories are tested actively. Human-review categories
-              are disclosed as limitations, never marked secure.
+              See what ran, what was skipped, and why. Missing coverage is never
+              treated as a pass.
             </p>
           </div>
           <div className='owasp'>
@@ -599,10 +598,10 @@ function LandingPage() {
 
         <section className='public-section' id='teams'>
           <div className='section-head'>
-            <h2>One report. Three useful views.</h2>
+            <h2>One report, useful at every level.</h2>
             <p>
-              Everyone works from the same verified evidence, presented at the
-              right level.
+              Each role gets the detail it needs without losing the underlying
+              evidence.
             </p>
           </div>
           <div className='roles'>
@@ -624,7 +623,7 @@ function LandingPage() {
 
         <section className='public-section' id='faq'>
           <div className='faq'>
-            <h2>Questions worth asking.</h2>
+            <h2>Common questions</h2>
             {FAQS.map(([q, a], i) => (
               <article
                 key={q}
@@ -651,8 +650,8 @@ function LandingPage() {
 
         <section className='cta'>
           <div>
-            <h2>Start with your application URL.</h2>
-            <p>Get an OWASP Top 10 2025 VAPT report your whole team can use.</p>
+            <h2>Scan an authorized web app.</h2>
+            <p>Start with a URL. Add test accounts when you need authenticated coverage.</p>
           </div>
           <Link className='btn' to='/register'>
             Create account

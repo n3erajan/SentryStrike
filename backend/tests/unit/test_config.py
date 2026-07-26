@@ -2,6 +2,23 @@ from app.config import BackendSettings
 from shared.config import InfrastructureSettings
 
 
+def test_backend_defaults_do_not_require_smtp_credentials(monkeypatch) -> None:
+    for name in (
+        "EMAIL_SMTP_HOST",
+        "EMAIL_SMTP_PORT",
+        "EMAIL_SMTP_USER",
+        "EMAIL_SMTP_PASSWORD",
+        "EMAIL_SMTP_STARTTLS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = BackendSettings(_env_file=None)
+
+    assert settings.email_smtp_host == "localhost"
+    assert settings.email_smtp_port == 1025
+    assert settings.email_smtp_starttls is False
+
+
 def test_infrastructure_settings_exclude_service_configuration() -> None:
     fields = InfrastructureSettings.model_fields
 

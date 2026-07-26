@@ -57,6 +57,7 @@ wheels/
 
 # Testing
 .pytest_cache/
+.pytest_tmp/
 .coverage
 htmlcov/
 .tox/
@@ -94,4 +95,17 @@ playwright/.auth/
 .continue/
 .agents/
 .playwright-mcp/
+.WARP.md
+.github/
+brain/
+audit_evidence
+
+shared.egg-
 shared.egg-info/
+
+# ----------
+UI-ideas/
+AGENTS.md
+CLAUDE.md
+.understand-anything/
+docs/

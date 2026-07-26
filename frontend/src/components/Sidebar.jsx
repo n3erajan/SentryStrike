@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { NavLink, useNavigate } from "react-router-dom";
+import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import { X, LogOut } from "lucide-react";
 import { NAV_ITEMS } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
@@ -24,6 +24,7 @@ function displayName(user) {
 function Sidebar({ open = false, onClose }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const { count } = useActiveScans();
   const { health, loading: healthLoading, error: healthError } =
     useBackendHealth();
@@ -76,7 +77,12 @@ function Sidebar({ open = false, onClose }) {
             to={to}
             end={end}
             onClick={onClose}
-            className={({ isActive }) => (isActive ? "active" : undefined)}
+            className={({ isActive }) => {
+              // /report/:scanId starts with /report/ not /reports, so
+              // NavLink's default matching won't highlight "Reports".
+              const isReportActive = to === "/reports" && location.pathname.startsWith("/report/");
+              return isActive || isReportActive ? "active" : undefined;
+            }}
           >
             <Icon className='ico' />
             <span>{label}</span>

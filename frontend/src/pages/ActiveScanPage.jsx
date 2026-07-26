@@ -23,7 +23,7 @@ const ANALYSIS_LABEL = {
 };
 
 function formatEta(seconds) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "—";
+  if (!Number.isFinite(seconds) || seconds <= 0) return "N/A";
   if (seconds < 60) return `${Math.ceil(seconds)}s`;
   const mins = Math.ceil(seconds / 60);
   if (mins < 60) return `${mins}m`;
@@ -57,6 +57,8 @@ function ActiveScanPage() {
     stageIdx,
     eta,
     analysis,
+    siteTitle,
+    targetUrl,
     logs,
     logRef,
     error,
@@ -64,6 +66,8 @@ function ActiveScanPage() {
     cancelling,
     cancel,
   } = useScanStatus(scanId);
+
+  const displayName = siteTitle || hostnameOf(targetUrl || target);
 
   // The deterministic report is ready the moment the scan completes; AI
   // enrichment continues in the analyzer worker, and the report page renders
@@ -86,9 +90,9 @@ function ActiveScanPage() {
       </button>
       <div className='head'>
         <div>
-          <h1>Assessing {target ? hostnameOf(target) : "target"}</h1>
+          <h1>Scanning {displayName || "target"}</h1>
           <p>
-            {target || `Scan ${scanId}`}
+            {targetUrl || target || `Scan ${scanId}`}
           </p>
         </div>
         {active && user?.role !== "viewer" ? (
@@ -103,7 +107,7 @@ function ActiveScanPage() {
           </Link>
         ) : user?.role !== "viewer" ? (
           <Link className='btn' to='/scan'>
-            Start a new Scan
+            Start a new scan
           </Link>
         ) : null}
       </div>
@@ -144,7 +148,7 @@ function ActiveScanPage() {
             <span>
               {analysis.message ||
                 analysis.error_message ||
-                "Findings and the report are being enriched. The scan results are already available."}
+                "Analyzing findings and preparing the final report."}
             </span>
             {Number.isFinite(analysis.progress) && (
               <small>
@@ -174,7 +178,7 @@ function ActiveScanPage() {
                     style={{ animation: "spin 1s linear infinite" }}
                   />
                 ) : (
-                  "—"
+                  "N/A"
                 )}
               </time>
               <span>{p.label}</span>

@@ -52,14 +52,14 @@ class BackendSettings(
         default="sentrystrike:invite-rate", alias="INVITE_RATE_LIMIT_KEY_PREFIX"
     )
 
-    # Email delivery uses SMTP. Gmail: smtp.gmail.com:587 with STARTTLS and an app
-    # password as EMAIL_SMTP_PASSWORD.
+    # Local defaults allow the API to boot without external credentials. Point
+    # these at a real relay in deployment; Gmail requires an app password.
     email_from: str = Field(default="SentryStrike <no-reply@sentrystrike.local>", alias="EMAIL_FROM")
-    email_smtp_host: str = Field(default="smtp.gmail.com", alias="EMAIL_SMTP_HOST")
-    email_smtp_port: int = Field(default=587, alias="EMAIL_SMTP_PORT")
+    email_smtp_host: str = Field(default="localhost", alias="EMAIL_SMTP_HOST")
+    email_smtp_port: int = Field(default=1025, alias="EMAIL_SMTP_PORT")
     email_smtp_user: str | None = Field(default=None, alias="EMAIL_SMTP_USER")
     email_smtp_password: SecretStr | None = Field(default=None, alias="EMAIL_SMTP_PASSWORD")
-    email_smtp_starttls: bool = Field(default=True, alias="EMAIL_SMTP_STARTTLS")
+    email_smtp_starttls: bool = Field(default=False, alias="EMAIL_SMTP_STARTTLS")
 
     # Retention purge. The background worker runs a purge pass on this interval,
     # deleting each org's scans older than its retention window. Twelve hours by

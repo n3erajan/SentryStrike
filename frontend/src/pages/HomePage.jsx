@@ -14,7 +14,7 @@ function greeting() {
 }
 
 function postureLetter(scans) {
-  if (!scans.length) return "—";
+  if (!scans.length) return "N/A";
   const avg =
     scans.reduce((sum, s) => sum + (s.risk_score || 0), 0) / scans.length;
   if (avg >= 80) return "D";
@@ -88,28 +88,28 @@ function HomePage() {
           <h1>
             {greeting()}, {displayName(user).split(" ")[0]}
           </h1>
-          <p>Security posture across your web applications.</p>
+          <p>Your apps, scans, and latest results.</p>
         </div>
       </div>
 
       <div className='summary'>
         <div className='stat'>
-          <strong>{loading ? "—" : appCount ?? "—"}</strong>
+          <strong>{loading ? "N/A" : appCount ?? "N/A"}</strong>
           <span>Web applications</span>
         </div>
         <div className='stat'>
           <strong>{count}</strong>
           <span>
-            {count === 1 ? "Assessment running" : "Assessments running"}
+            {count === 1 ? "Scan running" : "Scans running"}
           </span>
         </div>
         <div className='stat'>
-          <strong>{loading ? "—" : highRisk}</strong>
+          <strong>{loading ? "N/A" : highRisk}</strong>
           <span>High-risk findings</span>
         </div>
         <div className='stat'>
-          <strong>{loading ? "—" : postureLetter(latestPerApp)}</strong>
-          <span>Workspace Security posture</span>
+          <strong>{loading ? "N/A" : postureLetter(latestPerApp)}</strong>
+          <span>Workspace grade</span>
         </div>
       </div>
 
@@ -118,8 +118,8 @@ function HomePage() {
           <article className='card'>
             <h2>{latestCompleted.application_name || latestCompleted.site_title || hostnameOf(latestCompleted.target_url)} report ready</h2>
             <p>
-              {Math.round(latestCompleted.risk_score || 0)}/100 · review
-              verified findings and remediation.
+              {Math.round(latestCompleted.risk_score || 0)}/100 · Review the
+              findings and fix status.
             </p>
             <div className='cardfoot'>
               <span
@@ -145,10 +145,9 @@ function HomePage() {
         )}
         {runningScan && (
           <article className='card'>
-            <h2>{hostnameOf(runningScan.target_url)} assessment running</h2>
+            <h2>Scanning {hostnameOf(runningScan.target_url)}</h2>
             <p>
-              Security testing is {Math.round(runningScan.progress || 0)}%
-              complete.
+              {Math.round(runningScan.progress || 0)}% complete.
             </p>
             <div className='cardfoot'>
               <span>{runningScan.phase_message || "Scanning"}</span>
@@ -159,12 +158,12 @@ function HomePage() {
           </article>
         )}
         <article className='card'>
-          <h2>Assess another application</h2>
-          <p>Run an OWASP Top 10 2025 VAPT assessment.</p>
+          <h2>Scan another app</h2>
+          <p>Choose a saved app or enter a new target URL.</p>
           <div className='cardfoot'>
-            <span>Ready when you are</span>
+            <span>Authorized targets only</span>
             <Link className='text-btn' to='/scan'>
-              Start now
+              New scan
             </Link>
           </div>
         </article>

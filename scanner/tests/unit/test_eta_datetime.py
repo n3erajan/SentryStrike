@@ -10,7 +10,7 @@ from app.core.scanner import (
     ScanOrchestrator,
     _elapsed_utc_seconds,
 )
-from shared.models.scan import ScanPhase
+from shared.models.scan import CrawlMode, ScanPhase
 
 
 class _DummyRepository:
@@ -57,6 +57,7 @@ def test_compute_eta_crawling_with_naive_started_at() -> None:
     orch = _orchestrator()
     scan = SimpleNamespace(
         started_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=60),
+        crawl_mode=CrawlMode.full,
     )
 
     eta = orch._compute_eta_seconds(scan, ScanPhase.crawling, 1.0, progress=27)
@@ -131,7 +132,10 @@ def test_progress_fraction_is_work_weighted_not_detector_count() -> None:
     fraction = orch._eta_state.detector_completed_work / orch._eta_state.detector_total_work
     assert fraction < 0.1
 
-    scan = SimpleNamespace(started_at=datetime.now(timezone.utc) - timedelta(minutes=5))
+    scan = SimpleNamespace(
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        crawl_mode=CrawlMode.full,
+    )
     eta = orch._compute_eta_seconds(
         scan, ScanPhase.vulnerability_detection, fraction, progress=40
     )
@@ -145,7 +149,10 @@ def test_progress_fraction_is_work_weighted_not_detector_count() -> None:
 def test_starting_eta_includes_crawl_and_detector_priors() -> None:
     """Before detector work is measured, crawl+vuln must not contribute 0s."""
     orch = _orchestrator()
-    scan = SimpleNamespace(started_at=datetime.now(timezone.utc))
+    scan = SimpleNamespace(
+        started_at=datetime.now(timezone.utc),
+        crawl_mode=CrawlMode.full,
+    )
 
     eta = orch._compute_eta_seconds(
         scan, ScanPhase.initializing, 1.0, progress=2
@@ -175,7 +182,10 @@ def test_last_heavy_detector_does_not_claim_tiny_eta() -> None:
     prior_share = 400.0 * (500.0 / 530.0)
     assert remaining >= prior_share * 0.99
 
-    scan = SimpleNamespace(started_at=datetime.now(timezone.utc) - timedelta(minutes=8))
+    scan = SimpleNamespace(
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=8),
+        crawl_mode=CrawlMode.full,
+    )
     eta = orch._compute_eta_seconds(
         scan, ScanPhase.vulnerability_detection, 30 / 530, progress=40
     )

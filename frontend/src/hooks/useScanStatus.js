@@ -35,6 +35,8 @@ function useScanStatus(scanId) {
   const [logs, setLogs] = useState([]);
   const [error, setError] = useState("");
   const [cancelling, setCancelling] = useState(false);
+  const [siteTitle, setSiteTitle] = useState("");
+  const [targetUrl, setTargetUrl] = useState("");
 
   const logRef = useRef(null);
   const lastPhaseRef = useRef("");
@@ -106,6 +108,8 @@ function useScanStatus(scanId) {
             ? scan.eta_seconds
             : null,
         );
+        if (scan.site_title) setSiteTitle(scan.site_title);
+        if (scan.target_url) setTargetUrl(scan.target_url);
 
         if (
           nextPhase !== lastPhaseRef.current &&
@@ -201,6 +205,8 @@ function useScanStatus(scanId) {
     stageIdx,
     eta,
     analysis,
+    siteTitle,
+    targetUrl,
     logs,
     logRef,
     error,

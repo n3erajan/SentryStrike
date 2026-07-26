@@ -1258,6 +1258,7 @@ textarea:focus-visible {
   padding: 17px clamp(18px, 6vw, 96px);
   background: var(--paper);
   border-block: 1px solid var(--line);
+  margin-top: -1px;
 }
 .ticker-label {
   white-space: nowrap;
