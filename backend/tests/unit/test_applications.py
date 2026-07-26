@@ -56,6 +56,9 @@ class FakeApplicationRepository:
         items = [a for a in self.apps.values() if a.org_id == org_id]
         return items[skip : skip + limit]
 
+    async def count_in_org(self, org_id: str) -> int:
+        return sum(app.org_id == org_id for app in self.apps.values())
+
     async def update_in_org(self, app_id: str, org_id: str, *, name=None, target_url=None, default_scan_config=None):
         app = await self.get_in_org(app_id, org_id)
         if app is None:
@@ -140,14 +143,19 @@ def test_create_application() -> None:
 
 def test_list_applications_org_scoped() -> None:
     app_repo = FakeApplicationRepository()
+    app_repo.apps["app-3"] = FakeApplication(
+        "app-3", "App Three", "https://app3.example.test", "org-1"
+    )
     scan_repo = FakeScanRepository()
     client = _client(app_repo, scan_repo, org_id="org-1")
 
-    resp = client.get("/api/v1/applications")
+    resp = client.get("/api/v1/applications?limit=1")
     assert resp.status_code == 200
-    items = resp.json()["data"]["items"]
+    data = resp.json()["data"]
+    items = data["items"]
     assert len(items) == 1
     assert items[0]["id"] == "app-1"
+    assert data["total"] == 2
 
 
 def test_get_application_idor_prevention() -> None:

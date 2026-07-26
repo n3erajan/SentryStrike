@@ -42,6 +42,10 @@ class AuditRepository:
             return None
         return entry
 
+    async def count_in_org(self, org_id: str) -> int:
+        """Total number of audit entries for this org."""
+        return await AuditLogEntry.find(AuditLogEntry.org_id == org_id).count()
+
     async def list_in_org(self, org_id: str, skip: int = 0, limit: int = 50) -> list[AuditLogEntry]:
         """List an org's audit entries, newest first."""
         return (

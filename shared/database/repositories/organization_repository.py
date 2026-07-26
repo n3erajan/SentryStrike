@@ -21,6 +21,13 @@ class OrganizationRepository:
         """List every organization (used by the retention purge to sweep each tenant)."""
         return await Organization.find_all().to_list()
 
+    async def set_name(self, org: Organization, name: str) -> Organization:
+        """Rename the workspace."""
+        org.name = name
+        org.updated_at = datetime.now(timezone.utc)
+        await org.save()
+        return org
+
     async def set_retention_days(self, org: Organization, days: int) -> Organization:
         """Update retention, enforcing the compliance floor of ``MIN_RETENTION_DAYS``."""
         org.retention_days = max(MIN_RETENTION_DAYS, days)

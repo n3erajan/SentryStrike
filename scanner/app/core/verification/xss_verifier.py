@@ -1163,17 +1163,8 @@ class XSSVerifier(BaseVerifier):
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(ignore_https_errors=True, user_agent="SentryStrikeScanner/1.0")
+            context = await self._new_reflection_context(browser, url)
             try:
-                if hasattr(self.http_verifier, "cookies") and self.http_verifier.cookies:
-                    domain = parsed.netloc.split(":")[0]
-                    await context.add_cookies(
-                        [
-                            {"name": str(k), "value": str(v), "domain": domain, "path": "/"}
-                            for k, v in self.http_verifier.cookies.items()
-                        ]
-                    )
-
                 for probe_url in probes:
                     page = await context.new_page()
                     await self._install_xss_browser_hooks(page, canary)
@@ -1356,20 +1347,26 @@ class XSSVerifier(BaseVerifier):
         # so authenticated-only SPA routes render during DOM confirmation. Falls
         # back to cookie injection when absent. Opaque per-origin blob — generic.
         context = None
+        extra_http_headers = {
+            str(key): str(value)
+            for key, value in (getattr(self.http_verifier, "headers", None) or {}).items()
+            if str(key).lower()
+            not in {"cookie", "content-length", "host", "user-agent"}
+        }
+        context_kwargs = {
+            "ignore_https_errors": True,
+            "user_agent": "SentryStrikeScanner/1.0",
+        }
+        if extra_http_headers:
+            context_kwargs["extra_http_headers"] = extra_http_headers
         if storage_state:
             try:
-                context = await browser.new_context(
-                    ignore_https_errors=True,
-                    user_agent="SentryStrikeScanner/1.0",
-                    storage_state=storage_state,
-                )
+                context = await browser.new_context(**context_kwargs, storage_state=storage_state)
             except Exception as exc:
                 logger.debug("failed to seed reflection context from storage_state: %s", exc)
                 context = None
         if context is None:
-            context = await browser.new_context(
-                ignore_https_errors=True, user_agent="SentryStrikeScanner/1.0"
-            )
+            context = await browser.new_context(**context_kwargs)
         cookies = getattr(self.http_verifier, "cookies", None)
         if cookies:
             domain = urlparse(route_url).netloc.split(":")[0]
@@ -1438,6 +1435,7 @@ class XSSVerifier(BaseVerifier):
             "Running deferred browser verification for %s param=%s",
             job.url, job.parameter,
         )
+        self._last_browser_verification_error = None
         try:
             execution_confirmed = await self._verify_browser_execution(
                 job.url, job.parameter, job.method, job.payload, job.canary,
@@ -1445,6 +1443,7 @@ class XSSVerifier(BaseVerifier):
                 target=job.target,
             )
         except Exception as e:
+            self._last_browser_verification_error = e
             logger.error("Browser verification failed for %s: %s", job.url, e)
             return []
 

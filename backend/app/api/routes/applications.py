@@ -62,8 +62,9 @@ async def list_applications(
 ) -> dict:
     """List applications for the caller's organization."""
     app_list = await apps.list_in_org(current_user.org_id, skip=skip, limit=limit)
+    total = await apps.count_in_org(current_user.org_id)
     payload = [_application_response(app) for app in app_list]
-    return json_response({"items": payload, "total": len(payload)})
+    return json_response({"items": payload, "total": total})
 
 
 @router.get("/{app_id}")

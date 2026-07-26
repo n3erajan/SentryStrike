@@ -7,6 +7,7 @@ from app.reverification_strategies import ResolvedSessions, register_strategy
 from app.reverification_strategies.common import (
     inconclusive,
     match_findings,
+    origin_url,
     outcome_from_matches,
 )
 from shared.models.reverification import ReverificationEvidence, ReverificationOutcome
@@ -52,7 +53,7 @@ class AccessControlStrategy:
 
         detector = AccessControlDetector()
         kwargs = {
-            "root_url": target.url,
+            "root_url": origin_url(target.url),
             "session_cookies": dict(sessions.main_cookies),
             "auth_headers": dict(sessions.main_headers),
             "second_user_cookies": dict(sessions.second_cookies) if sessions.second_usable else None,

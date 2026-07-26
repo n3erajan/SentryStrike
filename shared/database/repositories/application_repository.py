@@ -38,6 +38,10 @@ class ApplicationRepository:
             return None
         return await Application.find_one(Application.id == oid, Application.org_id == org_id)
 
+    async def count_in_org(self, org_id: str) -> int:
+        """Total number of applications for this org."""
+        return await Application.find(Application.org_id == org_id).count()
+
     async def list_in_org(self, org_id: str, skip: int = 0, limit: int = 20) -> list[Application]:
         """List applications for an organization, newest first."""
         return (

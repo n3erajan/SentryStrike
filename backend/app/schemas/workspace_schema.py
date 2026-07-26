@@ -50,6 +50,12 @@ class ChangeRoleRequest(BaseModel):
         return value
 
 
+class RenameWorkspaceRequest(BaseModel):
+    """Payload for renaming the workspace."""
+
+    name: str = Field(min_length=1, max_length=128)
+
+
 class RetentionRequest(BaseModel):
     """Payload for updating the workspace's scan-data retention window."""
 

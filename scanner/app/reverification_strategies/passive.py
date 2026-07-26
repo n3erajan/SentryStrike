@@ -12,6 +12,7 @@ from app.reverification_strategies import ResolvedSessions, register_strategy
 from app.reverification_strategies.common import (
     inconclusive,
     match_findings,
+    origin_url,
     outcome_from_matches,
 )
 from shared.models.reverification import ReverificationEvidence, ReverificationOutcome
@@ -50,10 +51,16 @@ class _DetectStrategy:
 
         detector = self.detector_factory()
         kwargs: dict = {
-            "root_url": target.url,
+            "root_url": origin_url(target.url),
             "session_cookies": dict(sessions.main_cookies),
             "auth_headers": dict(sessions.main_headers),
         }
+        if self.family == ReverifyFamily.sensitive_paths:
+            # Sensitive-path discovery normally expands a site root into a large
+            # candidate catalog. A focused replay must instead request the exact
+            # route that produced the original content proof; otherwise custom
+            # documentation, source-map, backup, and listing paths are never retried.
+            kwargs["focused_probe_urls"] = [target.url]
         forms: list[object] = []
         template = target.request_template if isinstance(target.request_template, dict) else {}
         form_inputs = template.get("form_inputs")

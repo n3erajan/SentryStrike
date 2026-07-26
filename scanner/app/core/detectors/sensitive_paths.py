@@ -371,11 +371,21 @@ class SensitivePathsDetector(BaseDetector):
         spa_detector = SpaFallbackDetector()
 
         effective_timeout = scan_config.get_val("request_timeout_seconds", settings.request_timeout_seconds) if scan_config else settings.request_timeout_seconds
+        client_kwargs: dict[str, object] = {
+            "timeout": effective_timeout,
+            "follow_redirects": True,
+            "verify": False,  # Similar to other detectors, allow self-signed for scanning
+            "event_hooks": {"response": [make_httpx_response_logger("sensitive_paths", "path_probe")]},
+        }
+        session_cookies = kwargs.get("session_cookies") or {}
+        auth_headers = kwargs.get("auth_headers") or {}
+        if session_cookies:
+            client_kwargs["cookies"] = dict(session_cookies)
+        if auth_headers:
+            client_kwargs["headers"] = dict(auth_headers)
+
         async with create_scan_client(
-            timeout=effective_timeout,
-            follow_redirects=True,
-            verify=False,  # Similar to other detectors, allow self-signed for scanning
-            event_hooks={"response": [make_httpx_response_logger("sensitive_paths", "path_probe")]},
+            **client_kwargs,
         ) as client:
             if spa_root_html:
                 spa_detector.configure_root(str(root_url), spa_root_html)
@@ -472,13 +482,31 @@ class SensitivePathsDetector(BaseDetector):
                     target_url = root_url.rstrip("/") + base_dir.rstrip("/") + "/" + clean_path
                 return await probe_url(target_url, path)
 
-            tasks = [check_path(dir, path) for dir in dirs_to_check for path in self._common_sensitive_paths]
+            focused_probe_urls = [
+                str(candidate)
+                for candidate in (kwargs.get("focused_probe_urls") or [])
+                if str(candidate)
+            ]
+            if focused_probe_urls:
+                root_origin = f"{urlparse(root_url).scheme}://{urlparse(root_url).netloc}"
+                tasks = [
+                    probe_url(candidate, urlparse(candidate).path)
+                    for candidate in focused_probe_urls
+                    if f"{urlparse(candidate).scheme}://{urlparse(candidate).netloc}"
+                    == root_origin
+                ]
+            else:
+                tasks = [
+                    check_path(directory, path)
+                    for directory in dirs_to_check
+                    for path in self._common_sensitive_paths
+                ]
 
-            # Backup/temp permutations + directory probes derived from what was
-            # actually crawled (no hardcoded app paths), bounded per host.
-            for perm_url in self._permutation_targets(root_url, urls, kwargs):
-                classify_path = urlparse(perm_url).path
-                tasks.append(probe_url(perm_url, classify_path))
+                # Backup/temp permutations + directory probes derived from what was
+                # actually crawled (no hardcoded app paths), bounded per host.
+                for perm_url in self._permutation_targets(root_url, urls, kwargs):
+                    classify_path = urlparse(perm_url).path
+                    tasks.append(probe_url(perm_url, classify_path))
 
             results = await asyncio.gather(*tasks)
 

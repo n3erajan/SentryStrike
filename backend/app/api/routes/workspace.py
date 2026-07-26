@@ -25,6 +25,7 @@ from app.schemas.workspace_schema import (
     InviteMemberRequest,
     InviteResponse,
     MemberResponse,
+    RenameWorkspaceRequest,
     RetentionRequest,
 )
 
@@ -295,6 +296,31 @@ async def cancel_invite(
     return json_response(_invite_response(invite), "invite cancelled")
 
 
+@router.put("")
+async def rename_workspace(
+    payload: RenameWorkspaceRequest,
+    orgs: OrganizationRepository = Depends(get_organization_repository),
+    audit: AuditRepository = Depends(get_audit_repository),
+    current_user: User = Depends(require_role(UserRole.owner)),
+) -> dict:
+    """Rename the workspace. Owner only."""
+    org = await orgs.get_by_id(current_user.org_id)
+    if org is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+    previous_name = org.name
+    org = await orgs.set_name(org, payload.name)
+    await audit.record(
+        org_id=current_user.org_id,
+        action=AuditAction.workspace_renamed,
+        actor_user_id=str(current_user.id),
+        actor_email=current_user.email,
+        target_type="workspace",
+        target_id=str(org.id),
+        metadata={"from": previous_name, "to": payload.name},
+    )
+    return json_response({"name": org.name}, "workspace renamed")
+
+
 @router.get("/audit-log")
 async def list_audit_log(
     skip: int = Query(default=0, ge=0),
@@ -304,6 +330,7 @@ async def list_audit_log(
 ) -> dict:
     """Return the org's audit-log entries, newest first. Owner/admin only."""
     entries = await audit.list_in_org(current_user.org_id, skip=skip, limit=limit)
+    total = await audit.count_in_org(current_user.org_id)
     items = [
         {
             "id": str(entry.id),
@@ -317,7 +344,7 @@ async def list_audit_log(
         }
         for entry in entries
     ]
-    return json_response({"items": items, "total": len(items)})
+    return json_response({"items": items, "total": total})
 
 
 # --------------------------------------------------------------------------- #

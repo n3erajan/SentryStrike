@@ -198,6 +198,53 @@ async def test_sensitive_path_detector_reports_openapi_with_content_proof(monkey
     assert "example.test" in api_docs.verification_request_snippet
 
 
+@pytest.mark.asyncio
+async def test_focused_sensitive_path_probe_replays_exact_authenticated_url(monkeypatch):
+    detector = SensitivePathsDetector()
+    requested_urls: list[str] = []
+    client_options: dict[str, object] = {}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url):
+            requested_urls.append(url)
+            return httpx.Response(
+                200,
+                text="<html><body>Swagger UI</body></html>",
+                headers={"content-type": "text/html"},
+                request=httpx.Request("GET", url),
+            )
+
+    def fake_client_factory(**kwargs):
+        client_options.update(kwargs)
+        return FakeClient()
+
+    monkeypatch.setattr(
+        "app.core.detectors.sensitive_paths.create_scan_client",
+        fake_client_factory,
+    )
+    target_url = "https://example.test/custom/internal/api-docs/"
+
+    findings = await detector.detect(
+        urls=[target_url],
+        forms=[],
+        root_url="https://example.test/",
+        focused_probe_urls=[target_url],
+        session_cookies={"session": "cookie-value"},
+        auth_headers={"Authorization": "Bearer token-value"},
+    )
+
+    assert requested_urls == [target_url]
+    assert client_options["cookies"] == {"session": "cookie-value"}
+    assert client_options["headers"] == {"Authorization": "Bearer token-value"}
+    assert [finding.vuln_type for finding in findings] == ["Exposed API Documentation"]
+
+
 def test_classify_content_detects_apache_autoindex():
     detector = SensitivePathsDetector()
     body = (

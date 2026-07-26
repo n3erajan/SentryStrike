@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from app.core.crawler.models import ParameterLocation
 from app.core.detectors.attack_surface import AttackTarget
@@ -15,6 +16,33 @@ def _normalize(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
+def origin_url(url: str) -> str:
+    """Return the site origin expected by crawl-oriented detector APIs."""
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+
+
+def _canonical_http_url(url: str | None) -> str:
+    """Canonicalize detector URLs for finding identity comparisons.
+
+    Focused detectors may probe ``/api-docs`` while the target redirects to
+    ``/api-docs/``. Those are the same HTTP resource for re-verification, as
+    are URLs that differ only by a fragment or a default port.
+    """
+    parsed = urlsplit((url or "").strip())
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        hostname = f"{hostname}:{port}"
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/") or "/"
+    return urlunsplit((scheme, hostname, path, "", ""))
+
+
 def finding_matches(
     finding: Finding,
     *,
@@ -22,10 +50,8 @@ def finding_matches(
     vuln_type: str | None,
     parameter: str | None,
 ) -> bool:
-    if _normalize(finding.url) != _normalize(url):
-        # Allow path-only drift when the detector rewrites query strings.
-        if _normalize(finding.url).split("?", 1)[0] != _normalize(url).split("?", 1)[0]:
-            return False
+    if _canonical_http_url(finding.url) != _canonical_http_url(url):
+        return False
     if parameter and finding.parameter and _normalize(finding.parameter) != _normalize(parameter):
         return False
     if not vuln_type:

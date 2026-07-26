@@ -39,6 +39,9 @@ class FakeAuditRepository:
     async def record(self, **kwargs) -> None:
         self.entries.append(kwargs)
 
+    async def count_in_org(self, org_id: str) -> int:
+        return sum(entry.get("org_id") == org_id for entry in self.entries)
+
 
 class FakeNotificationRepository:
     def __init__(self) -> None:
@@ -641,15 +644,22 @@ def test_audit_log_is_readable_by_admin_and_org_scoped() -> None:
             )
         ]
 
+    async def _count_in_org(org_id):
+        assert org_id == "org-1"
+        return 23
+
     audit.list_in_org = _list_in_org
+    audit.count_in_org = _count_in_org
     client = _client(members=members, orgs=orgs, invites=invites, audit=audit, role=UserRole.admin)
 
     response = client.get("/api/v1/workspace/audit-log")
 
     assert response.status_code == 200
-    items = response.json()["data"]["items"]
+    data = response.json()["data"]
+    items = data["items"]
     assert items[0]["action"] == "member_removed"
     assert items[0]["target_id"] == "user-dev"
+    assert data["total"] == 23
 
 
 def test_viewer_cannot_read_audit_log() -> None:

@@ -23,6 +23,7 @@ class AuditAction(str, Enum):
     finding_reverification_created = "finding_reverification_created"
     analysis_retry_created = "analysis_retry_created"
     scan_purged = "scan_purged"
+    workspace_renamed = "workspace_renamed"
 
 
 class AuditLogEntry(Document):
