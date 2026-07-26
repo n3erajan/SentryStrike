@@ -2,27 +2,22 @@
 //
 // Every backend route lives under `/api/v1` and wraps its payload in a
 // `{ success, message, data }` envelope (see backend app/api/dependencies.py).
-// This helper attaches the bearer token, unwraps that envelope, and turns
-// non-2xx or `{ success: false }` responses into thrown Errors that carry the
-// backend's own `message` so the UI can show something meaningful.
+// This helper unwraps that envelope, and turns non-2xx or `{ success: false }`
+// responses into thrown Errors that carry the backend's own `message`.
+//
+// The backend sets an HttpOnly session cookie on login; every request includes
+// it via `credentials: "include"` — no client-side token storage needed.
 //
 // In dev, requests go to the relative `/api/v1` path which Vite proxies to the
 // backend (see vite.config.js) — same-origin, no CORS. For a hosted build set
 // VITE_API_URL to the backend origin, e.g. https://api.example.com/api/v1.
 
 export const API_BASE = import.meta.env.VITE_API_URL || "/api/v1";
-const TOKEN_KEY = "sentrystrike_token";
 
-export function getToken() {
-  return localStorage.getItem(TOKEN_KEY);
-}
-
-export function setToken(token) {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-}
-
-export function clearToken() {
-  localStorage.removeItem(TOKEN_KEY);
+// Registered once by App.jsx so any 401 from any API call clears the session.
+let onUnauthorized = null;
+export function setOnUnauthorized(cb) {
+  onUnauthorized = cb;
 }
 
 function extractMessage(payload, status) {
@@ -30,7 +25,7 @@ function extractMessage(payload, status) {
     if (typeof payload.message === "string" && payload.message) return payload.message;
     const detail = payload.detail;
     if (typeof detail === "string" && detail) return detail;
-    // FastAPI validation errors: detail is an array of {loc, msg}.
+    if (detail && typeof detail.message === "string") return detail.message;
     if (Array.isArray(detail) && detail.length) {
       const first = detail[0];
       if (first && typeof first.msg === "string") {
@@ -42,13 +37,9 @@ function extractMessage(payload, status) {
   return `Request failed (${status})`;
 }
 
-export async function apiRequest(path, { method = "GET", body, auth = true, signal } = {}) {
+export async function apiRequest(path, { method = "GET", body, signal } = {}) {
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (auth) {
-    const token = getToken();
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-  }
 
   let response;
   try {
@@ -57,10 +48,15 @@ export async function apiRequest(path, { method = "GET", body, auth = true, sign
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
+      credentials: "include",
     });
   } catch (err) {
     if (err.name === "AbortError") throw err;
     throw new Error("Cannot reach the server. Is the backend running?", { cause: err });
+  }
+
+  if (response.status === 401 && onUnauthorized) {
+    onUnauthorized();
   }
 
   let payload = null;
@@ -74,12 +70,13 @@ export async function apiRequest(path, { method = "GET", body, auth = true, sign
   }
 
   if (!response.ok || (payload && payload.success === false)) {
-    const error = new Error(extractMessage(payload, response.status));
+    const msg = extractMessage(payload, response.status);
+    const error = new Error(msg);
     error.status = response.status;
+    error.responseBody = text || null;
     throw error;
   }
 
-  // Unwrap the { success, message, data } envelope when present.
   if (payload && Object.prototype.hasOwnProperty.call(payload, "data")) {
     return payload.data;
   }

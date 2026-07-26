@@ -1,62 +1,118 @@
 // Scan service — wraps the backend `/scans/*` routes (mounted under /api/v1).
 //
 //   POST   /scans                 { target_url, crawl_mode,
-//                                   authorization_confirmed, authorization_text,
-//                                   credentials?, config? }
+//                                   authorization_confirmed,
+//                                   credentials? (main/second/admin accounts),
+//                                   config? (full ScanConfig overrides) }
 //                                 -> 202 { scan_id, status, progress, ... }
 //   GET    /scans                 ?skip&limit -> { items: [...], total }
 //   GET    /scans/{id}            -> full scan document
-//   GET    /scans/{id}/status     -> { id, status, progress, error }
+//   GET    /scans/{id}/status     -> { id, status, progress, current_phase,
+//                                     phase_message, eta_seconds, error }
 //   POST   /scans/{id}/cancel     -> { cancelled: bool }
 //
 // `status` is one of: queued | running | completed | failed | cancelled
 import { apiRequest } from "./apiClient.js";
 
-// Build the optional `credentials` block only when a main account is supplied.
-// The backend accepts up to three roles (main/second/admin); we expose the
-// primary account, which drives the authenticated crawl and IDOR baseline.
-function buildCredentials({ authUsername, authPassword } = {}) {
-  if (!authUsername || !authPassword) return undefined;
-  return {
-    main: {
-      username: authUsername.trim(),
-      password: authPassword,
-    },
-  };
+// Drop empty strings/null/undefined so unset fields are omitted entirely and
+// the backend falls back to its own defaults. Returns the object only if it
+// still has keys, else undefined.
+function compact(obj) {
+  const out = {};
+  for (const [key, value] of Object.entries(obj || {})) {
+    if (value === null || value === undefined || value === "") continue;
+    out[key] = typeof value === "string" ? value.trim() : value;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
-// Only send config keys the user actually set, so unset fields fall back to
-// the backend's global defaults.
-function buildConfig({ scanMode } = {}) {
-  const config = {};
-  if (scanMode) config.scan_mode = scanMode;
-  return Object.keys(config).length ? config : undefined;
+const CREDENTIAL_FIELDS = ["username", "password", "cookie", "header"];
+const CONFIG_FIELDS = [
+  "crawl_depth",
+  "crawl_max_urls",
+  "crawl_rate_limit_per_second",
+  "crawl_browser_mode",
+  "crawl_browser_max_interactions",
+  "crawl_browser_budget_seconds",
+  "scan_mode",
+  "blind_injection_timing_threshold",
+  "ssrf_inband_timing_delta_ms",
+  "scanner_concurrency",
+  "sensitive_paths_permutation_cap",
+  "xss_browser_dom_max_jobs",
+  "xss_browser_dom_budget_seconds",
+  "allow_secondary_provisioning",
+  "request_timeout_seconds",
+];
+
+function compactFields(obj, allowedFields) {
+  return compact(
+    Object.fromEntries(allowedFields.map((field) => [field, obj?.[field]])),
+  );
+}
+
+// Strip a raw config object down to the fields the backend ScanConfig accepts.
+// Used for both per-scan overrides and an application's default_scan_config.
+export function compactScanConfig(config) {
+  return compactFields(config, CONFIG_FIELDS);
+}
+
+// Build the optional `credentials` block from up to three role accounts
+// (main/second/admin). Each account is a ScanAccountCredential; empty accounts
+// are dropped so we never send blank roles. Shared with the finding
+// re-verification endpoint, which accepts the same shape.
+export function buildCredentials(credentials = {}) {
+  const out = {};
+  for (const role of ["main", "second", "admin"]) {
+    const account = compactFields(credentials[role], CREDENTIAL_FIELDS);
+    const populated =
+      (account?.username && account?.password) ||
+      account?.cookie ||
+      account?.header;
+    if (populated) out[role] = account;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 export function createScan({
   targetUrl,
+  applicationId,
   crawlMode,
   authorizationConfirmed,
-  authorizationText,
-  authUsername,
-  authPassword,
-  scanMode,
+  credentials,
+  config,
 }) {
   return apiRequest("/scans", {
     method: "POST",
     body: {
       target_url: targetUrl,
+      application_id: applicationId || undefined,
       crawl_mode: crawlMode,
       authorization_confirmed: authorizationConfirmed,
-      authorization_text: authorizationText ? authorizationText.trim() : null,
-      credentials: buildCredentials({ authUsername, authPassword }),
-      config: buildConfig({ scanMode }),
+      credentials: buildCredentials(credentials),
+      config: compactScanConfig(config),
     },
   });
 }
 
 export function listScans({ skip = 0, limit = 50, signal } = {}) {
   return apiRequest(`/scans?skip=${skip}&limit=${limit}`, { signal });
+}
+
+export async function listAllScans({ signal } = {}) {
+  const limit = 50;
+  const items = [];
+  let skip = 0;
+
+  while (true) {
+    const page = await listScans({ skip, limit, signal });
+    const pageItems = Array.isArray(page?.items) ? page.items : [];
+    items.push(...pageItems);
+    if (pageItems.length < limit) break;
+    skip += pageItems.length;
+  }
+
+  return { items, total: items.length };
 }
 
 export function getScanDetails(scanId, signal) {

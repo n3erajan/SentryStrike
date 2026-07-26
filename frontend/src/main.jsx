@@ -1,10 +1,19 @@
 import ReactDOM from "react-dom/client";
-import { IconContext } from "@phosphor-icons/react";
+import { BrowserRouter } from "react-router-dom";
 import "./index.css";
 import App from "./App.jsx";
+import { AuthProvider } from "./context/AuthContext.jsx";
+import { ToastProvider } from "./components/Toast.jsx";
+import { ThemeProvider } from "./context/ThemeContext.jsx";
 
 ReactDOM.createRoot(document.getElementById("root")).render(
-  <IconContext.Provider value={{ size: 18, weight: "regular" }}>
-    <App />
-  </IconContext.Provider>,
+  <ThemeProvider>
+    <BrowserRouter>
+      <AuthProvider>
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      </AuthProvider>
+    </BrowserRouter>
+  </ThemeProvider>,
 );

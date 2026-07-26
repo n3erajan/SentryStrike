@@ -2,14 +2,37 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.png" />
+    <link rel="icon" type="image/svg+xml" href="/sentrystrike-logo.svg" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/sentrystrike-logo.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/sentrystrike-logo.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#08090c" />
+    <meta name="theme-color" content="#f7f9fc" />
     <meta
       name="description"
       content="SentryStrike - AI-assisted web vulnerability scanner. OWASP Top 10 detectors with evidence-based verification."
     />
-    <title>SentryStrike - Web Vulnerability Scanner</title>
+    <title>SentryStrike Connected Platform</title>
+    <script>
+      (() => {
+        let theme;
+        try {
+          theme = localStorage.getItem("sentrystrike-theme");
+        } catch {}
+        if (theme !== "light" && theme !== "dark") {
+          theme = matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light";
+        }
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+      })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
   </head>
   <body>
     <div id="root"></div>

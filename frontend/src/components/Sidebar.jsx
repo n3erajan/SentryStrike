@@ -1,0 +1,127 @@
+import { useEffect, useState } from "react";
+import { NavLink, useNavigate } from "react-router-dom";
+import { X, LogOut } from "lucide-react";
+import { NAV_ITEMS } from "../data/constants.js";
+import { useAuth } from "../context/AuthContext.jsx";
+import { useActiveScans } from "../hooks/useActiveScans.js";
+import { useBackendHealth } from "../hooks/useBackendHealth.js";
+import { getWorkspace } from "../services/workspace.js";
+import Tooltip from "./Tooltip.jsx";
+
+function displayName(user) {
+  if (!user) return "Signed in";
+  if (user.full_name) return user.full_name;
+  const email = user.email || "";
+  const handle = email.split("@")[0];
+  if (!handle) return "Signed in";
+  return handle
+    .split(/[._-]/)
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join(" ");
+}
+
+function Sidebar({ open = false, onClose }) {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+  const { count } = useActiveScans();
+  const { health, loading: healthLoading, error: healthError } =
+    useBackendHealth();
+  const [workspace, setWorkspace] = useState(null);
+
+  useEffect(() => {
+    getWorkspace().then(setWorkspace).catch(() => {});
+  }, []);
+  const scannerCount = health?.active_scanners;
+  const scannerStatusKnown = Number.isInteger(scannerCount) && !healthError;
+  const scannersOnline = scannerStatusKnown && scannerCount > 0;
+
+  let scannerStatus = "Scanner status unavailable";
+  let scannerDetail = "Could not reach scanner health";
+  if (healthLoading) {
+    scannerStatus = "Checking scanner";
+    scannerDetail = "Reading active scanners";
+  } else if (scannerStatusKnown) {
+    scannerStatus = scannersOnline ? "Scanner online" : "Scanner offline";
+    scannerDetail = `${scannerCount} active ${scannerCount === 1 ? "scanner" : "scanners"}`;
+  }
+
+  async function handleLogout() {
+    await logout();
+    navigate("/", { replace: true });
+  }
+
+  return (
+    <aside className={`side${open ? " open" : ""}`}>
+      <div className='side-top'>
+        <NavLink to='/home' className='brand' onClick={onClose}>
+          <img src='/sentrystrike-logo.svg' className='mark-img' alt='' />
+          SentryStrike
+        </NavLink>
+        <Tooltip label='Close menu'>
+          <button
+            type='button'
+            className='side-close'
+            onClick={onClose}
+            aria-label='Close menu'
+          >
+            <X className='ico' />
+          </button>
+        </Tooltip>
+      </div>
+      <nav className='app-nav' aria-label='Primary'>
+        {NAV_ITEMS.map(({ to, label, Icon, badge, end }) => (
+          <NavLink
+            key={to}
+            to={to}
+            end={end}
+            onClick={onClose}
+            className={({ isActive }) => (isActive ? "active" : undefined)}
+          >
+            <Icon className='ico' />
+            <span>{label}</span>
+            {badge === "active" && count > 0 && (
+              <span className='nav-badge'>{count}</span>
+            )}
+          </NavLink>
+        ))}
+      </nav>
+      <div
+        className={`scanner-status${
+          healthLoading ? " checking" : scannersOnline ? " online" : " offline"
+        }`}
+        role='status'
+        aria-live='polite'
+      >
+        <span className='scanner-status-dot' aria-hidden='true' />
+        <span className='scanner-status-copy'>
+          <b>{scannerStatus}</b>
+          <small>{scannerDetail}</small>
+        </span>
+      </div>
+      <div className='sidefoot'>
+        <span>User</span>
+        <b title={user?.email}>{displayName(user)}</b>
+        {workspace?.name && <span className='workspace-name'>{workspace.name}</span>}
+
+        <button
+          className='text-btn'
+          onClick={handleLogout}
+          style={{
+            marginTop: 8,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+          }}
+        >
+          <LogOut className='ico' />
+          Sign out
+        </button>
+      </div>
+    </aside>
+  );
+}
+
+export default Sidebar;
+// eslint-disable-next-line react-refresh/only-export-components
+export { displayName };

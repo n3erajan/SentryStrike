@@ -1,326 +1,459 @@
+import { useEffect, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { ChevronDown } from "lucide-react";
+import { useScanForm } from "../hooks/useScan.js";
+import { useToast } from "../components/Toast.jsx";
+import { useAuth } from "../context/AuthContext.jsx";
+import Select from "../components/Select.jsx";
+import ConfigField, { configValid } from "../components/ConfigField.jsx";
+import { listApplications } from "../services/applications.js";
 import {
-  Globe,
-  CheckCircle,
-  WarningCircle,
-  CircleNotch,
-  TreeStructure,
-  File as FileIcon,
-  Check,
-  ShieldCheck,
-  SealCheck,
-  FileArrowDown,
-  CaretDown,
-  Sliders,
-  User,
-  Lock,
-} from "@phosphor-icons/react";
-import { useState } from "react";
-import { useScan } from "../hooks/useScan.js";
-import { SCAN_STAGES } from "../data/constants.js";
+  CONFIG_GROUPS,
+  CRED_FIELDS,
+  CRED_ROLES,
+  SCAN_MODES,
+} from "../data/constants.js";
 
-const SCAN_MODES = [
-  ["verified", "Verified", "Only evidence-verified findings"],
-  ["heuristic", "Heuristic", "Adds strong heuristic matches"],
-  ["aggressive", "Aggressive", "Widest checks, more noise"],
-];
+function CredentialAccount({ role, account, onField, disabled }) {
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const basic = CRED_FIELDS.filter((f) => !f.advanced);
+  const advanced = CRED_FIELDS.filter((f) => f.advanced);
 
-const STATUS_LABEL = {
-  queued: "Queued",
-  running: "Scanning",
-  completed: "Complete",
-  failed: "Failed",
-  cancelled: "Cancelled",
-};
+  return (
+    <section className='credential-account'>
+      <div className='credential-account-head'>
+        <h3>{role.label}</h3>
+        <p>{role.desc}</p>
+      </div>
+      <div className='grid2'>
+        {basic.map((f) => (
+          <div key={f.key} className='field'>
+            <label htmlFor={`credential-${role.key}-${f.key}`}>{f.label}</label>
+            <div className='control'>
+              <input
+                id={`credential-${role.key}-${f.key}`}
+                type={f.type}
+                autoComplete='off'
+                maxLength={f.maxLength}
+                value={account[f.key] ?? ""}
+                onChange={(e) => onField(role.key, f.key, e.target.value)}
+                disabled={disabled}
+                aria-describedby={`credential-${role.key}-${f.key}-description`}
+              />
+            </div>
+            <p
+              className='field-description'
+              id={`credential-${role.key}-${f.key}-description`}
+            >
+              {f.description}
+            </p>
+          </div>
+        ))}
+      </div>
+      <button
+        type='button'
+        className='text-btn'
+        style={{ marginTop: 10, fontSize: "0.7rem" }}
+        onClick={() => setShowAdvanced((v) => !v)}
+      >
+        {showAdvanced
+          ? "Hide session alternatives"
+          : "Use a cookie or header instead"}
+      </button>
+      {showAdvanced && (
+        <div className='grid2'>
+          {advanced.map((f) => (
+            <div key={f.key} className='field'>
+              <label htmlFor={`credential-${role.key}-${f.key}`}>
+                {f.label}
+              </label>
+              <div className='control'>
+                <input
+                  id={`credential-${role.key}-${f.key}`}
+                  type='text'
+                  autoComplete='off'
+                  maxLength={f.maxLength}
+                  placeholder={f.placeholder || f.label}
+                  value={account[f.key] ?? ""}
+                  onChange={(e) => onField(role.key, f.key, e.target.value)}
+                  disabled={disabled}
+                  aria-describedby={`credential-${role.key}-${f.key}-description`}
+                />
+              </div>
+              <p
+                className='field-description'
+                id={`credential-${role.key}-${f.key}-description`}
+              >
+                {f.description}
+              </p>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
 
-const NOTES = [
-  {
-    icon: ShieldCheck,
-    title: "OWASP Top 10 detectors",
-    desc: "Injection, XSS, access control, SSRF, misconfiguration and more. A06, A08 and A09 are out of automated scope.",
-  },
-  {
-    icon: SealCheck,
-    title: "Evidence-based",
-    desc: "Findings are verified against real request and response evidence to cut down false positives.",
-  },
-  {
-    icon: FileArrowDown,
-    title: "Export ready",
-    desc: "Hand results to your team as a formatted PDF or raw JSON.",
-  },
-];
+function credentialPresent(account = {}) {
+  return Boolean(
+    (account.username && account.password) || account.cookie || account.header,
+  );
+}
 
-function ScanPage({ onComplete }) {
+function ScanPage() {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+  const toast = useToast();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const applicationId = searchParams.get("app") || "";
+  const [apps, setApps] = useState([]);
+  const [usersOpen, setUsersOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const {
     url,
     setUrl,
     crawlMode,
     setCrawlMode,
-    authText,
-    setAuthText,
     consent,
     setConsent,
     touched,
     setTouched,
-    scanMode,
-    setScanMode,
-    authUsername,
-    setAuthUsername,
-    authPassword,
-    setAuthPassword,
-    scanning,
-    status,
-    progress,
-    stageIdx,
+    config,
+    defaultsLoading,
+    setConfigField,
+    credentials,
+    setCredentialField,
+    submitting,
     error,
+    conflict,
     valid,
     canStart,
     startScan,
-    cancel,
-  } = useScan(onComplete);
+  } = useScanForm({ applicationId });
+
+  // The picker is a convenience only — a scan can always be run against a raw
+  // URL, so a failed application fetch is silently ignored.
+  useEffect(() => {
+    const controller = new AbortController();
+    listApplications({ signal: controller.signal })
+      .then((data) => setApps(data.items || []))
+      .catch(() => {});
+    return () => controller.abort();
+  }, []);
+
+  if (user?.role === "viewer") {
+    return (
+      <div className='view'>
+        <div className='head'>
+          <div>
+            <h1>New Scan</h1>
+            <p>Your viewer role has read-only workspace access.</p>
+          </div>
+        </div>
+        <div className='empty-state'>
+          Ask a workspace owner or admin to change your role before launching
+          assessments.
+        </div>
+      </div>
+    );
+  }
+  // Backend default is "verified"; reflect that as pre-selected in the UI.
+  const scanMode = config.scan_mode || "verified";
+  const credentialCount = CRED_ROLES.filter(({ key }) =>
+    credentialPresent(credentials[key]),
+  ).length;
+  const configIsValid = configValid(CONFIG_GROUPS, config);
+  const selectedApp = apps.find((a) => a.id === applicationId);
+
+  function selectApplication(nextId) {
+    if (nextId) setSearchParams({ app: nextId });
+    else setSearchParams({});
+  }
+
+  async function handleStart() {
+    if (!configIsValid) return;
+    const result = await startScan();
+    if (result) {
+      toast("Assessment started");
+      navigate(`/active/${result.scanId}`, {
+        state: { target: result.target },
+      });
+    }
+  }
 
   return (
-    <div className='page'>
-      <div className='scan-hero'>
-        <div className='scan-pill'>
-          <span className='pulse-dot' /> Live Scanner
+    <div className='view'>
+      <div className='head'>
+        <div>
+          <h1>New Scan</h1>
+          <p>Configure an OWASP Top 10 2025 VAPT assessment.</p>
         </div>
-        <h1 className='scan-title'>
-          Audit any web target,
-          <br />
-          <span>end to end.</span>
-        </h1>
-        <p className='scan-sub'>
-          SentryStrike crawls your target, runs OWASP Top 10 detectors, and
-          verifies findings against real evidence. A full scan runs in the
-          background and can take a while.
-        </p>
       </div>
 
-      <div className='card scan-form'>
-        {error && (
-          <div className='auth-error'>
-            <WarningCircle size={16} weight='fill' /> {error}
-          </div>
-        )}
-
-        <label className='form-label' htmlFor='target-url'>
-          Target URL
-        </label>
+      {error && (
         <div
-          className={`input-group ${touched && url && !valid ? "error" : valid ? "valid" : ""}`}
+          className={conflict ? "scan-conflict" : "auth-error"}
+          style={{ margin: "0 0 16px" }}
         >
-          <Globe className='field-icon' size={17} />
-          <input
-            id='target-url'
-            type='url'
-            placeholder='https://example.com'
-            value={url}
-            onChange={(event) => setUrl(event.target.value)}
-            onBlur={() => setTouched(true)}
-            disabled={scanning}
-          />
-          {valid && <CheckCircle className='input-ok' size={17} weight='fill' />}
+          {error}
         </div>
-        {touched && url && !valid && (
-          <p className='field-error'>
-            Enter a valid URL including http:// or https://
-          </p>
-        )}
+      )}
 
-        <label className='form-label' style={{ marginTop: 20 }}>
-          Crawl mode
-        </label>
-        <div className='segmented' role='group' aria-label='Crawl mode'>
-          <button
-            type='button'
-            className={`segmented-btn ${crawlMode === "full" ? "active" : ""}`}
-            onClick={() => setCrawlMode("full")}
-            disabled={scanning}
-          >
-            <span className='segmented-title'>
-              <TreeStructure size={16} weight='bold' /> Full site
-            </span>
-            <span className='segmented-desc'>
-              Crawl and test every reachable page
-            </span>
-          </button>
-          <button
-            type='button'
-            className={`segmented-btn ${crawlMode === "single" ? "active" : ""}`}
-            onClick={() => setCrawlMode("single")}
-            disabled={scanning}
-          >
-            <span className='segmented-title'>
-              <FileIcon size={16} weight='bold' /> Single page
-            </span>
-            <span className='segmented-desc'>Test only the URL above</span>
-          </button>
-        </div>
-
-        <label
-          className='form-label'
-          htmlFor='auth-text'
-          style={{ marginTop: 20 }}
-        >
-          Authorization reference{" "}
-          <span className='label-optional'>optional</span>
-        </label>
-        <div className='input-group'>
-          <input
-            id='auth-text'
-            type='text'
-            maxLength={1000}
-            placeholder='Ticket, contract, or scope note'
-            value={authText}
-            onChange={(event) => setAuthText(event.target.value)}
-            disabled={scanning}
-          />
-        </div>
-
-        <button
-          type='button'
-          className='advanced-toggle'
-          onClick={() => setAdvancedOpen((o) => !o)}
-          aria-expanded={advancedOpen}
-        >
-          <Sliders size={15} weight='bold' /> Advanced options
-          <CaretDown
-            className={`chevron ${advancedOpen ? "open" : ""}`}
-            size={14}
-            weight='bold'
-          />
-        </button>
-        {advancedOpen && (
-          <div className='advanced-panel'>
-            <label className='form-label'>
-              Scan mode <span className='label-optional'>optional</span>
-            </label>
-            <div
-              className='segmented segmented-3'
-              role='group'
-              aria-label='Scan mode'
-            >
-              {SCAN_MODES.map(([val, title, desc]) => (
-                <button
-                  key={val}
-                  type='button'
-                  className={`segmented-btn ${scanMode === val ? "active" : ""}`}
-                  onClick={() => setScanMode(scanMode === val ? "" : val)}
-                  disabled={scanning}
+      <div className='formlayout'>
+        <main>
+          <section className='formsection'>
+            <h3>Application URL</h3>
+            {apps.length > 0 && (
+              <div className='grid2'>
+                <div className='field wide'>
+                  <label htmlFor='scan-application'>Web application</label>
+                  <div className='control'>
+                    <Select
+                      value={applicationId}
+                      onChange={selectApplication}
+                      disabled={submitting}
+                      options={[
+                        { value: "", label: "None" },
+                        ...apps.map((a) => ({ value: a.id, label: a.name })),
+                      ]}
+                    />
+                  </div>
+                  <p
+                    className='field-description'
+                    id='scan-application-description'
+                  >
+                    Picking an application fills in its target URL and saved
+                    scan defaults. You can still edit both below.
+                  </p>
+                </div>
+              </div>
+            )}
+            <div className='grid2'>
+              <div className='field wide'>
+                <div
+                  className={`control${touched && url && !valid ? " error" : ""}`}
                 >
-                  <span className='segmented-title'>{title}</span>
-                  <span className='segmented-desc'>{desc}</span>
+                  <input
+                    id='target-url'
+                    type='url'
+                    placeholder='https://example.com'
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    onBlur={() => setTouched(true)}
+                    disabled={submitting || defaultsLoading}
+                    aria-describedby='target-url-description'
+                  />
+                </div>
+                {touched && url && !valid && (
+                  <span className='field-error'>
+                    Enter a valid URL including http:// or https://
+                  </span>
+                )}
+                <p className='field-description' id='target-url-description'>
+                  {selectedApp
+                    ? `Loaded from ${selectedApp.name}. Edit it to scan a different path on this target.`
+                    : "Enter the public or staging URL where the assessment should begin."}
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <section className='formsection'>
+            <h3 className='form-subhead'>Crawl scope</h3>
+            <div
+              className='mode-choice'
+              style={{ gridTemplateColumns: "1fr 1fr" }}
+            >
+              <button
+                type='button'
+                className={crawlMode === "full" ? "active" : ""}
+                onClick={() => setCrawlMode("full")}
+                disabled={submitting}
+              >
+                <b>Full site</b>
+                <small>Crawl every reachable page.</small>
+              </button>
+              <button
+                type='button'
+                className={crawlMode === "single" ? "active" : ""}
+                onClick={() => setCrawlMode("single")}
+                disabled={submitting}
+              >
+                <b>Single page</b>
+                <small>Only the target URL.</small>
+              </button>
+            </div>
+
+            <h3 className='form-subhead'>Verification mode</h3>
+            <div className='mode-choice'>
+              {SCAN_MODES.map(([value, title, desc]) => (
+                <button
+                  key={value}
+                  type='button'
+                  className={scanMode === value ? "active" : ""}
+                  onClick={() =>
+                    setConfigField("scan_mode", scanMode === value ? "" : value)
+                  }
+                  disabled={submitting}
+                >
+                  <b>{title}</b>
+                  <small>{desc}</small>
                 </button>
               ))}
             </div>
+          </section>
 
-            <label className='form-label' style={{ marginTop: 20 }}>
-              Authenticated testing{" "}
-              <span className='label-optional'>optional</span>
-            </label>
-            <p className='advanced-hint'>
-              Add a test account to crawl authenticated pages and check for
-              access-control and IDOR issues. Used for this scan only, never
-              stored.
-            </p>
-            <div className='input-group'>
-              <User className='field-icon' size={17} />
-              <input
-                type='text'
-                autoComplete='off'
-                placeholder='Username or email'
-                value={authUsername}
-                onChange={(event) => setAuthUsername(event.target.value)}
-                disabled={scanning}
-              />
-            </div>
-            <div className='input-group' style={{ marginTop: 10 }}>
-              <Lock className='field-icon' size={17} />
-              <input
-                type='password'
-                autoComplete='off'
-                placeholder='Password'
-                value={authPassword}
-                onChange={(event) => setAuthPassword(event.target.value)}
-                disabled={scanning}
-              />
-            </div>
-          </div>
-        )}
-
-        <label className='consent-label'>
-          <input
-            type='checkbox'
-            checked={consent}
-            onChange={(event) => setConsent(event.target.checked)}
-            disabled={scanning}
-          />
-          <span className='consent-text'>
-            I confirm I am authorized to scan this target. Unauthorized scanning
-            may be illegal.
-          </span>
-        </label>
-
-        <button className='btn-primary' disabled={!canStart} onClick={startScan}>
-          {scanning ? (
-            <>
-              <CircleNotch className='spin' size={17} weight='bold' /> Scanning
-            </>
-          ) : (
-            <>
-              <ShieldCheck size={17} weight='bold' /> Start Security Scan
-            </>
-          )}
-        </button>
-      </div>
-
-      {scanning && (
-        <div className='card scan-progress'>
-          <div className='progress-header'>
-            <div className='progress-stage'>
-              <CircleNotch className='spin' size={16} weight='bold' />
-              {SCAN_STAGES[stageIdx]}
-            </div>
-            <div className='progress-meta'>
-              <span className={`status-pill status-${status || "queued"}`}>
-                {STATUS_LABEL[status] || "Queued"}
-              </span>
-              <span className='progress-pct'>{Math.round(progress)}%</span>
-            </div>
-          </div>
-          <div className='progress-bar'>
-            <div className='progress-fill' style={{ width: `${progress}%` }} />
-          </div>
-          <div className='stage-chips'>
-            {SCAN_STAGES.slice(0, -1).map((stage, index) => (
-              <div
-                key={stage}
-                className={`stage-chip ${index <= stageIdx ? "done" : "pending"}`}
-              >
-                {index <= stageIdx && <Check size={12} weight='bold' />}
-                {stage.replace("...", "")}
-              </div>
-            ))}
-          </div>
-          <button type='button' className='btn-ghost' onClick={cancel}>
-            Cancel scan
+          <button
+            type='button'
+            className={`advanced-toggle${usersOpen ? " open" : ""}`}
+            onClick={() => setUsersOpen((value) => !value)}
+            aria-expanded={usersOpen}
+            aria-controls='test-users-panel'
+          >
+            <span className='advanced-toggle-title'>
+              Test users <span className='muted-text'>(optional)</span>
+            </span>
+            <span className='advanced-toggle-hint'>
+              Accounts for authenticated and access-control testing
+            </span>
+            <ChevronDown className='ico chev' />
           </button>
-        </div>
-      )}
 
-      {!scanning && (
-        <div className='scan-notes'>
-          {NOTES.map(({ icon: Icon, title, desc }) => (
-            <div key={title} className='scan-note'>
-              <Icon className='scan-note-icon' size={24} weight='bold' />
-              <div className='scan-note-title'>{title}</div>
-              <div className='scan-note-desc'>{desc}</div>
+          {usersOpen && (
+            <div className='advanced-panel users-panel' id='test-users-panel'>
+              <p className='panel-intro'>
+                Add up to three dedicated test accounts to improve authenticated
+                coverage. Do not use personal or production credentials.
+              </p>
+              {CRED_ROLES.map((role) => (
+                <CredentialAccount
+                  key={role.key}
+                  role={role}
+                  account={credentials[role.key] || {}}
+                  onField={setCredentialField}
+                  disabled={submitting}
+                />
+              ))}
+
+              <label className='consent secondary-provisioning'>
+                <input
+                  type='checkbox'
+                  checked={Boolean(config.allow_secondary_provisioning)}
+                  onChange={(e) =>
+                    setConfigField(
+                      "allow_secondary_provisioning",
+                      e.target.checked ? true : "",
+                    )
+                  }
+                  disabled={submitting}
+                />
+                <span>
+                  Auto-provision a throwaway second identity for horizontal IDOR
+                  testing when none is supplied.
+                </span>
+              </label>
             </div>
-          ))}
-        </div>
-      )}
+          )}
+
+          <button
+            type='button'
+            className={`advanced-toggle${advancedOpen ? " open" : ""}`}
+            onClick={() => setAdvancedOpen((v) => !v)}
+            aria-expanded={advancedOpen}
+          >
+            <span className='advanced-toggle-title'>
+              Advanced configuration{" "}
+              <span className='muted-text'>(optional)</span>
+            </span>
+            <span className='advanced-toggle-hint'>
+              Crawler, scanner, injection, and browser tuning
+            </span>
+            <ChevronDown className='ico chev' />
+          </button>
+
+          {advancedOpen && (
+            <div className='advanced-panel'>
+              {CONFIG_GROUPS.map((group) => (
+                <div key={group.title}>
+                  <h3>{group.title}</h3>
+                  <p className='muted-text'>{group.blurb}</p>
+                  <div className='grid2'>
+                    {group.fields.map((field) => (
+                      <ConfigField
+                        key={field.key}
+                        field={field}
+                        value={config[field.key]}
+                        onChange={setConfigField}
+                        disabled={submitting}
+                      />
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <label className='consent' style={{ marginTop: 20 }}>
+            <input
+              type='checkbox'
+              checked={consent}
+              onChange={(e) => setConsent(e.target.checked)}
+              disabled={submitting}
+            />
+            <span>
+              I confirm I am authorized to scan this target. Unauthorized
+              scanning may be illegal.
+            </span>
+          </label>
+        </main>
+
+        <aside className='review'>
+          <h2>Assessment summary</h2>
+          <dl>
+            {selectedApp && (
+              <div>
+                <dt>Application</dt>
+                <dd>{selectedApp.name}</dd>
+              </div>
+            )}
+            <div>
+              <dt>Standard</dt>
+              <dd>OWASP 2025</dd>
+            </div>
+            <div>
+              <dt>Scope</dt>
+              <dd>{crawlMode === "single" ? "Single page" : "Full site"}</dd>
+            </div>
+            <div>
+              <dt>Access</dt>
+              <dd>
+                {credentialCount
+                  ? `${credentialCount} test user${credentialCount === 1 ? "" : "s"}`
+                  : "Public"}
+              </dd>
+            </div>
+            <div>
+              <dt>Evidence</dt>
+              <dd>
+                {scanMode
+                  ? scanMode.charAt(0).toUpperCase() + scanMode.slice(1)
+                  : "Verified"}
+              </dd>
+            </div>
+          </dl>
+          <button
+            className='btn primary'
+            onClick={handleStart}
+            disabled={!canStart || !configIsValid}
+          >
+            {defaultsLoading
+              ? "Loading defaults…"
+              : submitting
+                ? "Starting…"
+                : "Start assessment"}
+          </button>
+        </aside>
+      </div>
     </div>
   );
 }
