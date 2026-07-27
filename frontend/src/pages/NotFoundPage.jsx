@@ -1,22 +1,24 @@
-import { Link } from "react-router-dom";
-import { ArrowLeft } from "lucide-react";
-import ThemeToggle from "../components/ThemeToggle.jsx";
+import { Link } from 'react-router-dom'
+import { ArrowLeft } from 'lucide-react'
+import ThemeToggle from '../components/ThemeToggle.jsx'
 
 function NotFoundPage() {
   return (
     <main
       style={{
-        display: "grid",
-        placeItems: "center",
-        minHeight: "100dvh",
+        display: 'grid',
+        placeItems: 'center',
+        minHeight: '100dvh',
         padding: 20,
-        background: "var(--bg)",
-        color: "var(--ink)",
+        background: 'var(--bg)',
+        color: 'var(--ink)',
         fontFamily: '"DM Sans", system-ui, sans-serif',
       }}
     >
-      <div className='not-found-theme'><ThemeToggle /></div>
-      <div className='card' style={{ maxWidth: 520 }}>
+      <div className='not-found-theme'>
+        <ThemeToggle />
+      </div>
+      <div className='card' style={{ maxWidth: 520, padding: 60 }}>
         <img
           src='/sentrystrike-logo.svg'
           alt='SentryStrike'
@@ -25,21 +27,21 @@ function NotFoundPage() {
         <span
           className='mono'
           style={{
-            display: "block",
+            display: 'block',
             marginTop: 20,
-            fontSize: "0.7rem",
-            color: "var(--brand)",
+            fontSize: '0.7rem',
+            color: 'var(--brand)',
             fontWeight: 700,
           }}
         >
           404 / ROUTE NOT FOUND
         </span>
         <h1
-          style={{ marginTop: 8, fontSize: "1.8rem", letterSpacing: "-0.03em" }}
+          style={{ marginTop: 8, fontSize: '1.8rem', letterSpacing: '-0.03em' }}
         >
-          This page is outside the scan scope.
+          We could not find that page.
         </h1>
-        <p style={{ marginTop: 10, color: "var(--sub)", fontSize: "0.8rem" }}>
+        <p style={{ marginTop: 10, color: 'var(--sub)', fontSize: '0.8rem' }}>
           The address may be incorrect or the page may have moved.
         </p>
         <Link to='/' className='btn primary' style={{ marginTop: 20 }}>
@@ -48,7 +50,7 @@ function NotFoundPage() {
         </Link>
       </div>
     </main>
-  );
+  )
 }
 
-export default NotFoundPage;
+export default NotFoundPage
