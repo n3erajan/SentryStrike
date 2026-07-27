@@ -20,8 +20,7 @@ def test_approve_access_request_accepts_per_workspace_member_limit(monkeypatch) 
 
     result = cli.main(
         [
-            "approve-access-request",
-            "--request-id",
+            "approve",
             "request-1",
             "--member-limit",
             "100",
@@ -45,7 +44,7 @@ def test_approve_access_request_defaults_to_ten_members(monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "_approve_access_request", approve)
 
-    assert cli.main(["approve-access-request", "--request-id", "request-1"]) == 0
+    assert cli.main(["approve", "request-1"]) == 0
     assert captured["request_id"] == "request-1"
     assert captured["member_limit"] == 10
 
@@ -115,7 +114,7 @@ def test_set_member_limit_targets_one_existing_workspace(monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "_set_member_limit", set_member_limit)
 
-    result = cli.main(["set-member-limit", "--org-id", "org-100", "--limit", "25"])
+    result = cli.main(["set-limit", "org-100", "25"])
 
     assert result == 0
     assert captured == {"org_id": "org-100", "limit": 25}
@@ -126,8 +125,7 @@ def test_member_limit_rejects_invalid_values(value: str) -> None:
     with pytest.raises(SystemExit) as exc_info:
         cli.main(
             [
-                "approve-access-request",
-                "--request-id",
+                "approve",
                 "request-1",
                 "--member-limit",
                 value,
@@ -156,7 +154,7 @@ def test_email_check_reports_smtp_acceptance(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "get_email_backend", Backend)
 
-    result = cli.main(["email-check", "--to", "operator@example.test"])
+    result = cli.main(["email", "operator@example.test"])
 
     output = capsys.readouterr().out
     assert result == 0
@@ -173,10 +171,67 @@ def test_invite_status_dispatches_by_email(monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "_invite_status", invite_status)
 
-    result = cli.main(["invite-status", "--email", "owner@example.test"])
+    result = cli.main(["status", "owner@example.test"])
 
     assert result == 0
     assert captured["email"] == "owner@example.test"
+
+
+@pytest.mark.parametrize("command", ["invite", "invite-status"])
+def test_invite_status_aliases_remain_supported(monkeypatch, command: str) -> None:
+    captured = {}
+
+    async def invite_status(email: str) -> int:
+        captured["email"] = email
+        return 0
+
+    monkeypatch.setattr(cli, "_invite_status", invite_status)
+
+    assert cli.main([command, "owner@example.test"]) == 0
+    assert captured["email"] == "owner@example.test"
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("list-access-requests", "list"),
+        ("approve-access-request", "approve"),
+        ("reject-access-request", "reject"),
+        ("email-check", "email"),
+        ("set-member-limit", "set-limit"),
+        ("purge-retention", "purge"),
+    ],
+)
+def test_legacy_command_aliases_are_canonicalized(alias: str, canonical: str) -> None:
+    assert cli._canonicalize_command([alias, "value"]) == [canonical, "value"]
+
+
+def test_main_help_has_banner_commands_and_examples(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--help"])
+
+    output = capsys.readouterr().out
+    assert exc_info.value.code == 0
+    assert cli._BANNER in output
+    assert "Management console | vendor operations" in output
+    assert "USAGE: python -m app.cli" in output
+    assert "COMMANDS:" in output
+    assert "EXAMPLES:" in output
+    assert "approve" in output
+    command_table = output.split("COMMANDS:", 1)[1].split("OPTIONS:", 1)[0]
+    assert "list-access-requests" not in command_table
+
+
+def test_command_help_documents_arguments_example_and_alias(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["approve", "--help"])
+
+    output = capsys.readouterr().out
+    assert exc_info.value.code == 0
+    assert "REQUEST_ID" in output
+    assert "--member-limit N" in output
+    assert "EXAMPLE:" in output
+    assert "approve-access-request" in output
 
 
 def test_invite_status_reports_delivery_and_owner_joined(monkeypatch, capsys) -> None:

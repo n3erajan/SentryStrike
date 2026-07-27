@@ -4,14 +4,15 @@ Owner onboarding has no web UI: the vendor invites a business owner from a shell
 inside the backend container. Access *is* container access, so there is no HTTP
 surface to secure.
 
-Usage::
+Usage (long-form aliases in parentheses still work)::
 
-    python -m app.cli list-access-requests
-    python -m app.cli approve-access-request --request-id <id> --member-limit 100
-    python -m app.cli reject-access-request --request-id <id>
-    python -m app.cli email-check --to operator@example.com
-    python -m app.cli invite-status --email owner@acme.com
-    python -m app.cli set-member-limit --org-id <organization-id> --limit 25
+    python -m app.cli list [-l 50]                         (list-access-requests)
+    python -m app.cli approve <request-id> [-l 100]        (approve-access-request)
+    python -m app.cli reject <request-id>                  (reject-access-request)
+    python -m app.cli status owner@acme.com                (invite, invite-status)
+    python -m app.cli email operator@example.com           (email-check)
+    python -m app.cli purge                                (purge-retention)
+    python -m app.cli set-limit <organization-id> 25       (set-member-limit)
 
 Creates a pending owner invite, prints the signup link, and emails it when a
 real (SMTP) email backend is configured. The owner accepts by registering with
@@ -320,72 +321,226 @@ async def _set_member_limit(org_id: str, limit: int) -> int:
         await close_db()
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="app.cli", description="SentryStrike management CLI")
-    sub = parser.add_subparsers(dest="command", required=True)
+_PROGRAM = "python -m app.cli"
+_BANNER = r"""
+  ____  _____ _   _ _____ ______   ______ _____ ____  ___ _  _______
+ / ___|| ____| \ | |_   _|  _ \ \ / / ___|_   _|  _ \|_ _| |/ / ____|
+ \___ \|  _| |  \| | | | | |_) \ V /\___ \ | | | |_) || || ' /|  _|
+  ___) | |___| |\  | | | |  _ < | |  ___) || | |  _ < | || . \| |___
+ |____/|_____|_| \_| |_| |_| \_\|_| |____/ |_| |_| \_\___|_|\_\_____|
+""".strip("\n")
 
-    access_list = sub.add_parser(
-        "list-access-requests", help="List pending public workspace-access requests"
-    )
-    access_list.add_argument(
-        "--limit", type=_access_request_list_limit, default=50, metavar="LIMIT"
-    )
+_COMMAND_ALIASES = {
+    "list-access-requests": "list",
+    "approve-access-request": "approve",
+    "reject-access-request": "reject",
+    "invite": "status",
+    "invite-status": "status",
+    "email-check": "email",
+    "set-member-limit": "set-limit",
+    "purge-retention": "purge",
+}
 
-    approve = sub.add_parser(
-        "approve-access-request", help="Approve a request and email an owner invite"
-    )
-    approve.add_argument("--request-id", required=True, help="Pending access-request id")
-    approve.add_argument(
-        "--member-limit",
-        type=_member_limit,
-        default=10,
-        help="Initial workspace member limit (1–10000), including the owner and pending invites (default: 10)",
-    )
+_MAIN_EPILOG = """\
+EXAMPLES:
+  Review the oldest pending access requests:
+    python -m app.cli list --limit 20
 
-    reject = sub.add_parser(
-        "reject-access-request", help="Reject and delete a pending access request"
-    )
-    reject.add_argument("--request-id", required=True, help="Pending access-request id")
+  Approve a request and create a workspace with 100 seats:
+    python -m app.cli approve 665f0c2b3d4e5f60718293a4 --member-limit 100
 
-    email_check = sub.add_parser(
-        "email-check", help="Show effective email settings and send an SMTP diagnostic"
-    )
-    email_check.add_argument("--to", required=True, help="Recipient for the diagnostic email")
+  Inspect invitation delivery and account acceptance:
+    python -m app.cli status owner@acme.com
 
-    invite_status = sub.add_parser(
-        "invite-status", help="Show email delivery and acceptance state for the latest invite"
-    )
-    invite_status.add_argument("--email", required=True, help="Invited email address")
+  Verify the configured SMTP service:
+    python -m app.cli email ops@example.com
 
-    sub.add_parser("purge-retention", help="Run one scan-data retention purge pass across all workspaces")
+Run 'python -m app.cli COMMAND --help' for command-specific arguments and examples.
+Legacy long-form command aliases remain supported.\
+"""
 
-    member_limit = sub.add_parser(
-        "set-member-limit", help="Set the vendor-controlled member limit for a workspace"
-    )
-    member_limit.add_argument("--org-id", required=True, help="Workspace organization id")
-    member_limit.add_argument(
-        "--limit", required=True, type=_member_limit, help="Member limit (1–10000)"
-    )
 
-    args = parser.parse_args(argv)
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keep management help readable and stable across terminal widths."""
 
-    if args.command == "list-access-requests":
-        return asyncio.run(_list_access_requests(args.limit))
-    if args.command == "approve-access-request":
-        return asyncio.run(
-            _approve_access_request(args.request_id, args.member_limit)
+    def __init__(self, prog: str) -> None:
+        super().__init__(prog, max_help_position=30, width=100)
+
+    def start_section(self, heading: str | None) -> None:
+        super().start_section(heading.upper() if heading else heading)
+
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            # The section already says COMMANDS; argparse's extra "COMMAND" row
+            # adds no information and pushes the useful command names too far right.
+            return self._join_parts(
+                [self._format_action(item) for item in action._get_subactions()]
+            )
+        return super()._format_action(action)
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """Argument parser with SentryStrike branding and actionable errors."""
+
+    def format_help(self) -> str:
+        help_text = super().format_help().replace("usage:", "USAGE:", 1)
+        return f"{_BANNER}\n  Management console | vendor operations\n\n{help_text}"
+
+    def format_usage(self) -> str:
+        return super().format_usage().replace("usage:", "USAGE:", 1)
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(
+            2,
+            f"\nERROR: {message}\n"
+            f"Run '{self.prog} --help' for usage and examples.\n",
         )
-    if args.command == "reject-access-request":
+
+
+def _command_aliases(command: str) -> tuple[str, ...]:
+    return tuple(alias for alias, canonical in _COMMAND_ALIASES.items() if canonical == command)
+
+
+def _add_command(
+    sub,
+    name: str,
+    summary: str,
+    description: str,
+    example: str,
+) -> argparse.ArgumentParser:
+    """Register a subcommand with consistent help, examples, and documented aliases."""
+    aliases = _command_aliases(name)
+    alias_help = f"\n\nALIASES:\n  {', '.join(aliases)}" if aliases else ""
+    return sub.add_parser(
+        name,
+        help=summary,
+        description=description,
+        epilog=f"EXAMPLE:\n  {example}{alias_help}",
+        formatter_class=_HelpFormatter,
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = _ArgumentParser(
+        prog=_PROGRAM,
+        description=(
+            "Vendor-only operations for access requests, workspace invitations, "
+            "email diagnostics, member limits, and scan-data retention. Run this "
+            "command inside the backend container."
+        ),
+        epilog=_MAIN_EPILOG,
+        formatter_class=_HelpFormatter,
+    )
+    sub = parser.add_subparsers(
+        title="commands",
+        dest="command",
+        metavar="COMMAND",
+        required=True,
+    )
+    # Command discovery is the primary purpose of top-level help, so present it
+    # before the single global help option.
+    parser._action_groups.remove(sub.container)
+    parser._action_groups.insert(1, sub.container)
+
+    p = _add_command(
+        sub, "list",
+        "List pending workspace-access requests",
+        "List pending public workspace-access requests, oldest first.",
+        "python -m app.cli list -l 20",
+    )
+    p.add_argument(
+        "-l", "--limit", type=_access_request_list_limit, default=50, metavar="N",
+        help="maximum rows to show, 1–200 (default: 50)",
+    )
+
+    p = _add_command(
+        sub, "approve",
+        "Approve a request and email the owner a signup link",
+        "Approve a pending access request: create a pending owner invite, print "
+        "the signup link, and email it to the requester.",
+        "python -m app.cli approve 665f0c2b3d4e5f60718293a4 -l 100",
+    )
+    p.add_argument("request_id", metavar="REQUEST_ID", help="pending access-request id (from `list`)")
+    p.add_argument(
+        "-l", "--member-limit", type=_member_limit, default=10, metavar="N",
+        help="initial workspace member limit, 1–10000 (default: 10)",
+    )
+
+    p = _add_command(
+        sub, "reject",
+        "Reject and delete a pending access request",
+        "Reject a pending access request and delete it. No email is sent.",
+        "python -m app.cli reject 665f0c2b3d4e5f60718293a4",
+    )
+    p.add_argument("request_id", metavar="REQUEST_ID", help="pending access-request id (from `list`)")
+
+    p = _add_command(
+        sub, "status",
+        "Show invite delivery / acceptance state for an email",
+        "Show the latest invite's email-delivery and account-acceptance state "
+        "for an invited email address.",
+        "python -m app.cli status owner@acme.com",
+    )
+    p.add_argument("email", metavar="EMAIL", help="invited email address")
+
+    p = _add_command(
+        sub, "email",
+        "Send an SMTP diagnostic and show email settings",
+        "Show the effective email configuration and send a real diagnostic "
+        "message to confirm SMTP handoff.",
+        "python -m app.cli email ops@example.com",
+    )
+    p.add_argument("to", metavar="TO", help="recipient for the diagnostic email")
+
+    p = _add_command(
+        sub, "set-limit",
+        "Set a workspace's member limit",
+        "Set the vendor-controlled member limit for one existing workspace.",
+        "python -m app.cli set-limit 665f1a0b2c3d4e5f60718293 25",
+    )
+    p.add_argument("org_id", metavar="ORG_ID", help="workspace organization id")
+    p.add_argument("limit", type=_member_limit, metavar="LIMIT", help="new member limit, 1–10000")
+
+    _add_command(
+        sub, "purge",
+        "Run one scan-data retention purge pass",
+        "Run a single scan-data retention purge pass across all workspaces.",
+        "python -m app.cli purge",
+    )
+
+    return parser
+
+
+def _canonicalize_command(arguments: list[str]) -> list[str]:
+    if not arguments:
+        return arguments
+    command = _COMMAND_ALIASES.get(arguments[0], arguments[0])
+    return [command, *arguments[1:]]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(_canonicalize_command(arguments))
+
+    cmd = args.command
+
+    if cmd == "list":
+        return asyncio.run(_list_access_requests(args.limit))
+    if cmd == "approve":
+        return asyncio.run(_approve_access_request(args.request_id, args.member_limit))
+    if cmd == "reject":
         return asyncio.run(_reject_access_request(args.request_id))
-    if args.command == "email-check":
+    if cmd == "email":
         return _email_check(args.to)
-    if args.command == "invite-status":
+    if cmd == "status":
         return asyncio.run(_invite_status(args.email))
-    if args.command == "purge-retention":
+    if cmd == "purge":
         return asyncio.run(_purge_retention())
-    if args.command == "set-member-limit":
+    if cmd == "set-limit":
         return asyncio.run(_set_member_limit(args.org_id, args.limit))
-    parser.error(f"unknown command: {args.command}")
+    parser.error(f"unknown command: {cmd}")
     return 2
 
 
