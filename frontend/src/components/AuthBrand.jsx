@@ -1,39 +1,64 @@
-function AuthBrand({ mode = "login" }) {
-  const register = mode === "register";
-  const heading = register
-    ? "Start with the app you need to test."
-    : "Keep your security work in one place.";
-  const sub = register
-    ? "Run an authorized scan and get evidence your team can review."
-    : "Track apps, scans, findings, and fixes from one workspace.";
-  const proof = register
+import { motion } from 'motion/react'
+import { AnimatedWords } from './motion/primitives.jsx'
+import { fadeUp } from './motion/tokens.js'
+
+function AuthBrand({ mode = 'login' }) {
+  const register = mode === 'register'
+  const request = mode === 'request'
+  const heading = request
+    ? 'Bring your web security work under one organization.'
+    : register
+      ? 'Complete your workspace invitation.'
+      : 'Pick up your security work.'
+  const sub = request
+    ? 'A workspace keeps your applications, DAST scans, findings, and team access in one place.'
+    : register
+      ? 'Create your account with the invited email to enter the workspace and role included in your invitation.'
+      : 'Return to your scans, AI-assisted findings, team discussions, and remediation progress.'
+  const proof = request
     ? [
-        ["Standard", "OWASP Top 10 2025"],
-        ["Coverage", "Public and authenticated"],
-        ["Reports", "UI and PDF"],
+        ['Applications', 'Authorized targets'],
+        ['Work', 'Scans, findings and fixes'],
+        ['Team', 'Owner-managed invitations'],
       ]
-    : [
-        ["Applications", "Saved targets and history"],
-        ["Findings", "Evidence and fix status"],
-        ["Reports", "Results your team can share"],
-      ];
+    : register
+      ? [
+          ['Email', 'Fixed by the invitation'],
+          ['Role', 'Included in the invitation'],
+          ['Link', 'Valid for one signup'],
+        ]
+      : [
+          ['Applications', 'Saved targets and history'],
+          ['Findings', 'Evidence, comments and status'],
+          ['Reports', 'Web, PDF and JSON'],
+        ]
 
   return (
     <aside className='auth-art'>
-      <div className='auth-copy'>
-        <h2>{heading}</h2>
-        <p>{sub}</p>
-        <div className='proof'>
+      <motion.div
+        className='auth-copy'
+        initial='hidden'
+        animate='visible'
+        variants={{
+          hidden: {},
+          visible: {
+            transition: { staggerChildren: 0.1, delayChildren: 0.18 },
+          },
+        }}
+      >
+        <AnimatedWords as='h2' text={heading} delay={0.18} />
+        <motion.p variants={fadeUp}>{sub}</motion.p>
+        <motion.div className='proof' variants={fadeUp}>
           {proof.map(([label, value]) => (
             <div key={label}>
               <span>{label}</span>
               <b>{value}</b>
             </div>
           ))}
-        </div>
-      </div>
+        </motion.div>
+      </motion.div>
     </aside>
-  );
+  )
 }
 
-export default AuthBrand;
+export default AuthBrand

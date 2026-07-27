@@ -2,6 +2,7 @@ from beanie import init_beanie
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from shared.config import InfrastructureSettings
+from shared.models.access_request import AccessRequest
 from shared.models.application import Application
 from shared.models.audit import AuditLogEntry
 from shared.models.analysis_job import AnalysisJob
@@ -27,7 +28,7 @@ async def init_db(settings: InfrastructureSettings) -> None:
     _client = AsyncIOMotorClient(settings.mongodb_uri)
     await init_beanie(
         database=_client[settings.mongodb_db_name],
-        document_models=[Application, Scan, AnalysisJob, CveRecord, User, UserSession, OastInteractionRecord, Organization, Invite, AuditLogEntry, Notification, ReverificationJob],
+        document_models=[Application, Scan, AnalysisJob, CveRecord, User, UserSession, OastInteractionRecord, Organization, Invite, AccessRequest, AuditLogEntry, Notification, ReverificationJob],
     )
 
 

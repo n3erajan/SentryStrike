@@ -81,14 +81,31 @@ Login and registration set an HttpOnly session cookie. Production deployments sh
 Run commands from `backend/` with the repository virtual environment active.
 
 ```bash
-python -m app.cli invite-owner --email owner@example.com --org "Example Security" --member-limit 10
+python -m app.cli list-access-requests
+python -m app.cli approve-access-request --request-id <request-id> --member-limit 10
+python -m app.cli reject-access-request --request-id <request-id>
 python -m app.cli invite-status --email owner@example.com
 python -m app.cli email-check --to operator@example.com
 python -m app.cli set-member-limit --org-id <organization-id> --limit 25
 python -m app.cli purge-retention
 ```
 
-Owner onboarding is deliberately CLI-only. The first accepted owner invitation creates the workspace and owner account together.
+Prospective owners submit through the public `/request-access` page, but review
+and approval remain CLI-only. Approval creates and emails a single-use owner
+invitation using the organization name and email from the request. The first
+accepted owner invitation creates the workspace and owner account together.
+
+The public endpoint verifies Cloudflare Turnstile server-side and uses Redis to
+allow one submission per IP every 15 minutes and seven per IP per day. Redis
+failure returns `503`. Only one pending request is stored per normalized email.
+MongoDB removes pending requests after 30 days, while CLI approval and rejection
+remove them immediately.
+
+The production Compose stack trusts forwarded client addresses because the
+backend port is private and public traffic reaches it only through the bundled
+nginx container. If you deploy behind a different proxy, configure Uvicorn's
+`FORWARDED_ALLOW_IPS` for that trusted proxy so rate limits use the real client
+address. Never trust forwarded headers when the backend is directly exposed.
 
 ## Configuration
 
@@ -98,7 +115,14 @@ Important production settings include:
 
 - `CORS_ORIGINS`
 - `AUTH_SESSION_TTL_HOURS`, `AUTH_COOKIE_SECURE`, and `AUTH_COOKIE_SAMESITE`
+- `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY`
+- `ACCESS_REQUEST_IP_LIMIT_PER_FIFTEEN_MINUTES` and `ACCESS_REQUEST_IP_LIMIT_PER_DAY`
 - `EMAIL_SMTP_HOST`, `EMAIL_SMTP_USER`, and `EMAIL_SMTP_PASSWORD`
+
+The values in `.env.example` are Cloudflare's always-pass Turnstile test keys.
+They work only for local development: the backend refuses to start with those
+keys when `APP_DEBUG=false`. Create a free Turnstile widget in the Cloudflare
+dashboard, add the deployed hostname, and replace both keys before production.
 - invitation lifetime and rate-limit settings
 - `RETENTION_PURGE_INTERVAL_SECONDS`
 

@@ -168,16 +168,30 @@ Windows users can instead run `./start-dev.ps1` in PowerShell to open the four s
 | OpenAPI documentation | <http://localhost:8000/docs>          |
 | Health endpoint       | <http://localhost:8000/api/v1/health> |
 
-### 5. Create the first workspace owner
+### 5. Request and approve the first workspace owner
 
-Registration is invitation-only. With the backend running:
+Registration is invitation-only. With the frontend and backend running, open
+<http://localhost:5173/request-access> and submit a workspace-access request.
+The development configuration uses Cloudflare Turnstile's official test keys.
+
+Review the pending request and approve it from the backend CLI:
 
 ```bash
 cd backend
-python -m app.cli invite-owner --email owner@example.com --org "Example Security" --member-limit 10
+python -m app.cli list-access-requests
+python -m app.cli approve-access-request --request-id <request-id> --member-limit 10
 ```
 
-Open the invitation link printed by the command. If SMTP is not configured locally, the CLI still prints a valid link or token.
+Approval creates the owner invitation, prints its link or token, and attempts to
+email it. A rejected request can instead be removed with:
+
+```bash
+python -m app.cli reject-access-request --request-id <request-id>
+```
+
+Pending access requests are limited by IP in Redis, deduplicated by normalized
+email address, and automatically removed from MongoDB after 30 days. Approved
+and rejected requests are removed immediately.
 
 ## Configuration
 
@@ -188,7 +202,7 @@ Configuration is split by service so that scanner limits, email credentials, and
 | File                                             | What to set                                     | Notes                                                                                                                                                      |
 | ------------------------------------------------ | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Root [`.env.example`](.env.example)              | Usually nothing                                 | The localhost MongoDB, Redis, queue, and port defaults work with the quick start. Set `PUBLIC_HOSTNAME` when invite and OAST links need a public base URL. |
-| [`backend/.env.example`](backend/.env.example)   | Usually nothing                                 | Development cookie and CORS defaults work locally.                                                                                                         |
+| [`backend/.env.example`](backend/.env.example)   | Usually nothing                                 | Development cookie, CORS, SMTP, and Turnstile test defaults work locally. Production requires real Turnstile keys.                                         |
 | [`scanner/.env.example`](scanner/.env.example)   | Usually nothing                                 | Start with the supplied crawl and request limits; lower them for fragile applications.                                                                     |
 | [`analyzer/.env.example`](analyzer/.env.example) | `AI_BASE_URL` and `AI_MODEL` only if you use AI | Defaults expect Ollama on the host. Set `AI_ANALYSIS_ENABLED=false` to run without provider calls.                                                         |
 

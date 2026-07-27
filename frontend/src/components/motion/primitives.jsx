@@ -1,9 +1,14 @@
-import { AnimatePresence, motion } from "motion/react";
-import { SPRING, SPRING_FAST, VIEWPORT, fadeUp, staggerParent } from "./tokens.js";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
+import {
+  FOCUS_REVEAL,
+  SPRING_FAST,
+  VIEWPORT,
+  fadeUp,
+  staggerParent,
+} from "./tokens.js";
 
-/* Shared motion components for the landing page. Reduced motion is
-   handled globally by <MotionConfig reducedMotion="user"> at the
-   landing root. Tokens (springs, variants) live in tokens.js. */
+/* Shared motion components for public pages. Their route roots provide
+   MotionConfig reduced-motion handling; tokens live in tokens.js. */
 
 /* Fades + slides a block up once it scrolls into view. */
 export function Reveal({ as = "div", delay = 0, ...props }) {
@@ -13,7 +18,7 @@ export function Reveal({ as = "div", delay = 0, ...props }) {
       initial={{ opacity: 0, y: 34, filter: "blur(6px)" }}
       whileInView={{ opacity: 1, y: 0, filter: "blur(0px)" }}
       viewport={VIEWPORT}
-      transition={{ ...SPRING, delay }}
+      transition={{ ...FOCUS_REVEAL, delay }}
       {...props}
     />
   );
@@ -40,10 +45,22 @@ export function StaggerItem({ as = "div", ...props }) {
 
 /* Per-word headline reveal. Words rise into place with a slight
    stagger; the full text stays available to screen readers. */
-export function AnimatedWords({ text, className, delay = 0 }) {
+export function AnimatedWords({
+  as = "h1",
+  text,
+  className,
+  delay = 0,
+  blur = true,
+  transition = FOCUS_REVEAL,
+}) {
+  const Tag = motion[as];
+  const reduced = useReducedMotion();
   const words = text.split(" ");
+
+  if (reduced) return <Tag className={className}>{text}</Tag>;
+
   return (
-    <motion.h1
+    <Tag
       className={className}
       aria-label={text}
       initial='hidden'
@@ -61,19 +78,23 @@ export function AnimatedWords({ text, className, delay = 0 }) {
           aria-hidden='true'
           style={{ display: "inline-block", whiteSpace: "pre" }}
           variants={{
-            hidden: { opacity: 0, y: "0.4em", filter: "blur(5px)" },
+            hidden: {
+              opacity: 0,
+              y: "0.4em",
+              ...(blur ? { filter: "blur(5px)" } : {}),
+            },
             visible: {
               opacity: 1,
               y: 0,
-              filter: "blur(0px)",
-              transition: SPRING,
+              ...(blur ? { filter: "blur(0px)" } : {}),
+              transition,
             },
           }}
         >
           {i < words.length - 1 ? `${word} ` : word}
         </motion.span>
       ))}
-    </motion.h1>
+    </Tag>
   );
 }
 

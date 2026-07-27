@@ -7,8 +7,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.dependencies import analysis_queue, get_current_user, invite_service
-from app.api.routes import applications, analysis, auth, health, notifications, oast, reports, scan, workspace
+from app.api.dependencies import (
+    access_request_service,
+    analysis_queue,
+    get_current_user,
+    invite_service,
+    turnstile_verifier,
+)
+from app.api.routes import access_requests, applications, analysis, auth, health, notifications, oast, reports, scan, workspace
 from app.config import get_settings
 from app.core.exceptions import AppError
 from shared.database.connection import close_db, init_db
@@ -79,6 +85,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await access_request_service.close()
+        await turnstile_verifier.close()
         await invite_service.close()
         await analysis_queue.close()
         await scan_queue.close()
@@ -119,6 +127,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router, prefix="/api/v1")
     app.include_router(auth.router, prefix="/api/v1")
+    app.include_router(access_requests.router, prefix="/api/v1")
     app.include_router(applications.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(scan.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(analysis.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])

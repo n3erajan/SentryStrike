@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
 import { MotionConfig, motion } from "motion/react";
 import {
   BadgeCheck,
@@ -10,6 +9,7 @@ import {
   Plus,
 } from "lucide-react";
 import ThemeToggle from "../components/ThemeToggle.jsx";
+import PageTransitionLink from "../components/PageTransitionLink.jsx";
 import {
   AnimatedWords,
   Reveal,
@@ -19,7 +19,8 @@ import {
 } from "../components/motion/primitives.jsx";
 import { SPRING, fadeUp } from "../components/motion/tokens.js";
 
-const MotionLink = motion.create(Link);
+const Link = PageTransitionLink;
+const MotionLink = motion.create(PageTransitionLink);
 
 const WORKFLOW = [
   {
@@ -299,6 +300,7 @@ function WorkflowVisual({ id }) {
             <Link
               className='btn primary'
               to='/login'
+              viewTransition
               style={{ marginTop: 15 }}
             >
               Continue
@@ -495,15 +497,21 @@ function LandingPage() {
         </div>
         <div className='navactions'>
           <ThemeToggle />
-          <MotionLink className='btn' to='/login' whileTap={{ scale: 0.97 }}>
+          <MotionLink
+            className='btn'
+            to='/login'
+            viewTransition
+            whileTap={{ scale: 0.97 }}
+          >
             Sign in
           </MotionLink>
           <MotionLink
             className='btn primary'
-            to='/register'
+            to='/request-access'
+            viewTransition
             whileTap={{ scale: 0.97 }}
           >
-            Join with invite
+            Request access
           </MotionLink>
         </div>
       </nav>
@@ -535,10 +543,11 @@ function LandingPage() {
             <motion.div className='hero-actions' variants={fadeUp}>
               <MotionLink
                 className='btn primary'
-                to='/register'
+                to='/request-access'
+                viewTransition
                 whileTap={{ scale: 0.97 }}
               >
-                Join with invite
+                Request access
               </MotionLink>
               <motion.a
                 className='btn'
@@ -761,16 +770,17 @@ function LandingPage() {
 
         <section className='cta'>
           <Reveal>
-            <h2>Join your SentryStrike workspace.</h2>
-            <p>Use your invitation to create an account, then launch authorized scans and manage remediation with your team.</p>
+            <h2>Start with a SentryStrike workspace.</h2>
+            <p>Request access for your organization. Approved owners receive a secure setup link by email.</p>
           </Reveal>
           <Reveal delay={0.12}>
             <MotionLink
               className='btn'
-              to='/register'
+              to='/request-access'
+              viewTransition
               whileTap={{ scale: 0.97 }}
             >
-              Join with invite
+              Request access
             </MotionLink>
           </Reveal>
         </section>

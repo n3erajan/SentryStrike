@@ -15,9 +15,8 @@ export function ToastProvider({ children }) {
   const showToast = useCallback((message, { type = "success", duration, fallback } = {}) => {
     const text = typeof message === "string" ? message : message?.message || fallback;
     if (!text) return;
-    const requestId = typeof message === "object" ? message?.requestId : "";
     setToast({
-      message: requestId ? `${text} Reference: ${requestId}` : text,
+      message: text,
       type,
       duration: duration ?? (type === "error" ? 7000 : 3500),
       id: Date.now(),

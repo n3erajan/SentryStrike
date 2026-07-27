@@ -5,8 +5,8 @@
 // — no localStorage, no bearer header management.
 //
 // Contract (mounted under /api/v1):
-//   POST /auth/register  { email, password, full_name, invite_token } -> 201 { user } + set-cookie
-//   POST /auth/login     { email, password }                          ->     { user } + set-cookie
+//   POST /auth/register  { email, password, full_name, invite_token, turnstile_token } -> 201 { user } + set-cookie
+//   POST /auth/login     { email, password, turnstile_token }                          ->     { user } + set-cookie
 //   POST /auth/logout                                                 ->     { logged_out: true } + clear-cookie
 //   GET  /auth/me                                                     ->     { id, email, ... }
 //   GET  /auth/invite    ?token                                       ->     { email, role, org_name }
@@ -20,10 +20,14 @@ export function isAuthenticated() {
   return false;
 }
 
-export async function login(credentials) {
+export function getAuthConfig(signal) {
+  return apiRequest("/auth/config", { signal });
+}
+
+export async function login({ email, password, turnstileToken }) {
   const data = await apiRequest("/auth/login", {
     method: "POST",
-    body: credentials,
+    body: { email, password, turnstile_token: turnstileToken },
   });
   return data.user;
 }
@@ -32,7 +36,13 @@ export function previewInvite(inviteToken, signal) {
   return apiRequest(`/auth/invite?token=${encodeURIComponent(inviteToken)}`, { signal });
 }
 
-export async function register({ email, password, fullName, inviteToken }) {
+export async function register({
+  email,
+  password,
+  fullName,
+  inviteToken,
+  turnstileToken,
+}) {
   const data = await apiRequest("/auth/register", {
     method: "POST",
     body: {
@@ -40,6 +50,7 @@ export async function register({ email, password, fullName, inviteToken }) {
       password,
       full_name: fullName,
       invite_token: inviteToken,
+      turnstile_token: turnstileToken,
     },
   });
   return data.user;

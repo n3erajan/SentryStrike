@@ -127,7 +127,7 @@ def test_smtp_backend_attaches_invite_logo_as_inline_png(monkeypatch) -> None:
 
 
 def test_owner_invite_email_has_token_fallback_when_no_public_link() -> None:
-    _, body_text, body_html = render_workspace_invite_email(
+    subject, body_text, body_html = render_workspace_invite_email(
         org_name="Acme",
         role="owner",
         link=None,
@@ -138,6 +138,12 @@ def test_owner_invite_email_has_token_fallback_when_no_public_link() -> None:
     assert "raw-<token>" in body_text
     assert "raw-&lt;token&gt;" in body_html
     assert "Workspace owner" in body_html
+    assert subject == "Your SentryStrike access request was approved"
+    assert "Your access request was approved" in body_html
+    assert "because you requested access" in body_html
+    assert "invited to create" not in body_text
+    assert "invitation" not in body_text.lower()
+    assert "workspace setup token" in body_text
     assert "Set up workspace" not in body_html
 
 
@@ -147,3 +153,8 @@ def test_smtp_configuration_rejects_only_one_credential() -> None:
             _env_file=None,
             EMAIL_SMTP_USER="sender@example.test",
         )
+
+
+def test_production_configuration_rejects_turnstile_test_keys() -> None:
+    with pytest.raises(ValueError, match="TURNSTILE_SITE_KEY"):
+        BackendSettings(_env_file=None, APP_DEBUG=False)

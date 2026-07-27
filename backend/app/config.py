@@ -11,6 +11,9 @@ from shared.config import (
     service_env_files,
 )
 
+TURNSTILE_TEST_SITE_KEY = "1x00000000000000000000AA"
+TURNSTILE_TEST_SECRET_KEY = "1x0000000000000000000000000000000AA"
+
 
 class BackendSettings(
     ScanQueueSettings,
@@ -52,6 +55,37 @@ class BackendSettings(
         default="sentrystrike:invite-rate", alias="INVITE_RATE_LIMIT_KEY_PREFIX"
     )
 
+    # Public workspace-access requests. Cloudflare's documented always-pass keys
+    # keep local development runnable, but are rejected when APP_DEBUG is false.
+    turnstile_site_key: str = Field(
+        default=TURNSTILE_TEST_SITE_KEY,
+        min_length=1,
+        alias="TURNSTILE_SITE_KEY",
+    )
+    turnstile_secret_key: SecretStr = Field(
+        default=TURNSTILE_TEST_SECRET_KEY,
+        alias="TURNSTILE_SECRET_KEY",
+    )
+    access_request_ttl_days: int = Field(
+        default=30,
+        ge=1,
+        alias="ACCESS_REQUEST_TTL_DAYS",
+    )
+    access_request_ip_limit_per_fifteen_minutes: int = Field(
+        default=1,
+        ge=1,
+        alias="ACCESS_REQUEST_IP_LIMIT_PER_FIFTEEN_MINUTES",
+    )
+    access_request_ip_limit_per_day: int = Field(
+        default=7,
+        ge=1,
+        alias="ACCESS_REQUEST_IP_LIMIT_PER_DAY",
+    )
+    access_request_rate_limit_key_prefix: str = Field(
+        default="sentrystrike:access-request-rate",
+        alias="ACCESS_REQUEST_RATE_LIMIT_KEY_PREFIX",
+    )
+
     # Local defaults allow the API to boot without external credentials. Point
     # these at a real relay in deployment; Gmail requires an app password.
     email_from: str = Field(default="SentryStrike <no-reply@sentrystrike.local>", alias="EMAIL_FROM")
@@ -88,6 +122,11 @@ class BackendSettings(
             )
         if self.email_smtp_host.lower() == "smtp.gmail.com" and not has_user:
             raise ValueError("Gmail SMTP requires EMAIL_SMTP_USER and EMAIL_SMTP_PASSWORD")
+        if not self.app_debug:
+            if self.turnstile_site_key == TURNSTILE_TEST_SITE_KEY:
+                raise ValueError("TURNSTILE_SITE_KEY must use a production key when APP_DEBUG is false")
+            if self.turnstile_secret_key.get_secret_value() == TURNSTILE_TEST_SECRET_KEY:
+                raise ValueError("TURNSTILE_SECRET_KEY must use a production key when APP_DEBUG is false")
         return self
 
 

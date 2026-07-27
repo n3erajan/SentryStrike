@@ -1079,7 +1079,6 @@ textarea:focus-visible {
 /* ============ LANDING ============ */
 .landing {
   min-height: 100dvh;
-  animation: enter 0.48s var(--ease);
 }
 .public-nav {
   height: 72px;
@@ -1874,6 +1873,28 @@ footer.public-footer {
 .auth-box .btn {
   width: 100%;
   margin-top: 19px;
+}
+.turnstile-slot {
+  width: 100%;
+  height: 65px;
+  margin-top: 20px;
+}
+.access-request-honeypot {
+  position: absolute;
+  left: -10000px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+.access-request-success > svg {
+  width: 42px;
+  height: 42px;
+  color: var(--good);
+  margin-bottom: 18px;
+}
+.access-request-success > p {
+  color: var(--sub);
+  margin-top: 8px;
 }
 .auth-switch {
   text-align: center;
@@ -3682,7 +3703,79 @@ footer.public-footer {
   }
 }
 
+/* Snapshot the complete route so the incoming page can stack over the current
+   one without animating either page's live layout or its nested effects. */
+::view-transition-group(root) {
+  perspective: 1400px;
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 680ms;
+  animation-fill-mode: both;
+  mix-blend-mode: normal;
+  backface-visibility: hidden;
+}
+
+::view-transition-old(root) {
+  z-index: 1;
+  animation-name: public-page-under;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+::view-transition-new(root) {
+  --public-page-shadow-opacity: 0;
+  z-index: 2;
+  transform-origin: right center;
+  animation-name: public-page-stack-in;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  box-shadow:
+    28px 0 96px 10px rgb(9 30 66 / var(--public-page-shadow-opacity)),
+    8px 0 36px rgb(9 30 66 / var(--public-page-shadow-opacity));
+}
+
+html[data-page-transition='back']::view-transition-new(root) {
+  transform-origin: left center;
+  animation-name: public-page-stack-back;
+  box-shadow:
+    -28px 0 96px 10px rgb(9 30 66 / var(--public-page-shadow-opacity)),
+    -8px 0 36px rgb(9 30 66 / var(--public-page-shadow-opacity));
+}
+
+@keyframes public-page-stack-in {
+  from {
+    transform: translate3d(-102%, 0, 0) rotateY(-2.5deg);
+  }
+  to {
+    transform: translate3d(0, 0, 0) rotateY(0deg);
+  }
+}
+
+@keyframes public-page-stack-back {
+  from {
+    transform: translate3d(102%, 0, 0) rotateY(2.5deg);
+  }
+  to {
+    transform: translate3d(0, 0, 0) rotateY(0deg);
+  }
+}
+
+@keyframes public-page-under {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0.9;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(root),
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 0.01ms !important;
+  }
+
   *,
   *:before,
   *:after {

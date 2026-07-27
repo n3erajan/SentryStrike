@@ -1,19 +1,48 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from app.api.dependencies import (
     get_auth_service,
     get_current_user,
     get_invite_service,
     get_session_token,
+    get_turnstile_verifier,
     json_response,
 )
 from app.config import get_settings
 from app.core.auth import AuthError, AuthService
 from app.core.invites import InviteError, InviteService
-from shared.models.user import User
+from app.core.turnstile import (
+    CaptchaInvalidError,
+    CaptchaUnavailableError,
+    TurnstileVerifier,
+)
+from shared.models.user import User, UserRole
 from app.schemas.auth_schema import AuthResponse, LoginRequest, RegisterRequest, UserResponse
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+async def _verify_captcha(
+    *,
+    token: str,
+    request: Request,
+    action: str,
+    verifier: TurnstileVerifier,
+) -> None:
+    client_ip = request.client.host if request.client else "unknown"
+    try:
+        await verifier.verify(
+            token=token,
+            client_ip=client_ip,
+            expected_action=action,
+        )
+    except CaptchaInvalidError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except CaptchaUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
 
 def _user_response(user: User) -> UserResponse:
@@ -62,6 +91,15 @@ def _auth_response(user: User, token: str, expires_at) -> dict:
     return AuthResponse(user=_user_response(user), access_token=token, expires_at=expires_at).model_dump(mode="json")
 
 
+@router.get("/config")
+async def auth_config() -> dict:
+    """Expose the public Turnstile site key used by auth forms."""
+    return json_response(
+        {"turnstile_site_key": get_settings().turnstile_site_key},
+        "auth configuration",
+    )
+
+
 @router.get("/invite")
 async def preview_invite(
     token: str = Query(min_length=1, max_length=512),
@@ -77,7 +115,12 @@ async def preview_invite(
     except InviteError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     return json_response(
-        {"email": invite.email, "role": invite.role.value, "org_name": invite.org_name},
+        {
+            "email": invite.email,
+            "role": invite.role.value,
+            "org_name": invite.org_name,
+            "owns_workspace": invite.role == UserRole.owner and invite.org_id is None,
+        },
         "invite valid",
     )
 
@@ -85,15 +128,23 @@ async def preview_invite(
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 async def register(
     payload: RegisterRequest,
+    request: Request,
     response: Response,
     invites: InviteService = Depends(get_invite_service),
     service: AuthService = Depends(get_auth_service),
+    turnstile: TurnstileVerifier = Depends(get_turnstile_verifier),
 ) -> dict:
     """Accept an invite and issue an initial session token.
 
     Registration is invite-only: the token pins the email and role, and (for an
     owner invite) creates the workspace. The submitted email must match.
     """
+    await _verify_captcha(
+        token=payload.turnstile_token,
+        request=request,
+        action="register",
+        verifier=turnstile,
+    )
     try:
         user = await invites.accept(
             token=payload.invite_token,
@@ -112,10 +163,18 @@ async def register(
 @router.post("/login")
 async def login(
     payload: LoginRequest,
+    request: Request,
     response: Response,
     service: AuthService = Depends(get_auth_service),
+    turnstile: TurnstileVerifier = Depends(get_turnstile_verifier),
 ) -> dict:
     """Authenticate with email and password, returning a session token."""
+    await _verify_captcha(
+        token=payload.turnstile_token,
+        request=request,
+        action="login",
+        verifier=turnstile,
+    )
     try:
         user = await service.authenticate(payload.email, payload.password)
         token, session = await service.create_session(user)

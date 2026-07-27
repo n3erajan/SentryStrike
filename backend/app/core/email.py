@@ -42,13 +42,24 @@ def render_workspace_invite_email(
     workspace = org_name or "your team's"
     role_label = "Workspace owner" if owns_workspace else role.replace("_", " ").title()
     if owns_workspace:
-        subject = f"You're invited to set up the {workspace} workspace on SentryStrike"
-        headline = f"Set up the {workspace} workspace"
+        subject = "Your SentryStrike access request was approved"
+        headline = "Your access request was approved"
         introduction = (
-            f"You've been invited to create and own the '{workspace}' workspace on "
-            "SentryStrike."
+            f"You can now create and own the '{workspace}' workspace on SentryStrike."
         )
         action_label = "Set up workspace"
+        action_instruction = "To get started, complete registration here:"
+        preheader = "Your SentryStrike access request was approved."
+        footer = (
+            "You received this email because you requested access to SentryStrike. "
+            "If you did not make this request, no action is required."
+        )
+        badge = "Access approved"
+        security_note = (
+            "This setup link is single-use and expires automatically. SentryStrike "
+            "will never ask you to share this link or your password."
+        )
+        token_label = "workspace setup token"
     else:
         subject = (
             f"You're invited to join the {org_name} workspace on SentryStrike"
@@ -61,17 +72,28 @@ def render_workspace_invite_email(
             f"as a {role}."
         )
         action_label = "Accept invitation"
+        action_instruction = "To accept, complete registration here:"
+        preheader = "Your SentryStrike workspace invitation is ready."
+        footer = (
+            "You received this email because someone invited you to a SentryStrike "
+            "workspace. If you were not expecting it, no action is required."
+        )
+        badge = "Workspace invitation"
+        security_note = (
+            "This invitation is single-use and expires automatically. SentryStrike "
+            "will never ask you to share this link or your password."
+        )
+        token_label = "invite token"
 
     destination = link or (
-        "your SentryStrike signup page with this invite token:\n\n"
+        f"your SentryStrike signup page with this {token_label}:\n\n"
         f"    {token}"
     )
     body_text = (
         "Hello,\n\n"
         f"{introduction}\n\n"
-        f"To accept, complete registration here:\n\n    {destination}\n\n"
-        "This invitation is single-use and will expire automatically. If you weren't "
-        "expecting it, you can safely ignore this email.\n"
+        f"{action_instruction}\n\n    {destination}\n\n"
+        f"{security_note}\n"
     )
 
     safe_workspace = escape(workspace)
@@ -79,6 +101,11 @@ def render_workspace_invite_email(
     safe_headline = escape(headline)
     safe_introduction = escape(introduction)
     safe_action_label = escape(action_label)
+    safe_badge = escape(badge)
+    safe_footer = escape(footer)
+    safe_preheader = escape(preheader)
+    safe_security_note = escape(security_note)
+    safe_token_label = escape(token_label)
     if link:
         safe_link = escape(link, quote=True)
         action_html = f"""
@@ -95,7 +122,7 @@ def render_workspace_invite_email(
     else:
         safe_token = escape(token)
         action_html = f"""
-          <p style="margin: 28px 0 10px; color: {SUBTLE_INK}; font-family: 'Segoe UI', sans-serif; font-size: 13px; line-height: 20px;">Open the SentryStrike registration page and enter this invite token:</p>
+          <p style="margin: 28px 0 10px; color: {SUBTLE_INK}; font-family: 'Segoe UI', sans-serif; font-size: 13px; line-height: 20px;">Open the SentryStrike registration page and enter this {safe_token_label}:</p>
           <div style="padding: 14px 16px; border: 1px solid {HAIRLINE}; border-radius: 8px; background: {PAGE_BACKGROUND}; overflow-wrap: anywhere; word-break: break-word; color: {INK}; font-family: Consolas, 'Courier New', monospace; font-size: 12px; line-height: 20px;">{safe_token}</div>
         """
 
@@ -108,7 +135,7 @@ def render_workspace_invite_email(
     <title>{escape(subject)}</title>
   </head>
   <body style="margin: 0; padding: 0; background: {PAGE_BACKGROUND}; color: {INK};">
-    <div style="display: none; max-height: 0; overflow: hidden; opacity: 0;">Your SentryStrike workspace invitation is ready.</div>
+    <div style="display: none; max-height: 0; overflow: hidden; opacity: 0;">{safe_preheader}</div>
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="{PAGE_BACKGROUND}" style="width: 100%; background: {PAGE_BACKGROUND};">
       <tr>
         <td align="center" style="padding: 40px 16px;">
@@ -126,7 +153,7 @@ def render_workspace_invite_email(
             </tr>
             <tr>
               <td style="padding: 38px 34px 34px;">
-                <span style="display: inline-block; padding: 5px 9px; border-radius: 999px; background: {BRAND_BLUE_SOFT}; color: {BRAND_BLUE_DARK}; font-family: 'Segoe UI', sans-serif; font-size: 10px; font-weight: 800; letter-spacing: 1.2px; line-height: 14px; text-transform: uppercase;">Workspace invitation</span>
+                <span style="display: inline-block; padding: 5px 9px; border-radius: 999px; background: {BRAND_BLUE_SOFT}; color: {BRAND_BLUE_DARK}; font-family: 'Segoe UI', sans-serif; font-size: 10px; font-weight: 800; letter-spacing: 1.2px; line-height: 14px; text-transform: uppercase;">{safe_badge}</span>
                 <h1 style="margin: 18px 0 14px; color: {INK}; font-family: 'Segoe UI', sans-serif; font-size: 30px; font-weight: 750; letter-spacing: -0.8px; line-height: 38px;">{safe_headline}</h1>
                 <p style="margin: 0; color: {SUBTLE_INK}; font-family: 'Segoe UI', sans-serif; font-size: 15px; line-height: 24px;">{safe_introduction}</p>
                 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top: 26px; border-top: 1px solid {HAIRLINE}; border-bottom: 1px solid {HAIRLINE};">
@@ -140,11 +167,11 @@ def render_workspace_invite_email(
                   </tr>
                 </table>
                 {action_html}
-                <div style="margin-top: 28px; padding: 15px 16px; border-left: 3px solid {BRAND_BLUE}; background: {BRAND_BLUE_SOFT}; color: {SUBTLE_INK}; font-family: 'Segoe UI', sans-serif; font-size: 12px; line-height: 19px;"><strong style="color: {INK};">Security note:</strong> This invitation is single-use and expires automatically. SentryStrike will never ask you to share this link or your password.</div>
+                <div style="margin-top: 28px; padding: 15px 16px; border-left: 3px solid {BRAND_BLUE}; background: {BRAND_BLUE_SOFT}; color: {SUBTLE_INK}; font-family: 'Segoe UI', sans-serif; font-size: 12px; line-height: 19px;"><strong style="color: {INK};">Security note:</strong> {safe_security_note}</div>
               </td>
             </tr>
             <tr>
-              <td style="padding: 21px 34px; border-top: 1px solid {HAIRLINE}; background: {PAGE_BACKGROUND}; color: {MUTED_INK}; font-family: 'Segoe UI', sans-serif; font-size: 11px; line-height: 17px;">You received this email because someone invited you to a SentryStrike workspace. If you were not expecting it, no action is required.</td>
+              <td style="padding: 21px 34px; border-top: 1px solid {HAIRLINE}; background: {PAGE_BACKGROUND}; color: {MUTED_INK}; font-family: 'Segoe UI', sans-serif; font-size: 11px; line-height: 17px;">{safe_footer}</td>
             </tr>
           </table>
         </td>

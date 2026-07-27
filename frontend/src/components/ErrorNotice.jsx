@@ -11,7 +11,6 @@ export default function ErrorNotice({
   if (!error) return null;
 
   const message = typeof error === "string" ? error : error.message || fallback;
-  const requestId = typeof error === "object" ? error.requestId : "";
 
   return (
     <div
@@ -23,7 +22,6 @@ export default function ErrorNotice({
       <div className='error-notice-copy'>
         {!compact && <strong>{title}</strong>}
         <p>{message}</p>
-        {requestId && <small>Reference: {requestId}</small>}
       </div>
       {onRetry && (
         <button type='button' className='error-notice-retry' onClick={onRetry}>

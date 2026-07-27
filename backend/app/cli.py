@@ -6,7 +6,9 @@ surface to secure.
 
 Usage::
 
-    python -m app.cli invite-owner --email owner@acme.com --org "Acme Corp" --member-limit 100
+    python -m app.cli list-access-requests
+    python -m app.cli approve-access-request --request-id <id> --member-limit 100
+    python -m app.cli reject-access-request --request-id <id>
     python -m app.cli email-check --to operator@example.com
     python -m app.cli invite-status --email owner@acme.com
     python -m app.cli set-member-limit --org-id <organization-id> --limit 25
@@ -21,6 +23,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import unicodedata
+
+from beanie import PydanticObjectId
 
 from app.config import get_settings
 from app.core.auth import normalize_email
@@ -29,6 +34,7 @@ from app.core.invites import InviteError, InviteService, build_invite_link
 from app.core.retention import RetentionService
 from shared.database.connection import close_db, init_db
 from shared.database.repositories.organization_repository import OrganizationRepository
+from shared.models.access_request import AccessRequest
 from shared.models.invite import Invite, InviteEmailStatus, InviteState
 from shared.models.user import User
 
@@ -43,17 +49,84 @@ def _member_limit(value: str) -> int:
     return limit
 
 
-async def _invite_owner(email: str, org: str, member_limit: int) -> int:
+def _access_request_list_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("limit must be an integer") from exc
+    if not 1 <= limit <= 200:
+        raise argparse.ArgumentTypeError("limit must be between 1 and 200")
+    return limit
+
+
+def _safe_table_cell(value: object, max_length: int) -> str:
+    text = " ".join(str(value).split())
+    text = "".join(
+        char for char in text if not unicodedata.category(char).startswith("C")
+    )
+    if len(text) <= max_length:
+        return text
+    return f"{text[: max_length - 1]}…"
+
+
+async def _list_access_requests(limit: int) -> int:
     await init_db(get_settings())
     try:
-        if not 1 <= member_limit <= 10000:
-            print("Error: member-limit must be between 1 and 10000.", file=sys.stderr)
+        requests = (
+            await AccessRequest.find()
+            .sort(AccessRequest.created_at)
+            .limit(limit)
+            .to_list()
+        )
+        if not requests:
+            print("No pending access requests.")
+            return 0
+
+        headers = ("REQUEST ID", "CREATED", "NAME", "EMAIL", "ORGANIZATION")
+        rows = [
+            (
+                str(item.id),
+                item.created_at.strftime("%Y-%m-%d %H:%M"),
+                _safe_table_cell(item.full_name, 24),
+                _safe_table_cell(item.email, 36),
+                _safe_table_cell(item.organization_name, 30),
+            )
+            for item in requests
+        ]
+        widths = [
+            max(len(headers[index]), *(len(row[index]) for row in rows))
+            for index in range(len(headers))
+        ]
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(headers)))
+        print("  ".join("-" * width for width in widths))
+        for row in rows:
+            print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+        return 0
+    finally:
+        await close_db()
+
+
+async def _find_access_request(request_id: str) -> AccessRequest | None:
+    try:
+        object_id = PydanticObjectId(request_id)
+    except Exception:
+        return None
+    return await AccessRequest.get(object_id)
+
+
+async def _approve_access_request(request_id: str, member_limit: int) -> int:
+    await init_db(get_settings())
+    try:
+        access_request = await _find_access_request(request_id)
+        if access_request is None:
+            print("Error: pending access request not found.", file=sys.stderr)
             return 1
+
         service = InviteService()
         try:
             token, invite, retried = await service.create_or_retry_owner_invite(
-                email=email,
-                org_name=org,
+                email=access_request.email,
+                org_name=access_request.organization_name,
                 member_limit=member_limit,
             )
         except InviteError as exc:
@@ -62,17 +135,17 @@ async def _invite_owner(email: str, org: str, member_limit: int) -> int:
 
         link = build_invite_link(token)
         subject, body_text, body_html = render_workspace_invite_email(
-            org_name=org,
+            org_name=access_request.organization_name,
             role="owner",
             link=link,
             token=token,
             owns_workspace=True,
         )
 
-        # Always show the operator the link/token, then attempt delivery.
         action = "reused after failed delivery" if retried else "created"
         print(
-            f"Owner invite {action} for {email} (workspace: {org!r}, "
+            f"Owner invite {action} for {access_request.email} "
+            f"(workspace: {access_request.organization_name!r}, "
             f"member limit: {member_limit})."
         )
         print(f"Invite id: {invite.id}")
@@ -85,7 +158,7 @@ async def _invite_owner(email: str, org: str, member_limit: int) -> int:
         backend = get_email_backend()
         try:
             backend.send(
-                to=email,
+                to=access_request.email,
                 subject=subject,
                 body_text=body_text,
                 body_html=body_html,
@@ -110,9 +183,25 @@ async def _invite_owner(email: str, org: str, member_limit: int) -> int:
             backend=backend.name,
         )
         print(
-            f"SMTP server accepted the invitation for {email}. "
+            f"SMTP server accepted the invitation for {access_request.email}. "
             "This confirms server handoff, not inbox delivery."
         )
+        await access_request.delete()
+        print(f"Access request {request_id} approved and removed.")
+        return 0
+    finally:
+        await close_db()
+
+
+async def _reject_access_request(request_id: str) -> int:
+    await init_db(get_settings())
+    try:
+        access_request = await _find_access_request(request_id)
+        if access_request is None:
+            print("Error: pending access request not found.", file=sys.stderr)
+            return 1
+        await access_request.delete()
+        print(f"Access request {request_id} rejected and removed.")
         return 0
     finally:
         await close_db()
@@ -235,15 +324,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="app.cli", description="SentryStrike management CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    invite = sub.add_parser("invite-owner", help="Invite a business owner to create a new workspace")
-    invite.add_argument("--email", required=True, help="Email address of the owner to invite")
-    invite.add_argument("--org", required=True, help="Name of the workspace the owner will create")
-    invite.add_argument(
+    access_list = sub.add_parser(
+        "list-access-requests", help="List pending public workspace-access requests"
+    )
+    access_list.add_argument(
+        "--limit", type=_access_request_list_limit, default=50, metavar="LIMIT"
+    )
+
+    approve = sub.add_parser(
+        "approve-access-request", help="Approve a request and email an owner invite"
+    )
+    approve.add_argument("--request-id", required=True, help="Pending access-request id")
+    approve.add_argument(
         "--member-limit",
         type=_member_limit,
         default=10,
         help="Initial workspace member limit (1–10000), including the owner and pending invites (default: 10)",
     )
+
+    reject = sub.add_parser(
+        "reject-access-request", help="Reject and delete a pending access request"
+    )
+    reject.add_argument("--request-id", required=True, help="Pending access-request id")
 
     email_check = sub.add_parser(
         "email-check", help="Show effective email settings and send an SMTP diagnostic"
@@ -267,8 +369,14 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    if args.command == "invite-owner":
-        return asyncio.run(_invite_owner(args.email, args.org, args.member_limit))
+    if args.command == "list-access-requests":
+        return asyncio.run(_list_access_requests(args.limit))
+    if args.command == "approve-access-request":
+        return asyncio.run(
+            _approve_access_request(args.request_id, args.member_limit)
+        )
+    if args.command == "reject-access-request":
+        return asyncio.run(_reject_access_request(args.request_id))
     if args.command == "email-check":
         return _email_check(args.to)
     if args.command == "invite-status":

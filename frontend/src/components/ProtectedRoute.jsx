@@ -1,4 +1,5 @@
 import { Navigate, Outlet, useLocation } from "react-router-dom";
+import { MotionConfig } from "motion/react";
 import { useAuth } from "../context/AuthContext.jsx";
 
 // Gate for authenticated routes. When there's no signed-in user
@@ -15,15 +16,19 @@ function ProtectedRoute() {
   return <Outlet />;
 }
 
-// Inverse gate for the landing / login / register screens: a signed-in user is
-// sent straight into the app instead of seeing them again.
+// Inverse gate for public screens: a signed-in user is sent straight into the
+// app instead of seeing them again.
 export function PublicOnlyRoute() {
   const { user, loading } = useAuth();
   if (loading) return null;
   if (user) {
     return <Navigate to='/home' replace />;
   }
-  return <Outlet />;
+  return (
+    <MotionConfig reducedMotion='user'>
+      <Outlet />
+    </MotionConfig>
+  );
 }
 
 export default ProtectedRoute;

@@ -1,9 +1,13 @@
-/* Shared motion tokens for the landing page.
+/* Shared motion tokens for the public pages.
    Feel: subtle & confident — opacity + small translate + blur,
    springs with no bounce. */
 
 export const SPRING = { type: "spring", duration: 0.7, bounce: 0 };
 export const SPRING_FAST = { type: "spring", duration: 0.38, bounce: 0 };
+export const FOCUS_REVEAL = {
+  duration: 0.5,
+  ease: [0.16, 1, 0.3, 1],
+};
 /* Trigger reveals only once the element is well inside the viewport,
    so the motion is visible while scrolling instead of already done. */
 export const VIEWPORT = { once: true, margin: "0px 0px -160px 0px" };
@@ -14,7 +18,7 @@ export const fadeUp = {
     opacity: 1,
     y: 0,
     filter: "blur(0px)",
-    transition: SPRING,
+    transition: FOCUS_REVEAL,
   },
 };
 

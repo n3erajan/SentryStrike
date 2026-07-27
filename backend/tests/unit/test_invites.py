@@ -11,7 +11,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_auth_service, get_invite_service
+from app.api.dependencies import (
+    get_auth_service,
+    get_invite_service,
+    get_turnstile_verifier,
+)
 from app.api.routes import auth
 from app.config import get_settings
 from app.core import invites as invite_module
@@ -201,6 +205,7 @@ class FakeInviteService:
             email="invitee@example.test",
             role=SimpleNamespace(value="developer"),
             org_name=None,
+            org_id="org-1",
         )
 
     async def preview(self, token):
@@ -239,11 +244,17 @@ class FakeAuthService:
         return "session-token", self.session
 
 
+class FakeTurnstileVerifier:
+    async def verify(self, **_kwargs) -> None:
+        return None
+
+
 def _client(invites: FakeInviteService) -> TestClient:
     app = FastAPI()
     app.include_router(auth.router, prefix="/api/v1")
     app.dependency_overrides[get_invite_service] = lambda: invites
     app.dependency_overrides[get_auth_service] = lambda: FakeAuthService()
+    app.dependency_overrides[get_turnstile_verifier] = lambda: FakeTurnstileVerifier()
     return TestClient(app)
 
 
@@ -256,6 +267,25 @@ def test_preview_invite_returns_pinned_email_and_role() -> None:
     data = response.json()["data"]
     assert data["email"] == "invitee@example.test"
     assert data["role"] == "developer"
+    assert data["owns_workspace"] is False
+
+
+def test_preview_owner_access_request_identifies_workspace_setup() -> None:
+    invites = FakeInviteService()
+    invites.pending = SimpleNamespace(
+        email="owner@example.test",
+        role=UserRole.owner,
+        org_name="Acme",
+        org_id=None,
+    )
+    client = _client(invites)
+
+    response = client.get("/api/v1/auth/invite", params={"token": "good-token"})
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["org_name"] == "Acme"
+    assert data["owns_workspace"] is True
 
 
 def test_preview_invalid_invite_returns_400() -> None:
@@ -277,6 +307,7 @@ def test_register_consumes_invite_and_issues_session() -> None:
             "full_name": "Niuradaj   Adhadh",
             "email": "invitee@example.test",
             "password": "password123",
+            "turnstile_token": "verified-token",
         },
     )
 
@@ -302,6 +333,7 @@ def test_register_rejects_email_not_matching_invite() -> None:
             "full_name": "Niuradaj Adhadh",
             "email": "someone-else@example.test",
             "password": "password123",
+            "turnstile_token": "verified-token",
         },
     )
 
@@ -317,6 +349,7 @@ def test_register_requires_invite_token() -> None:
             "full_name": "Niuradaj Adhadh",
             "email": "invitee@example.test",
             "password": "password123",
+            "turnstile_token": "verified-token",
         },
     )
 
@@ -333,6 +366,7 @@ def test_register_requires_full_name() -> None:
             "invite_token": "good-token",
             "email": "invitee@example.test",
             "password": "password123",
+            "turnstile_token": "verified-token",
         },
     )
 

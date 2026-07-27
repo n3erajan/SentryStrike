@@ -3,9 +3,12 @@ from http.cookies import SimpleCookie
 from fastapi import Depends, Header, HTTPException, Request, status
 
 from app.config import get_settings
+from app.core.access_request_rate_limit import RedisAccessRequestRateLimiter
+from app.core.access_requests import AccessRequestService
 from app.core.auth import AuthService, InvalidSessionError
 from app.core.invites import InviteService
 from app.core.invite_rate_limit import RedisInviteRateLimiter
+from app.core.turnstile import TurnstileVerifier
 from shared.analysis_queue import AnalysisQueue, RedisAnalysisQueue
 from shared.database.repositories.application_repository import ApplicationRepository
 from shared.database.repositories.audit_repository import AuditRepository
@@ -30,6 +33,11 @@ analysis_job_repository = AnalysisJobRepository()
 analysis_queue = RedisAnalysisQueue.from_settings(get_settings())
 auth_service = AuthService()
 invite_service = InviteService(RedisInviteRateLimiter.from_settings())
+turnstile_verifier = TurnstileVerifier()
+access_request_service = AccessRequestService(
+    RedisAccessRequestRateLimiter.from_settings(),
+    turnstile_verifier,
+)
 
 
 def get_scan_repository() -> ScanRepository:
@@ -81,6 +89,16 @@ def get_auth_service() -> AuthService:
 def get_invite_service() -> InviteService:
     """FastAPI dependency: provide the shared InviteService singleton."""
     return invite_service
+
+
+def get_access_request_service() -> AccessRequestService:
+    """FastAPI dependency: provide the shared public access-request service."""
+    return access_request_service
+
+
+def get_turnstile_verifier() -> TurnstileVerifier:
+    """FastAPI dependency: provide the shared Turnstile verifier."""
+    return turnstile_verifier
 
 
 def _bearer_token(authorization: str | None) -> str | None:

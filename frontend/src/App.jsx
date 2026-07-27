@@ -6,6 +6,7 @@ import { PublicOnlyRoute } from "./components/ProtectedRoute.jsx";
 import LandingPage from "./pages/LandingPage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import RegisterPage from "./pages/RegisterPage.jsx";
+import RequestAccessPage from "./pages/RequestAccessPage.jsx";
 import HomePage from "./pages/HomePage.jsx";
 import AppsPage from "./pages/AppsPage.jsx";
 import ApplicationPage from "./pages/ApplicationPage.jsx";
@@ -25,6 +26,7 @@ function App() {
         <Route path='/' element={<LandingPage />} />
         <Route path='/login' element={<LoginPage />} />
         <Route path='/register' element={<RegisterPage />} />
+        <Route path='/request-access' element={<RequestAccessPage />} />
       </Route>
 
       <Route element={<ProtectedRoute />}>

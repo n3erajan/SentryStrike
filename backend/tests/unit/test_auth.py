@@ -4,14 +4,21 @@ from types import SimpleNamespace
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_auth_service, get_current_user, get_session_token
+from app.api.dependencies import (
+    get_auth_service,
+    get_current_user,
+    get_session_token,
+    get_turnstile_verifier,
+)
 from app.api.routes import auth, scan
 from app.core.auth import as_utc_naive, hash_password, utc_now, verify_password
+from app.core.turnstile import CaptchaInvalidError
 
 
 class FakeAuthService:
     def __init__(self) -> None:
         self.revoked_token: str | None = None
+        self.authenticate_calls: list[tuple[str, str]] = []
         self.user = SimpleNamespace(
             id="user-1",
             full_name="Niuradaj Adhadh",
@@ -24,7 +31,7 @@ class FakeAuthService:
         self.session = SimpleNamespace(created_at=now, expires_at=now + timedelta(hours=24))
 
     async def authenticate(self, email: str, password: str):
-        _ = (email, password)
+        self.authenticate_calls.append((email, password))
         return self.user
 
     async def create_session(self, user):
@@ -36,10 +43,27 @@ class FakeAuthService:
         return True
 
 
-def _auth_app(service: FakeAuthService) -> TestClient:
+class FakeTurnstileVerifier:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.calls: list[dict] = []
+        self.error = error
+
+    async def verify(self, **kwargs) -> None:
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+
+
+def _auth_app(
+    service: FakeAuthService,
+    turnstile: FakeTurnstileVerifier | None = None,
+) -> TestClient:
     app = FastAPI()
     app.include_router(auth.router, prefix="/api/v1")
     app.dependency_overrides[get_auth_service] = lambda: service
+    app.dependency_overrides[get_turnstile_verifier] = lambda: (
+        turnstile or FakeTurnstileVerifier()
+    )
     return TestClient(app)
 
 
@@ -62,11 +86,16 @@ def test_auth_datetime_helpers_compare_database_naive_values() -> None:
 
 
 def test_login_returns_token_and_http_only_cookie() -> None:
-    client = _auth_app(FakeAuthService())
+    turnstile = FakeTurnstileVerifier()
+    client = _auth_app(FakeAuthService(), turnstile)
 
     response = client.post(
         "/api/v1/auth/login",
-        json={"email": "USER@example.test", "password": "password123"},
+        json={
+            "email": "USER@example.test",
+            "password": "password123",
+            "turnstile_token": "verified-token",
+        },
     )
 
     assert response.status_code == 200
@@ -77,6 +106,34 @@ def test_login_returns_token_and_http_only_cookie() -> None:
     assert body["data"]["user"]["email"] == "user@example.test"
     assert "sentrystrike_session=test-token" in response.headers["set-cookie"]
     assert "HttpOnly" in response.headers["set-cookie"]
+    assert turnstile.calls == [
+        {
+            "token": "verified-token",
+            "client_ip": "testclient",
+            "expected_action": "login",
+        }
+    ]
+
+
+def test_login_rejects_invalid_captcha_before_checking_credentials() -> None:
+    service = FakeAuthService()
+    turnstile = FakeTurnstileVerifier(
+        CaptchaInvalidError("Complete the security check and try again.")
+    )
+    client = _auth_app(service, turnstile)
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "user@example.test",
+            "password": "password123",
+            "turnstile_token": "invalid-token",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "security check" in response.json()["detail"]
+    assert service.authenticate_calls == []
 
 
 def test_logout_requires_current_user_and_revokes_current_token() -> None:

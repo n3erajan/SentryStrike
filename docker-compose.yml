@@ -36,6 +36,9 @@ services:
     environment:
       MONGODB_URI: mongodb://mongo:27017
       REDIS_URL: redis://redis:6379/0
+      # The backend is not published to the host in this stack; all public HTTP
+      # traffic arrives through the frontend nginx container.
+      FORWARDED_ALLOW_IPS: '*'
     depends_on:
       mongo:
         condition: service_healthy

@@ -9,22 +9,20 @@ from shared.models.invite import InviteEmailStatus, InviteState
 from shared.models.user import UserRole
 
 
-def test_invite_owner_accepts_per_workspace_member_limit(monkeypatch) -> None:
+def test_approve_access_request_accepts_per_workspace_member_limit(monkeypatch) -> None:
     captured = {}
 
-    async def invite_owner(email: str, org: str, member_limit: int) -> int:
-        captured.update(email=email, org=org, member_limit=member_limit)
+    async def approve(request_id: str, member_limit: int) -> int:
+        captured.update(request_id=request_id, member_limit=member_limit)
         return 0
 
-    monkeypatch.setattr(cli, "_invite_owner", invite_owner)
+    monkeypatch.setattr(cli, "_approve_access_request", approve)
 
     result = cli.main(
         [
-            "invite-owner",
-            "--email",
-            "owner@example.test",
-            "--org",
-            "Acme",
+            "approve-access-request",
+            "--request-id",
+            "request-1",
             "--member-limit",
             "100",
         ]
@@ -32,29 +30,40 @@ def test_invite_owner_accepts_per_workspace_member_limit(monkeypatch) -> None:
 
     assert result == 0
     assert captured == {
-        "email": "owner@example.test",
-        "org": "Acme",
+        "request_id": "request-1",
         "member_limit": 100,
     }
 
 
-def test_invite_owner_defaults_to_ten_members(monkeypatch) -> None:
+def test_approve_access_request_defaults_to_ten_members(monkeypatch) -> None:
     captured = {}
 
-    async def invite_owner(email: str, org: str, member_limit: int) -> int:
+    async def approve(request_id: str, member_limit: int) -> int:
+        captured["request_id"] = request_id
         captured["member_limit"] = member_limit
         return 0
 
-    monkeypatch.setattr(cli, "_invite_owner", invite_owner)
+    monkeypatch.setattr(cli, "_approve_access_request", approve)
 
-    assert cli.main(["invite-owner", "--email", "owner@example.test", "--org", "Acme"]) == 0
+    assert cli.main(["approve-access-request", "--request-id", "request-1"]) == 0
+    assert captured["request_id"] == "request-1"
     assert captured["member_limit"] == 10
 
 
-def test_invite_owner_smtp_failure_is_recorded_and_returns_error(monkeypatch, capsys) -> None:
+def test_approve_access_request_smtp_failure_keeps_request(monkeypatch, capsys) -> None:
     recorded = {}
     sent = {}
     invite = SimpleNamespace(id="invite-1")
+    access_request = SimpleNamespace(
+        email="owner@example.test",
+        organization_name="Acme",
+        deleted=False,
+    )
+
+    async def delete_request():
+        access_request.deleted = True
+
+    access_request.delete = delete_request
 
     class Service:
         async def create_or_retry_owner_invite(self, **kwargs):
@@ -75,21 +84,26 @@ def test_invite_owner_smtp_failure_is_recorded_and_returns_error(monkeypatch, ca
     async def no_op(*_args):
         return None
 
+    async def find_access_request(_request_id):
+        return access_request
+
     monkeypatch.setattr(cli, "init_db", no_op)
     monkeypatch.setattr(cli, "close_db", no_op)
     monkeypatch.setattr(cli, "InviteService", Service)
     monkeypatch.setattr(cli, "get_email_backend", FailingBackend)
     monkeypatch.setattr(cli, "build_invite_link", lambda token: f"https://test/register?invite={token}")
+    monkeypatch.setattr(cli, "_find_access_request", find_access_request)
 
-    result = asyncio.run(cli._invite_owner("owner@example.test", "Acme", 10))
+    result = asyncio.run(cli._approve_access_request("request-1", 10))
 
     captured = capsys.readouterr()
     assert result == 1
     assert recorded["status"] == InviteEmailStatus.failed
-    assert "Set up the Acme workspace" in sent["body_html"]
+    assert "Your access request was approved" in sent["body_html"]
     assert "https://test/register?invite=raw-token" in sent["body_html"]
     assert "SMTP did not accept" in captured.err
     assert "dispatched" not in captured.out
+    assert access_request.deleted is False
 
 
 def test_set_member_limit_targets_one_existing_workspace(monkeypatch) -> None:
@@ -112,11 +126,9 @@ def test_member_limit_rejects_invalid_values(value: str) -> None:
     with pytest.raises(SystemExit) as exc_info:
         cli.main(
             [
-                "invite-owner",
-                "--email",
-                "owner@example.test",
-                "--org",
-                "Acme",
+                "approve-access-request",
+                "--request-id",
+                "request-1",
                 "--member-limit",
                 value,
             ]

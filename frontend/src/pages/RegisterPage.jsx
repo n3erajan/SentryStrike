@@ -1,12 +1,18 @@
-import { useEffect, useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useCallback, useEffect, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { CheckCircle2, Loader2, Eye, EyeOff } from "lucide-react";
 import { useAuth } from "../context/AuthContext.jsx";
-import { previewInvite } from "../services/auth.js";
+import { getAuthConfig, previewInvite } from "../services/auth.js";
 import AuthBrand from "../components/AuthBrand.jsx";
 import ThemeToggle from "../components/ThemeToggle.jsx";
 import Tooltip from "../components/Tooltip.jsx";
 import ErrorNotice from "../components/ErrorNotice.jsx";
+import PageTransitionLink from "../components/PageTransitionLink.jsx";
+import TurnstileWidget from "../components/TurnstileWidget.jsx";
+import { AnimatedWords } from "../components/motion/primitives.jsx";
+import useDelayedTurnstileConfig from "../hooks/useDelayedTurnstileConfig.js";
+
+const Link = PageTransitionLink;
 
 function RegisterPage() {
   const { register } = useAuth();
@@ -22,6 +28,10 @@ function RegisterPage() {
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [turnstileToken, setTurnstileToken] = useState("");
+  const [captchaReset, setCaptchaReset] = useState(0);
+  const { siteKey: turnstileSiteKey, configError } =
+    useDelayedTurnstileConfig(getAuthConfig);
 
   useEffect(() => {
     if (!inviteToken) return;
@@ -37,7 +47,16 @@ function RegisterPage() {
   const nameValid = fullName.trim().length >= 2;
   const passwordValid = password.length >= 8;
   const confirmValid = confirmPassword.length > 0 && confirmPassword === password;
-  const canSubmit = inviteState === "valid" && nameValid && passwordValid && confirmValid && !submitting;
+  const canSubmit =
+    inviteState === "valid" &&
+    nameValid &&
+    passwordValid &&
+    confirmValid &&
+    Boolean(turnstileToken) &&
+    !submitting;
+  const ownsWorkspace = invite?.owns_workspace === true;
+
+  const handleCaptchaError = useCallback((message) => setError(message), []);
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -45,10 +64,18 @@ function RegisterPage() {
     if (!canSubmit) return;
     setSubmitting(true);
     try {
-      await register({ email: invite.email, password, fullName, inviteToken });
+      await register({
+        email: invite.email,
+        password,
+        fullName,
+        inviteToken,
+        turnstileToken,
+      });
       navigate("/home", { replace: true });
     } catch (err) {
       setError(err);
+      setTurnstileToken("");
+      setCaptchaReset((value) => value + 1);
     } finally { setSubmitting(false); }
   }
 
@@ -61,12 +88,15 @@ function RegisterPage() {
   return (
     <div className='auth-shell'>
       <div className='auth-left'>
-        <div className='auth-header'><Link to='/' className='brand'><img src='/sentrystrike-logo.svg' alt='' className='mark-img' />SentryStrike</Link><ThemeToggle /></div>
+        <div className='auth-header'><Link to='/' className='brand' viewTransition><img src='/sentrystrike-logo.svg' alt='' className='mark-img' />SentryStrike</Link><ThemeToggle /></div>
         <div className='auth-box'>
-          <h1>Join your workspace</h1>
-          <p>{invite ? <>You were invited to <b>{invite.org_name}</b> as <b>{invite.role}</b>.</> : "Use the invitation link sent by your workspace administrator."}</p>
-          {inviteState === "loading" && <div className='empty-state'><Loader2 className='ico spin' /> Validating invitation…</div>}
-          {inviteState === "missing" && <ErrorNotice error='Registration is invite-only. Ask a workspace owner or admin for an invitation.' compact />}
+          <AnimatedWords
+            text={ownsWorkspace ? "Set up your workspace" : "Join your workspace"}
+            delay={0.16}
+          />
+          <p>{invite ? (ownsWorkspace ? <>Your request for <b>{invite.org_name}</b> was approved. Create your account to set up the workspace.</> : <>You were invited to join <b>{invite.org_name}</b> as <b>{invite.role}</b>. Create your account to continue.</>) : "Open the invitation link sent to your email."}</p>
+          {inviteState === "loading" && <div className='empty-state'><Loader2 className='ico spin' /> Checking invitation…</div>}
+          {inviteState === "missing" && <ErrorNotice error='Registration requires a valid invitation link. Ask a workspace owner or admin to send you one.' compact />}
           {inviteState === "invalid" && <ErrorNotice error={error} fallback='This invitation is invalid or has expired.' compact />}
           {inviteState === "valid" && (
             <form onSubmit={handleSubmit} noValidate style={{ marginTop: 26 }}>
@@ -82,11 +112,18 @@ function RegisterPage() {
                   {touched[f.key] && !f.valid && <span className='field-error'>{f.error}</span>}
                 </div>;
               })}
-              <ErrorNotice error={error} fallback='Unable to create your account.' compact />
-              <button className='btn primary' type='submit' disabled={!canSubmit}>{submitting && <Loader2 className='ico spin' />}Accept invite and join</button>
+              <TurnstileWidget
+                siteKey={turnstileSiteKey}
+                action='register'
+                onTokenChange={setTurnstileToken}
+                onError={handleCaptchaError}
+                resetKey={captchaReset}
+              />
+              <ErrorNotice error={error || configError} fallback='Unable to create your account.' compact />
+              <button className='btn primary' type='submit' disabled={!canSubmit}>{submitting && <Loader2 className='ico spin' />}{ownsWorkspace ? "Create account and workspace" : "Create account and join"}</button>
             </form>
           )}
-          <div className='auth-switch'>Already registered? <Link className='text-btn' to='/login'>Sign in</Link></div>
+          <div className='auth-switch'>Already have an account? <Link className='text-btn' to='/login' viewTransition>Sign in</Link></div>
         </div>
       </div>
       <AuthBrand mode='register' />
