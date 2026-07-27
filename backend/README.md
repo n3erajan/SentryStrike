@@ -79,16 +79,20 @@ Login and registration set an HttpOnly session cookie. Production deployments sh
 ## Management CLI
 
 Run commands from `backend/` with the repository virtual environment active.
+Use `python -m app.cli --help` to see the command overview, or append `--help`
+to any command for its arguments, aliases, and an example.
 
 ```bash
-python -m app.cli list-access-requests
-python -m app.cli approve-access-request --request-id <request-id> --member-limit 10
-python -m app.cli reject-access-request --request-id <request-id>
-python -m app.cli invite-status --email owner@example.com
-python -m app.cli email-check --to operator@example.com
-python -m app.cli set-member-limit --org-id <organization-id> --limit 25
-python -m app.cli purge-retention
+python -m app.cli list --limit 50
+python -m app.cli approve <request-id> --member-limit 10
+python -m app.cli reject <request-id>
+python -m app.cli status owner@example.com
+python -m app.cli email operator@example.com
+python -m app.cli set-limit <organization-id> 25
+python -m app.cli purge
 ```
+
+The previous long-form command names remain available as aliases.
 
 Prospective owners submit through the public `/request-access` page, but review
 and approval remain CLI-only. Approval creates and emails a single-use owner

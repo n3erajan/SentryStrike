@@ -178,15 +178,15 @@ Review the pending request and approve it from the backend CLI:
 
 ```bash
 cd backend
-python -m app.cli list-access-requests
-python -m app.cli approve-access-request --request-id <request-id> --member-limit 10
+python -m app.cli list
+python -m app.cli approve <request-id> --member-limit 10
 ```
 
 Approval creates the owner invitation, prints its link or token, and attempts to
 email it. A rejected request can instead be removed with:
 
 ```bash
-python -m app.cli reject-access-request --request-id <request-id>
+python -m app.cli reject <request-id>
 ```
 
 Pending access requests are limited by IP in Redis, deduplicated by normalized
