@@ -73,7 +73,7 @@ function useScanForm({ applicationId } = {}) {
       })
       .catch((err) => {
         if (err.name !== "AbortError")
-          setError(err.message || "Could not load this application's defaults.");
+          setError(err);
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoadedApp(applicationId);
@@ -107,7 +107,7 @@ function useScanForm({ applicationId } = {}) {
     } catch (err) {
       // 409 means a scan for this same target is already queued or running;
       // the backend's message names it, so surface that verbatim.
-      setError(err.message || "Could not start the scan.");
+      setError(err);
       setConflict(err.status === 409);
       return null;
     } finally {

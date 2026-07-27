@@ -18,6 +18,7 @@ from shared.database.repositories.reverification_repository import Reverificatio
 from shared.models.notification import NotificationType
 from shared.models.reverification import ReverificationStatus
 from shared.models.scan import ScanPhase, ScanStatus
+from shared.notification_copy import reverification_copy, scan_terminal_copy
 from shared.scan_queue import RedisScanQueue, ScanJob, ScanJobKind, ScanQueue, ScanQueueError
 from shared.utils.logger import configure_logging
 
@@ -33,22 +34,21 @@ TERMINAL_SCAN_STATUSES = {
 async def _notify_terminal_scan(scan) -> None:
     """Emit one idempotent terminal notification for the scan submitter."""
     mapping = {
-        ScanStatus.completed: (NotificationType.scan_completed, "Scan completed", "completed"),
-        ScanStatus.failed: (NotificationType.scan_failed, "Scan failed", "failed"),
-        ScanStatus.cancelled: (NotificationType.scan_cancelled, "Scan cancelled", "was cancelled"),
+        ScanStatus.completed: NotificationType.scan_completed,
+        ScanStatus.failed: NotificationType.scan_failed,
+        ScanStatus.cancelled: NotificationType.scan_cancelled,
     }
-    details = mapping.get(scan.status)
-    if details is None:
+    notification_type = mapping.get(scan.status)
+    if notification_type is None:
         return
-    notification_type, title, verb = details
     target_url = scan.target_url
-    message = f"The scan of {target_url} {verb}."
+    copy = scan_terminal_copy(scan.status, target_url)
     await NotificationRepository().create(
         org_id=scan.org_id,
         recipient_user_id=scan.submitted_by_user_id,
         type=notification_type,
-        title=title,
-        message=message,
+        title=copy.title,
+        message=copy.message,
         resource_type="scan",
         resource_id=str(scan.id),
         metadata={"status": scan.status.value, "target_url": target_url},
@@ -263,20 +263,27 @@ async def process_reverification_job(
             vuln_type=verification.target.vuln_type,
         )
         await repository.complete(verification, outcome=outcome, evidence=evidence)
-        message = (
-            f"Re-verification finished with outcome: {outcome.value.replace('_', ' ')}."
+        copy = reverification_copy(
+            outcome=outcome,
+            finding_type=verification.target.vuln_type,
         )
     except Exception as exc:
         logger.exception("re-verification job %s failed", verification.id)
-        await repository.fail(verification, str(exc))
-        message = "Re-verification failed before a result could be determined."
+        await repository.fail(
+            verification,
+            "Re-verification stopped before it could finish. Please try again.",
+        )
+        copy = reverification_copy(
+            outcome=None,
+            finding_type=verification.target.vuln_type,
+        )
 
     await NotificationRepository().create(
         org_id=verification.org_id,
         recipient_user_id=verification.requested_by_user_id,
         type=NotificationType.reverification_completed,
-        title="Finding re-verification completed",
-        message=message,
+        title=copy.title,
+        message=copy.message,
         resource_type="reverification",
         resource_id=str(verification.id),
         metadata={

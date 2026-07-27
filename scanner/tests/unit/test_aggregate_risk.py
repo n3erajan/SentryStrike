@@ -1,10 +1,10 @@
-"""Aggregate risk-score model: max-anchored + bounded severity-weighted breadth.
+"""Aggregate risk-score model: evidence-adjusted, band-preserving breadth.
 
 Standards-aligned properties under test (CVSS base scores must not be averaged —
 averaging dilutes the worst finding, and an attacker only needs one):
   * the worst finding anchors the score and is never diluted by lower-severity noise
-  * additional findings add bounded, saturating, severity-weighted breadth
-  * unverified findings weigh less; the score is bounded to 100
+  * additional findings add saturating breadth without crossing the anchor's band
+  * evidence strength adjusts risk; manual dispositions do not rewrite scan history
 """
 
 from uuid import uuid4
@@ -12,6 +12,7 @@ from uuid import uuid4
 from app.core.scanner import ScanOrchestrator
 from shared.models.vulnerability import (
     Evidence,
+    EvidenceStrength,
     LocationInfo,
     OwaspCategory,
     SeverityLevel,
@@ -27,6 +28,11 @@ C, H, M, L = (
 
 
 def mk(cvss: float, severity: SeverityLevel, verified: bool = True, fp: bool = False) -> Vulnerability:
+    strength = (
+        EvidenceStrength.confirmed_exploit
+        if verified
+        else EvidenceStrength.probable
+    )
     return Vulnerability(
         id=str(uuid4()),
         category=OwaspCategory.a05,
@@ -34,7 +40,7 @@ def mk(cvss: float, severity: SeverityLevel, verified: bool = True, fp: bool = F
         severity=severity,
         cvss_score=cvss,
         location=LocationInfo(url="http://target.test/"),
-        evidence=Evidence(verified=verified),
+        evidence=Evidence(verified=verified, evidence_strength=strength),
         is_false_positive=fp,
     )
 
@@ -47,8 +53,18 @@ def test_empty_is_zero_info() -> None:
     assert agg([]) == (0.0, "Info")
 
 
-def test_all_false_positives_scored_zero() -> None:
-    assert agg([mk(9.1, C, fp=True), mk(8.0, H, fp=True)]) == (0.0, "Info")
+def test_typical_verified_medium_scores_are_calibrated() -> None:
+    assert agg([mk(5.5, M)]) == (55.0, "Medium")
+    assert agg([mk(5.5, M), mk(5.5, M)]) == (57.09, "Medium")
+
+
+def test_manual_false_positive_disposition_does_not_rewrite_risk() -> None:
+    findings = [mk(9.1, C), mk(8.0, H)]
+    original = agg(findings)
+    for finding in findings:
+        finding.is_false_positive = True
+
+    assert agg(findings) == original
 
 
 def test_worst_finding_is_not_diluted_by_low_severity_noise() -> None:
@@ -89,7 +105,7 @@ def test_report_scenario_stays_critical_for_the_right_reason() -> None:
     )
     score, band = agg(vulns)
     assert band == "Critical"
-    assert 94.0 <= score <= 97.0
+    assert 94.0 <= score <= 100.0
 
 
 def test_unverified_findings_weigh_less() -> None:
@@ -109,6 +125,13 @@ def test_breadth_is_severity_weighted_at_a_fixed_anchor() -> None:
     s_lows, _ = agg([anchor] + [mk(2.5, L)] * 10)
 
     assert s_mediums > s_lows
+
+
+def test_medium_only_breadth_never_becomes_high() -> None:
+    score, band = agg([mk(6.9, M)] * 100)
+
+    assert score < 70.0
+    assert band == "Medium"
 
 
 def test_score_is_bounded_to_100() -> None:

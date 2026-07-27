@@ -460,6 +460,7 @@ async def test_security_headers_detector_reports_once_for_site() -> None:
     class DummyResponse:
         headers = {
             "server": "Apache/2.4.0",
+            "content-security-policy": "default-src *; script-src 'unsafe-inline'",
         }
 
     class DummyClient:
@@ -489,6 +490,16 @@ async def test_security_headers_detector_reports_once_for_site() -> None:
 
     header_findings = [finding for finding in findings if finding.vuln_type == "Missing Security Header"]
     assert len(header_findings) >= 4
+    assert all(finding.severity == SeverityLevel.info for finding in header_findings)
+    posture_findings = [
+        finding for finding in findings
+        if finding.vuln_type in {
+            "Weak Content Security Policy (CSP)",
+            "Information Disclosure in Header",
+        }
+    ]
+    assert len(posture_findings) == 2
+    assert all(finding.severity == SeverityLevel.info for finding in posture_findings)
 
 
 def test_evaluate_cors_classifies_permissive_policies() -> None:

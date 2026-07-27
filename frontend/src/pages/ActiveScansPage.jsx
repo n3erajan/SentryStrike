@@ -6,6 +6,7 @@ import {
 } from "../hooks/useActiveScans.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import Tooltip from "../components/Tooltip.jsx";
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 function formatRelative(iso) {
   if (!iso) return "-";
@@ -23,7 +24,7 @@ function formatRelative(iso) {
 function ActiveScansPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
-  const { scans, loading, error } = useActiveScans();
+  const { scans, loading, error, refresh } = useActiveScans();
 
   return (
     <div className='view'>
@@ -36,7 +37,7 @@ function ActiveScansPage() {
       {loading && scans.length === 0 ? (
         <div className='empty-state'>Loading active scans…</div>
       ) : error ? (
-        <div className='auth-error'>{error}</div>
+        <ErrorNotice error={error} fallback='Could not load active scans.' onRetry={refresh} />
       ) : scans.length === 0 ? (
         <div className='empty-state'>
           <ShieldCheck size={30} />

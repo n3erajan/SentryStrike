@@ -107,7 +107,11 @@ class SecurityHeadersDetector(BaseDetector):
                         Finding(
                             category=OwaspCategory.a02,
                             vuln_type="Missing Security Header",
-                            severity=SeverityLevel.medium if req_header in ["content-security-policy", "x-frame-options"] else SeverityLevel.low,
+                            # Header absence is a verified posture observation, but
+                            # it does not by itself demonstrate exploitable impact.
+                            # Correlated findings (for example XSS plus missing CSP)
+                            # can still raise the aggregate attack-chain severity.
+                            severity=SeverityLevel.info,
                             url=root_url,
                             evidence=f"Header not found: {req_header}",
                             verified=True,
@@ -132,7 +136,7 @@ class SecurityHeadersDetector(BaseDetector):
                         Finding(
                             category=OwaspCategory.a02,
                             vuln_type="Weak Content Security Policy (CSP)",
-                            severity=SeverityLevel.medium,
+                            severity=SeverityLevel.info,
                             url=root_url,
                             evidence=f"CSP header policy is weak: {'; '.join(weaknesses)} (CSP: {response.headers.get('content-security-policy')})",
                             verified=True,
@@ -200,7 +204,7 @@ class SecurityHeadersDetector(BaseDetector):
                     Finding(
                         category=OwaspCategory.a02,
                         vuln_type="Information Disclosure in Header",
-                        severity=SeverityLevel.low,
+                        severity=SeverityLevel.info,
                         url=root_url,
                         evidence=f"Server header leaks version: {server_hdr}",
                         verified=True,

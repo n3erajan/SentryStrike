@@ -11,6 +11,7 @@ import { useAuth } from "../context/AuthContext.jsx";
 import Tooltip from "../components/Tooltip.jsx";
 import Select from "../components/Select.jsx";
 import { belongsToApplication } from "../utils/reportFilters.js";
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 function pages(current, total) {
   if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
@@ -90,7 +91,7 @@ function ReportsPage() {
       );
     } catch (err) {
       if (err.name !== "AbortError")
-        setError(err.message || "Could not load reports.");
+        setError(err);
     } finally {
       if (!signal || !signal.aborted) setLoading(false);
     }
@@ -132,12 +133,12 @@ function ReportsPage() {
 
   async function handleDownload(id) {
     setBusy(id);
-    toast("Building PDF");
+    toast("Building PDF", { type: "info" });
     try {
       const blob = await downloadReportPdf(id);
       saveBlob(blob, `sentrystrike-${id}.pdf`);
     } catch (err) {
-      toast(err.message || "Could not build the PDF.");
+      toast(err, { type: "error", fallback: "Could not build the PDF." });
     } finally {
       setBusy("");
     }
@@ -181,7 +182,7 @@ function ReportsPage() {
       {loading ? (
         <div className='empty-state'>Loading reports…</div>
       ) : error ? (
-        <div className='auth-error'>{error}</div>
+        <ErrorNotice error={error} fallback='Could not load reports.' onRetry={() => load()} />
       ) : rows.length === 0 && !loading ? (
         <div className='empty-state'>
           <FileBarChart size={30} />

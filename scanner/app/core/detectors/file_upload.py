@@ -643,7 +643,7 @@ class FileUploadDetector(BaseDetector):
             findings.append(Finding(
                 category=OwaspCategory.a05,
                 vuln_type="XML Parser Behavior - Probable",
-                severity=SeverityLevel.low,
+                severity=SeverityLevel.info,
                 url=candidate.url,
                 parameter=candidate.file_field,
                 method=candidate.method,

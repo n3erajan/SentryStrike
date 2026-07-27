@@ -28,6 +28,7 @@ from shared.database.repositories.scan_repository import ScanRepository
 from shared.models.analysis_job import AnalysisJob, AnalysisStatus
 from shared.models.notification import NotificationType
 from shared.models.scan import ScanStatus
+from shared.notification_copy import analysis_terminal_copy
 from shared.utils.logger import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -151,16 +152,13 @@ async def _notify_analysis_terminal(
             if completed
             else NotificationType.analysis_failed
         )
+        copy = analysis_terminal_copy(completed)
         await notification_repository.create(
             org_id=job.org_id,
             recipient_user_id=scan.submitted_by_user_id,
             type=notification_type,
-            title="Analysis completed" if completed else "Analysis failed",
-            message=(
-                "The analyzed report and PDF are ready."
-                if completed
-                else "Deterministic findings remain available; an authorized triager can retry analysis."
-            ),
+            title=copy.title,
+            message=copy.message,
             resource_type="scan",
             resource_id=job.scan_id,
             metadata={

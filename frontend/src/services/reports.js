@@ -2,7 +2,7 @@
 //
 //   GET  /reports/{id}           -> full report payload (see reports.py)
 //   GET  /reports/{id}/pdf       -> application/pdf attachment
-import { apiRequest, API_BASE } from "./apiClient.js";
+import { apiErrorFromResponse, apiRequest, API_BASE, ApiError } from "./apiClient.js";
 
 export function getReport(scanId, signal) {
   return apiRequest(`/reports/${scanId}`, { signal });
@@ -17,15 +17,16 @@ export async function downloadReportPdf(scanId) {
       credentials: "include",
     });
   } catch (err) {
-    throw new Error("Cannot reach the server to build the PDF.", { cause: err });
+    throw new ApiError(
+      "We couldn't connect to SentryStrike to build the PDF. Check your connection and try again.",
+      { code: "NETWORK_ERROR", cause: err },
+    );
   }
   if (!response.ok) {
-    let message = `Could not generate the PDF (${response.status}).`;
-    try {
-      const payload = await response.json();
-      message = payload?.detail?.message || payload?.detail || payload?.message || message;
-    } catch { /* Keep the status fallback for non-JSON responses. */ }
-    throw new Error(message);
+    throw await apiErrorFromResponse(
+      response,
+      "We couldn't generate the PDF. Please try again.",
+    );
   }
   return response.blob();
 }

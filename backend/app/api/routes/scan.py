@@ -19,6 +19,7 @@ from shared.models.notification import NotificationType
 from shared.models.audit import AuditAction
 from shared.models.scan import ScanPhase, ScanStatus
 from shared.models.user import User, UserRole
+from shared.notification_copy import scan_start_failed_copy, scan_terminal_copy
 from shared.scan_queue import ScanJob, ScanQueue, ScanQueueError
 from shared.schemas.scan_schema import CreateScanRequest, scan_auth_accounts_from_credentials
 
@@ -81,12 +82,13 @@ async def _reconcile_and_notify(
     previous_status = scan.status
     scan = await repo.reconcile_if_orphaned(scan, scan_queue)
     if previous_status != ScanStatus.failed and scan.status == ScanStatus.failed:
+        copy = scan_terminal_copy(ScanStatus.failed, scan.target_url)
         await notifications.create(
             org_id=scan.org_id,
             recipient_user_id=scan.submitted_by_user_id,
             type=NotificationType.scan_failed,
-            title="Scan failed",
-            message=f"The scan of {scan.target_url} failed.",
+            title=copy.title,
+            message=copy.message,
             resource_type="scan",
             resource_id=str(scan.id),
             metadata={"status": ScanStatus.failed.value, "target_url": scan.target_url},
@@ -161,12 +163,13 @@ async def create_scan(
             phase_message="Scan queue unavailable",
             error_message="Scan queue unavailable",
         )
+        copy = scan_start_failed_copy(scan.target_url)
         await notifications.create(
             org_id=current_user.org_id,
             recipient_user_id=str(current_user.id),
             type=NotificationType.scan_failed,
-            title="Scan failed",
-            message=f"The scan of {scan.target_url} could not be queued.",
+            title=copy.title,
+            message=copy.message,
             resource_type="scan",
             resource_id=str(scan.id),
             metadata={"status": ScanStatus.failed.value, "target_url": scan.target_url},
@@ -273,6 +276,7 @@ async def get_scan_status(
         "eta_seconds": scan.eta_seconds,
         "error": scan.error_message,
         "analysis": getattr(scan, "analysis", None),
+        "statistics": scan.statistics.model_dump(mode="json"),
         "updated_at": scan.updated_at,
     })
 
@@ -320,12 +324,13 @@ async def cancel_scan(
             current_phase=ScanPhase.cancelled,
             phase_message="Scan cancelled by user",
         )
+        copy = scan_terminal_copy(ScanStatus.cancelled, scan.target_url)
         await notifications.create(
             org_id=current_user.org_id,
             recipient_user_id=scan.submitted_by_user_id,
             type=NotificationType.scan_cancelled,
-            title="Scan cancelled",
-            message=f"The scan of {scan.target_url} was cancelled.",
+            title=copy.title,
+            message=copy.message,
             resource_type="scan",
             resource_id=scan_id,
             metadata={"status": ScanStatus.cancelled.value, "target_url": scan.target_url},

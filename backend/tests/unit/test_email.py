@@ -75,6 +75,55 @@ def test_workspace_invite_email_is_branded_and_escapes_dynamic_values() -> None:
     assert "a&amp;next=&quot;&lt;home&gt;&quot;" in body_html
     assert "#2864D7" in body_html
     assert "Accept invitation" in body_html
+    assert 'src="cid:sentrystrike-logo"' in body_html
+    assert "data:image/svg+xml" not in body_html
+
+
+def test_smtp_backend_attaches_invite_logo_as_inline_png(monkeypatch) -> None:
+    sent = {}
+
+    class FakeSmtp:
+        def __init__(self, host, port, timeout):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def ehlo(self):
+            pass
+
+        def send_message(self, message):
+            sent["message"] = message
+            return {}
+
+    monkeypatch.setattr(email_module.smtplib, "SMTP", FakeSmtp)
+    settings = BackendSettings(_env_file=None)
+    _, body_text, body_html = render_workspace_invite_email(
+        org_name="Acme",
+        role="member",
+        link="https://app.example.test/register?invite=token",
+        token="token",
+    )
+
+    SmtpEmailBackend(settings).send(
+        to="recipient@example.test",
+        subject="Invitation",
+        body_text=body_text,
+        body_html=body_html,
+    )
+
+    logo = next(
+        part
+        for part in sent["message"].walk()
+        if part.get_content_type() == "image/png"
+    )
+    assert logo.get_content_type() == "image/png"
+    assert logo["Content-ID"] == "<sentrystrike-logo>"
+    assert logo.get_content_disposition() == "inline"
+    assert logo.get_payload(decode=True) == email_module.EMAIL_LOGO_PATH.read_bytes()
 
 
 def test_owner_invite_email_has_token_fallback_when_no_public_link() -> None:

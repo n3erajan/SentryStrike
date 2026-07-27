@@ -23,7 +23,7 @@ export function useBackendHealth({ intervalMs = POLL_INTERVAL_MS } = {}) {
         setError("");
       } catch (err) {
         if (stopped || err.name === "AbortError") return;
-        setError(err.message || "Could not read scanner health.");
+        setError(err);
       } finally {
         polling = false;
         if (!stopped) setLoading(false);

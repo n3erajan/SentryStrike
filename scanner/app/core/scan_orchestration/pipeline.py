@@ -28,6 +28,18 @@ from shared.verification.oast import OastClient
 logger = logging.getLogger("app.core.scanner")
 
 
+def public_scan_failure(exc: Exception) -> str:
+    """Return safe, actionable copy while the full exception stays in logs."""
+    if exc.__class__.__name__ == "TargetUnreachableError" or isinstance(
+        exc, (TimeoutError, ConnectionError)
+    ):
+        return (
+            "We couldn't connect to the target. Confirm that it is reachable "
+            "from the scanner, then try again."
+        )
+    return "The scan stopped before it could finish. Please try again."
+
+
 class PipelineMixin:
     async def _run_scan_pipeline(
         self,
@@ -703,9 +715,15 @@ class PipelineMixin:
             await self._set_progress(scan, scan.progress, ScanPhase.cancelled, "Scan cancelled by user", status=ScanStatus.cancelled)
         except Exception as exc:
             logger.exception("scan %s failed", scan_id)
-            scan.error_message = str(exc)
+            scan.error_message = public_scan_failure(exc)
             scan.completed_at = datetime.now(timezone.utc)
-            await self._set_progress(scan, scan.progress, ScanPhase.failed, f"Scan failed: {exc}", status=ScanStatus.failed)
+            await self._set_progress(
+                scan,
+                scan.progress,
+                ScanPhase.failed,
+                "Scan failed",
+                status=ScanStatus.failed,
+            )
 
     async def _create_analysis_handoff(self, scan) -> None:
         """Create and signal revision 1 without changing completed scan status."""

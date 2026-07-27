@@ -25,7 +25,13 @@ function Sidebar({ open = false, onClose }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
-  const { count } = useActiveScans();
+  const { count, refresh } = useActiveScans();
+
+  useEffect(() => {
+    const handler = () => refresh();
+    window.addEventListener("scan-started", handler);
+    return () => window.removeEventListener("scan-started", handler);
+  }, [refresh]);
   const { health, loading: healthLoading, error: healthError } =
     useBackendHealth();
   const [workspace, setWorkspace] = useState(null);

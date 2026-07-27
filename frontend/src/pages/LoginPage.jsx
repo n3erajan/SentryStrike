@@ -5,6 +5,7 @@ import { useAuth } from "../context/AuthContext.jsx";
 import AuthBrand from "../components/AuthBrand.jsx";
 import ThemeToggle from "../components/ThemeToggle.jsx";
 import Tooltip from "../components/Tooltip.jsx";
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -32,7 +33,7 @@ function LoginPage() {
       await login({ email, password });
       navigate(dest, { replace: true });
     } catch (err) {
-      setError(err.message || "Unable to sign in. Please try again.");
+      setError(err);
     } finally {
       setSubmitting(false);
     }
@@ -62,7 +63,7 @@ function LoginPage() {
                   type='email'
                   autoComplete='email'
                   value={email}
-                  onChange={(e) => setEmail(e.target.value)}
+                  onChange={(e) => { setEmail(e.target.value); setError(""); }}
                   onBlur={() => setTouched((v) => ({ ...v, email: true }))}
                   disabled={submitting}
                 />
@@ -87,7 +88,7 @@ function LoginPage() {
                   type={showPassword ? "text" : "password"}
                   autoComplete='current-password'
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={(e) => { setPassword(e.target.value); setError(""); }}
                   onBlur={() => setTouched((v) => ({ ...v, password: true }))}
                   disabled={submitting}
                 />
@@ -114,7 +115,7 @@ function LoginPage() {
                 </span>
               )}
             </div>
-            {error && <div className='auth-error'>{error}</div>}
+            <ErrorNotice error={error} fallback='Unable to sign in. Please try again.' compact />
             <button className='btn primary' type='submit' disabled={!canSubmit}>
               {submitting && (
                 <Loader2

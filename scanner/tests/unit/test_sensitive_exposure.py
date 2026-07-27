@@ -44,6 +44,10 @@ def test_observed_response_finds_source_map_api_docs_stack_trace_and_secret_valu
     assert "Exposed API Documentation" in vuln_types
     assert "Verbose Stack Trace Exposure" in vuln_types
     assert "Secret-Like Value Exposure" in vuln_types
+    api_docs = next(finding for finding in findings if finding.vuln_type == "Exposed API Documentation")
+    assert api_docs.severity == SeverityLevel.info
+    source_map = next(finding for finding in findings if finding.vuln_type == "Exposed Source Map")
+    assert source_map.severity == SeverityLevel.info
     assert all(finding.detection_evidence["proof_type"] == "content_verified_observed_response" for finding in findings)
     # Each finding is derived from a real observed request, so it must carry a
     # reconstructed request snippet (not left empty).
@@ -193,6 +197,7 @@ async def test_sensitive_path_detector_reports_openapi_with_content_proof(monkey
         (f for f in findings if f.vuln_type == "Exposed API Documentation"), None
     )
     assert api_docs is not None
+    assert api_docs.severity == SeverityLevel.info
     assert api_docs.verification_request_snippet is not None
     assert api_docs.verification_request_snippet.startswith("GET /openapi.json HTTP/1.1\nHost:")
     assert "example.test" in api_docs.verification_request_snippet
@@ -400,3 +405,15 @@ _REQ_TXT = "Django==4.2.1\nFlask>=2.3\n"
 def test_dependency_manifest_classification(path, body, expected):
     det = SensitivePathsDetector()
     assert det._looks_like_dependency_manifest(path, body) is expected
+
+
+def test_dependency_manifest_reachability_is_informational():
+    det = SensitivePathsDetector()
+
+    matched, vuln_type, _evidence, severity = det._classify_content(
+        "/package.json", _PKG_JSON, "application/json"
+    )
+
+    assert matched is True
+    assert vuln_type == "Sensitive File Exposure"
+    assert severity == SeverityLevel.info

@@ -7,6 +7,7 @@ import {
 } from "../services/applications.js";
 import { severityClass } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
 
@@ -52,7 +53,7 @@ function ApplicationPage() {
         setScans(Array.isArray(scanData?.items) ? scanData.items : []);
       } catch (err) {
         if (err.name !== "AbortError")
-          setError(err.message || "Could not load this application.");
+          setError(err);
       } finally {
         if (!signal || !signal.aborted) setLoading(false);
       }
@@ -79,7 +80,7 @@ function ApplicationPage() {
         <button className='back' onClick={() => navigate("/apps")}>
           ← All applications
         </button>
-        <div className='auth-error'>{error}</div>
+        <ErrorNotice error={error} fallback='Could not load this application.' onRetry={() => load()} />
       </div>
     );
   if (!app) return null;

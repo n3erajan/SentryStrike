@@ -24,6 +24,7 @@ from shared.models.audit import AuditAction
 from shared.models.invite import Invite, InviteEmailStatus
 from shared.models.notification import NotificationType
 from shared.models.user import User, UserRole
+from shared.notification_copy import role_change_copy
 from app.schemas.workspace_schema import (
     ChangeRoleRequest,
     InviteMemberRequest,
@@ -155,12 +156,17 @@ async def change_member_role(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The owner's role cannot be changed.")
     previous_role = target.role.value
     await members.set_role(target, payload.role)
+    copy = role_change_copy(
+        actor_name=getattr(current_user, "full_name", None),
+        previous_role=previous_role,
+        new_role=payload.role,
+    )
     await notifications.create(
         org_id=current_user.org_id,
         recipient_user_id=user_id,
         type=NotificationType.member_role_changed,
-        title="Workspace role changed",
-        message=f"Your workspace role changed from {previous_role} to {payload.role.value}.",
+        title=copy.title,
+        message=copy.message,
         resource_type="member",
         resource_id=user_id,
         metadata={"from": previous_role, "to": payload.role.value},

@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import logging
+import re
 import smtplib
 from email.message import EmailMessage
 from functools import lru_cache
 from html import escape
+from pathlib import Path
 
 from app.config import BackendSettings, get_settings
 
 logger = logging.getLogger(__name__)
 DEFAULT_EMAIL_FROM = "SentryStrike <no-reply@sentrystrike.local>"
+EMAIL_LOGO_CONTENT_ID = "sentrystrike-logo"
+EMAIL_LOGO_PATH = (
+    Path(__file__).resolve().parent.parent / "assets" / "sentrystrike-logo.png"
+)
 
 BRAND_BLUE = "#2864D7"
 BRAND_BLUE_DARK = "#1747AD"
@@ -146,6 +152,14 @@ def render_workspace_invite_email(
     </table>
   </body>
 </html>"""
+    # Data-URI SVG images are stripped by common email clients. Keep the template's
+    # source self-contained, but emit a CID reference backed by an inline PNG MIME part.
+    body_html = re.sub(
+        r'src="data:image/svg\+xml;base64,[^"]+"',
+        f'src="cid:{EMAIL_LOGO_CONTENT_ID}"',
+        body_html,
+        count=1,
+    )
     return subject, body_text, body_html
 
 
@@ -171,6 +185,16 @@ class SmtpEmailBackend:
         message.set_content(body_text)
         if body_html:
             message.add_alternative(body_html, subtype="html")
+            if f"cid:{EMAIL_LOGO_CONTENT_ID}" in body_html:
+                html_part = message.get_payload()[-1]
+                html_part.add_related(
+                    EMAIL_LOGO_PATH.read_bytes(),
+                    maintype="image",
+                    subtype="png",
+                    cid=f"<{EMAIL_LOGO_CONTENT_ID}>",
+                    filename=EMAIL_LOGO_PATH.name,
+                    disposition="inline",
+                )
 
         with smtplib.SMTP(settings.email_smtp_host, settings.email_smtp_port, timeout=30) as client:
             client.ehlo()

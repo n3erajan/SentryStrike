@@ -5,10 +5,11 @@ import httpx
 import pytest
 
 from app.core.crawler.models import ApiEndpoint, ParameterCandidate, ParameterLocation, RequestObservation
-from app.core.detectors.file_upload import FileUploadDetector
+from app.core.detectors.file_upload import FileUploadDetector, UploadCandidate
 from app.core.detectors.open_redirect import OpenRedirectDetector
 from app.core.verification.response_analyzer import ResponseData
 from app.core.verification.verification_framework import HttpVerifier
+from shared.models.vulnerability import SeverityLevel
 
 
 @pytest.mark.asyncio
@@ -572,6 +573,34 @@ async def test_file_upload_detector_reports_xml_entity_expansion(monkeypatch):
     assert xxe
     assert xxe[0].verified is True
     assert xxe[0].vuln_type == "XML Entity Expansion"
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_xml_parser_behavior_is_informational(monkeypatch):
+    detector = FileUploadDetector()
+    candidate = UploadCandidate(
+        url="https://example.test/api/import/xml",
+        method="POST",
+        file_field="document",
+    )
+    responses = iter(
+        [
+            (True, httpx.Response(200, text="Parsed", request=httpx.Request("POST", candidate.url))),
+            (True, httpx.Response(200, text="XML parse error", request=httpx.Request("POST", candidate.url))),
+        ]
+    )
+
+    async def fake_send_upload(*args, **kwargs):
+        return next(responses)
+
+    monkeypatch.setattr(detector, "_send_upload", fake_send_upload)
+    findings = []
+
+    await detector._test_xml_parser(object(), findings, candidate)
+
+    probable = [f for f in findings if f.vuln_type == "XML Parser Behavior - Probable"]
+    assert len(probable) == 1
+    assert probable[0].severity == SeverityLevel.info
 
 
 @pytest.mark.asyncio

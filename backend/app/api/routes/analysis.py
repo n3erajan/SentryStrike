@@ -20,7 +20,7 @@ from shared.database.repositories.member_repository import MemberRepository
 from shared.database.repositories.notification_repository import NotificationRepository
 from shared.database.repositories.reverification_repository import ReverificationRepository
 from shared.database.repositories.scan_repository import ScanRepository
-from shared.finding_rollups import apply_finding_rollups
+from shared.finding_rollups import apply_finding_statistics
 from shared.models.audit import AuditAction
 from shared.models.analysis_job import AnalysisStatus
 from shared.models.notification import NotificationType
@@ -28,6 +28,12 @@ from shared.models.reverification import ReverificationJob
 from shared.models.scan import ScanStatus
 from shared.models.user import User, UserRole
 from shared.models.vulnerability import FindingComment, RemediationStatus, Vulnerability
+from shared.notification_copy import (
+    finding_assigned_copy,
+    finding_comment_copy,
+    finding_review_copy,
+    remediation_copy,
+)
 from shared.analysis_queue import AnalysisQueue, AnalysisQueueError, AnalysisSignal
 from shared.scan_queue import ScanJob, ScanJobKind, ScanQueueError
 from shared.schemas.scan_schema import scan_auth_accounts_from_credentials
@@ -271,7 +277,9 @@ async def review_finding(
         vulnerability.false_positive_marked_at = None
 
     vulnerability.refresh_review_status()
-    apply_finding_rollups(scan)
+    # Review disposition changes live triage counts, not the immutable risk
+    # snapshot captured when the scan completed.
+    apply_finding_statistics(scan)
     await scan.save()
 
     await audit.record(
@@ -301,10 +309,10 @@ async def review_finding(
         )
         if recipient and recipient != str(current_user.id)
     }
-    action_label = (
-        "marked as a false positive"
-        if payload.disposition == "false_positive"
-        else "restored as an active finding"
+    copy = finding_review_copy(
+        actor_name=current_user.full_name,
+        finding_type=vulnerability.vuln_type,
+        false_positive=payload.disposition == "false_positive",
     )
     event_key = marked_at.isoformat()
     for recipient in recipients:
@@ -312,8 +320,8 @@ async def review_finding(
             org_id=current_user.org_id,
             recipient_user_id=recipient,
             type=NotificationType.finding_review_changed,
-            title="Finding review changed",
-            message=f"{current_user.email} {action_label}: {vulnerability.vuln_type}.",
+            title=copy.title,
+            message=copy.message,
             resource_type="finding",
             resource_id=vulnerability.id,
             metadata={
@@ -367,12 +375,13 @@ async def assign_finding(
 
     await scan.save()
     if vuln.assignee_user_id is not None:
+        copy = finding_assigned_copy(vuln.vuln_type)
         await notifications.create(
             org_id=current_user.org_id,
             recipient_user_id=vuln.assignee_user_id,
             type=NotificationType.finding_assigned,
-            title="Finding assigned",
-            message=f"{vuln.vuln_type} was assigned to you.",
+            title=copy.title,
+            message=copy.message,
             resource_type="finding",
             resource_id=vuln.id,
             metadata={"scan_id": scan_id},
@@ -409,13 +418,17 @@ async def add_finding_comment(
         for recipient in (vuln.assignee_user_id, getattr(scan, "submitted_by_user_id", None))
         if recipient and recipient != str(current_user.id)
     }
+    copy = finding_comment_copy(
+        actor_name=current_user.full_name,
+        finding_type=vuln.vuln_type,
+    )
     for recipient in recipients:
         await notifications.create(
             org_id=current_user.org_id,
             recipient_user_id=recipient,
             type=NotificationType.finding_commented,
-            title="New finding comment",
-            message=f"{current_user.email} commented on {vuln.vuln_type}.",
+            title=copy.title,
+            message=copy.message,
             resource_type="finding",
             resource_id=vuln.id,
             metadata={"scan_id": scan_id, "comment_id": comment.id},
@@ -457,15 +470,18 @@ async def update_finding_remediation(
         for recipient in (vuln.assignee_user_id, getattr(scan, "submitted_by_user_id", None))
         if recipient and recipient != str(current_user.id)
     }
+    copy = remediation_copy(
+        actor_name=current_user.full_name,
+        finding_type=vuln.vuln_type,
+        status=payload.remediation_status,
+    )
     for recipient in recipients:
         await notifications.create(
             org_id=current_user.org_id,
             recipient_user_id=recipient,
             type=NotificationType.remediation_status_changed,
-            title="Remediation status changed",
-            message=(
-                f"{vuln.vuln_type} moved to {payload.remediation_status.value.replace('_', ' ')}."
-            ),
+            title=copy.title,
+            message=copy.message,
             resource_type="finding",
             resource_id=vuln.id,
             metadata={"scan_id": scan_id, "status": payload.remediation_status.value},

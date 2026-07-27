@@ -37,6 +37,7 @@ function useScanStatus(scanId) {
   const [cancelling, setCancelling] = useState(false);
   const [siteTitle, setSiteTitle] = useState("");
   const [targetUrl, setTargetUrl] = useState("");
+  const [statistics, setStatistics] = useState(null);
 
   const logRef = useRef(null);
   const lastPhaseRef = useRef("");
@@ -64,7 +65,7 @@ function useScanStatus(scanId) {
       }
     } catch (err) {
       setCancelling(false);
-      setError(err.message || "Could not request cancellation.");
+      setError(err);
     }
   }, [scanId, cancelling, pushLog]);
 
@@ -110,6 +111,7 @@ function useScanStatus(scanId) {
         );
         if (scan.site_title) setSiteTitle(scan.site_title);
         if (scan.target_url) setTargetUrl(scan.target_url);
+        if (scan.statistics) setStatistics(scan.statistics);
 
         if (
           nextPhase !== lastPhaseRef.current &&
@@ -173,7 +175,7 @@ function useScanStatus(scanId) {
         }
       } catch (err) {
         if (stopped || err.name === "AbortError") return;
-        setError(err.message || "Lost connection to the scan.");
+        setError(err);
         pushLog("warn", `[!] ${err.message || "Lost connection to the scan."}`);
         stopPolling();
       } finally {
@@ -207,6 +209,7 @@ function useScanStatus(scanId) {
     analysis,
     siteTitle,
     targetUrl,
+    statistics,
     logs,
     logRef,
     error,

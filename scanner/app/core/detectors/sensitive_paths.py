@@ -221,11 +221,14 @@ class SensitivePathsDetector(BaseDetector):
         if "web.xml" in path_lower and "<web-app" in body_lower:
             return True, "Sensitive File Exposure", "Java web.xml configuration file exposed.", SeverityLevel.medium
         if self._looks_like_source_map(path, body, content_type):
-            return True, "Exposed Source Map", "JavaScript source map content is reachable.", SeverityLevel.medium
+            return True, "Exposed Source Map", "JavaScript source map content is reachable.", SeverityLevel.info
         if self._looks_like_api_docs(path, body, content_type):
-            return True, "Exposed API Documentation", "OpenAPI/Swagger/GraphQL documentation content is reachable.", SeverityLevel.medium
+            # Reachable API documentation is often intentional. Promote it only
+            # when separate evidence proves sensitive disclosure or unauthorized
+            # access; reachability alone is an informational posture observation.
+            return True, "Exposed API Documentation", "OpenAPI/Swagger/GraphQL documentation content is reachable.", SeverityLevel.info
         if self._looks_like_dependency_manifest(path, body, content_type):
-            return True, "Sensitive File Exposure", "Dependency manifest or lockfile content is reachable.", SeverityLevel.medium
+            return True, "Sensitive File Exposure", "Dependency manifest or lockfile content is reachable.", SeverityLevel.info
         if any(pattern.search(body) for pattern in self._DEBUG_METRICS_PATTERNS):
             return True, "Debug / Metrics Endpoint Exposed", "Debug, metrics, or actuator content exposed.", SeverityLevel.medium
         if any(pattern.search(body) for pattern in self._STACK_TRACE_PATTERNS):

@@ -51,7 +51,7 @@ export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
         }
       } catch (err) {
         if (stopped || err.name === "AbortError") return;
-        setError(err.message || "Could not load active scans.");
+        setError(err);
       } finally {
         if (!stopped) setLoading(false);
       }

@@ -234,28 +234,7 @@ class FindingProcessingMixin:
 
     @staticmethod
     def _calculate_aggregate_risk(vulnerabilities: list[Vulnerability]) -> tuple[float, str]:
-        """Aggregate per-vulnerability CVSS into one 0-100 posture score + qualitative band.
-
-        Standards-aligned design. CVSS base scores are per-vulnerability severity metrics
-        and must NOT be averaged: averaging dilutes the worst finding, and an attacker only
-        needs to exploit a single vulnerability (FIRST CVSS guidance; OWASP Risk Rating).
-        Instead:
-
-          * anchor  — worst-case. The highest verified-weighted CVSS, scaled to 0-100.
-                      This dominates, so a single confirmed Critical reads as Critical and
-                      is never diluted by lower-severity noise.
-          * breadth — a bounded, saturating bonus for the *additional* attack surface,
-                      severity-weighted (Critical > High > Medium > Low) so many low
-                      findings can never outweigh one severe one. It can fill at most
-                      ``BREADTH_CAP`` of the headroom above the anchor, with diminishing
-                      returns, so the score stays anchored and does not trivially saturate
-                      at 100 the way a volume multiplier did.
-
-        Verified findings weigh 1.0, unverified 0.7 (applied to both anchor and breadth).
-        The band label reuses the CVSS severity thresholds via ``CvssCalculator.get_severity``.
-
-        Returns ``(score 0-100, band)`` where band is Critical/High/Medium/Low/Info.
-        """
+        """Calculate the evidence-adjusted, band-preserving scan risk snapshot."""
         return calculate_aggregate_risk(vulnerabilities)
 
     def _evidence_strength_breakdown(self, vulnerabilities: list[Vulnerability]) -> EvidenceStrengthBreakdown:

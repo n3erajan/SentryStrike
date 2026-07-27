@@ -8,6 +8,7 @@ from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.verification.response_analyzer import ResponseData
 from app.core.verification.verification_framework import BaseVerifier, HttpVerifier
 from app.core.verification.xss_verifier import XSSVerifier
+from shared.models.vulnerability import SeverityLevel
 
 
 def test_xss_verifier_builds_json_attack_request_from_attack_target() -> None:
@@ -99,7 +100,9 @@ async def test_xss_detector_tests_browser_observed_json_body_targets(monkeypatch
     findings = await XSSDetector().detect(urls=[], forms=[], requests=[request])
 
     assert any(isinstance(body, dict) and "comment" in body for body in seen_json_bodies)
-    assert any(f.vuln_type == "Reflected XSS in API Response" for f in findings)
+    api_reflections = [f for f in findings if f.vuln_type == "Reflected XSS in API Response"]
+    assert api_reflections
+    assert all(f.severity == SeverityLevel.info for f in api_reflections)
 
 
 @pytest.mark.asyncio
@@ -181,6 +184,7 @@ def test_static_dom_xss_findings_mark_sink_only_as_unverified_probable() -> None
     assert len(findings) == 1
     finding = findings[0]
     assert finding.vuln_type == "DOM-Based XSS"
+    assert finding.severity == SeverityLevel.info
     assert finding.verified is False
     assert finding.detection_evidence["browser_execution_confirmed"] is False
 

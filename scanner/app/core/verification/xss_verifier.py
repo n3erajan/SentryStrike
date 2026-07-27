@@ -571,7 +571,7 @@ class XSSVerifier(BaseVerifier):
         return self._create_finding(
             category=OwaspCategory.a05,
             vuln_type="Reflected XSS in API Response",
-            severity=SeverityLevel.medium,
+            severity=SeverityLevel.info,
             url=url,
             parameter=parameter,
             payload=payload,
@@ -600,7 +600,7 @@ class XSSVerifier(BaseVerifier):
                 f"{found_sources} reaching risky sinks {found_sinks}. Browser execution is not confirmed."
             )
             return self._create_finding(
-                category=OwaspCategory.a05, vuln_type="DOM-Based XSS", severity=SeverityLevel.medium,
+                category=OwaspCategory.a05, vuln_type="DOM-Based XSS", severity=SeverityLevel.info,
                 url=url, parameter="javascript", payload="location.hash", evidence=evidence,
                 confidence_score=60.0, detection_method="dom_xss_heuristics", method="GET",
                 detection_evidence={

@@ -6,6 +6,7 @@ import { previewInvite } from "../services/auth.js";
 import AuthBrand from "../components/AuthBrand.jsx";
 import ThemeToggle from "../components/ThemeToggle.jsx";
 import Tooltip from "../components/Tooltip.jsx";
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 function RegisterPage() {
   const { register } = useAuth();
@@ -28,7 +29,7 @@ function RegisterPage() {
     previewInvite(inviteToken, controller.signal)
       .then((data) => { setInvite(data); setInviteState("valid"); })
       .catch((err) => {
-        if (err.name !== "AbortError") { setError(err.message || "This invite is invalid."); setInviteState("invalid"); }
+        if (err.name !== "AbortError") { setError(err); setInviteState("invalid"); }
       });
     return () => controller.abort();
   }, [inviteToken]);
@@ -47,7 +48,7 @@ function RegisterPage() {
       await register({ email: invite.email, password, fullName, inviteToken });
       navigate("/home", { replace: true });
     } catch (err) {
-      setError(err.message || "Unable to create your account.");
+      setError(err);
     } finally { setSubmitting(false); }
   }
 
@@ -65,7 +66,8 @@ function RegisterPage() {
           <h1>Join your workspace</h1>
           <p>{invite ? <>You were invited to <b>{invite.org_name}</b> as <b>{invite.role}</b>.</> : "Use the invitation link sent by your workspace administrator."}</p>
           {inviteState === "loading" && <div className='empty-state'><Loader2 className='ico spin' /> Validating invitation…</div>}
-          {inviteState === "missing" && <div className='auth-error'>Registration is invite-only. Ask a workspace owner or admin for an invitation.</div>}
+          {inviteState === "missing" && <ErrorNotice error='Registration is invite-only. Ask a workspace owner or admin for an invitation.' compact />}
+          {inviteState === "invalid" && <ErrorNotice error={error} fallback='This invitation is invalid or has expired.' compact />}
           {inviteState === "valid" && (
             <form onSubmit={handleSubmit} noValidate style={{ marginTop: 26 }}>
               <div className='field'><label>Work email</label><div className='control'><input value={invite.email} readOnly /><CheckCircle2 className='ico' style={{ color: "var(--good)" }} /></div></div>
@@ -74,13 +76,13 @@ function RegisterPage() {
                 return <div key={f.key} className='field'>
                   <label htmlFor={f.id}>{f.label}</label>
                   <div className={`control${touched[f.key] && !f.valid ? " error" : ""}`}>
-                    <input id={f.id} type={passwordField && showPassword ? "text" : f.type} autoComplete={f.autoComplete} value={f.value} onChange={(e) => f.set(e.target.value)} onBlur={() => setTouched((v) => ({ ...v, [f.key]: true }))} disabled={submitting} />
+                    <input id={f.id} type={passwordField && showPassword ? "text" : f.type} autoComplete={f.autoComplete} value={f.value} onChange={(e) => { f.set(e.target.value); setError(""); }} onBlur={() => setTouched((v) => ({ ...v, [f.key]: true }))} disabled={submitting} />
                     {passwordField && <Tooltip label={showPassword ? "Hide password" : "Show password"}><button type='button' className='pw-toggle' onClick={() => setShowPassword((v) => !v)} aria-label={showPassword ? "Hide password" : "Show password"}>{showPassword ? <EyeOff className='ico' /> : <Eye className='ico' />}</button></Tooltip>}
                   </div>
                   {touched[f.key] && !f.valid && <span className='field-error'>{f.error}</span>}
                 </div>;
               })}
-              {error && <div className='auth-error'>{error}</div>}
+              <ErrorNotice error={error} fallback='Unable to create your account.' compact />
               <button className='btn primary' type='submit' disabled={!canSubmit}>{submitting && <Loader2 className='ico spin' />}Accept invite and join</button>
             </form>
           )}

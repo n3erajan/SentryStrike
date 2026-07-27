@@ -13,14 +13,7 @@ import Tooltip from "../components/Tooltip.jsx";
 import { useToast } from "../components/Toast.jsx";
 import { useAuth } from "../context/AuthContext.jsx";
 import { isValidUrl } from "../utils/helpers.js";
-
-function hostnameOf(url) {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return url || "unknown";
-  }
-}
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 // Create/edit dialog. `app` is null when creating. Mirrors the invite modal on
 // TeamPage; the scan-config half reuses the same field renderer as ScanPage.
@@ -182,7 +175,7 @@ function AppsPage() {
       setApps(Array.isArray(data?.items) ? data.items : []);
     } catch (err) {
       if (err.name !== "AbortError")
-        setError(err.message || "Could not load applications.");
+        setError(err);
     } finally {
       if (!signal || !signal.aborted) setLoading(false);
     }
@@ -204,7 +197,7 @@ function AppsPage() {
       toast(editing ? "Application updated" : "Application created");
       await load();
     } catch (err) {
-      toast(err.message || "Could not save the application.");
+      toast(err, { type: "error", fallback: "Could not save the application." });
     }
   }
 
@@ -221,7 +214,7 @@ function AppsPage() {
       toast("Application deleted");
       await load();
     } catch (err) {
-      toast(err.message || "Could not delete the application.");
+      toast(err, { type: "error", fallback: "Could not delete the application." });
     } finally {
       setBusy("");
     }
@@ -245,7 +238,7 @@ function AppsPage() {
       {loading ? (
         <div className='empty-state'>Loading applications…</div>
       ) : error ? (
-        <div className='auth-error'>{error}</div>
+        <ErrorNotice error={error} fallback='Could not load applications.' onRetry={() => load()} />
       ) : apps.length === 0 ? (
         <div className='empty-state'>
           <Boxes size={30} />

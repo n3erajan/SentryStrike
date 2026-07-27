@@ -32,6 +32,7 @@ import ReverifyCredentialsDialog from "../components/ReverifyCredentialsDialog.j
 import Tooltip from "../components/Tooltip.jsx";
 import { reverifyAffordance } from "../utils/reverifyPolicy.js";
 import { httpSnippetToCurl } from "../utils/httpToCurl.js";
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
@@ -147,7 +148,7 @@ function FindingCollaboration({ scanId, finding, user, members, onChanged }) {
       toast(message);
       await onChanged();
     } catch (err) {
-      toast(err.message || "Could not update the finding.");
+      toast(err, { type: "error", fallback: "Could not update the finding." });
     } finally {
       setBusy("");
     }
@@ -534,7 +535,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
                         curlExe: navigator.userAgent.includes('Windows') ? 'curl.exe' : 'curl',
                       })
                       if (!curl) {
-                        toast('Could not build cURL from this request.')
+                        toast('Could not build cURL from this request.', { type: 'error' })
                         return
                       }
                       try {
@@ -545,7 +546,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
                             : 'cURL copied',
                         )
                       } catch {
-                        toast('Could not copy cURL')
+                        toast('Could not copy cURL', { type: 'error' })
                       }
                     }}
                   >
@@ -640,8 +641,8 @@ function ReportPage() {
         setMembers(memberData.items || []);
       } catch (err) {
         if (err.name === "AbortError") return;
-        if (silent) toast(err.message || "Could not refresh the report.");
-        else setError(err.message || "Could not load the report.");
+        if (silent) toast(err, { type: "error", fallback: "Could not refresh the report." });
+        else setError(err);
       } finally {
         if (!signal || !signal.aborted) {
           if (!silent) setLoading(false);
@@ -689,7 +690,7 @@ function ReportPage() {
     try {
       saveBlob(await downloadReportPdf(scanId), `sentrystrike-${scanId}.pdf`);
     } catch (err) {
-      toast(err.message || "Could not download the PDF.");
+      toast(err, { type: "error", fallback: "Could not download the PDF." });
     } finally {
       setBusy("");
     }
@@ -702,7 +703,7 @@ function ReportPage() {
       toast("Analysis retry queued");
       await load(undefined, { silent: true });
     } catch (err) {
-      toast(err.message || "Could not retry analysis.");
+      toast(err, { type: "error", fallback: "Could not retry analysis." });
     } finally {
       setBusy("");
     }
@@ -720,7 +721,7 @@ function ReportPage() {
         <button className='back' onClick={() => navigate("/reports")}>
           ← All reports
         </button>
-        <div className='auth-error'>{error}</div>
+        <div style={{ maxWidth: 760 }}><ErrorNotice error={error} fallback='Could not load the report.' onRetry={() => load()} /></div>
       </div>
     );
   if (!report) return null;

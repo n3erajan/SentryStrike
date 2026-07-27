@@ -5,10 +5,12 @@ import { useToast } from "../components/Toast.jsx";
 import Tooltip from "../components/Tooltip.jsx";
 import Select from "../components/Select.jsx";
 import { cancelInvite, changeMemberRole, inviteMember, listInvites, listMembers, removeMember } from "../services/workspace.js";
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 const ROLES = ["admin", "analyst", "developer", "viewer"];
 const title = (v) => (v || "").replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase());
 const date = (v) => v ? new Date(v).toLocaleDateString() : "N/A";
+const inviteStatus = (s) => ({ not_attempted: "Pending", smtp_accepted: "Invited", failed: "Failed" })[s] || title(s);
 
 function TeamPage() {
   const { user } = useAuth();
@@ -31,7 +33,7 @@ function TeamPage() {
       const memberData = await listMembers();
       setMembers(memberData.items || []); setSeatInfo(memberData);
       if (admin) setInvites((await listInvites()).items || []);
-    } catch (err) { setError(err.message || "Could not load the workspace."); }
+    } catch (err) { setError(err); }
     finally { setLoading(false); }
   }, [admin]);
   useEffect(() => {
@@ -47,26 +49,26 @@ function TeamPage() {
   async function submitInvite(e) {
     e.preventDefault(); setBusy("invite");
     try { await inviteMember(email, role); setEmail(""); setShowInvite(false); toast("Invitation sent"); await load(); }
-    catch (err) { toast(err.message || "Could not send invitation."); }
+    catch (err) { toast(err, { type: "error", fallback: "Could not send invitation." }); }
     finally { setBusy(""); }
   }
   async function updateRole(member, nextRole) {
     setBusy(member.id);
     try { await changeMemberRole(member.id, nextRole); toast("Role updated"); await load(); }
-    catch (err) { toast(err.message || "Could not update role."); }
+    catch (err) { toast(err, { type: "error", fallback: "Could not update role." }); }
     finally { setBusy(""); }
   }
   async function remove(member) {
     if (!window.confirm(`Remove ${member.email} from this workspace? Their account and sessions will be deleted.`)) return;
     setBusy(member.id);
     try { await removeMember(member.id); toast("Member removed"); await load(); }
-    catch (err) { toast(err.message || "Could not remove member."); }
+    catch (err) { toast(err, { type: "error", fallback: "Could not remove member." }); }
     finally { setBusy(""); }
   }
   async function cancel(invite) {
     setBusy(invite.id);
     try { await cancelInvite(invite.id); toast("Invitation cancelled"); await load(); }
-    catch (err) { toast(err.message || "Could not cancel invitation."); }
+    catch (err) { toast(err, { type: "error", fallback: "Could not cancel invitation." }); }
     finally { setBusy(""); }
   }
 
@@ -76,7 +78,7 @@ function TeamPage() {
     <div className='head'><div><h1>Team</h1><p>{seatLabel}</p></div>
       {admin && <button className='btn primary' onClick={() => setShowInvite(true)} disabled={seatInfo.occupied_seats >= seatInfo.member_limit}><MailPlus className='ico' />Invite member</button>}
     </div>
-    {error && <div className='auth-error'>{error}</div>}
+    <ErrorNotice error={error} fallback='Could not load the workspace.' onRetry={load} />
     {loading ? <div className='empty-state'><Loader2 className='ico spin' />Loading team…</div> : rows.length === 0 && !query && members.length === 0 ? (
       <div className='empty-state'><Users size={30} /><h2>No team members</h2><p>Invite people who need access to this workspace.</p>{admin && <button className='btn primary' onClick={() => setShowInvite(true)}><MailPlus className='ico' />Invite member</button>}</div>
     ) : <div className='team-table'>
@@ -90,7 +92,7 @@ function TeamPage() {
       </article>; })}
     </div>}
 
-    {admin && invites.length > 0 && <div className='panel' style={{ marginTop: 20 }}><div className='panel-h'>Pending invitations</div><div className='panel-b compact-list'>{invites.map((i) => <div className='invite-row' key={i.id}><div><b>{i.email}</b><div className='small'>{title(i.role)} · expires {date(i.expires_at)}</div></div><span className='status-pill'>{title(i.email_delivery_status)}</span><Tooltip label='Cancel invitation'><button className='icon-btn' onClick={() => cancel(i)} disabled={busy === i.id} aria-label='Cancel invitation'><X className='ico' /></button></Tooltip></div>)}</div></div>}
+    {admin && invites.length > 0 && <div className='panel' style={{ marginTop: 20 }}><div className='panel-h'>Pending invitations</div><div className='panel-b compact-list'>{invites.map((i) => <div className='invite-row' key={i.id}><div><b>{i.email}</b><div className='small'>{title(i.role)} · expires {date(i.expires_at)}</div></div><span className='status-pill'>{inviteStatus(i.email_delivery_status)}</span><Tooltip label='Cancel invitation'><button className='icon-btn' onClick={() => cancel(i)} disabled={busy === i.id} aria-label='Cancel invitation'><X className='ico' /></button></Tooltip></div>)}</div></div>}
 
     {showInvite && <div className='modal-backdrop' onMouseDown={() => setShowInvite(false)}><div className='modal-card' onMouseDown={(e) => e.stopPropagation()}><Tooltip label='Close'><button className='modal-close' onClick={() => setShowInvite(false)}><X className='ico' /></button></Tooltip><h2>Invite a teammate</h2><p className='muted-text'>Choose their email and workspace role.</p><form onSubmit={submitInvite}><div className='field'><label>Work email</label><div className='control'><input type='email' required value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></div></div><div className='field'><label>Role</label><div className='control'><Select value={role} onChange={setRole} options={ROLES.map((r) => ({value: r, label: title(r)}))} /></div></div><button className='btn primary' disabled={busy === "invite"}>{busy === "invite" ? "Sending…" : "Send invitation"}</button></form></div></div>}
   </div>;

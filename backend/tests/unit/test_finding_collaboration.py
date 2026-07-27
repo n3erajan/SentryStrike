@@ -159,11 +159,13 @@ def _repos():
 # ---------------------------------------------------------------------------
 
 
-def test_triager_can_mark_false_positive_with_reviewer_and_rollups() -> None:
+def test_triager_can_mark_false_positive_without_rewriting_scan_risk() -> None:
     repo, members = _repos()
     audit = FakeAuditRepository()
     notifications = FakeNotificationRepository()
     finding = repo.scans["scan-1"].vulnerabilities[0]
+    original_risk_score = repo.scans["scan-1"].overall_risk_score
+    original_risk_level = repo.scans["scan-1"].overall_risk_level
     finding.assignee_user_id = "user-dev"
     client = _client(
         repo,
@@ -191,7 +193,8 @@ def test_triager_can_mark_false_positive_with_reviewer_and_rollups() -> None:
     assert data["statistics"]["active_vulnerabilities"] == 0
     assert data["statistics"]["suppressed_vulnerabilities"] == 1
     assert data["statistics"]["severity_breakdown"]["high"] == 0
-    assert data["risk_score"] == 0.0
+    assert data["risk_score"] == original_risk_score
+    assert repo.scans["scan-1"].overall_risk_level == original_risk_level
     assert audit.entries[0]["metadata"]["new_disposition"] == "false_positive"
     assert {entry["recipient_user_id"] for entry in notifications.entries} == {
         "user-dev",

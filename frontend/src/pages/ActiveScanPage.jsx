@@ -4,6 +4,7 @@ import { ArrowRight, Check, Loader2, ShieldCheck } from "lucide-react";
 import { useScanStatus } from "../hooks/useScanStatus.js";
 import { SCAN_PHASES } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 const STATUS_LABEL = {
   queued: "Queued",
@@ -59,6 +60,7 @@ function ActiveScanPage() {
     analysis,
     siteTitle,
     targetUrl,
+    statistics,
     logs,
     logRef,
     error,
@@ -78,7 +80,8 @@ function ActiveScanPage() {
     return () => clearTimeout(id);
   }, [status, scanId, navigate]);
 
-  const surfaces = Math.max(1, stageIdx * 20);
+  const surfaces = statistics?.total_urls_crawled ?? Math.max(1, stageIdx * 20);
+  const alerts = statistics?.total_vulnerabilities ?? logs.filter((l) => l.kind === "warn").length;
   const analysisStatus = analysis?.status;
   const showAnalysis =
     Boolean(analysisStatus) && status === "completed";
@@ -122,7 +125,7 @@ function ActiveScanPage() {
           <span>Surfaces</span>
         </div>
         <div className='stat'>
-          <strong>{logs.filter((l) => l.kind === "warn").length}</strong>
+          <strong>{alerts}</strong>
           <span>Alerts</span>
         </div>
         <div className='stat'>
@@ -135,11 +138,7 @@ function ActiveScanPage() {
         <span style={{ width: `${progress}%` }} />
       </div>
 
-      {error && (
-        <div className='auth-error' style={{ marginBottom: 16 }}>
-          {error}
-        </div>
-      )}
+      <ErrorNotice error={error} title='Scan interrupted' className='scan-error-notice' />
 
       {showAnalysis && (
         <div className={`analysis-banner ${analysisStatus}`}>

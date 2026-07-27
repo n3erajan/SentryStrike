@@ -8,7 +8,7 @@ initial deterministic scan.
 import math
 
 from shared.models.scan import EvidenceStrengthBreakdown, SeverityBreakdown
-from shared.models.vulnerability import SeverityLevel, Vulnerability
+from shared.models.vulnerability import EvidenceStrength, SeverityLevel, Vulnerability
 
 
 def _risk_level(score: float) -> str:
@@ -27,34 +27,62 @@ def _risk_level(score: float) -> str:
 def calculate_aggregate_risk(
     vulnerabilities: list[Vulnerability],
 ) -> tuple[float, str]:
-    """Return the existing worst-case-anchored 0-100 risk score and band."""
-    active = [vulnerability for vulnerability in vulnerabilities if not vulnerability.is_false_positive]
-    if not active:
+    """Return an immutable, evidence-adjusted snapshot of detected scan risk.
+
+    Every finding produced by the scanner participates, including findings that a
+    user later marks as false positive. The worst finding anchors the score and
+    additional findings move it toward (but never into) the next severity band.
+    """
+    if not vulnerabilities:
         return 0.0, _risk_level(0.0)
 
-    tier_weight = {
+    evidence_weight = {
+        EvidenceStrength.confirmed_exploit: 1.0,
+        EvidenceStrength.confirmed_observation: 0.9,
+        EvidenceStrength.probable: 0.7,
+        EvidenceStrength.possible: 0.4,
+        EvidenceStrength.informational: 0.0,
+    }
+    breadth_weight = {
         SeverityLevel.critical: 1.0,
         SeverityLevel.high: 0.6,
         SeverityLevel.medium: 0.3,
         SeverityLevel.low: 0.1,
         SeverityLevel.info: 0.0,
     }
-    breadth_cap = 0.5
-    breadth_k = 0.35
 
-    weighted_cvss: list[float] = []
-    severity_weight_sum = 0.0
-    for vulnerability in active:
-        evidence_weight = 1.0 if vulnerability.evidence.verified else 0.7
-        weighted_cvss.append(vulnerability.cvss_score * evidence_weight)
-        severity_weight_sum += tier_weight.get(vulnerability.severity, 0.3) * evidence_weight
+    adjusted_scores = [
+        vulnerability.cvss_score
+        * 10.0
+        * evidence_weight.get(vulnerability.evidence_strength, 0.4)
+        for vulnerability in vulnerabilities
+    ]
+    anchor_index = max(range(len(adjusted_scores)), key=adjusted_scores.__getitem__)
+    anchor = adjusted_scores[anchor_index]
+    if anchor <= 0.0:
+        return 0.0, _risk_level(0.0)
 
-    anchor = max(weighted_cvss) * 10.0
-    headroom = 100.0 - anchor
-    breadth = headroom * breadth_cap * (
-        1.0 - math.exp(-breadth_k * severity_weight_sum)
+    # Non-critical ceilings are exclusive. Keeping one hundredth of a point of
+    # space also prevents two-decimal rounding from changing the severity band.
+    if anchor < 40.0:
+        band_ceiling = 39.99
+    elif anchor < 70.0:
+        band_ceiling = 69.99
+    elif anchor < 90.0:
+        band_ceiling = 89.99
+    else:
+        band_ceiling = 100.0
+
+    additional_weight = sum(
+        breadth_weight.get(vulnerability.severity, 0.3)
+        * evidence_weight.get(vulnerability.evidence_strength, 0.4)
+        for index, vulnerability in enumerate(vulnerabilities)
+        if index != anchor_index
     )
-    score = round(min(100.0, anchor + breadth), 2)
+    breadth = (band_ceiling - anchor) * (
+        1.0 - math.exp(-0.5 * additional_weight)
+    )
+    score = round(min(band_ceiling, anchor + breadth), 2)
     return score, _risk_level(score)
 
 
@@ -92,8 +120,8 @@ def severity_breakdown(vulnerabilities: list[Vulnerability]) -> SeverityBreakdow
     return counts
 
 
-def apply_finding_rollups(scan) -> None:
-    """Update all finding-derived scan totals in place."""
+def apply_finding_statistics(scan) -> None:
+    """Update mutable finding-review statistics without changing scan risk."""
     vulnerabilities = list(scan.vulnerabilities)
     active_count = sum(not vulnerability.is_false_positive for vulnerability in vulnerabilities)
 
@@ -105,6 +133,12 @@ def apply_finding_rollups(scan) -> None:
         scan.report_metadata.evidence_strength_breakdown = evidence_strength_breakdown(
             vulnerabilities
         )
+
+
+def apply_finding_rollups(scan) -> None:
+    """Finalize finding statistics and the immutable scan-completion risk snapshot."""
+    vulnerabilities = list(scan.vulnerabilities)
+    apply_finding_statistics(scan)
     scan.overall_risk_score, scan.overall_risk_level = calculate_aggregate_risk(
         vulnerabilities
     )

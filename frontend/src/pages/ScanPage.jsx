@@ -13,6 +13,7 @@ import {
   CRED_ROLES,
   SCAN_MODES,
 } from "../data/constants.js";
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 function CredentialAccount({ role, account, onField, disabled }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -174,6 +175,7 @@ function ScanPage() {
     const result = await startScan();
     if (result) {
       toast("Scan started");
+      window.dispatchEvent(new CustomEvent("scan-started"));
       navigate(`/active/${result.scanId}`, {
         state: { target: result.target },
       });
@@ -189,17 +191,13 @@ function ScanPage() {
         </div>
       </div>
 
-      {error && (
-        <div
-          className={conflict ? "scan-conflict" : "auth-error"}
-          style={{ margin: "0 0 16px" }}
-        >
-          {error}
-        </div>
-      )}
-
       <div className='formlayout'>
         <main>
+          <ErrorNotice
+            error={error}
+            title={conflict ? "Scan already active" : "Could not start scan"}
+            className={conflict ? "scan-conflict" : "scan-error-notice"}
+          />
           <section className='formsection'>
             <h3>Target</h3>
             {apps.length > 0 && (

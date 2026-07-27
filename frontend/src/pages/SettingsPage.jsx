@@ -10,6 +10,7 @@ import {
   setRetention,
   updateWorkspace,
 } from "../services/workspace.js";
+import ErrorNotice from "../components/ErrorNotice.jsx";
 
 const title = (v) =>
   (v || "").replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase());
@@ -105,7 +106,7 @@ function SettingsPage() {
       setRetentionDays(ret.retention_days);
       if (admin) await loadAudit(1);
     } catch (err) {
-      setError(err.message || "Could not load workspace settings.");
+      setError(err);
     } finally {
       setLoading(false);
     }
@@ -132,7 +133,7 @@ function SettingsPage() {
       await Promise.all(requests);
       toast("Workspace settings saved");
     } catch (err) {
-      toast(err.message || "Could not save settings.");
+      toast(err, { type: "error", fallback: "Could not save settings." });
     } finally {
       setSaving(false);
     }
@@ -155,7 +156,7 @@ function SettingsPage() {
           </button>
         )}
       </div>
-      {error && <div className='auth-error'>{error}</div>}
+      <ErrorNotice error={error} fallback='Could not load workspace settings.' onRetry={load} />
       {loading ? (
         <div className='empty-state'>Loading settings…</div>
       ) : (
