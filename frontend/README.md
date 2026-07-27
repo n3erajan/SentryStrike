@@ -1,6 +1,6 @@
 # SentryStrike Frontend
 
-The SentryStrike frontend is a React single-page application for managing web applications, launching authorized assessments, monitoring live progress, triaging findings, and exporting completed reports.
+The SentryStrike frontend is a React single-page application for managing web applications, launching authorized assessments, monitoring live progress, reviewing findings, coordinating remediation, and exporting completed reports.
 
 ## Stack
 
@@ -32,24 +32,37 @@ Routes are declared in [`src/App.jsx`](src/App.jsx). Public routes cover the lan
 
 ```bash
 npm ci
+cp .env.example .env   # points VITE_API_URL at the local backend
 npm run dev
 ```
 
-Open <http://localhost:5173>. Vite proxies `/api` to the local backend, so the default development flow remains same-origin.
+Open <http://localhost:5173>. The app calls the backend directly at the origin set in `VITE_API_URL`, so the backend's CORS must allow `http://localhost:5173` with credentials.
 
 ## Environment
 
-Copy the example when the API is served from a different origin:
+The app reads `VITE_API_URL`, the backend API base URL, which Vite bakes into the bundle at build time. Copy the template and adjust if your backend lives elsewhere:
 
 ```bash
 cp .env.example .env
 ```
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `VITE_API_URL` | `/api/v1` | Backend API base URL baked into the Vite build |
+```dotenv
+VITE_API_URL=http://localhost:8000/api/v1
+```
 
-For local development, either omit the variable and use Vite's proxy or set it to `http://localhost:8000/api/v1`. Production builds normally keep `/api/v1` and let Nginx proxy requests to the backend service.
+| Variable | Example | Purpose |
+| --- | --- | --- |
+| `VITE_API_URL` | `http://localhost:8000/api/v1` | Backend API base URL baked into the Vite build |
+
+In development the frontend (`http://localhost:5173`) and backend (`http://localhost:8000`) are different origins, so requests are cross-origin — the backend must allow the frontend origin with credentials (the auth session cookie). For an API on a separate host, set the full origin, e.g. `https://api.example.com/api/v1`.
+
+When the frontend and API share an origin behind a reverse proxy, use a relative value instead:
+
+```dotenv
+VITE_API_URL=/api/v1
+```
+
+The Docker image defaults to `/api/v1` and lets Nginx proxy requests to the backend service (see [Production image](#production-image)).
 
 ## Scripts
 

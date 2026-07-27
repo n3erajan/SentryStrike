@@ -1,6 +1,6 @@
 # SentryStrike Analyzer
 
-The analyzer is a durable background worker that turns scanner evidence into structured finding guidance and a report-level executive summary. It uses Ollama by default and can connect to any OpenAI-compatible chat-completions API. Every provider response is schema-validated, calibrated against deterministic false-positive rules, and published only while the worker owns the current analysis revision.
+The analyzer is a durable background worker that turns scanner evidence into structured finding guidance and a report-level executive summary. It uses local Ollama by default, so evidence remains in the deployment. It can also connect to an OpenAI-compatible chat-completions API when that is explicitly configured. Every provider response is schema-validated, calibrated against deterministic false-positive rules, and published only while the worker owns the current analysis revision.
 
 The analyzer does not discover vulnerabilities. Scanner evidence remains the source of the finding; model output adds explanation, exploitability context, business impact, remediation guidance, and conservative false-positive adjudication.
 
@@ -19,7 +19,7 @@ Provider and schema failures use bounded retries. Expired leases are recovered o
 
 ## Provider requirements
 
-The default provider is Ollama at `http://localhost:11434/v1`, using the configured `AI_MODEL`. Docker Compose uses `host.docker.internal` to reach Ollama running on the host. Any provider implementing an OpenAI-compatible chat-completions API can be used by changing `AI_BASE_URL`, `AI_MODEL`, and credentials when required.
+The default provider is Ollama at `http://localhost:11434/v1`, using the configured `AI_MODEL`. Docker Compose uses `host.docker.internal` to reach Ollama running on the host. With this default, scanner evidence is sent only to the local Ollama service. Any provider implementing an OpenAI-compatible chat-completions API can be used by changing `AI_BASE_URL`, `AI_MODEL`, and credentials when required; its data-handling policy then applies.
 
 The selected model should reliably return JSON matching the analyzer's Pydantic schemas. Provider request IDs and available token counts are retained on the analysis job for observability.
 

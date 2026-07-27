@@ -24,18 +24,18 @@ const MotionLink = motion.create(Link);
 const WORKFLOW = [
   {
     id: "provide",
-    title: "Set the target",
-    desc: "Enter a URL, choose the scope, and add test accounts if needed.",
+    title: "Set up the assessment",
+    desc: "Choose the web application and scope, then add dedicated test accounts when needed.",
   },
   {
     id: "scan",
-    title: "Run the scan",
-    desc: "Map the app and test the routes, inputs, and sessions it exposes.",
+    title: "Scan and analyze",
+    desc: "Map the application, test its exposed surface, verify findings, and run local AI analysis.",
   },
   {
     id: "report",
-    title: "Review the results",
-    desc: "Triage findings, assign fixes, and export the report.",
+    title: "Review and remediate",
+    desc: "Assign findings, discuss fixes, track remediation, re-verify, and export the report.",
   },
 ];
 
@@ -60,7 +60,7 @@ const OWASP = {
     chips: ["Security headers", "Sensitive paths", "Error disclosure"],
   },
   a03: {
-    nav: " A03 Supply Chain",
+    nav: "A03 Supply Chain",
     label: "A03 · SOFTWARE SUPPLY CHAIN FAILURES",
     title: "Find known risks in dependencies.",
     p: "Match detected components and versions against CVEs from the NVD.",
@@ -99,34 +99,35 @@ const OWASP = {
 const ROLES = {
   owner: {
     nav: "Business owner",
-    title: "See what could block a release.",
-    desc: "Get the risk, likely impact, and current remediation status without reading raw scanner output.",
+    title: "Understand the risk in plain language.",
+    desc: "See the overall risk, business impact, executive summary, and remediation progress without reading raw HTTP evidence.",
     items: [
-      "Risk score and release guidance",
-      "Plain-language impact",
-      "Fix status",
+      "Overall risk and severity",
+      "Plain-language business impact",
+      "Executive summary",
+      "Remediation progress",
     ],
   },
   developer: {
     nav: "Developer",
-    title: "Get enough detail to fix it.",
-    desc: "See the affected endpoint, payload, evidence, and recommended fix.",
+    title: "See exactly what needs to be fixed.",
+    desc: "Work from the affected request, parameters, scanner evidence, and AI-generated remediation guidance.",
     items: [
-      "Exact endpoint and parameter",
-      "Request and response evidence",
-      "CVSS and exploitability",
-      "Suggested fix",
+      "Affected URL, method, and parameters",
+      "Request, response, and payload snippets",
+      "Exploitability and business context",
+      "Remediation guidance and fix status",
     ],
   },
   security: {
-    nav: "Security team",
-    title: "Review what the scan covered.",
-    desc: "Check authentication context, evidence strength, skipped tests, and scan limits.",
+    nav: "Security reviewer",
+    title: "Inspect the evidence behind every result.",
+    desc: "Review verification details, confidence, AI false-positive reasoning, authentication coverage, and scan limits.",
     items: [
-      "SPA and API coverage",
-      "Authenticated coverage",
-      "Reasons tests were skipped",
-      "Evidence strength breakdown",
+      "Verification method and reproducibility",
+      "Evidence strength and confidence",
+      "AI false-positive assessment",
+      "Coverage warnings and re-verification",
     ],
   },
 };
@@ -134,23 +135,38 @@ const ROLES = {
 const FAQS = [
   [
     "Can SentryStrike test behind login?",
-    "Yes. Provide primary, secondary, and administrator test accounts for authenticated workflows and access-control testing. Credentials are used in memory and not stored at rest.",
+    "Yes. Provide primary, secondary, and administrator test accounts for authenticated workflows and access-control testing. They travel in the temporary Redis scan job, are removed from the queue when a worker claims it, and are never saved to MongoDB.",
   ],
   [
     "Does this replace a human penetration test?",
     "No. It automates repeatable DAST checks. Threat modeling, source review, and complex business logic still need skilled human testing.",
   ],
   [
-    "Can teams compare past reports?",
-    "Yes. Reports keeps every completed scan, and each application page shows its scan history and latest score.",
+    "Where does the AI analysis run?",
+    "SentryStrike uses local Ollama by default, so finding evidence stays inside the deployment. An external OpenAI-compatible provider can be configured when its data-handling policy is acceptable.",
   ],
+  [
+    "Can teams review earlier assessments?",
+    "Yes. SentryStrike keeps completed scans and reports in the workspace, and each application shows its scan history and latest risk score.",
+  ],
+];
+
+const AUDIENCES = [
+  "Business owners",
+  "E-commerce teams",
+  "Development teams",
+  "Security teams",
+  "Growing SaaS companies",
+  "Website operators",
+  "Product teams",
+  "Security consultants",
 ];
 
 const PHASE_LABELS = [
   "Mapping application",
-  "Detecting technology",
   "Testing security controls",
-  "Building report",
+  "Verifying evidence",
+  "Analyzing findings",
 ];
 
 function ScanPreview() {
@@ -223,7 +239,7 @@ function ScanPreview() {
           <span style={{ width: `${progress}%` }} />
         </div>
         <div className='phases'>
-          {["Map app", "Detect stack", "Test controls", "Build report"].map(
+          {["Map app", "Test controls", "Verify evidence", "Analyze findings"].map(
             (name, i) => (
               <div
                 key={name}
@@ -282,7 +298,7 @@ function WorkflowVisual({ id }) {
             </div>
             <Link
               className='btn primary'
-              to='/register'
+              to='/login'
               style={{ marginTop: 15 }}
             >
               Continue
@@ -305,7 +321,7 @@ function WorkflowVisual({ id }) {
             <b>164</b>
           </div>
           <div className='coverage-row'>
-            <span>API endpoints</span>
+            <span>Browser requests</span>
             <div className='mini'>
               <span style={{ width: "74%" }} />
             </div>
@@ -339,14 +355,14 @@ function WorkflowVisual({ id }) {
         <div className='preview-score'>
           <strong className='high mono'>42</strong>
           <p>
-            <b>High risk</b>
+            <b>Medium risk</b>
             <br />
-            Cross-tenant exposure should block release.
+            Cross-tenant exposure is the highest-priority finding.
           </p>
         </div>
         <div className='cardfoot'>
           <span>9 verified findings</span>
-          <b>96% coverage</b>
+          <b>Coverage recorded</b>
         </div>
       </div>
     </div>
@@ -411,7 +427,7 @@ HTTP 200 OK
               <b className='mono'>12</b>
             </div>
             <div className='coverage-stat'>
-              <span>API endpoints extracted</span>
+              <span>Browser requests observed</span>
               <b className='mono'>37</b>
             </div>
             <div className='coverage-stat'>
@@ -446,9 +462,9 @@ HTTP 200 OK
         <div className='preview-score'>
           <strong className='high mono'>42</strong>
           <p>
-            <b>High risk</b>
+            <b>Medium risk</b>
             <br />
-            Release should remain blocked.
+            Prioritize the strongest verified findings.
           </p>
         </div>
       </div>
@@ -487,7 +503,7 @@ function LandingPage() {
             to='/register'
             whileTap={{ scale: 0.97 }}
           >
-            Start a scan
+            Join with invite
           </MotionLink>
         </div>
       </nav>
@@ -504,15 +520,17 @@ function LandingPage() {
           >
             <motion.span className='eyebrow' variants={fadeUp}>
               <BadgeCheck className='ico' />
-              Evidence-driven DAST
+              Web DAST + vulnerability management
             </motion.span>
             <AnimatedWords
-              text='Find what your web app exposes.'
+              text='From web scan to verified fix.'
               delay={0.12}
             />
             <motion.p variants={fadeUp}>
-              SentryStrike scans public and authenticated routes, verifies
-              findings, and shows your team what to fix.
+              SentryStrike maps and tests traditional sites and SPAs, verifies
+              the evidence, and uses local AI to analyze findings and build the
+              report. Your team can review, assign, discuss, and track every fix
+              in the same workspace.
             </motion.p>
             <motion.div className='hero-actions' variants={fadeUp}>
               <MotionLink
@@ -520,7 +538,7 @@ function LandingPage() {
                 to='/register'
                 whileTap={{ scale: 0.97 }}
               >
-                Start a scan
+                Join with invite
               </MotionLink>
               <motion.a
                 className='btn'
@@ -533,15 +551,15 @@ function LandingPage() {
             <motion.div className='trust' variants={fadeUp}>
               <span>
                 <LockKeyhole className='ico' />
-                Credentials kept in memory
+                Test credentials never persisted
               </span>
               <span>
                 <CheckCircle2 className='ico' />
-                Evidence-backed findings
+                Local AI analysis
               </span>
               <span>
                 <FileCheck2 className='ico' />
-                PDF reports
+                Evidence-based reports
               </span>
             </motion.div>
           </motion.div>
@@ -556,28 +574,31 @@ function LandingPage() {
 
         <Reveal className='ticker-wrap'>
           <span className='ticker-label'>Built for</span>
-          <div className='ticker'>
-            {[
-              "Business owners",
-              "Development teams",
-              "Security teams",
-              "Growing SaaS companies",
-              "Business owners",
-              "Development teams",
-              "Security teams",
-              "Growing SaaS companies",
-            ].map((s, i) => (
-              <span key={`${s}-${i}`}>{s}</span>
-            ))}
+          <div className='ticker-viewport'>
+            <div className='ticker'>
+              {/* Two copies drive the -50% loop; each copy repeats the list so
+                  one copy always exceeds the viewport width, keeping the wrap
+                  seamless (no blank gap at the reset point) on any screen. */}
+              {[0, 1].flatMap((copy) =>
+                [...AUDIENCES, ...AUDIENCES].map((s, i) => (
+                  <span
+                    key={`${copy}-${s}-${i}`}
+                    aria-hidden={copy === 1 ? "true" : undefined}
+                  >
+                    {s}
+                  </span>
+                ))
+              )}
+            </div>
           </div>
         </Reveal>
 
         <section className='public-section' id='platform'>
           <StaggerGroup className='section-head'>
-            <StaggerItem as='h2'>A scan you can follow.</StaggerItem>
+            <StaggerItem as='h2'>From assessment to remediation.</StaggerItem>
             <StaggerItem as='p'>
-              Set the target and scope. SentryStrike handles discovery,
-              testing, and reporting.
+              Run the scan, understand the findings, and manage the work that
+              follows without moving between separate tools.
             </StaggerItem>
           </StaggerGroup>
           <div className='workflow'>
@@ -611,8 +632,9 @@ function LandingPage() {
           <StaggerGroup className='section-head'>
             <StaggerItem as='h2'>Coverage you can inspect.</StaggerItem>
             <StaggerItem as='p'>
-              See what ran, what was skipped, and why. Missing coverage is never
-              treated as a pass.
+              Inspect active checks across OWASP Top 10 (2025), along with what
+              ran, what was skipped, and why. A06, A08, and A09 are identified as
+              outside automated DAST scope rather than treated as passes.
             </StaggerItem>
           </StaggerGroup>
           <div className='owasp'>
@@ -668,10 +690,10 @@ function LandingPage() {
 
         <section className='public-section' id='teams'>
           <StaggerGroup className='section-head'>
-            <StaggerItem as='h2'>One report, useful at every level.</StaggerItem>
+            <StaggerItem as='h2'>One assessment, three useful views.</StaggerItem>
             <StaggerItem as='p'>
-              Each role gets the detail it needs without losing the underlying
-              evidence.
+              Business owners, developers, and security reviewers each get the
+              detail they need from the same findings and report.
             </StaggerItem>
           </StaggerGroup>
           <StaggerGroup className='roles'>
@@ -739,8 +761,8 @@ function LandingPage() {
 
         <section className='cta'>
           <Reveal>
-            <h2>Scan an authorized web app.</h2>
-            <p>Start with a URL. Add test accounts when you need authenticated coverage.</p>
+            <h2>Join your SentryStrike workspace.</h2>
+            <p>Use your invitation to create an account, then launch authorized scans and manage remediation with your team.</p>
           </Reveal>
           <Reveal delay={0.12}>
             <MotionLink
@@ -748,7 +770,7 @@ function LandingPage() {
               to='/register'
               whileTap={{ scale: 0.97 }}
             >
-              Create account
+              Join with invite
             </MotionLink>
           </Reveal>
         </section>

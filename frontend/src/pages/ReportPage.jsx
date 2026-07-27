@@ -782,11 +782,13 @@ function ReportPage() {
           <p>{formatDateTime(scanTime)} </p>
         </div>
         <div className='app-actions'>
-          <button className='btn' onClick={handleJson}>
-            <FileText className='ico' />
-            JSON
-          </button>
-          <Tooltip label={!analysisComplete ? "PDF is available after AI analysis completes" : ""}>
+          <Tooltip label="Download detailed JSON report">
+            <button className='btn' onClick={handleJson}>
+              <FileText className='ico' />
+              JSON
+            </button>
+          </Tooltip>
+          <Tooltip label={!analysisComplete ? "PDF is available after AI analysis completes" : "Download PDF report"}>
             <button
               className='btn primary'
               onClick={handlePdf}

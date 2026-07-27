@@ -37,7 +37,7 @@ All application images run as non-root users.
 
 - Docker Engine or Docker Desktop with Compose v2.24 or newer
 - At least 4 GB of available memory; browser-heavy scans may require more
-- An Ollama instance with the configured model, or another reachable OpenAI-compatible chat-completions provider
+- An Ollama instance with the configured model, or another reachable OpenAI-compatible provider, when AI analysis is enabled
 - A public HTTPS endpoint when OAST callbacks must be received from remote targets
 
 Confirm Docker and Compose are available:
@@ -117,7 +117,7 @@ SCAN_MODE=verified
 NVD_API_KEY=
 ```
 
-Start conservatively for fragile targets. Authenticated target credentials are submitted per scan and are not read from environment files or persisted to MongoDB.
+Start conservatively for fragile targets. Authenticated target credentials are submitted per scan, not read from environment files, and never persisted to MongoDB. They exist only in the Redis job payload and worker memory; Redis removes the payload when a worker claims it.
 
 ### AI analysis provider
 
@@ -132,20 +132,22 @@ AI_MAX_RETRIES=3
 AI_JSON_MODE=true
 ```
 
-Make sure the configured model exists in Ollama and the service is reachable from Docker. For a hosted or separately deployed provider, replace `AI_BASE_URL`, `AI_MODEL`, and `AI_API_KEY` as required. Provider responses must support the analyzer's structured JSON contract.
+Make sure the configured model exists in Ollama and the service is reachable from Docker. With the default local Ollama configuration, scan evidence stays within the deployment. For a hosted or separately deployed provider, replace `AI_BASE_URL`, `AI_MODEL`, and `AI_API_KEY` as required; that provider receives the analysis input, so review its data-handling terms. Provider responses must support the analyzer's structured JSON contract.
 
 ### OAST routing
 
-Compose defaults to this split topology:
+The backend is the OAST collaborator. It receives target callbacks at `/oast/{interaction_id}`, stores them in MongoDB, and answers scanner polling requests at `/oast/poll`.
+
+Docker Compose gives the scanner two addresses for those backend routes because they are reached from different network locations:
 
 ```dotenv
 OAST_CALLBACK_BASE_URL=http://host.docker.internal:8000/oast
 OAST_POLL_URL=http://backend:8000/oast/poll
 ```
 
-- `OAST_CALLBACK_BASE_URL` is embedded in payloads and must be reachable by the authorized target.
-- `OAST_POLL_URL` is used by scanner containers and normally stays on the internal Docker network.
-- OAST interactions are validated by the backend and persisted in MongoDB.
+- `OAST_CALLBACK_BASE_URL` is the backend callback route as seen by the target receiving the test payload.
+- `OAST_POLL_URL` is the same backend service as seen by the scanner on the Compose network.
+- The backend validates interaction IDs before it stores or returns a callback.
 
 Set Compose-specific OAST overrides in the root `.env`, not `scanner/.env`.
 Compose interpolation occurs before service `env_file` values are loaded. The
@@ -163,7 +165,7 @@ docker compose up -d mongo redis
 docker compose ps
 ```
 
-Then start the backend, scanner, analyzer, and frontend on the host using the [local development instructions](README.md#local-development). The root `.env.example` already uses localhost addresses for this topology.
+Then start the backend, scanner, analyzer, and frontend on the host using the [local development instructions](README.md#quick-start-for-local-development). The root `.env.example` already uses localhost addresses for this topology.
 
 Stop the data stores without deleting MongoDB data:
 

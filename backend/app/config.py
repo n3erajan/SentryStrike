@@ -29,7 +29,7 @@ class BackendSettings(
     cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
-    auth_session_ttl_hours: int = Field(default=24, ge=1, alias="AUTH_SESSION_TTL_HOURS")
+    auth_session_ttl_hours: int = Field(default=168, ge=1, alias="AUTH_SESSION_TTL_HOURS")
     auth_cookie_name: str = Field(
         default="sentrystrike_session",
         min_length=1,

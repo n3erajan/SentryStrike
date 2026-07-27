@@ -1322,33 +1322,66 @@ textarea:focus-visible {
   background: var(--bad);
 }
 .ticker-wrap {
+  display: flex;
+  align-items: center;
+  gap: clamp(14px, 2vw, 26px);
   overflow: hidden;
-  padding: 17px clamp(18px, 6vw, 96px);
+  padding: 14px clamp(18px, 6vw, 96px);
   background: var(--paper);
   border-block: 1px solid var(--line);
   margin-top: -1px;
 }
 .ticker-label {
-  display: block;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
   white-space: nowrap;
   color: var(--muted);
-  font-size: 0.67rem;
-  margin-bottom: 12px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg);
+}
+.ticker-viewport {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  -webkit-mask: linear-gradient(
+    90deg,
+    transparent 0,
+    #000 6%,
+    #000 94%,
+    transparent 100%
+  );
+  mask: linear-gradient(
+    90deg,
+    transparent 0,
+    #000 6%,
+    #000 94%,
+    transparent 100%
+  );
 }
 .ticker {
   display: flex;
-  min-width: max-content;
-  animation: ticker 22s linear infinite;
+  width: max-content;
+  animation: ticker 90s linear infinite;
   color: var(--sub);
   font-size: 0.72rem;
   font-weight: 650;
+}
+.ticker-wrap:hover .ticker {
+  animation-play-state: paused;
 }
 .ticker span {
   display: flex;
   gap: 8px;
   align-items: center;
-  /* Spacing lives on each item (not flex gap) so the strip's width is
-     exactly 2x one copy and the -50% loop wraps seamlessly. */
+  /* Spacing lives on each item (not flex gap) so both copies have identical
+     width and the -50% loop wraps seamlessly. */
   margin-right: 42px;
 }
 
@@ -3255,12 +3288,11 @@ footer.public-footer {
   place-items: center;
   border-radius: 6px;
   color: currentColor;
-  opacity: 0.72;
+  background: color-mix(in srgb, currentColor 8%, transparent);
 }
 .toast-dismiss:hover,
 .toast-dismiss:focus-visible {
-  background: color-mix(in srgb, currentColor 12%, transparent);
-  opacity: 1;
+  background: color-mix(in srgb, currentColor 16%, transparent);
 }
 .toast-dismiss svg {
   width: 15px;

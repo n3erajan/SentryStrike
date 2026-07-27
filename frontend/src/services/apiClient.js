@@ -8,9 +8,10 @@
 // The backend sets an HttpOnly session cookie on login; every request includes
 // it via `credentials: "include"` — no client-side token storage needed.
 //
-// In dev, requests go to the relative `/api/v1` path which Vite proxies to the
-// backend (see vite.config.js) — same-origin, no CORS. For a hosted build set
-// VITE_API_URL to the backend origin, e.g. https://api.example.com/api/v1.
+// Requests go to VITE_API_URL. In dev, set it to the backend's absolute origin
+// (e.g. http://localhost:8000/api/v1) — cross-origin, so the backend's CORS must
+// allow this origin with credentials. Leave it relative ("/api/v1", the default)
+// when the frontend and API share an origin behind a reverse proxy.
 
 export const API_BASE = import.meta.env?.VITE_API_URL || "/api/v1";
 

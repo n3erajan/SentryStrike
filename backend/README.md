@@ -7,9 +7,9 @@ Scanning and AI analysis run in separate workers; API requests enqueue durable w
 ## Responsibilities
 
 - Invite-only registration and HttpOnly session-cookie authentication
-- Tenant isolation and role-based authorization for owners, admins, analysts, and viewers
+- Tenant isolation and role-based authorization for owners, admins, analysts, developers, and viewers
 - Web application inventory and scan lifecycle management
-- Finding triage, assignments, comments, remediation decisions, and re-verification requests
+- Finding review, assignments, comments, false-positive decisions, remediation tracking, and re-verification requests
 - Notifications, audit history, membership, invitations, and retention settings
 - JSON report projection and PDF generation
 - Public OAST callback collection for blind verification
@@ -36,29 +36,29 @@ python -m pip install -r backend/requirements-dev.txt
 cp backend/.env.example backend/.env
 ```
 
-The backend also reads the root `.env`. Start MongoDB and Redis, configure SMTP in `backend/.env`, then run:
+The backend also reads the root `.env`. Start MongoDB and Redis, then run:
 
 ```bash
 cd backend
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Open <http://localhost:8000/docs> for the generated OpenAPI interface. Health is available at <http://localhost:8000/api/v1/health>.
+Open <http://localhost:8000/docs> for the generated OpenAPI interface. The health endpoint is available at <http://localhost:8000/api/v1/health>.
 
 ## API groups
 
 All application endpoints use the `/api/v1` prefix.
 
-| Prefix | Purpose |
-| --- | --- |
-| `/auth` | Invitation preview, registration, login, logout, and current user |
-| `/applications` | Workspace application inventory and application scan history |
-| `/scans` | Submission, listing, detail, status, and cancellation |
-| `/analysis` | Finding detail, review, assignment, comments, remediation, retry, and re-verification |
-| `/reports` | Report data and PDF download |
-| `/workspace` | Workspace profile, members, invitations, audit log, and retention |
-| `/notifications` | Notification listing, unread count, and read state |
-| `/health` | API status and active scanner count |
+| Prefix           | Purpose                                                                               |
+| ---------------- | ------------------------------------------------------------------------------------- |
+| `/auth`          | Invitation preview, registration, login, logout, and current user                     |
+| `/applications`  | Workspace application inventory and application scan history                          |
+| `/scans`         | Submission, listing, detail, status, and cancellation                                 |
+| `/analysis`      | Finding detail, review, assignment, comments, remediation, retry, and re-verification |
+| `/reports`       | Report data and PDF download                                                          |
+| `/workspace`     | Workspace profile, members, invitations, audit log, and retention                     |
+| `/notifications` | Notification listing, unread count, and read state                                    |
+| `/health`        | API status and active scanner count                                                   |
 
 The OAST routes live at `/oast`, outside `/api/v1`, and are intentionally unauthenticated so tested targets can call back. Interaction IDs are validated before data is stored.
 
@@ -103,6 +103,8 @@ Important production settings include:
 - `RETENTION_PURGE_INTERVAL_SECONDS`
 
 Gmail SMTP requires both a username and app password. Settings validation fails fast when only one credential is supplied or Gmail is selected without credentials.
+
+SMTP is used for invitation and notification delivery. Local development can use the invitation link printed by the management CLI instead.
 
 ## Project structure
 

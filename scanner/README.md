@@ -25,7 +25,7 @@ This separation lets scanner throughput scale independently from API traffic and
 ## Scan lifecycle
 
 1. **Claim** — dequeue a tenant-scoped job, acquire a renewable lease, and begin worker heartbeats.
-2. **Crawl** — discover same-origin URLs, routes, forms, parameters, SPA interactions, and observed API traffic with HTTP and optional Playwright assistance.
+2. **Crawl** — discover same-origin URLs, routes, forms, parameters, SPA interactions, and observed API traffic. HTTP crawling covers traditional sites; Playwright/Chromium covers client-side SPA routes, interactions, and browser-observed API calls.
 3. **Fingerprint** — identify technologies and versions, enrich known components through NVD data, and inspect TLS behavior.
 4. **Plan** — turn the discovered attack surface into bounded detector work, prioritizing relevant routes and parameters.
 5. **Detect** — run passive and active checks under scan-, detector-, and parameter-level request budgets.
@@ -77,7 +77,7 @@ Safety boundaries are implemented across orchestration, crawling, and HTTP utili
 - Mutating authorization confirmation is disabled unless explicitly enabled.
 - Cancellation is checked during active work and at phase boundaries, with leases covering worker crashes.
 - Captured evidence passes through redaction before durable storage.
-- Target credentials are carried only in the consumed Redis job and worker memory; they are not persisted to MongoDB.
+- Target credentials travel only in the Redis job payload and worker memory. The job is removed from Redis when a worker claims it, and credentials are never persisted to MongoDB.
 
 Use conservative budgets for fragile systems and coordinate test windows with application owners.
 
