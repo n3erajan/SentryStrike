@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import sys
 import unicodedata
+from datetime import datetime, timezone, tzinfo
 
 from beanie import PydanticObjectId
 
@@ -70,6 +71,20 @@ def _safe_table_cell(value: object, max_length: int) -> str:
     return f"{text[: max_length - 1]}…"
 
 
+def _format_local_datetime(
+    value: datetime,
+    local_timezone: tzinfo | None = None,
+) -> str:
+    """Format a stored UTC timestamp in the operator's local timezone."""
+    utc_value = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    local_value = (
+        utc_value.astimezone(local_timezone)
+        if local_timezone is not None
+        else utc_value.astimezone()
+    )
+    return local_value.strftime("%Y-%m-%d %H:%M %z")
+
+
 async def _list_access_requests(limit: int) -> int:
     await init_db(get_settings())
     try:
@@ -87,7 +102,7 @@ async def _list_access_requests(limit: int) -> int:
         rows = [
             (
                 str(item.id),
-                item.created_at.strftime("%Y-%m-%d %H:%M"),
+                _format_local_datetime(item.created_at),
                 _safe_table_cell(item.full_name, 24),
                 _safe_table_cell(item.email, 36),
                 _safe_table_cell(item.organization_name, 30),

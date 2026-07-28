@@ -9,7 +9,7 @@ from app.api.dependencies import (
     json_response,
 )
 from app.config import get_settings
-from app.core.auth import AuthError, AuthService
+from app.core.auth import AuthError, AuthService, InvalidSessionError
 from app.core.invites import InviteError, InviteService
 from app.core.turnstile import (
     CaptchaInvalidError,
@@ -197,6 +197,33 @@ async def logout(
     await service.revoke_session(token)
     _clear_session_cookie(response)
     return json_response({"logged_out": True}, "logged out")
+
+
+@router.get("/session")
+async def session_status(
+    response: Response,
+    token: str | None = Depends(get_session_token),
+    service: AuthService = Depends(get_auth_service),
+) -> dict:
+    """Return the current user, or null when the visitor has no valid session.
+
+    Unlike the protected ``/me`` endpoint, this is a quiet bootstrap probe for
+    public pages, where a missing session is an expected state rather than a
+    failed request.
+    """
+    if not token:
+        return json_response(None, "no active session")
+
+    try:
+        user, _ = await service.authenticate_session(token)
+    except InvalidSessionError:
+        _clear_session_cookie(response)
+        return json_response(None, "no active session")
+
+    return json_response(
+        _user_response(user).model_dump(mode="json"),
+        "session active",
+    )
 
 
 @router.get("/me")

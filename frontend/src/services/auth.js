@@ -8,6 +8,7 @@
 //   POST /auth/register  { email, password, full_name, invite_token, turnstile_token } -> 201 { user } + set-cookie
 //   POST /auth/login     { email, password, turnstile_token }                          ->     { user } + set-cookie
 //   POST /auth/logout                                                 ->     { logged_out: true } + clear-cookie
+//   GET  /auth/session                                                ->     user | null
 //   GET  /auth/me                                                     ->     { id, email, ... }
 //   GET  /auth/invite    ?token                                       ->     { email, role, org_name }
 import { apiRequest } from "./apiClient.js";
@@ -57,7 +58,7 @@ export async function register({
 }
 
 export async function refreshCurrentUser() {
-  return await apiRequest("/auth/me");
+  return await apiRequest("/auth/session");
 }
 
 export async function logout() {

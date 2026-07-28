@@ -11,6 +11,7 @@ from app.core.access_request_rate_limit import RedisAccessRequestRateLimiter
 from app.core.auth import normalize_email, utc_now
 from app.core.turnstile import TurnstileVerifier
 from shared.models.access_request import AccessRequest
+from shared.models.user import User
 
 
 class AccessRequestService:
@@ -47,6 +48,10 @@ class AccessRequestService:
         )
 
         normalized_email = normalize_email(email)
+        registered_user = await User.find_one(User.email == normalized_email)
+        if registered_user is not None:
+            return False
+
         existing = await AccessRequest.find_one(AccessRequest.email == normalized_email)
         if existing is not None:
             return False

@@ -16,8 +16,8 @@ import {
 import { setOnUnauthorized } from "../services/apiClient.js";
 
 // Session is managed via an HttpOnly cookie set by the backend. On mount we
-// validate the session by calling GET /auth/me; a 401 (or missing session)
-// simply leaves the user null, which ProtectedRoute redirects to /login.
+// validate the session with the public session probe. Signed-out visitors get
+// a null user without an expected 401 cluttering the browser console.
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {

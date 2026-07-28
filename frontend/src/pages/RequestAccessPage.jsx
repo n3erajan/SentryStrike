@@ -81,9 +81,9 @@ export default function RequestAccessPage() {
           {submitted ? (
             <div className='access-request-success'>
               <CheckCircle2 aria-hidden='true' />
-              <AnimatedWords text='Request submitted' delay={0.08} />
+              <AnimatedWords text='Request received' delay={0.08} />
               <p>
-                If your request is approved, we will send a one-time link to <b>{email}</b> to create your workspace and owner account.
+                If this email does not already have a pending request, it is now queued for review. If approved, we will send a one-time link to <b>{email}</b> to create your workspace and owner account.
               </p>
               <Link className='btn primary' to='/' viewTransition>Return home</Link>
             </div>

@@ -13,9 +13,15 @@ export default function useDelayedTurnstileConfig(loadConfig) {
     const timer = window.setTimeout(
       () => {
         loadConfig(controller.signal)
-          .then((config) => setSiteKey(config.turnstile_site_key))
+          .then((config) => setSiteKey(config.turnstile_site_key || ""))
           .catch((error) => {
-            if (error.name !== "AbortError") setConfigError(error);
+            if (error.name !== "AbortError") {
+              const message =
+                typeof error === "string"
+                  ? error
+                  : error?.message || "The security check could not be loaded. Please try again later.";
+              setConfigError(message);
+            }
           });
       },
       reducedMotion ? 0 : TURNSTILE_RENDER_DELAY_MS,

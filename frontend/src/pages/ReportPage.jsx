@@ -542,7 +542,7 @@ function Finding({ v, scanId, user, members, onChanged }) {
                         await copyToClipboard(curl)
                         toast(
                           curl.includes('<YOUR_')
-                            ? 'cURL copied. Replace <YOUR_…> placeholders with your own session.'
+                            ? 'cURL copied. Replace the auth placeholders with your session values.'
                             : 'cURL copied',
                         )
                       } catch {

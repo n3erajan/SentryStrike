@@ -11,7 +11,13 @@ from app.api.dependencies import (
     get_turnstile_verifier,
 )
 from app.api.routes import auth, scan
-from app.core.auth import as_utc_naive, hash_password, utc_now, verify_password
+from app.core.auth import (
+    InvalidSessionError,
+    as_utc_naive,
+    hash_password,
+    utc_now,
+    verify_password,
+)
 from app.core.turnstile import CaptchaInvalidError
 
 
@@ -19,6 +25,8 @@ class FakeAuthService:
     def __init__(self) -> None:
         self.revoked_token: str | None = None
         self.authenticate_calls: list[tuple[str, str]] = []
+        self.authenticate_session_calls: list[str | None] = []
+        self.invalid_session = False
         self.user = SimpleNamespace(
             id="user-1",
             full_name="Niuradaj Adhadh",
@@ -37,6 +45,12 @@ class FakeAuthService:
     async def create_session(self, user):
         _ = user
         return "test-token", self.session
+
+    async def authenticate_session(self, token: str | None):
+        self.authenticate_session_calls.append(token)
+        if self.invalid_session:
+            raise InvalidSessionError()
+        return self.user, self.session
 
     async def revoke_session(self, token: str | None) -> bool:
         self.revoked_token = token
@@ -149,6 +163,48 @@ def test_logout_requires_current_user_and_revokes_current_token() -> None:
     assert response.status_code == 200
     assert response.json()["data"]["logged_out"] is True
     assert service.revoked_token == "token-from-header"
+
+
+def test_session_probe_returns_null_without_credentials() -> None:
+    service = FakeAuthService()
+    client = _auth_app(service)
+
+    response = client.get("/api/v1/auth/session")
+
+    assert response.status_code == 200
+    assert response.json()["data"] is None
+    assert service.authenticate_session_calls == []
+
+
+def test_session_probe_returns_current_user_for_valid_cookie() -> None:
+    service = FakeAuthService()
+    client = _auth_app(service)
+
+    response = client.get(
+        "/api/v1/auth/session",
+        headers={"Cookie": "sentrystrike_session=valid-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["id"] == "user-1"
+    assert service.authenticate_session_calls == ["valid-token"]
+
+
+def test_session_probe_clears_invalid_cookie_without_a_401() -> None:
+    service = FakeAuthService()
+    service.invalid_session = True
+    client = _auth_app(service)
+
+    response = client.get(
+        "/api/v1/auth/session",
+        headers={"Cookie": "sentrystrike_session=expired-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"] is None
+    assert service.authenticate_session_calls == ["expired-token"]
+    assert "sentrystrike_session=" in response.headers["set-cookie"]
+    assert "Max-Age=0" in response.headers["set-cookie"]
 
 
 def test_session_token_prefers_bearer_token_over_cookie() -> None:

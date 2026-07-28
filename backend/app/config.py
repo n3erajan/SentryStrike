@@ -29,7 +29,7 @@ class BackendSettings(
 
     app_name: str = Field(default="Sentry Strike Backend", alias="APP_NAME")
     app_debug: bool = Field(default=True, alias="APP_DEBUG")
-    cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
+    cors_origins: list[str] = Field(default=["http://localhost:5173"], alias="CORS_ORIGINS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     auth_session_ttl_hours: int = Field(default=168, ge=1, alias="AUTH_SESSION_TTL_HOURS")
@@ -72,12 +72,12 @@ class BackendSettings(
         alias="ACCESS_REQUEST_TTL_DAYS",
     )
     access_request_ip_limit_per_fifteen_minutes: int = Field(
-        default=1,
+        default=3,
         ge=1,
         alias="ACCESS_REQUEST_IP_LIMIT_PER_FIFTEEN_MINUTES",
     )
     access_request_ip_limit_per_day: int = Field(
-        default=7,
+        default=10,
         ge=1,
         alias="ACCESS_REQUEST_IP_LIMIT_PER_DAY",
     )

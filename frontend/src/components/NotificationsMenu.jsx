@@ -60,6 +60,7 @@ function targetFor(item) {
     item.metadata?.scan_id ||
     (item.resource_type === "scan" ? item.resource_id : null);
   if (!scanId) return null;
+  if (item.type === "scan_completed") return `/report/${scanId}`;
   return item.type?.startsWith("scan_")
     ? `/active/${scanId}`
     : `/report/${scanId}`;

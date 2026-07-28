@@ -50,11 +50,11 @@ export default function TurnstileWidget({
 
   useEffect(() => {
     const container = containerRef.current;
-    if (!siteKey) return undefined;
-    if (!container) return undefined;
+    if (!siteKey) return;
+    if (!container) return;
 
-    let widgetId;
     let active = true;
+    let widgetId;
     onTokenChange("");
 
     loadTurnstile()
@@ -62,8 +62,6 @@ export default function TurnstileWidget({
         if (!active || !turnstile) return;
         widgetId = turnstile.render(container, {
           sitekey: siteKey,
-          // ThemeProvider updates the document color-scheme. Auto lets the
-          // iframe follow it without recreating and invalidating a solved check.
           theme: "auto",
           size: "flexible",
           action,
@@ -81,11 +79,15 @@ export default function TurnstileWidget({
 
     return () => {
       active = false;
-      if (widgetId !== undefined && window.turnstile) {
+      if (widgetId != null && window.turnstile) {
         window.turnstile.remove(widgetId);
       }
     };
   }, [siteKey, action, onTokenChange, onError, resetKey]);
+
+  if (!siteKey) {
+    return <div className='turnstile-slot' role='status' aria-live='polite' />;
+  }
 
   return <div className='turnstile-slot' ref={containerRef} />;
 }

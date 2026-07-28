@@ -17,15 +17,20 @@ from app.core.turnstile import CaptchaInvalidError, TurnstileVerifier
 
 
 class FakeAccessRequestService:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        error: Exception | None = None,
+        result: bool = True,
+    ) -> None:
         self.error = error
+        self.result = result
         self.calls: list[dict] = []
 
     async def submit(self, **kwargs) -> bool:
         self.calls.append(kwargs)
         if self.error:
             raise self.error
-        return True
+        return self.result
 
 
 def _client(service: FakeAccessRequestService) -> TestClient:
@@ -54,6 +59,15 @@ def test_public_access_request_forwards_validated_submission() -> None:
     assert response.json()["data"] == {"submitted": True}
     assert service.calls[0]["email"] == "avery@example.test"
     assert service.calls[0]["client_ip"] == "testclient"
+
+
+def test_public_access_request_does_not_disclose_a_rejected_email() -> None:
+    service = FakeAccessRequestService(result=False)
+
+    response = _client(service).post("/api/v1/access-requests", json=_payload())
+
+    assert response.status_code == 202
+    assert response.json()["data"] == {"submitted": True}
 
 
 def test_public_access_request_returns_retry_after_when_limited() -> None:
@@ -138,6 +152,15 @@ class FakeAccessRequestDocument:
         self.__class__.inserted.append(self)
 
 
+class FakeUserDocument:
+    email = FakeField()
+    existing = None
+
+    @classmethod
+    async def find_one(cls, _query):
+        return cls.existing
+
+
 @pytest.mark.asyncio
 async def test_turnstile_verifier_rejects_missing_token_without_network_call() -> None:
     http_client = FakeHttpClient()
@@ -173,7 +196,9 @@ async def test_access_request_service_verifies_normalizes_and_sets_thirty_day_ex
 ) -> None:
     FakeAccessRequestDocument.existing = None
     FakeAccessRequestDocument.inserted = []
+    FakeUserDocument.existing = None
     monkeypatch.setattr(access_request_module, "AccessRequest", FakeAccessRequestDocument)
+    monkeypatch.setattr(access_request_module, "User", FakeUserDocument)
     limiter = FakeLimiter()
     http_client = FakeHttpClient()
     service = AccessRequestService(limiter, TurnstileVerifier(http_client))
@@ -201,7 +226,9 @@ async def test_access_request_service_verifies_normalizes_and_sets_thirty_day_ex
 async def test_access_request_service_deduplicates_pending_email(monkeypatch) -> None:
     FakeAccessRequestDocument.existing = object()
     FakeAccessRequestDocument.inserted = []
+    FakeUserDocument.existing = None
     monkeypatch.setattr(access_request_module, "AccessRequest", FakeAccessRequestDocument)
+    monkeypatch.setattr(access_request_module, "User", FakeUserDocument)
     service = AccessRequestService(
         FakeLimiter(),
         TurnstileVerifier(FakeHttpClient()),
@@ -211,6 +238,30 @@ async def test_access_request_service_deduplicates_pending_email(monkeypatch) ->
         full_name="Avery Stone",
         email="avery@example.test",
         organization_name="Northstar Security",
+        turnstile_token="captcha-token",
+        client_ip="203.0.113.9",
+    )
+
+    assert created is False
+    assert FakeAccessRequestDocument.inserted == []
+
+
+@pytest.mark.asyncio
+async def test_access_request_service_skips_registered_email(monkeypatch) -> None:
+    FakeAccessRequestDocument.existing = None
+    FakeAccessRequestDocument.inserted = []
+    FakeUserDocument.existing = object()
+    monkeypatch.setattr(access_request_module, "AccessRequest", FakeAccessRequestDocument)
+    monkeypatch.setattr(access_request_module, "User", FakeUserDocument)
+    service = AccessRequestService(
+        FakeLimiter(),
+        TurnstileVerifier(FakeHttpClient()),
+    )
+
+    created = await service.submit(
+        full_name="Existing User",
+        email="  EXISTING@EXAMPLE.TEST ",
+        organization_name="Existing Workspace",
         turnstile_token="captcha-token",
         client_ip="203.0.113.9",
     )

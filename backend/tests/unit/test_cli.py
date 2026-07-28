@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +7,17 @@ import pytest
 from app import cli
 from shared.models.invite import InviteEmailStatus, InviteState
 from shared.models.user import UserRole
+
+
+def test_format_local_datetime_treats_database_naive_values_as_utc() -> None:
+    nepal_timezone = timezone(timedelta(hours=5, minutes=45))
+
+    formatted = cli._format_local_datetime(
+        datetime(2026, 7, 27, 12, 53),
+        nepal_timezone,
+    )
+
+    assert formatted == "2026-07-27 18:38 +0545"
 
 
 def test_approve_access_request_accepts_per_workspace_member_limit(monkeypatch) -> None:
