@@ -5,7 +5,13 @@ import pytest
 
 from app.clients.ai_client import ProviderError, ProviderResult
 from app.services.result_applier import ResultApplier, StaleAnalysisRevisionError
-from app.worker import _notify_analysis_terminal, process_analysis_job, recover_expired_analysis_jobs
+from app.worker import (
+    _notify_analysis_terminal,
+    process_analysis_job,
+    recover_expired_analysis_jobs,
+    run_worker,
+)
+from shared.analysis_queue import AnalysisQueueError
 from shared.models.analysis_job import AnalysisJob, AnalysisStatus
 from shared.models.notification import NotificationType
 from shared.models.scan import ReportMetadata, ScanStatistics, ScanStatus
@@ -107,6 +113,65 @@ class FakeJobRepository:
     async def fail(self, **kwargs):
         self.failures.append(kwargs)
         return self.fail_result
+
+
+@pytest.mark.asyncio
+async def test_queue_failure_waits_before_polling_mongodb(monkeypatch) -> None:
+    class StopWorker(Exception):
+        pass
+
+    class FailingQueue:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def dequeue(self, timeout_seconds):
+            assert timeout_seconds == 5
+            raise AnalysisQueueError("Redis connection closed")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    settings = SimpleNamespace(
+        ai_analysis_enabled=True,
+        ai_model="model-1",
+        analysis_lease_seconds=300,
+        analysis_poll_seconds=5,
+        analysis_reconcile_interval_seconds=60,
+        log_level="INFO",
+    )
+    queue = FailingQueue()
+    sleep_delays = []
+
+    async def do_nothing(*args, **kwargs):
+        return None
+
+    async def stop_after_backoff(delay):
+        sleep_delays.append(delay)
+        raise StopWorker
+
+    monkeypatch.setattr("app.worker.get_settings", lambda: settings)
+    monkeypatch.setattr("app.worker.configure_logging", lambda **kwargs: None)
+    monkeypatch.setattr("app.worker.init_db", do_nothing)
+    monkeypatch.setattr("app.worker.close_db", do_nothing)
+    monkeypatch.setattr("app.worker.recover_expired_analysis_jobs", do_nothing)
+    monkeypatch.setattr("app.worker.reconcile_missing_analysis_jobs", do_nothing)
+    monkeypatch.setattr("app.worker.AnalysisJobRepository", object)
+    monkeypatch.setattr("app.worker.ScanRepository", object)
+    monkeypatch.setattr(
+        "app.worker.RedisAnalysisQueue.from_settings", lambda worker_settings: queue
+    )
+    monkeypatch.setattr("app.worker.MemberRepository", object)
+    monkeypatch.setattr("app.worker.NotificationRepository", object)
+    monkeypatch.setattr("app.worker.AIClient", object)
+    monkeypatch.setattr("app.worker.FindingAnalysisService", lambda client: object())
+    monkeypatch.setattr("app.worker.ReportAnalysisService", lambda client: object())
+    monkeypatch.setattr("app.worker.asyncio.sleep", stop_after_backoff)
+
+    with pytest.raises(StopWorker):
+        await run_worker()
+
+    assert sleep_delays == [settings.analysis_poll_seconds]
+    assert queue.closed is True
 
 
 class SuccessfulFindingService:

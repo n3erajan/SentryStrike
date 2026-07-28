@@ -552,6 +552,7 @@ async def run_worker() -> None:
                 signal = await queue.dequeue(settings.analysis_poll_seconds)
             except AnalysisQueueError:
                 logger.exception("analysis queue read failed; polling MongoDB")
+                await asyncio.sleep(settings.analysis_poll_seconds)
                 signal = None
 
             job = await job_repository.claim_next(
