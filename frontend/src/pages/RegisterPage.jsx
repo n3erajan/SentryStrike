@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { CheckCircle2, Loader2, Eye, EyeOff } from "lucide-react";
+import { Loader2, Eye, EyeOff } from "lucide-react";
 import { useAuth } from "../context/AuthContext.jsx";
 import { getAuthConfig, previewInvite } from "../services/auth.js";
 import AuthBrand from "../components/AuthBrand.jsx";
@@ -21,6 +21,7 @@ function RegisterPage() {
   const inviteToken = params.get("invite") || params.get("token") || "";
   const [invite, setInvite] = useState(null);
   const [inviteState, setInviteState] = useState(inviteToken ? "loading" : "missing");
+  const [email, setEmail] = useState("");
   const [fullName, setFullName] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -44,11 +45,13 @@ function RegisterPage() {
     return () => controller.abort();
   }, [inviteToken]);
 
+  const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
   const nameValid = fullName.trim().length >= 2;
   const passwordValid = password.length >= 8;
   const confirmValid = confirmPassword.length > 0 && confirmPassword === password;
   const canSubmit =
     inviteState === "valid" &&
+    emailValid &&
     nameValid &&
     passwordValid &&
     confirmValid &&
@@ -60,12 +63,12 @@ function RegisterPage() {
 
   async function handleSubmit(event) {
     event.preventDefault();
-    setTouched({ fullName: true, password: true, confirmPassword: true });
+    setTouched({ email: true, fullName: true, password: true, confirmPassword: true });
     if (!canSubmit) return;
     setSubmitting(true);
     try {
       await register({
-        email: invite.email,
+        email,
         password,
         fullName,
         inviteToken,
@@ -80,6 +83,7 @@ function RegisterPage() {
   }
 
   const fields = [
+    { key: "email", id: "reg-email", label: "Work email", type: "email", autoComplete: "email", value: email, set: setEmail, valid: emailValid, error: "Enter a valid email address" },
     { key: "fullName", id: "reg-name", label: "Full name", type: "text", autoComplete: "name", value: fullName, set: setFullName, valid: nameValid, error: "Enter your full name" },
     { key: "password", id: "reg-password", label: "Password", type: "password", autoComplete: "new-password", value: password, set: setPassword, valid: passwordValid, error: "Password must be at least 8 characters" },
     { key: "confirmPassword", id: "reg-confirm-password", label: "Confirm password", type: "password", autoComplete: "new-password", value: confirmPassword, set: setConfirmPassword, valid: confirmValid, error: "Passwords do not match" },
@@ -100,7 +104,6 @@ function RegisterPage() {
           {inviteState === "invalid" && <ErrorNotice error={error} fallback='This invitation is invalid or has expired.' compact />}
           {inviteState === "valid" && (
             <form onSubmit={handleSubmit} noValidate style={{ marginTop: 26 }}>
-              <div className='field'><label>Work email</label><div className='control'><input value={invite.email} readOnly /><CheckCircle2 className='ico' style={{ color: "var(--good)" }} /></div></div>
               {fields.map((f) => {
                 const passwordField = f.type === "password";
                 return <div key={f.key} className='field'>

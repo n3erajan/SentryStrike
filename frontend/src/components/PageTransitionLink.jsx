@@ -6,6 +6,8 @@ let transitionSequence = 0;
 const PUBLIC_PAGE_ORDER = new Map([
   ["/", 0],
   ["/login", 1],
+  ["/privacy", 1],
+  ["/terms", 1],
   ["/request-access", 2],
   ["/register", 2],
 ]);

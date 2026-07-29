@@ -258,14 +258,21 @@ def _client(invites: FakeInviteService) -> TestClient:
     return TestClient(app)
 
 
-def test_preview_invite_returns_pinned_email_and_role() -> None:
+def test_preview_invite_returns_role_without_disclosing_email() -> None:
+    """The preview must not leak the pinned address to an unauthenticated caller.
+
+    Anyone holding the token can call this endpoint, so returning the invited
+    email would turn a leaked link into an address disclosure. The invitee types
+    their own email at registration, where ``accept`` still checks it matches.
+    """
     client = _client(FakeInviteService())
 
     response = client.get("/api/v1/auth/invite", params={"token": "good-token"})
 
     assert response.status_code == 200
     data = response.json()["data"]
-    assert data["email"] == "invitee@example.test"
+    assert "email" not in data
+    assert "invitee@example.test" not in response.text
     assert data["role"] == "developer"
     assert data["owns_workspace"] is False
 

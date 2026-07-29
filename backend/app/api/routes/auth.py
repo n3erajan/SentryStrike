@@ -105,10 +105,11 @@ async def preview_invite(
     token: str = Query(min_length=1, max_length=512),
     invites: InviteService = Depends(get_invite_service),
 ) -> dict:
-    """Validate an invite token and return its pinned email and role.
+    """Validate an invite token and return the role and org info.
 
-    Lets the signup form prefill the (read-only) email and show the role before
-    the invitee sets a password. Does not consume the invite.
+    Shows the role and org name before the invitee fills in their details.
+    Does not return the pinned email — the user must enter it.
+    Does not consume the invite.
     """
     try:
         invite = await invites.preview(token)
@@ -116,7 +117,6 @@ async def preview_invite(
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     return json_response(
         {
-            "email": invite.email,
             "role": invite.role.value,
             "org_name": invite.org_name,
             "owns_workspace": invite.role == UserRole.owner and invite.org_id is None,

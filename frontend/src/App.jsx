@@ -17,6 +17,8 @@ import ReportsPage from "./pages/ReportsPage.jsx";
 import ReportPage from "./pages/ReportPage.jsx";
 import TeamPage from "./pages/TeamPage.jsx";
 import SettingsPage from "./pages/SettingsPage.jsx";
+import PrivacyPage from "./pages/PrivacyPage.jsx";
+import TermsPage from "./pages/TermsPage.jsx";
 import NotFoundPage from "./pages/NotFoundPage.jsx";
 
 function App() {
@@ -44,6 +46,10 @@ function App() {
           <Route path='/history' element={<Navigate to='/reports' replace />} />
         </Route>
       </Route>
+
+      {/* Readable signed in or out, so these sit outside both route guards. */}
+      <Route path='/privacy' element={<PrivacyPage />} />
+      <Route path='/terms' element={<TermsPage />} />
 
       <Route path='*' element={<NotFoundPage />} />
     </Routes>

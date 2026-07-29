@@ -787,7 +787,15 @@ function LandingPage() {
       </main>
       <footer className='public-footer'>
         <span>Copyright © {new Date().getFullYear()} SentryStrike</span>
-        <span>Authorized security testing only</span>
+        <span className='footer-links'>
+          <Link to='/privacy' viewTransition>
+            Privacy policy
+          </Link>
+          <Link to='/terms' viewTransition>
+            Terms of use
+          </Link>
+          Authorized security testing only
+        </span>
       </footer>
       </div>
     </MotionConfig>
