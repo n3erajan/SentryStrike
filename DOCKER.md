@@ -125,7 +125,7 @@ The analyzer is configured for Ollama by default and accepts any provider implem
 
 ```dotenv
 AI_BASE_URL=http://host.docker.internal:11434/v1
-AI_MODEL=gemma4-e4b-8k
+AI_MODEL=gemma4-e4b-it-qat
 AI_API_KEY=
 AI_TIMEOUT_SECONDS=120
 AI_MAX_RETRIES=3

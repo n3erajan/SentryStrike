@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from "react";
 import { isValidUrl } from "../utils/helpers.js";
 import { createScan } from "../services/scan.js";
 import { getApplication } from "../services/applications.js";
+import useQuery from "./useQuery.js";
 
 // Form state + submission for a new scan. Polling and progress no longer live
 // here — once a scan is created the caller navigates to its own active-scan
@@ -13,8 +14,15 @@ import { getApplication } from "../services/applications.js";
 // from that application's stored defaults — the workspace-level default config
 // no longer exists; defaults live on the Application entity now.
 function useScanForm({ applicationId } = {}) {
+  const applicationQuery = useQuery({
+    queryKey: `applications:detail:${applicationId || "none"}`,
+    queryFn: () => getApplication(applicationId),
+    enabled: Boolean(applicationId),
+  });
+  const selectedApplication = applicationQuery.data;
+
   // Inputs required by the backend CreateScanRequest.
-  const [url, setUrl] = useState("");
+  const [url, setUrl] = useState(() => selectedApplication?.target_url || "");
   const [crawlMode, setCrawlMode] = useState("full"); // full | single
   const [consent, setConsent] = useState(false);
   const [touched, setTouched] = useState(false);
@@ -22,7 +30,9 @@ function useScanForm({ applicationId } = {}) {
   // Optional per-scan ScanConfig overrides. Keyed by the backend field name;
   // any key left blank/absent falls back to the backend default. `scan_mode`
   // is just another config key here. Seeded from the selected application.
-  const [config, setConfig] = useState({});
+  const [config, setConfig] = useState(
+    () => selectedApplication?.default_scan_config || {},
+  );
   const setConfigField = useCallback((key, value) => {
     setConfig((prev) => {
       if (value === "" || value === undefined || value === null) {
@@ -62,24 +72,21 @@ function useScanForm({ applicationId } = {}) {
   // whatever the user has already typed alone — only an explicit pick rewrites
   // the URL and config. `loadedApp` tracks which id the form currently
   // reflects, so the loading flag is derived rather than set synchronously.
-  const [loadedApp, setLoadedApp] = useState("");
+  const [loadedApp, setLoadedApp] = useState(() =>
+    selectedApplication ? applicationId : "",
+  );
   useEffect(() => {
     if (!applicationId) return undefined;
-    const controller = new AbortController();
-    getApplication(applicationId, controller.signal)
-      .then((app) => {
-        setUrl(app.target_url || "");
-        setConfig(app.default_scan_config || {});
-      })
-      .catch((err) => {
-        if (err.name !== "AbortError")
-          setError(err);
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoadedApp(applicationId);
-      });
-    return () => controller.abort();
-  }, [applicationId]);
+    if (applicationQuery.data) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setUrl(applicationQuery.data.target_url || "");
+      setConfig(applicationQuery.data.default_scan_config || {});
+      setLoadedApp(applicationId);
+    } else if (applicationQuery.error) {
+      setError(applicationQuery.error);
+      setLoadedApp(applicationId);
+    }
+  }, [applicationId, applicationQuery.data, applicationQuery.error]);
 
   const defaultsLoading = Boolean(applicationId) && loadedApp !== applicationId;
   const valid = isValidUrl(url);

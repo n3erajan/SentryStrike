@@ -69,7 +69,8 @@ All application endpoints use the `/api/v1` prefix.
 | Comment and update non-terminal remediation | Yes | Yes | Yes | Yes | No |
 | Assign, review, retry analysis, and request re-verification | Yes | Yes | Yes | No | No |
 | Close or waive remediation | Yes | Yes | Yes | No | No |
-| Read audit history and retention settings | Yes | Yes | Yes | Yes | Yes |
+| Read audit history | Yes | Yes | No | No | No |
+| Read retention settings | Yes | Yes | Yes | Yes | Yes |
 | Manage members, invitations, and retention settings | Yes | Yes | No | No | No |
 | Rename the workspace | Yes | No | No | No | No |
 
@@ -115,7 +116,7 @@ invitation using the organization name and email from the request. The first
 accepted owner invitation creates the workspace and owner account together.
 
 The public endpoint verifies Cloudflare Turnstile server-side and uses Redis to
-allow one submission per IP every 15 minutes and seven per IP per day. Redis
+allow 3 submissions per IP every 15 minutes and 10 per IP per day (configurable via `ACCESS_REQUEST_IP_LIMIT_PER_FIFTEEN_MINUTES` and `ACCESS_REQUEST_IP_LIMIT_PER_DAY`). Redis
 failure returns `503`. Only one pending request is stored per normalized email.
 MongoDB removes pending requests after 30 days, while CLI approval and rejection
 remove them immediately.
@@ -129,6 +130,12 @@ address. Never trust forwarded headers when the backend is directly exposed.
 ## Configuration
 
 Start with [`../.env.example`](../.env.example) for MongoDB, Redis, queues, and public-host settings, then [`./.env.example`](.env.example) for backend-specific values.
+
+In production mode (`APP_DEBUG=false`) the backend blocks scan targets that
+resolve to private, loopback, or link-local network addresses (``10.x.x.x``,
+``192.168.x.x``, ``172.16-31.x.x``, ``127.x.x.x``, ``169.254.x.x``,
+``localhost``). Local development is unaffected because ``APP_DEBUG`` defaults
+to ``true``.
 
 Important production settings include:
 

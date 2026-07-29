@@ -16,7 +16,7 @@ class AnalyzerSettings(AnalysisQueueSettings, InfrastructureSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     ai_analysis_enabled: bool = Field(default=True, alias="AI_ANALYSIS_ENABLED")
     ai_base_url: str = Field(default="http://localhost:11434/v1", alias="AI_BASE_URL")
-    ai_model: str = Field(default="gemma4-e4b-8k", alias="AI_MODEL")
+    ai_model: str = Field(default="gemma4-e4b-it-qat", alias="AI_MODEL")
     ai_api_key: str | None = Field(default=None, alias="AI_API_KEY")
     ai_timeout_seconds: float = Field(default=120.0, gt=0, alias="AI_TIMEOUT_SECONDS")
     ai_max_retries: int = Field(default=3, ge=0, alias="AI_MAX_RETRIES")

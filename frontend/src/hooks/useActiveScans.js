@@ -1,9 +1,17 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { listScans } from "../services/scan.js";
+import useQuery from "./useQuery.js";
+import {
+  invalidateQueries,
+  retainQueryPolling,
+} from "../services/queryCache.js";
 
 const POLL_INTERVAL_MS = 5000;
+export const ACTIVE_SCANS_QUERY_KEY = "scans:list:25";
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
 const ANALYSIS_ACTIVE = new Set(["queued", "running"]);
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const ANALYSIS_TERMINAL = new Set(["completed", "failed", "cancelled"]);
 
 export function isAnalysisPending(scan) {
   return (
@@ -17,56 +25,93 @@ export function isActive(scan) {
   return isAnalysisPending(scan);
 }
 
+export function findFinishedScans(previousItems, nextItems) {
+  const previousById = new Map(
+    (previousItems || []).map((scan) => [scan.id, scan]),
+  );
+
+  return (nextItems || []).filter((scan) => {
+    const previous = previousById.get(scan.id);
+    if (!previous) return false;
+
+    const scanFinished =
+      !TERMINAL_STATUSES.has(previous.status) &&
+      TERMINAL_STATUSES.has(scan.status);
+    const analysisFinished =
+      scan.status === "completed" &&
+      ANALYSIS_ACTIVE.has(previous.analysis?.status) &&
+      ANALYSIS_TERMINAL.has(scan.analysis?.status);
+
+    return scanFinished || analysisFinished;
+  });
+}
+
+export async function invalidateFinishedScanQueries(finishedScans) {
+  if (finishedScans.length === 0) return;
+
+  const invalidations = [
+    invalidateQueries("scans:list:all"),
+    invalidateQueries("applications:scans"),
+  ];
+  finishedScans.forEach((scan) => {
+    if (scan.status === "completed") {
+      invalidations.push(invalidateQueries(`reports:detail:${scan.id}`));
+    }
+  });
+  await Promise.all(invalidations);
+}
+
 // Polls GET /scans on an interval and exposes the scans that are still in
 // flight (queued or running) or completed but still running AI analysis.
 // Backs both the Active dashboard and the sidebar count badge, so the user
 // can watch every concurrent scan. `refresh()` forces an immediate re-fetch
 // (e.g. right after starting a new scan).
 export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
-  const [scans, setScans] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [refreshToken, setRefreshToken] = useState(0);
+  const {
+    data,
+    error,
+    isFetchedAfterMount,
+    isLoading: loading,
+    refetch,
+  } = useQuery({
+    queryKey: ACTIVE_SCANS_QUERY_KEY,
+    queryFn: () => listScans({ limit: 25 }),
+    staleTime: POLL_INTERVAL_MS,
+  });
+  const items = useMemo(
+    () => (Array.isArray(data?.items) ? data.items : []),
+    [data],
+  );
+  const scans = items.filter(isActive);
+  const hasActiveScans = scans.length > 0;
 
   const refresh = useCallback(() => {
-    setRefreshToken((value) => value + 1);
+    invalidateQueries("applications:scans");
+    return invalidateQueries("scans");
   }, []);
 
+  const poll = useCallback(async () => {
+    const nextData = await refetch();
+    const nextItems = Array.isArray(nextData?.items) ? nextData.items : [];
+    const finishedScans = findFinishedScans(items, nextItems);
+    await invalidateFinishedScanQueries(finishedScans);
+    return nextData;
+  }, [items, refetch]);
+
   useEffect(() => {
-    let stopped = false;
-    let timer = null;
-    const controller = new AbortController();
+    if (!hasActiveScans) return;
+    return retainQueryPolling(ACTIVE_SCANS_QUERY_KEY, intervalMs, poll);
+  }, [hasActiveScans, intervalMs, poll]);
 
-    async function poll() {
-      try {
-        const data = await listScans({ limit: 25, signal: controller.signal });
-        if (stopped) return;
-        const items = Array.isArray(data?.items) ? data.items : [];
-        const active = items.filter(isActive);
-        setScans(active);
-        setError("");
-        if (!active.length && timer) {
-          clearInterval(timer);
-          timer = null;
-        }
-      } catch (err) {
-        if (stopped || err.name === "AbortError") return;
-        setError(err);
-      } finally {
-        if (!stopped) setLoading(false);
-      }
-    }
-
-    poll();
-    timer = setInterval(poll, intervalMs);
-    return () => {
-      stopped = true;
-      controller.abort();
-      if (timer) clearInterval(timer);
-    };
-  }, [intervalMs, refreshToken]);
-
-  return { scans, loading, error, count: scans.length, refresh };
+  return {
+    scans,
+    allScans: items,
+    loading,
+    error,
+    count: scans.length,
+    isFetchedAfterMount,
+    refresh,
+  };
 }
 
 export { useActiveScans as default };

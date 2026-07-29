@@ -5,6 +5,7 @@ import Sidebar from "./Sidebar.jsx";
 import { MOBILE_NAV, ROUTE_NAMES } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import { getWorkspace } from "../services/workspace.js";
+import useQuery from "../hooks/useQuery.js";
 import ThemeToggle from "./ThemeToggle.jsx";
 import NotificationsMenu from "./NotificationsMenu.jsx";
 import Tooltip from "./Tooltip.jsx";
@@ -25,13 +26,11 @@ function AppLayout() {
   const { user } = useAuth();
   const onScanPage = location.pathname === "/scan";
   const [menuOpen, setMenuOpen] = useState(false);
-  const [workspace, setWorkspace] = useState(null);
-
-  useEffect(() => {
-    getWorkspace()
-      .then(setWorkspace)
-      .catch(() => {});
-  }, []);
+  const { data: workspace } = useQuery({
+    queryKey: "workspace",
+    queryFn: getWorkspace,
+    staleTime: 5 * 60_000,
+  });
 
   // Close the mobile drawer whenever the route changes.
   useEffect(() => {

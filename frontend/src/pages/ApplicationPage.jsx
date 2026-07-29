@@ -1,4 +1,3 @@
-import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { FileBarChart, Plus } from "lucide-react";
 import {
@@ -8,6 +7,7 @@ import {
 import { severityClass } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import ErrorNotice from "../components/ErrorNotice.jsx";
+import useQuery from "../hooks/useQuery.js";
 
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
 
@@ -35,61 +35,67 @@ function ApplicationPage() {
   const { user } = useAuth();
   const { appId } = useParams();
   const navigate = useNavigate();
-  const [app, setApp] = useState(null);
-  const [scans, setScans] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const applicationQuery = useQuery({
+    queryKey: `applications:detail:${appId}`,
+    queryFn: () => getApplication(appId),
+  });
+  const scansQuery = useQuery({
+    queryKey: `applications:scans:${appId}`,
+    queryFn: () => listAllApplicationScans(appId),
+    staleTime: 30_000,
+  });
+  const app = applicationQuery.data;
+  const scans = Array.isArray(scansQuery.data?.items)
+    ? scansQuery.data.items
+    : [];
+  const loading = applicationQuery.isLoading || scansQuery.isLoading;
+  const error = applicationQuery.error || scansQuery.error;
+  const hasData = applicationQuery.hasData && scansQuery.hasData;
+  const contentEntered =
+    applicationQuery.isFetchedAfterMount || scansQuery.isFetchedAfterMount;
 
-  const load = useCallback(
-    async (signal) => {
-      setLoading(true);
-      setError("");
-      try {
-        const [appData, scanData] = await Promise.all([
-          getApplication(appId, signal),
-          listAllApplicationScans(appId, { signal }),
-        ]);
-        setApp(appData);
-        setScans(Array.isArray(scanData?.items) ? scanData.items : []);
-      } catch (err) {
-        if (err.name !== "AbortError")
-          setError(err);
-      } finally {
-        if (!signal || !signal.aborted) setLoading(false);
-      }
-    },
-    [appId],
-  );
-
-  useEffect(() => {
-    const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+  function refetch() {
+    return Promise.allSettled([
+      applicationQuery.refetch(),
+      scansQuery.refetch(),
+    ]);
+  }
 
   if (loading)
     return (
       <div className='view'>
-        <div className='empty-state'>Loading application…</div>
+        <div className='app-detail-skeleton query-skeleton' role='status' aria-label='Loading application'>
+          <span className='skeleton-block skeleton-heading' />
+          <span className='skeleton-block skeleton-copy' />
+          <div className='summary' aria-hidden='true'>
+            {[0, 1, 2].map((item) => <div className='stat' key={item}><strong><span className='skeleton-block skeleton-value' /></strong><span className='skeleton-block skeleton-copy' /></div>)}
+          </div>
+        </div>
       </div>
     );
-  if (error)
+  if (error && !hasData)
     return (
       <div className='view'>
         <button className='back' onClick={() => navigate("/apps")}>
           ← All applications
         </button>
-        <ErrorNotice error={error} fallback='Could not load this application.' onRetry={() => load()} />
+        <ErrorNotice error={error} fallback='Could not load this application.' onRetry={refetch} />
       </div>
     );
   if (!app) return null;
 
   return (
-    <div className='view'>
+    <div className={`view${contentEntered ? " query-content-enter" : ""}`}>
       <button className='back' onClick={() => navigate("/apps")}>
         ← All applications
       </button>
+      {error && (
+        <ErrorNotice
+          error={error}
+          fallback='Application data may be out of date.'
+          onRetry={refetch}
+        />
+      )}
       <div className='head'>
         <div>
           <h1>{app.name}</h1>

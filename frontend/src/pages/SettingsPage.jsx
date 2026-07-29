@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { ArrowUpRight } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../context/AuthContext.jsx";
@@ -11,6 +11,11 @@ import {
   updateWorkspace,
 } from "../services/workspace.js";
 import ErrorNotice from "../components/ErrorNotice.jsx";
+import useQuery from "../hooks/useQuery.js";
+import {
+  invalidateQueries,
+  setQueryData,
+} from "../services/queryCache.js";
 
 const title = (v) =>
   (v || "").replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase());
@@ -77,60 +82,67 @@ function SettingsPage() {
   const toast = useToast();
   const admin = ["owner", "admin"].includes(user?.role);
   const isOwner = user?.role === "owner";
-  const [workspaceName, setWorkspaceName] = useState("");
-  const [retention, setRetentionDays] = useState(90);
+  const [workspaceNameDraft, setWorkspaceNameDraft] = useState(null);
+  const [retentionDraft, setRetentionDraft] = useState(null);
   const PAGE_SIZE = 15;
-  const [audit, setAudit] = useState([]);
-  const [auditTotal, setAuditTotal] = useState(0);
   const [auditPage, setAuditPage] = useState(1);
-  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
+  const workspaceQuery = useQuery({
+    queryKey: "workspace",
+    queryFn: getWorkspace,
+    staleTime: 5 * 60_000,
+  });
+  const retentionQuery = useQuery({
+    queryKey: "retention",
+    queryFn: getRetention,
+    staleTime: 5 * 60_000,
+  });
+  const auditQuery = useQuery({
+    queryKey: `audit:page:${auditPage}`,
+    queryFn: () =>
+      listAuditLog((auditPage - 1) * PAGE_SIZE, PAGE_SIZE),
+    staleTime: 30_000,
+    enabled: admin,
+  });
+  const workspaceName = workspaceNameDraft ?? workspaceQuery.data?.name ?? "";
+  const retention = retentionDraft ?? retentionQuery.data?.retention_days ?? 90;
+  const audit = auditQuery.data?.items || [];
+  const auditTotal = auditQuery.data?.total || 0;
+  const loading =
+    workspaceQuery.isLoading ||
+    retentionQuery.isLoading ||
+    (admin && auditQuery.isLoading);
+  const error =
+    workspaceQuery.error || retentionQuery.error || (admin && auditQuery.error);
+  const hasData =
+    workspaceQuery.hasData &&
+    retentionQuery.hasData &&
+    (!admin || auditQuery.hasData);
+  const contentEntered =
+    workspaceQuery.isFetchedAfterMount ||
+    retentionQuery.isFetchedAfterMount ||
+    auditQuery.isFetchedAfterMount;
 
-  const loadAudit = useCallback(async (page) => {
-    const skip = (page - 1) * PAGE_SIZE;
-    const data = await listAuditLog(skip, PAGE_SIZE);
-    setAudit(data.items || []);
-    setAuditTotal(data.total || 0);
-  }, []);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const [ws, ret] = await Promise.all([
-        getWorkspace(),
-        getRetention(),
-      ]);
-      setWorkspaceName(ws.name);
-      setRetentionDays(ret.retention_days);
-      if (admin) await loadAudit(1);
-    } catch (err) {
-      setError(err);
-    } finally {
-      setLoading(false);
-    }
-  }, [admin, loadAudit]);
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load();
-  }, [load]);
+  function refetch() {
+    const requests = [workspaceQuery.refetch(), retentionQuery.refetch()];
+    if (admin) requests.push(auditQuery.refetch());
+    return Promise.allSettled(requests);
+  }
 
   async function save() {
     setSaving(true);
     try {
-      const requests = [];
-      requests.push(
-        setRetention(Number(retention)).then((r) => setRetentionDays(r.retention_days)),
-      );
-      if (isOwner) {
-        requests.push(
-          updateWorkspace({ name: workspaceName }).then((r) =>
-            setWorkspaceName(r.name),
-          ),
-        );
-      }
-      await Promise.all(requests);
+      const [retentionResult, workspaceResult] = await Promise.all([
+        setRetention(Number(retention)),
+        isOwner
+          ? updateWorkspace({ name: workspaceName })
+          : Promise.resolve(workspaceQuery.data),
+      ]);
+      setQueryData("retention", retentionResult);
+      if (workspaceResult) setQueryData("workspace", workspaceResult);
+      setRetentionDraft(null);
+      setWorkspaceNameDraft(null);
+      invalidateQueries("audit", { refetchActive: false });
       toast("Workspace settings saved");
     } catch (err) {
       toast(err, { type: "error", fallback: "Could not save settings." });
@@ -156,11 +168,18 @@ function SettingsPage() {
           </button>
         )}
       </div>
-      <ErrorNotice error={error} fallback='Could not load workspace settings.' onRetry={load} />
+      <ErrorNotice error={error} fallback='Could not load workspace settings.' onRetry={refetch} />
       {loading ? (
-        <div className='empty-state'>Loading settings…</div>
-      ) : (
-        <div className='settings-stack'>
+        <div className='settings-stack query-skeleton' role='status' aria-label='Loading settings'>
+          {[0, 1, 2].map((item) => (
+            <section className='formsection skeleton-formsection' key={item} aria-hidden='true'>
+              <span className='skeleton-block skeleton-heading' />
+              <span className='skeleton-block skeleton-input' />
+            </section>
+          ))}
+        </div>
+      ) : error && !hasData ? null : (
+        <div className={`settings-stack${contentEntered ? " query-content-enter" : ""}`}>
           <section className='formsection'>
             <h2>Account</h2>
             <div className='grid2'>
@@ -185,7 +204,7 @@ function SettingsPage() {
               <div className='control'>
                 <input
                   value={workspaceName}
-                  onChange={(e) => setWorkspaceName(e.target.value)}
+                  onChange={(e) => setWorkspaceNameDraft(e.target.value)}
                   readOnly={!isOwner}
                 />
               </div>
@@ -204,7 +223,7 @@ function SettingsPage() {
                   type='number'
                   min='30'
                   value={retention}
-                  onChange={(e) => setRetentionDays(e.target.value)}
+                  onChange={(e) => setRetentionDraft(e.target.value)}
                   readOnly={!admin}
                 />
               </div>
@@ -252,9 +271,7 @@ function SettingsPage() {
                     className='btn page-btn'
                     disabled={auditPage <= 1}
                     onClick={() => {
-                      const p = auditPage - 1;
-                      setAuditPage(p);
-                      loadAudit(p);
+                      setAuditPage((page) => page - 1);
                     }}
                   >
                     ‹ Prev
@@ -269,7 +286,6 @@ function SettingsPage() {
                           className={`btn page-btn${p === auditPage ? " active" : ""}`}
                           onClick={() => {
                             setAuditPage(p);
-                            loadAudit(p);
                           }}
                         >
                           {p}
@@ -280,9 +296,7 @@ function SettingsPage() {
                     className='btn page-btn'
                     disabled={auditPage >= Math.ceil(auditTotal / PAGE_SIZE)}
                     onClick={() => {
-                      const p = auditPage + 1;
-                      setAuditPage(p);
-                      loadAudit(p);
+                      setAuditPage((page) => page + 1);
                     }}
                   >
                     Next ›

@@ -50,6 +50,7 @@ Shared infrastructure and queue variables live in [`../.env.example`](../.env.ex
 
 | Variable | Purpose |
 | --- | --- |
+| `AI_ANALYSIS_ENABLED` | Toggle AI analysis on or off. Default `true`. The backend blocks PDF export until analysis completes, so disabling this makes scans finish faster when no AI provider or Ollama is available. Falls back to deterministic templates |
 | `AI_BASE_URL` | OpenAI-compatible API root |
 | `AI_MODEL` | Provider model identifier |
 | `AI_API_KEY` | Optional bearer credential |

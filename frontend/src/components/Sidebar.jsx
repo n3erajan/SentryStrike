@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import { X, LogOut } from "lucide-react";
 import { NAV_ITEMS } from "../data/constants.js";
@@ -6,6 +6,7 @@ import { useAuth } from "../context/AuthContext.jsx";
 import { useActiveScans } from "../hooks/useActiveScans.js";
 import { useBackendHealth } from "../hooks/useBackendHealth.js";
 import { getWorkspace } from "../services/workspace.js";
+import useQuery from "../hooks/useQuery.js";
 import Tooltip from "./Tooltip.jsx";
 
 function displayName(user) {
@@ -34,11 +35,11 @@ function Sidebar({ open = false, onClose }) {
   }, [refresh]);
   const { health, loading: healthLoading, error: healthError } =
     useBackendHealth();
-  const [workspace, setWorkspace] = useState(null);
-
-  useEffect(() => {
-    getWorkspace().then(setWorkspace).catch(() => {});
-  }, []);
+  const { data: workspace } = useQuery({
+    queryKey: "workspace",
+    queryFn: getWorkspace,
+    staleTime: 5 * 60_000,
+  });
   const scannerCount = health?.active_scanners;
   const scannerStatusKnown = Number.isInteger(scannerCount) && !healthError;
   const scannersOnline = scannerStatusKnown && scannerCount > 0;
@@ -114,7 +115,9 @@ function Sidebar({ open = false, onClose }) {
       <div className='sidefoot'>
         <span>User</span>
         <b title={user?.email}>{displayName(user)}</b>
-        {workspace?.name && <span className='workspace-name'>{workspace.name}</span>}
+        <span className='workspace-name' aria-busy={!workspace}>
+          {workspace?.name || "Workspace"}
+        </span>
 
         <button
           className='text-btn'

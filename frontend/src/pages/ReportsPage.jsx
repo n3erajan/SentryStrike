@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Download, FileBarChart, Search } from "lucide-react";
 import { listAllScans } from "../services/scan.js";
@@ -12,6 +12,9 @@ import Tooltip from "../components/Tooltip.jsx";
 import Select from "../components/Select.jsx";
 import { belongsToApplication } from "../utils/reportFilters.js";
 import ErrorNotice from "../components/ErrorNotice.jsx";
+import useQuery from "../hooks/useQuery.js";
+
+const EMPTY_ITEMS = [];
 
 function pages(current, total) {
   if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
@@ -67,42 +70,39 @@ function ReportsPage() {
   const navigate = useNavigate();
   const toast = useToast();
   const PAGE_SIZE = 25;
-  const [scans, setScans] = useState([]);
-  const [applications, setApplications] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [applicationId, setApplicationId] = useState("");
   const [page, setPage] = useState(1);
   const [busy, setBusy] = useState("");
 
-  const load = useCallback(async (signal) => {
-    setLoading(true);
-    setError("");
-    try {
-      const [scanData, applicationData] = await Promise.all([
-        listAllScans({ signal }),
-        listAllApplications({ signal }),
-      ]);
-      const items = Array.isArray(scanData?.items) ? scanData.items : [];
-      setScans(items.filter((s) => s.status === "completed"));
-      setApplications(
-        Array.isArray(applicationData?.items) ? applicationData.items : [],
-      );
-    } catch (err) {
-      if (err.name !== "AbortError")
-        setError(err);
-    } finally {
-      if (!signal || !signal.aborted) setLoading(false);
-    }
-  }, []);
+  const scansQuery = useQuery({
+    queryKey: "scans:list:all",
+    queryFn: listAllScans,
+    staleTime: 30_000,
+  });
+  const applicationsQuery = useQuery({
+    queryKey: "applications:list:all",
+    queryFn: listAllApplications,
+  });
+  const scanItems = Array.isArray(scansQuery.data?.items)
+    ? scansQuery.data.items
+    : EMPTY_ITEMS;
+  const scans = scanItems.filter((scan) => scan.status === "completed");
+  const applications = Array.isArray(applicationsQuery.data?.items)
+    ? applicationsQuery.data.items
+    : EMPTY_ITEMS;
+  const loading = scansQuery.isLoading || applicationsQuery.isLoading;
+  const error = scansQuery.error || applicationsQuery.error;
+  const hasData = scansQuery.hasData && applicationsQuery.hasData;
+  const contentEntered =
+    scansQuery.isFetchedAfterMount || applicationsQuery.isFetchedAfterMount;
 
-  useEffect(() => {
-    const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+  function refetch() {
+    return Promise.allSettled([
+      scansQuery.refetch(),
+      applicationsQuery.refetch(),
+    ]);
+  }
 
   const rows = useMemo(() => {
     const q = query.toLowerCase();
@@ -179,10 +179,34 @@ function ReportsPage() {
         )}
       </div>
 
+      {error && hasData && (
+        <ErrorNotice
+          error={error}
+          fallback='Reports may be out of date.'
+          onRetry={refetch}
+        />
+      )}
       {loading ? (
-        <div className='empty-state'>Loading reports…</div>
-      ) : error ? (
-        <ErrorNotice error={error} fallback='Could not load reports.' onRetry={() => load()} />
+        <div
+          className='reports-table query-skeleton'
+          role='status'
+          aria-label='Loading reports'
+        >
+          <div className='reports-head' aria-hidden='true'>
+            <span>Target</span><span>Started</span><span>Score</span><span>Findings</span><span>Report</span>
+          </div>
+          {[0, 1, 2, 3].map((item) => (
+            <div className='reports-row skeleton-table-row' key={item} aria-hidden='true'>
+              <span className='skeleton-block skeleton-heading' />
+              <span className='skeleton-block skeleton-copy' />
+              <span className='skeleton-block skeleton-copy' />
+              <span className='skeleton-block skeleton-copy' />
+              <span className='skeleton-block skeleton-action' />
+            </div>
+          ))}
+        </div>
+      ) : error && !hasData ? (
+        <ErrorNotice error={error} fallback='Could not load reports.' onRetry={refetch} />
       ) : rows.length === 0 && !loading ? (
         <div className='empty-state'>
           <FileBarChart size={30} />
@@ -204,7 +228,7 @@ function ReportsPage() {
           </button>}
         </div>
       ) : (
-        <div className='reports-table'>
+        <div className={`reports-table${contentEntered ? " query-content-enter" : ""}`}>
           <div className='reports-head'>
             <span>Target</span>
             <span>Started</span>

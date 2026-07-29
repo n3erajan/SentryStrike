@@ -428,8 +428,8 @@ OWASP_CATEGORY_LABELS = {
     "a05": "A05-Injection",
     "a06": "A06-Insecure Design",
     "a07": "A07-Authentication Failures",
-    "a08": "A08-Software and Data Integrity Failures",
-    "a09": "A09-Security Logging and Monitoring Failures",
+    "a08": "A08-Software or Data Integrity Failures",
+    "a09": "A09-Security Logging and Alerting Failures",
     "a10": "A10-Mishandling of Exceptional Conditions",
 }
 

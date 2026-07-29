@@ -90,7 +90,7 @@ async def test_two_pass_analysis_documentation_fp():
     service.settings = SimpleNamespace(
         ai_analysis_enabled=True,
         analysis_finding_evidence_max_chars=3000,
-        ai_model="gemma4-e4b-8k",
+        ai_model="gemma4-e4b-it-qat",
     )
 
     vuln = Vulnerability(
@@ -125,7 +125,7 @@ async def test_active_output_ceiling_clamping():
     service.settings = SimpleNamespace(
         ai_analysis_enabled=True,
         analysis_finding_evidence_max_chars=3000,
-        ai_model="gemma4-e4b-8k",
+        ai_model="gemma4-e4b-it-qat",
     )
 
     vuln = Vulnerability(

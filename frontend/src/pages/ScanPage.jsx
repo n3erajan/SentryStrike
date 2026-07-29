@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { ChevronDown } from "lucide-react";
 import { useScanForm } from "../hooks/useScan.js";
@@ -14,6 +14,7 @@ import {
   SCAN_MODES,
 } from "../data/constants.js";
 import ErrorNotice from "../components/ErrorNotice.jsx";
+import useQuery from "../hooks/useQuery.js";
 
 function CredentialAccount({ role, account, onField, disabled }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -107,7 +108,13 @@ function ScanPage() {
   const toast = useToast();
   const [searchParams, setSearchParams] = useSearchParams();
   const applicationId = searchParams.get("app") || "";
-  const [apps, setApps] = useState([]);
+  const applicationsQuery = useQuery({
+    queryKey: "applications:list:default",
+    queryFn: listApplications,
+  });
+  const apps = Array.isArray(applicationsQuery.data?.items)
+    ? applicationsQuery.data.items
+    : [];
   const [usersOpen, setUsersOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const {
@@ -131,16 +138,6 @@ function ScanPage() {
     canStart,
     startScan,
   } = useScanForm({ applicationId });
-
-  // The picker is a convenience only — a scan can always be run against a raw
-  // URL, so a failed application fetch is silently ignored.
-  useEffect(() => {
-    const controller = new AbortController();
-    listApplications({ signal: controller.signal })
-      .then((data) => setApps(data.items || []))
-      .catch(() => {});
-    return () => controller.abort();
-  }, []);
 
   if (user?.role === "viewer") {
     return (
@@ -200,30 +197,30 @@ function ScanPage() {
           />
           <section className='formsection'>
             <h3>Target</h3>
-            {apps.length > 0 && (
-              <div className='grid2'>
-                <div className='field wide'>
-                  <label htmlFor='scan-application'>Web application</label>
-                  <div className='control'>
-                    <Select
-                      value={applicationId}
-                      onChange={selectApplication}
-                      disabled={submitting}
-                      options={[
-                        { value: "", label: "None" },
-                        ...apps.map((a) => ({ value: a.id, label: a.name })),
-                      ]}
-                    />
-                  </div>
-                  <p
-                    className='field-description'
-                    id='scan-application-description'
-                  >
-                    Select a saved app to load its URL and scan defaults.
-                  </p>
+            <div className='grid2'>
+              <div className='field wide'>
+                <label htmlFor='scan-application'>Web application</label>
+                <div className='control'>
+                  <Select
+                    value={applicationId}
+                    onChange={selectApplication}
+                    disabled={submitting || applicationsQuery.isLoading}
+                    placeholder='None'
+                    ariaLabel='Web application'
+                    options={[
+                      { value: "", label: "None" },
+                      ...apps.map((a) => ({ value: a.id, label: a.name })),
+                    ]}
+                  />
                 </div>
+                <p
+                  className='field-description'
+                  id='scan-application-description'
+                >
+                  Select a saved app to load its URL and scan defaults.
+                </p>
               </div>
-            )}
+            </div>
             <div className='grid2'>
               <div className='field wide'>
                 <label htmlFor='target-url'>URL</label>

@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "test": "node --test src/utils/httpToCurl.test.js src/services/apiClient.test.js",
+    "test": "node --test src/utils/httpToCurl.test.js src/services/apiClient.test.js src/services/queryCache.test.js src/hooks/useActiveScans.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

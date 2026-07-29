@@ -1,52 +1,54 @@
-import { useCallback, useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { Boxes, ChevronDown, Pencil, Plus, Trash2, X } from "lucide-react";
+import { useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import { Boxes, ChevronDown, Pencil, Plus, Trash2, X } from 'lucide-react'
 import {
   createApplication,
   deleteApplication,
   listApplications,
   updateApplication,
-} from "../services/applications.js";
-import { CONFIG_GROUPS } from "../data/constants.js";
-import ConfigField, { configValid } from "../components/ConfigField.jsx";
-import Tooltip from "../components/Tooltip.jsx";
-import { useToast } from "../components/Toast.jsx";
-import { useAuth } from "../context/AuthContext.jsx";
-import { isValidUrl } from "../utils/helpers.js";
-import ErrorNotice from "../components/ErrorNotice.jsx";
+} from '../services/applications.js'
+import { CONFIG_GROUPS } from '../data/constants.js'
+import ConfigField, { configValid } from '../components/ConfigField.jsx'
+import Tooltip from '../components/Tooltip.jsx'
+import { useToast } from '../components/Toast.jsx'
+import { useAuth } from '../context/AuthContext.jsx'
+import { isValidUrl } from '../utils/helpers.js'
+import ErrorNotice from '../components/ErrorNotice.jsx'
+import useQuery from '../hooks/useQuery.js'
+import { invalidateQueries } from '../services/queryCache.js'
 
 // Create/edit dialog. `app` is null when creating. Mirrors the invite modal on
 // TeamPage; the scan-config half reuses the same field renderer as ScanPage.
 function ApplicationDialog({ app, onSave, onClose }) {
-  const [name, setName] = useState(app?.name || "");
-  const [targetUrl, setTargetUrl] = useState(app?.target_url || "");
-  const [config, setConfig] = useState(app?.default_scan_config || {});
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [name, setName] = useState(app?.name || '')
+  const [targetUrl, setTargetUrl] = useState(app?.target_url || '')
+  const [config, setConfig] = useState(app?.default_scan_config || {})
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [saving, setSaving] = useState(false)
 
-  const urlValid = isValidUrl(targetUrl);
+  const urlValid = isValidUrl(targetUrl)
   const canSave =
-    name.trim() && urlValid && configValid(CONFIG_GROUPS, config) && !saving;
+    name.trim() && urlValid && configValid(CONFIG_GROUPS, config) && !saving
 
   function setConfigField(key, value) {
     setConfig((prev) => {
-      if (value === "" || value === undefined || value === null) {
-        const next = { ...prev };
-        delete next[key];
-        return next;
+      if (value === '' || value === undefined || value === null) {
+        const next = { ...prev }
+        delete next[key]
+        return next
       }
-      return { ...prev, [key]: value };
-    });
+      return { ...prev, [key]: value }
+    })
   }
 
   async function submit(e) {
-    e.preventDefault();
-    if (!canSave) return;
-    setSaving(true);
+    e.preventDefault()
+    if (!canSave) return
+    setSaving(true)
     try {
-      await onSave({ name: name.trim(), targetUrl: targetUrl.trim(), config });
+      await onSave({ name: name.trim(), targetUrl: targetUrl.trim(), config })
     } finally {
-      setSaving(false);
+      setSaving(false)
     }
   }
 
@@ -59,18 +61,16 @@ function ApplicationDialog({ app, onSave, onClose }) {
         aria-labelledby='application-dialog-title'
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <Tooltip label='Close'>
-          <button
-            type='button'
-            className='modal-close'
-            aria-label='Close application dialog'
-            onClick={onClose}
-          >
-            <X className='ico' />
-          </button>
-        </Tooltip>
+        <button
+          type='button'
+          className='modal-close'
+          aria-label='Close application dialog'
+          onClick={onClose}
+        >
+          <X className='ico' />
+        </button>
         <h2 id='application-dialog-title'>
-          {app ? "Edit application" : "Add a web application"}
+          {app ? 'Edit application' : 'Add a web application'}
         </h2>
         <p className='muted-text'>
           Save the target URL and defaults you want to reuse for future scans.
@@ -84,14 +84,14 @@ function ApplicationDialog({ app, onSave, onClose }) {
                 value={name}
                 maxLength={200}
                 onChange={(e) => setName(e.target.value)}
-                placeholder='Customer portal (staging)'
+                placeholder='Customer portal'
                 autoFocus
               />
             </div>
           </div>
           <div className='field'>
             <label htmlFor='app-url'>Target URL</label>
-            <div className={`control${targetUrl && !urlValid ? " error" : ""}`}>
+            <div className={`control${targetUrl && !urlValid ? ' error' : ''}`}>
               <input
                 id='app-url'
                 type='url'
@@ -109,12 +109,14 @@ function ApplicationDialog({ app, onSave, onClose }) {
 
           <button
             type='button'
-            className={`advanced-toggle${advancedOpen ? " open" : ""}`}
+            className={`advanced-toggle${advancedOpen ? ' open' : ''}`}
             onClick={() => setAdvancedOpen((v) => !v)}
             aria-expanded={advancedOpen}
           >
-            Default scan configuration{" "}
-            <span className='muted-text'>(optional)</span>
+            <span className='advanced-toggle-title'>
+              Default scan configuration{' '}
+              <span className='muted-text'>(optional)</span>
+            </span>
             <span className='advanced-toggle-hint'>
               Used to prefill new scans of this app
             </span>
@@ -144,60 +146,44 @@ function ApplicationDialog({ app, onSave, onClose }) {
           )}
 
           <button className='btn primary' disabled={!canSave}>
-            {saving
-              ? "Saving…"
-              : app
-                ? "Save changes"
-                : "Create application"}
+            {saving ? 'Saving…' : app ? 'Save changes' : 'Create application'}
           </button>
         </form>
       </div>
     </div>
-  );
+  )
 }
 
 function AppsPage() {
-  const { user } = useAuth();
-  const navigate = useNavigate();
-  const toast = useToast();
-  const canManage = user?.role !== "viewer";
-  const [apps, setApps] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [dialog, setDialog] = useState(null); // { app } | null
-  const [busy, setBusy] = useState("");
-
-  const load = useCallback(async (signal) => {
-    setLoading(true);
-    setError("");
-    try {
-      const data = await listApplications({ signal });
-      setApps(Array.isArray(data?.items) ? data.items : []);
-    } catch (err) {
-      if (err.name !== "AbortError")
-        setError(err);
-    } finally {
-      if (!signal || !signal.aborted) setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+  const { user } = useAuth()
+  const navigate = useNavigate()
+  const toast = useToast()
+  const canManage = user?.role !== 'viewer'
+  const [dialog, setDialog] = useState(null) // { app } | null
+  const [busy, setBusy] = useState('')
+  const {
+    data,
+    error,
+    hasData,
+    isFetchedAfterMount,
+    isLoading: loading,
+    refetch,
+  } = useQuery({
+    queryKey: 'applications:list:default',
+    queryFn: listApplications,
+  })
+  const apps = Array.isArray(data?.items) ? data.items : []
 
   async function save(payload) {
-    const editing = dialog?.app;
+    const editing = dialog?.app
     try {
-      if (editing) await updateApplication(editing.id, payload);
-      else await createApplication(payload);
-      setDialog(null);
-      toast(editing ? "Application updated" : "Application created");
-      await load();
+      if (editing) await updateApplication(editing.id, payload)
+      else await createApplication(payload)
+      setDialog(null)
+      toast(editing ? 'Application updated' : 'Application created')
+      await invalidateQueries('applications')
     } catch (err) {
-      toast(err, { type: "error", fallback: "Could not save the application." });
+      toast(err, { type: 'error', fallback: 'Could not save the application.' })
     }
   }
 
@@ -207,16 +193,19 @@ function AppsPage() {
         `Delete ${app.name}? Its scan reports are kept, but the saved target and defaults are removed.`,
       )
     )
-      return;
-    setBusy(app.id);
+      return
+    setBusy(app.id)
     try {
-      await deleteApplication(app.id);
-      toast("Application deleted");
-      await load();
+      await deleteApplication(app.id)
+      toast('Application deleted')
+      await invalidateQueries('applications')
     } catch (err) {
-      toast(err, { type: "error", fallback: "Could not delete the application." });
+      toast(err, {
+        type: 'error',
+        fallback: 'Could not delete the application.',
+      })
     } finally {
-      setBusy("");
+      setBusy('')
     }
   }
 
@@ -228,24 +217,48 @@ function AppsPage() {
           <p>Save targets and keep their scan history together.</p>
         </div>
         {canManage && (
-          <button className='btn primary' onClick={() => setDialog({ app: null })}>
+          <button
+            className='btn primary'
+            onClick={() => setDialog({ app: null })}
+          >
             <Plus className='ico' />
             Add application
           </button>
         )}
       </div>
 
+      {error && hasData && (
+        <ErrorNotice
+          error={error}
+          fallback='Applications may be out of date.'
+          onRetry={refetch}
+        />
+      )}
       {loading ? (
-        <div className='empty-state'>Loading applications…</div>
-      ) : error ? (
-        <ErrorNotice error={error} fallback='Could not load applications.' onRetry={() => load()} />
+        <div
+          className='app-grid query-skeleton'
+          role='status'
+          aria-label='Loading applications'
+        >
+          {[0, 1, 2].map((item) => (
+            <article className='card skeleton-card' key={item} aria-hidden='true'>
+              <span className='skeleton-block skeleton-heading' />
+              <span className='skeleton-block skeleton-copy' />
+              <span className='skeleton-block skeleton-action' />
+            </article>
+          ))}
+        </div>
+      ) : error && !hasData ? (
+        <ErrorNotice
+          error={error}
+          fallback='Could not load applications.'
+          onRetry={refetch}
+        />
       ) : apps.length === 0 ? (
         <div className='empty-state'>
           <Boxes size={30} />
           <h2>No applications yet</h2>
-          <p>
-            Add an app to save its target URL, defaults, and scan history.
-          </p>
+          <p>Add an app to save its target URL, defaults, and scan history.</p>
           {canManage && (
             <button
               className='btn primary'
@@ -257,11 +270,13 @@ function AppsPage() {
           )}
         </div>
       ) : (
-        <div className='app-grid'>
+        <div className={`app-grid${isFetchedAfterMount ? ' query-content-enter' : ''}`}>
           {apps.map((a) => (
             <article key={a.id} className='card'>
               <h2>{a.name}</h2>
-              <p className='mono' style={{ wordBreak: "break-all" }}>{a.target_url}</p>
+              <p className='mono' style={{ wordBreak: 'break-all' }}>
+                {a.target_url}
+              </p>
               <div className='cardfoot'>
                 <Link className='text-btn' to={`/apps/${a.id}`}>
                   Scan history
@@ -314,7 +329,7 @@ function AppsPage() {
         />
       )}
     </div>
-  );
+  )
 }
 
-export default AppsPage;
+export default AppsPage

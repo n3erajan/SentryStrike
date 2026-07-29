@@ -1,5 +1,10 @@
+import ipaddress
+import socket
+from urllib.parse import urlsplit
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.config import get_settings
 from app.api.dependencies import (
     get_analysis_job_repository,
     get_application_repository,
@@ -41,6 +46,54 @@ def set_scan_queue(instance: ScanQueue) -> None:
     """
     global scan_queue
     scan_queue = instance
+
+
+_LOCAL_HOSTNAMES = frozenset({"localhost", "localhost.localdomain"})
+
+
+def _is_private_target(url: str) -> tuple[bool, str]:
+    """Check whether *url* points to a private / loopback network address.
+
+    Performs a DNS resolution so hostnames like ``internal.service.local``
+    that resolve to ``10.x.x.x``, ``192.168.x.x``, ``172.16-31.x.x``,
+    ``127.x.x.x``, or ``169.254.x.x`` are caught.
+
+    Returns ``(blocked: bool, reason: str)``. On DNS failure the target
+    is allowed through — the scanner will fail later if the host is
+    genuinely unreachable.
+    """
+    try:
+        host = urlsplit(url).hostname
+    except Exception:
+        return False, ""
+    if not host:
+        return False, ""
+
+    if host in _LOCAL_HOSTNAMES:
+        return True, "The target URL points to the local machine. Please provide a publicly accessible target."
+
+    try:
+        addrs = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError):
+        return False, ""
+
+    seen: set[str] = set()
+    for _, _, _, _, sockaddr in addrs:
+        ip_str = sockaddr[0]
+        if ip_str in seen:
+            continue
+        seen.add(ip_str)
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return True, (
+                "The target URL points to a private or internal network address. "
+                "Please provide a publicly accessible target."
+            )
+
+    return False, ""
 
 
 def _scan_summary(scan) -> dict:
@@ -133,6 +186,14 @@ async def create_scan(
                 "Wait for it to complete or cancel it first."
             ),
         )
+    settings = get_settings()
+    if not settings.app_debug:
+        blocked, reason = _is_private_target(str(payload.target_url))
+        if blocked:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=reason,
+            )
     scan = await repo.create(
         str(payload.target_url),
         application_id=application_id,

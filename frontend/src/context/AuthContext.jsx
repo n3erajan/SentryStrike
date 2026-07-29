@@ -14,6 +14,7 @@ import {
   refreshCurrentUser,
 } from "../services/auth.js";
 import { setOnUnauthorized } from "../services/apiClient.js";
+import { clearQueryCache } from "../services/queryCache.js";
 
 // Session is managed via an HttpOnly cookie set by the backend. On mount we
 // validate the session with the public session probe. Signed-out visitors get
@@ -26,6 +27,7 @@ export function AuthProvider({ children }) {
   const navigate = useNavigate();
 
   const clearSession = useCallback(() => {
+    clearQueryCache();
     setUser(null);
     navigate("/login", { replace: true });
   }, [navigate]);
@@ -40,18 +42,21 @@ export function AuthProvider({ children }) {
 
   const login = useCallback(async (credentials) => {
     const authed = await loginService(credentials);
+    clearQueryCache();
     setUser(authed);
     return authed;
   }, []);
 
   const register = useCallback(async (credentials) => {
     const authed = await registerService(credentials);
+    clearQueryCache();
     setUser(authed);
     return authed;
   }, []);
 
   const logout = useCallback(async () => {
     await logoutService();
+    clearQueryCache();
     setUser(null);
     navigate("/login", { replace: true });
   }, [navigate]);

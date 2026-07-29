@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { listScans } from "../services/scan.js";
 import { listApplications } from "../services/applications.js";
 import { useActiveScans } from "../hooks/useActiveScans.js";
+import useQuery from "../hooks/useQuery.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import { displayName } from "../components/Sidebar.jsx";
 
@@ -34,33 +33,21 @@ function hostnameOf(url) {
 
 function HomePage() {
   const { user } = useAuth();
-  const { scans: active, count } = useActiveScans();
-  const [scans, setScans] = useState([]);
-  const [appCount, setAppCount] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  const load = useCallback(async (signal) => {
-    setLoading(true);
-    try {
-      const [scanData, appData] = await Promise.all([
-        listScans({ limit: 25, signal }),
-        listApplications({ limit: 1, signal }),
-      ]);
-      setScans(Array.isArray(scanData?.items) ? scanData.items : []);
-      setAppCount(appData?.total ?? null);
-    } catch {
-      /* handled quietly on Home */
-    } finally {
-      if (!signal || !signal.aborted) setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+  const {
+    scans: active,
+    allScans: scans,
+    count,
+    loading: scansLoading,
+    isFetchedAfterMount: scansFetchedAfterMount,
+  } = useActiveScans();
+  const applicationsQuery = useQuery({
+    queryKey: "applications:list:count",
+    queryFn: () => listApplications({ limit: 1 }),
+  });
+  const appCount = applicationsQuery.data?.total ?? null;
+  const loading = scansLoading || applicationsQuery.isLoading;
+  const contentEntered =
+    scansFetchedAfterMount || applicationsQuery.isFetchedAfterMount;
 
   const completed = scans.filter((s) => s.status === "completed");
   const latestPerApp = Object.values(
@@ -92,9 +79,37 @@ function HomePage() {
         </div>
       </div>
 
-      <div className='summary'>
+      {loading ? (
+        <>
+          <div
+            className='summary query-skeleton'
+            role='status'
+            aria-label='Loading workspace overview'
+          >
+            {["Web applications", "Scans running", "High-risk findings", "Workspace grade"].map(
+              (label) => (
+                <div className='stat' key={label}>
+                  <strong><span className='skeleton-block skeleton-value' /></strong>
+                  <span>{label}</span>
+                </div>
+              ),
+            )}
+          </div>
+          <div className='app-grid query-skeleton' aria-hidden='true'>
+            {[0, 1, 2].map((item) => (
+              <article className='card skeleton-card' key={item}>
+                <span className='skeleton-block skeleton-heading' />
+                <span className='skeleton-block skeleton-copy' />
+                <span className='skeleton-block skeleton-action' />
+              </article>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+      <div className={`summary${contentEntered ? " query-content-enter" : ""}`}>
         <div className='stat'>
-          <strong>{loading ? "N/A" : appCount ?? "N/A"}</strong>
+          <strong>{appCount ?? "N/A"}</strong>
           <span>Web applications</span>
         </div>
         <div className='stat'>
@@ -104,16 +119,16 @@ function HomePage() {
           </span>
         </div>
         <div className='stat'>
-          <strong>{loading ? "N/A" : highRisk}</strong>
+          <strong>{highRisk}</strong>
           <span>High-risk findings</span>
         </div>
         <div className='stat'>
-          <strong>{loading ? "N/A" : postureLetter(latestPerApp)}</strong>
+          <strong>{postureLetter(latestPerApp)}</strong>
           <span>Workspace grade</span>
         </div>
       </div>
 
-      <div className='app-grid'>
+      <div className={`app-grid${contentEntered ? " query-content-enter" : ""}`}>
         {latestCompleted && (
           <article className='card'>
             <h2>{latestCompleted.application_name || latestCompleted.site_title || hostnameOf(latestCompleted.target_url)} report ready</h2>
@@ -168,6 +183,8 @@ function HomePage() {
           </div>
         </article>
       </div>
+        </>
+      )}
     </div>
   );
 }

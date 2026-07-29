@@ -33,6 +33,8 @@ import Tooltip from "../components/Tooltip.jsx";
 import { reverifyAffordance } from "../utils/reverifyPolicy.js";
 import { httpSnippetToCurl } from "../utils/httpToCurl.js";
 import ErrorNotice from "../components/ErrorNotice.jsx";
+import useQuery from "../hooks/useQuery.js";
+import { invalidateQueries } from "../services/queryCache.js";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
@@ -618,46 +620,48 @@ function ReportPage() {
   const location = useLocation();
   const target = location.state?.target || "";
   const toast = useToast();
-  const [report, setReport] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
   const [filter, setFilter] = useState("all");
   const [busy, setBusy] = useState("");
-  const [members, setMembers] = useState([]);
+  const reportQuery = useQuery({
+    queryKey: `reports:detail:${scanId}`,
+    queryFn: async () => {
+      const [reportData, scanData] = await Promise.all([
+        getReport(scanId),
+        getScanDetails(scanId),
+      ]);
+      return { ...scanData, ...reportData };
+    },
+    staleTime: 30_000,
+  });
+  const membersQuery = useQuery({
+    queryKey: "team:members",
+    queryFn: listMembers,
+  });
+  const { refetch: refetchReport } = reportQuery;
+  const { refetch: refetchMembers } = membersQuery;
+  const report = reportQuery.data;
+  const members = membersQuery.data?.items || [];
+  const loading = reportQuery.isLoading || membersQuery.isLoading;
+  const error = reportQuery.error || membersQuery.error;
+  const hasData = reportQuery.hasData && membersQuery.hasData;
+  const contentEntered =
+    reportQuery.isFetchedAfterMount || membersQuery.isFetchedAfterMount;
 
   const load = useCallback(
-    async (signal, { silent = false } = {}) => {
-      if (!silent) {
-        setLoading(true);
-        setError("");
-      }
+    async (_signal, { silent = false } = {}) => {
       try {
-        const [reportData, scanData, memberData] = await Promise.all([
-          getReport(scanId, signal),
-          getScanDetails(scanId, signal),
-          listMembers(signal),
-        ]);
-        setReport({ ...scanData, ...reportData });
-        setMembers(memberData.items || []);
+        await refetchReport();
       } catch (err) {
-        if (err.name === "AbortError") return;
         if (silent) toast(err, { type: "error", fallback: "Could not refresh the report." });
-        else setError(err);
-      } finally {
-        if (!signal || !signal.aborted) {
-          if (!silent) setLoading(false);
-        }
       }
     },
-    [scanId, toast],
+    [refetchReport, toast],
   );
 
-  useEffect(() => {
-    const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+  const refetchAll = useCallback(
+    () => Promise.allSettled([refetchReport(), refetchMembers()]),
+    [refetchReport, refetchMembers],
+  );
 
   // Poll for AI analysis progress when it isn't terminal yet.
   const pollTimer = useRef(null);
@@ -674,6 +678,11 @@ function ReportPage() {
       }
     };
   }, [status, load]);
+
+  useEffect(() => {
+    if (status !== "completed" && status !== "failed") return;
+    invalidateQueries("scans", { refetchActive: false });
+  }, [status]);
 
   const handleJson = useCallback(() => {
     if (report)
@@ -700,6 +709,7 @@ function ReportPage() {
     setBusy("analysis");
     try {
       await retryAnalysis(scanId);
+      invalidateQueries("scans", { refetchActive: false });
       toast("Analysis retry queued");
       await load(undefined, { silent: true });
     } catch (err) {
@@ -712,16 +722,22 @@ function ReportPage() {
   if (loading)
     return (
       <div className='view'>
-        <div className='empty-state'>Loading report…</div>
+        <div className='report-skeleton query-skeleton' role='status' aria-label='Loading report'>
+          <span className='skeleton-block skeleton-heading' />
+          <span className='skeleton-block skeleton-copy' />
+          <div className='summary' aria-hidden='true'>
+            {[0, 1, 2, 3].map((item) => <div className='stat' key={item}><strong><span className='skeleton-block skeleton-value' /></strong><span className='skeleton-block skeleton-copy' /></div>)}
+          </div>
+        </div>
       </div>
     );
-  if (error)
+  if (error && !hasData)
     return (
       <div className='view'>
         <button className='back' onClick={() => navigate("/reports")}>
           ← All reports
         </button>
-        <div style={{ maxWidth: 760 }}><ErrorNotice error={error} fallback='Could not load the report.' onRetry={() => load()} /></div>
+        <div style={{ maxWidth: 760 }}><ErrorNotice error={error} fallback='Could not load the report.' onRetry={refetchAll} /></div>
       </div>
     );
   if (!report) return null;
@@ -769,10 +785,19 @@ function ReportPage() {
     ["owner", "admin", "analyst"].includes(user?.role);
 
   return (
-    <div className='view'>
+    <div className={`view${contentEntered ? " query-content-enter" : ""}`}>
       <button className='back' onClick={() => navigate(-1)}>
         ← Back
       </button>
+      {error && (
+        <div style={{ maxWidth: 760 }}>
+          <ErrorNotice
+            error={error}
+            fallback='Report data may be out of date.'
+            onRetry={refetchAll}
+          />
+        </div>
+      )}
       <div className='head'>
         <div>
           <h2>{siteTitle}</h2>
