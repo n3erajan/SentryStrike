@@ -40,21 +40,21 @@ Most scanners end at a list of possible issues. SentryStrike keeps the scan, its
 
 ## How a team uses it
 
-1. An owner creates a workspace and invites the people who will manage, analyze, and fix findings.
-2. A team member adds an application and starts an authorized scan, optionally supplying dedicated test accounts for that scan.
+1. A prospective owner requests access. After CLI approval, accepting the single-use owner invitation creates the workspace; the owner can then invite the people who will manage, analyze, and fix findings.
+2. An owner, administrator, analyst, or developer adds an application and starts an authorized scan, optionally supplying dedicated test accounts for that scan. Viewers have read-only access.
 3. The scanner builds an attack surface from pages, SPA routes, forms, and browser-observed requests; it then performs bounded checks, verifies candidates, and saves the evidence and scan progress.
 4. The analyzer enriches completed findings and prepares the report summary. When AI analysis is intentionally disabled, it publishes deterministic fallback guidance; provider failures are recorded for retry and review.
-5. Workspace members can review the evidence and AI output, assign actionable findings, discuss them with developers, and mark false positives when appropriate.
-6. Developers update remediation status. A workspace member can request focused re-verification, then export a PDF report when the assessment is ready to share.
+5. Every workspace member can review evidence and AI output. Owners, administrators, and analysts can assign and triage findings; non-viewers can comment and update non-terminal remediation states.
+6. Developers can move work to `fixed_pending_verification`. An owner, administrator, or analyst requests focused re-verification and closes or waives the finding. Any workspace member can export the completed PDF report.
 
 ### One assessment, three useful views
 
 The same assessment must make sense to the person accepting the risk, the person fixing the code, and the person checking the security evidence. SentryStrike presents the results with the detail each of them needs:
 
-| View | What it provides |
-| --- | --- |
-| **Business owner** | A plain-language explanation, business impact, severity, overall risk, and an executive summary for decision-making. |
-| **Developer** | The affected URL, method and parameters, request and response snippets, payload details, remediation guidance, assignment, comments, and fix status. |
+| View                  | What it provides                                                                                                                                                                   |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Business owner**    | A plain-language explanation, business impact, severity, overall risk, and an executive summary for decision-making.                                                               |
+| **Developer**         | The affected URL, method and parameters, request and response snippets, payload details, remediation guidance, assignment, comments, and fix status.                               |
 | **Security reviewer** | Verification method, evidence strength, reproducibility, confidence, CVSS and OWASP mapping, AI false-positive assessment, coverage warnings, and focused re-verification results. |
 
 ## Security testing scope
@@ -65,10 +65,10 @@ Active checks are mapped to the OWASP Top 10 (2025) where a web DAST scan can pr
 
 Three OWASP categories are reported as outside active automated detector scope:
 
-| Category | Why it is outside automated DAST scope |
-| --- | --- |
-| **A06: Insecure Design** | Identifying a flawed design requires business rules, architecture, trust boundaries, abuse cases, and threat-model context that cannot be inferred reliably from black-box requests and responses. |
-| **A08: Software or Data Integrity Failures** | Assessing update trust, build and deployment pipelines, artifact signing, and internal data-integrity controls requires access to development and operational systems beyond the running web application. |
+| Category                                        | Why it is outside automated DAST scope                                                                                                                                                                             |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **A06: Insecure Design**                        | Identifying a flawed design requires business rules, architecture, trust boundaries, abuse cases, and threat-model context that cannot be inferred reliably from black-box requests and responses.                 |
+| **A08: Software or Data Integrity Failures**    | Assessing update trust, build and deployment pipelines, artifact signing, and internal data-integrity controls requires access to development and operational systems beyond the running web application.          |
 | **A09: Security Logging and Alerting Failures** | Verifying what the application logs, whether monitoring detects an event, and whether an alert reaches the right responder requires access to server-side logs, monitoring tools, and incident-response processes. |
 
 Coverage still depends on what the target exposes, the configured limits, available authentication, and the evidence that can be gathered safely. Reports include coverage warnings instead of treating untested areas as passes. A clean scan is not proof that an application is secure.
@@ -208,12 +208,12 @@ Configuration is split by service so that scanner limits, email credentials, and
 
 ### Optional configuration
 
-| Area                                | Variables                                                                                                 | When to change them                                                                                     |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Email invitations and notifications | `EMAIL_SMTP_*`, `EMAIL_FROM`                                                                              | Required for delivery by email; otherwise use the locally printed invitation link.                      |
-| AI provider                         | `AI_BASE_URL`, `AI_MODEL`, `AI_API_KEY`, `AI_TIMEOUT_SECONDS`, `AI_MAX_RETRIES`, `AI_JSON_MODE`           | Use a hosted or self-hosted OpenAI-compatible provider, choose a model, or tune provider behavior.      |
-| Scan safety and capacity            | `CRAWL_*`, `REQUEST_TIMEOUT_SECONDS`, `SCANNER_CONCURRENCY`, request caps, access-control safety settings | Match scan intensity to the authorized target and test window.                                          |
-| CVE enrichment                      | `NVD_API_KEY`, `NVD_API_URL`                                                                              | Add an NVD API key if needed for your rate limit.                                                       |
+| Area                                | Variables                                                                                                 | When to change them                                                                                           |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Email invitations and notifications | `EMAIL_SMTP_*`, `EMAIL_FROM`                                                                              | Required for delivery by email; otherwise use the locally printed invitation link.                            |
+| AI provider                         | `AI_BASE_URL`, `AI_MODEL`, `AI_API_KEY`, `AI_TIMEOUT_SECONDS`, `AI_MAX_RETRIES`, `AI_JSON_MODE`           | Use a hosted or self-hosted OpenAI-compatible provider, choose a model, or tune provider behavior.            |
+| Scan safety and capacity            | `CRAWL_*`, `REQUEST_TIMEOUT_SECONDS`, `SCANNER_CONCURRENCY`, request caps, access-control safety settings | Match scan intensity to the authorized target and test window.                                                |
+| CVE enrichment                      | `NVD_API_KEY`, `NVD_API_URL`                                                                              | Add an NVD API key if needed for your rate limit.                                                             |
 | Deployment security                 | `AUTH_COOKIE_SECURE`, `CORS_ORIGINS`, `PUBLIC_HOSTNAME`                                                   | Set secure cookies, explicit origins, and the public address used for invitation links and backend callbacks. |
 
 For Docker-specific variables, production hardening, OAST routing, scaling, and backup guidance, read [DOCKER.md](DOCKER.md). Treat scan evidence, logs, notifications, and PDF reports as sensitive assessment data.

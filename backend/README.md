@@ -2,7 +2,7 @@
 
 The backend is SentryStrike's authenticated control plane. It exposes the FastAPI REST API, manages organizations and sessions, persists scan and collaboration state in MongoDB, coordinates Redis-backed work queues, and generates PDF reports.
 
-Scanning and AI analysis run in separate workers; API requests enqueue durable work instead of performing long-running assessments in the web process.
+Scanning and AI analysis run in separate workers, so the web process does not perform long-running assessments. Scan state is durable in MongoDB, while scan execution is dispatched through a short-lived Redis job. Analysis work is durable in MongoDB and Redis acts only as a wake-up signal.
 
 ## Responsibilities
 
@@ -59,6 +59,21 @@ All application endpoints use the `/api/v1` prefix.
 | `/workspace`     | Workspace profile, members, invitations, audit log, and retention                     |
 | `/notifications` | Notification listing, unread count, and read state                                    |
 | `/health`        | API status and active scanner count                                                   |
+
+### Workspace role permissions
+
+| Operation | Owner | Admin | Analyst | Developer | Viewer |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| Read workspace scans, findings, and reports | Yes | Yes | Yes | Yes | Yes |
+| Create applications and scans; cancel scans | Yes | Yes | Yes | Yes | No |
+| Comment and update non-terminal remediation | Yes | Yes | Yes | Yes | No |
+| Assign, review, retry analysis, and request re-verification | Yes | Yes | Yes | No | No |
+| Close or waive remediation | Yes | Yes | Yes | No | No |
+| Read audit history and retention settings | Yes | Yes | Yes | Yes | Yes |
+| Manage members, invitations, and retention settings | Yes | Yes | No | No | No |
+| Rename the workspace | Yes | No | No | No | No |
+
+All authenticated operations are scoped to the current organization. The API prevents removing or demoting the owner and prevents a user from changing or removing their own membership.
 
 The OAST routes live at `/oast`, outside `/api/v1`, and are intentionally unauthenticated so tested targets can call back. Interaction IDs are validated before data is stored.
 
@@ -132,7 +147,7 @@ dashboard, add the deployed hostname, and replace both keys before production.
 
 Gmail SMTP requires both a username and app password. Settings validation fails fast when only one credential is supplied or Gmail is selected without credentials.
 
-SMTP is used for invitation and notification delivery. Local development can use the invitation link printed by the management CLI instead.
+SMTP is used for invitation delivery. In-app notifications are stored in MongoDB and fetched through the notification API. Local development can use the invitation link printed by the management CLI instead.
 
 ## Project structure
 

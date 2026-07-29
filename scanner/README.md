@@ -39,16 +39,16 @@ Progress, phase, ETA, request counts, coverage warnings, cancellation, and termi
 
 Detector modules live in [`app/core/detectors/`](app/core/detectors/). Their current OWASP-oriented coverage is:
 
-| Area | Current checks |
-| --- | --- |
-| Broken access control | BOLA/IDOR, forced browsing, authorization matrices, mass assignment, and bounded mutating authorization probes |
-| Authentication failures | Form and API authentication, session behavior, JWT handling and forgery checks, and observed authentication evidence |
-| Injection | SQL injection, NoSQL injection, command injection, and reflected/browser-verified XSS |
-| Server-side and file handling | SSRF, file inclusion, file upload, and open redirect |
-| Request integrity | CSRF behavior and authentication-bound request analysis |
-| Security configuration | Security headers, sensitive paths, exception handling, and exposed diagnostic behavior |
-| Cryptography and transport | TLS analysis and cryptographic-failure checks |
-| Software supply chain | Technology/version fingerprinting, manifest enrichment, and known-CVE correlation |
+| Area                          | Current checks                                                                                                       |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Broken access control         | BOLA/IDOR, forced browsing, authorization matrices, mass assignment, and bounded mutating authorization probes       |
+| Authentication failures       | Form and API authentication, session behavior, JWT handling and forgery checks, and observed authentication evidence |
+| Injection                     | SQL injection, NoSQL injection, command injection, and reflected/browser-verified XSS                                |
+| Server-side and file handling | SSRF, file inclusion, file upload, and open redirect                                                                 |
+| Request integrity             | CSRF behavior and authentication-bound request analysis                                                              |
+| Security configuration        | Security headers, sensitive paths, exception handling, and exposed diagnostic behavior                               |
+| Cryptography and transport    | TLS analysis and cryptographic-failure checks                                                                        |
+| Software supply chain         | Technology/version fingerprinting, manifest enrichment, and known-CVE correlation                                    |
 
 The [`attack_planner`](app/core/detectors/attack_planner.py), attack-surface model, and parameter selection logic decide what to probe and where. Checks that cannot be exercised are recorded as coverage limitations rather than silently treated as passes.
 
@@ -75,7 +75,6 @@ Safety boundaries are implemented across orchestration, crawling, and HTTP utili
 - A request governor caps traffic per scan, detector, and parameter.
 - Crawl depth, URL count, browser interactions, wall-clock budgets, concurrency, and request timeouts are configurable.
 - Mutating authorization confirmation is disabled unless explicitly enabled.
-- Cancellation is checked during active work and at phase boundaries, with leases covering worker crashes.
 - Captured evidence passes through redaction before durable storage.
 - Target credentials travel only in the Redis job payload and worker memory. The job is removed from Redis when a worker claims it, and credentials are never persisted to MongoDB.
 
@@ -83,14 +82,14 @@ Use conservative budgets for fragile systems and coordinate test windows with ap
 
 ## Integrations
 
-| Integration | Purpose |
-| --- | --- |
-| Playwright / Chromium | SPA discovery, authenticated browser state, interaction capture, and browser-backed verification |
-| HTTPX | Async HTTP crawling, probing, verification, and OAST polling |
-| SSLyze | TLS and transport-security inspection |
-| NVD API | Known-CVE enrichment for identified software versions |
-| Wappalyzer-style fingerprints | Technology and version identification |
-| Shared OAST client | Callback generation and polling through the backend collaborator endpoint |
+| Integration                   | Purpose                                                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------------------------ |
+| Playwright / Chromium         | SPA discovery, authenticated browser state, interaction capture, and browser-backed verification |
+| HTTPX                         | Async HTTP crawling, probing, verification, and OAST polling                                     |
+| SSLyze                        | TLS and transport-security inspection                                                            |
+| NVD API                       | Known-CVE enrichment for identified software versions                                            |
+| Wappalyzer-style fingerprints | Technology and version identification                                                            |
+| Shared OAST client            | Callback generation and polling through the backend collaborator endpoint                        |
 
 NVD enrichment and OAST verification are best-effort capabilities: missing configuration or an unavailable external service reduces coverage but should not corrupt the durable scan state.
 
@@ -145,15 +144,15 @@ Those OAST overrides match the repository's local Docker development topology. I
 
 Shared MongoDB, Redis, queue, cancellation, lease, heartbeat, and public-host values are documented in the [root configuration template](../.env.example). Scanner-specific controls are in [`.env.example`](.env.example).
 
-| Area | Important variables |
-| --- | --- |
-| Crawl scope | `CRAWL_DEPTH`, `CRAWL_MAX_URLS`, `CRAWL_RATE_LIMIT_PER_SECOND` |
-| Browser budget | `CRAWL_BROWSER_MODE`, `CRAWL_BROWSER_MAX_INTERACTIONS`, `CRAWL_BROWSER_BUDGET_SECONDS` |
-| Request control | `REQUEST_TIMEOUT_SECONDS`, `SCANNER_CONCURRENCY`, detector and parameter request caps |
-| Safety | `ACCESS_CONTROL_PROBE_MUTATING_METHODS`, `ALLOW_DESTRUCTIVE_AUTHZ_CONFIRMATION` |
-| Verification | Timing thresholds, OAST polling, and browser-verification budgets |
-| Enrichment | `NVD_API_URL`, `NVD_API_KEY`, `CVE_CACHE_TTL_SECONDS` |
-| Observability | `LOG_LEVEL`, `LOG_FILE` |
+| Area            | Important variables                                                                    |
+| --------------- | -------------------------------------------------------------------------------------- |
+| Crawl scope     | `CRAWL_DEPTH`, `CRAWL_MAX_URLS`, `CRAWL_RATE_LIMIT_PER_SECOND`                         |
+| Browser budget  | `CRAWL_BROWSER_MODE`, `CRAWL_BROWSER_MAX_INTERACTIONS`, `CRAWL_BROWSER_BUDGET_SECONDS` |
+| Request control | `REQUEST_TIMEOUT_SECONDS`, `SCANNER_CONCURRENCY`, detector and parameter request caps  |
+| Safety          | `ACCESS_CONTROL_PROBE_MUTATING_METHODS`, `ALLOW_DESTRUCTIVE_AUTHZ_CONFIRMATION`        |
+| Verification    | Timing thresholds, OAST polling, and browser-verification budgets                      |
+| Enrichment      | `NVD_API_URL`, `NVD_API_KEY`, `CVE_CACHE_TTL_SECONDS`                                  |
+| Observability   | `LOG_LEVEL`, `LOG_FILE`                                                                |
 
 ## Tests
 

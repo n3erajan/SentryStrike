@@ -21,7 +21,7 @@ The SentryStrike frontend is a React single-page application for managing web ap
 - Completed report filtering, AI-analysis status, and PDF download
 - Team membership, roles, invitations, audit history, and retention settings
 
-Routes are declared in [`src/App.jsx`](src/App.jsx). Public routes cover the landing, login, and registration screens; authenticated routes render inside the shared application layout.
+Routes are declared in [`src/App.jsx`](src/App.jsx). Public routes cover the landing, access-request, login, and registration screens; authenticated routes render inside the shared application layout.
 
 ## Development
 

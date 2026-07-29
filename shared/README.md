@@ -25,7 +25,7 @@ shared/
 
 ## Durable data model
 
-Beanie documents cover organizations, users and sessions, invitations, applications, scans, vulnerabilities, analysis jobs, re-verification jobs, notifications, audit events, and OAST interactions. Repository methods carry organization identifiers where tenant isolation is required.
+Beanie documents cover access requests, organizations, users and sessions, invitations, applications, scans, analysis jobs, re-verification jobs, notifications, audit events, cached CVE records, and OAST interactions. Vulnerabilities are embedded Pydantic records inside scan documents rather than standalone collections. Repository methods carry organization identifiers where tenant isolation is required.
 
 MongoDB is authoritative for scan and analysis state. Redis transports scan jobs and wake-up signals and holds ephemeral cancellation, lease, and heartbeat keys.
 

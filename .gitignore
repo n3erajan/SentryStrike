@@ -110,3 +110,6 @@ CLAUDE.md
 .understand-anything/
 docs/
 .agents
+
+report
+report-tracker.md
