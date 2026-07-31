@@ -51,6 +51,25 @@ def set_scan_queue(instance: ScanQueue) -> None:
 _LOCAL_HOSTNAMES = frozenset({"localhost", "localhost.localdomain"})
 
 
+def _normalized_target_url(value: str) -> str:
+    """Canonical form for comparing a scan target against an application url.
+
+    Mirrors the frontend's ``normalizedTargetUrl`` (reportFilters.js) so the
+    backend and the reports grouping agree on what counts as the same target:
+    lowercase scheme/host, and a bare ``/`` path treated as empty.
+    """
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    path = "" if parsed.path in ("", "/") else parsed.path
+    query = f"?{parsed.query}" if parsed.query else ""
+    fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+    return f"{scheme}://{netloc}{path}{query}{fragment}"
+
+
 def _is_private_target(url: str) -> tuple[bool, str]:
     """Check whether *url* points to a private / loopback network address.
 
@@ -96,11 +115,37 @@ def _is_private_target(url: str) -> tuple[bool, str]:
     return False, ""
 
 
-def _scan_summary(scan) -> dict:
+async def _application_name(
+    apps: ApplicationRepository,
+    scan,
+    org_id: str,
+) -> str:
+    """Resolve the org-scoped application name for a scan, if any."""
+    if not scan.application_id:
+        return ""
+    application = await apps.get_in_org(str(scan.application_id), org_id)
+    return application.name if application is not None else ""
+
+
+async def _application_names_by_id(
+    apps: ApplicationRepository,
+    scans: list,
+    org_id: str,
+) -> dict[str, str]:
+    """Map application ids to their org-scoped names for scan serialization."""
+    ids = [str(scan.application_id) for scan in scans if scan.application_id]
+    if not ids:
+        return {}
+    by_id = await apps.list_by_ids(ids, org_id)
+    return {app_id: app.name for app_id, app in by_id.items()}
+
+
+def _scan_summary(scan, application_name: str = "") -> dict:
     """Project a Scan document to its list-view representation."""
     return {
         "id": str(scan.id),
         "application_id": getattr(scan, "application_id", None),
+        "application_name": application_name or "",
         "target_url": scan.target_url,
         "submitted_by_user_id": scan.submitted_by_user_id,
         "submitted_by_full_name": scan.submitted_by_full_name,
@@ -171,8 +216,16 @@ async def create_scan(
     application_id = payload.application_id
     if application_id is not None:
         application = await apps.get_in_org(application_id, current_user.org_id)
-        if application is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Application not found")
+        if (
+            application is None
+            or _normalized_target_url(application.target_url)
+            != _normalized_target_url(str(payload.target_url))
+        ):
+            # The application is missing or its stored url no longer matches
+            # the submitted target. Don't reject the scan and don't misattribute
+            # it — run it as a plain non-application scan instead, so it keeps
+            # its own group in the reports section.
+            application_id = None
     active = await repo.find_active_by_target(
         org_id=current_user.org_id,
         target_url=str(payload.target_url),
@@ -271,6 +324,7 @@ async def list_scans(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=100),
     repo: ScanRepository = Depends(get_scan_repository),
+    apps: ApplicationRepository = Depends(get_application_repository),
     notifications: NotificationRepository = Depends(get_notification_repository),
     analysis_repo: AnalysisJobRepository = Depends(get_analysis_job_repository),
     current_user: User = Depends(get_current_user),
@@ -280,6 +334,7 @@ async def list_scans(
     All org members share one view, so scans are scoped by ``org_id`` rather
     than by the individual submitter.
     """
+    total = await repo.count_by_org(org_id=current_user.org_id)
     scans = await repo.list(skip=skip, limit=limit, org_id=current_user.org_id)
     # Flip any scan whose worker died (running in DB, no live lease) to failed so
     # the list never shows a permanently "running" zombie. Best-effort: a Redis
@@ -288,14 +343,19 @@ async def list_scans(
         scans = [await _reconcile_and_notify(scan, repo, notifications, analysis_repo) for scan in scans]
     else:
         scans = [await repo.reconcile_analysis_if_orphaned(scan, analysis_repo) for scan in scans]
-    payload = [_scan_summary(scan) for scan in scans]
-    return json_response({"items": payload, "total": len(payload)})
+    application_names = await _application_names_by_id(apps, scans, current_user.org_id)
+    payload = [
+        _scan_summary(scan, application_name=application_names.get(str(scan.application_id), ""))
+        for scan in scans
+    ]
+    return json_response({"items": payload, "total": total})
 
 
 @router.get("/{scan_id}")
 async def get_scan_details(
     scan_id: str,
     repo: ScanRepository = Depends(get_scan_repository),
+    apps: ApplicationRepository = Depends(get_application_repository),
     notifications: NotificationRepository = Depends(get_notification_repository),
     analysis_repo: AnalysisJobRepository = Depends(get_analysis_job_repository),
     current_user: User = Depends(get_current_user),
@@ -307,6 +367,7 @@ async def get_scan_details(
     scan = await _reconcile_and_notify(scan, repo, notifications, analysis_repo)
     data = scan.model_dump()
     data["id"] = str(scan.id)
+    data["application_name"] = await _application_name(apps, scan, current_user.org_id)
     # Defensive: credentials are never persisted, but strip any legacy field.
     data.pop("auth_accounts", None)
     return json_response(data)
@@ -316,6 +377,7 @@ async def get_scan_details(
 async def get_scan_status(
     scan_id: str,
     repo: ScanRepository = Depends(get_scan_repository),
+    apps: ApplicationRepository = Depends(get_application_repository),
     notifications: NotificationRepository = Depends(get_notification_repository),
     analysis_repo: AnalysisJobRepository = Depends(get_analysis_job_repository),
     current_user: User = Depends(get_current_user),
@@ -334,11 +396,14 @@ async def get_scan_status(
         "started_at": scan.started_at,
         "target_url": scan.target_url,
         "site_title": scan.site_title or "",
+        "application_name": await _application_name(apps, scan, current_user.org_id),
         "eta_seconds": scan.eta_seconds,
         "error": scan.error_message,
         "analysis": getattr(scan, "analysis", None),
         "statistics": scan.statistics.model_dump(mode="json"),
         "updated_at": scan.updated_at,
+        "crawl_mode": scan.crawl_mode,
+        "application_id": str(scan.application_id) if scan.application_id else None,
     })
 
 

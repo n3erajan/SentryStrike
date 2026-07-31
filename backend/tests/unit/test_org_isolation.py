@@ -50,7 +50,20 @@ class FakeApplicationRepository:
     async def get_in_org(self, application_id: str, org_id: str):
         if application_id != "app-owned" or org_id != "org-1":
             return None
-        return SimpleNamespace(id=application_id, org_id=org_id)
+        return SimpleNamespace(
+            id=application_id,
+            org_id=org_id,
+            name="Owned App",
+            target_url="https://target.example",
+        )
+
+    async def list_by_ids(self, app_ids: list[str], org_id: str) -> dict[str, object]:
+        names = {}
+        for app_id in app_ids:
+            app = await self.get_in_org(app_id, org_id)
+            if app is not None:
+                names[app_id] = app
+        return names
 
 
 class FakeScanQueue:
@@ -185,6 +198,9 @@ class FakeScanRepository:
     async def list(self, skip: int = 0, limit: int = 20, org_id: str | None = None):
         items = [scan for scan in self.scans.values() if org_id is None or scan.org_id == org_id]
         return items[skip: skip + limit]
+
+    async def count_by_org(self, org_id: str) -> int:
+        return sum(1 for scan in self.scans.values() if scan.org_id == org_id)
 
     async def get_in_org(self, scan_id: str, org_id: str):
         item = self.scans.get(scan_id)
@@ -342,7 +358,7 @@ def test_create_scan_accepts_and_persists_org_application_id() -> None:
     assert repo.scans["scan-new"].application_id == "app-owned"
 
 
-def test_create_scan_rejects_application_outside_callers_org() -> None:
+def test_create_scan_drops_application_outside_callers_org() -> None:
     repo = FakeScanRepository()
     scan.set_scan_queue(FakeScanQueue())
     client = _client(repo)
@@ -356,9 +372,50 @@ def test_create_scan_rejects_application_outside_callers_org() -> None:
         },
     )
 
-    assert response.status_code == 404
-    assert response.json()["detail"] == "Application not found"
-    assert repo.created_kwargs is None
+    assert response.status_code == 202
+    assert repo.created_kwargs["application_id"] is None
+    assert repo.scans["scan-new"].application_id is None
+
+
+def test_create_scan_drops_application_when_target_url_mismatches() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue())
+    client = _client(repo)
+
+    response = client.post(
+        "/api/v1/scans",
+        json={
+            "target_url": "https://other.example",
+            "application_id": "app-owned",
+            "authorization_confirmed": True,
+        },
+    )
+
+    assert response.status_code == 202
+    assert repo.created_kwargs["application_id"] is None
+    assert repo.scans["scan-new"].application_id is None
+
+
+def test_create_scan_keeps_application_when_url_matches_normally() -> None:
+    repo = FakeScanRepository()
+    scan.set_scan_queue(FakeScanQueue())
+    client = _client(repo)
+
+    # The stored application url is "https://target.example" but HttpUrl
+    # serializes the submitted target with a trailing slash; the normalized
+    # comparison must still treat them as the same target.
+    response = client.post(
+        "/api/v1/scans",
+        json={
+            "target_url": "https://target.example/",
+            "application_id": "app-owned",
+            "authorization_confirmed": True,
+        },
+    )
+
+    assert response.status_code == 202
+    assert repo.created_kwargs["application_id"] == "app-owned"
+    assert repo.scans["scan-new"].application_id == "app-owned"
 
 
 def test_create_scan_marks_scan_failed_when_queue_is_unavailable() -> None:

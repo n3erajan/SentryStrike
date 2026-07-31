@@ -1,7 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
-from app.api.dependencies import get_current_user, get_scan_repository, json_response
+from app.api.dependencies import (
+    get_application_repository,
+    get_current_user,
+    get_scan_repository,
+    json_response,
+)
+from shared.database.repositories.application_repository import ApplicationRepository
 from shared.database.repositories.scan_repository import ScanRepository
 from shared.models.analysis_job import AnalysisStatus
 from shared.models.user import User
@@ -22,7 +28,24 @@ def _model_dump(value: object) -> dict:
     return dict(value or {})
 
 
-def _build_report_payload(scan, scan_id: str) -> dict:
+async def _application_name(
+    apps: ApplicationRepository,
+    scan,
+    org_id: str,
+) -> str:
+    """Resolve the org-scoped application name for a scan, if any."""
+    if not getattr(scan, "application_id", None):
+        return ""
+    application = await apps.get_in_org(str(scan.application_id), org_id)
+    return application.name if application is not None else ""
+
+
+def _build_report_payload(
+    scan,
+    scan_id: str,
+    *,
+    application_name: str = "",
+) -> dict:
     report_metadata = _model_dump(scan.report_metadata)
     generated_at = report_metadata.get("generated_at")
     vulnerabilities = [v.model_dump(mode="json") for v in scan.vulnerabilities]
@@ -67,6 +90,7 @@ def _build_report_payload(scan, scan_id: str) -> dict:
         "active_vulnerabilities": active_vulnerabilities,
         "suppressed_findings": suppressed_findings,
         "site_title": getattr(scan, "site_title", ""),
+        "application_name": application_name or "",
         "report_metadata": report_metadata,
         "evidence_strength_breakdown": report_metadata.get("evidence_strength_breakdown", {}),
         "spa_api_coverage": report_metadata.get("spa_api_coverage", {}),
@@ -80,6 +104,7 @@ def _build_report_payload(scan, scan_id: str) -> dict:
 async def get_report_data(
     scan_id: str,
     repo: ScanRepository = Depends(get_scan_repository),
+    apps: ApplicationRepository = Depends(get_application_repository),
     current_user: User = Depends(get_current_user),
 ) -> dict:
     """Return the structured report data for a completed scan."""
@@ -87,13 +112,15 @@ async def get_report_data(
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 
-    return json_response(_build_report_payload(scan, scan_id))
+    application_name = await _application_name(apps, scan, current_user.org_id)
+    return json_response(_build_report_payload(scan, scan_id, application_name=application_name))
 
 
 @router.get("/{scan_id}/pdf")
 async def generate_pdf_report(
     scan_id: str,
     repo: ScanRepository = Depends(get_scan_repository),
+    apps: ApplicationRepository = Depends(get_application_repository),
     current_user: User = Depends(get_current_user),
 ) -> Response:
     """Generate and download a client-ready PDF report for a completed scan."""
@@ -115,9 +142,10 @@ async def generate_pdf_report(
             },
         )
 
+    application_name = await _application_name(apps, scan, current_user.org_id)
     scan_data = {
         "success": True,
-        "data": _build_report_payload(scan, scan_id),
+        "data": _build_report_payload(scan, scan_id, application_name=application_name),
     }
     payload = build_scan_pdf(scan_data=scan_data)
     return Response(

@@ -1,11 +1,29 @@
 import pytest
 from redis.exceptions import RedisError
 
+from app.config import get_settings
 from app.core.access_request_rate_limit import (
     AccessRequestRateLimiterUnavailable,
     AccessRequestRateLimitExceeded,
     RedisAccessRequestRateLimiter,
 )
+
+
+@pytest.fixture
+def fifteen_minute_limit(monkeypatch) -> int:
+    """Pin the 15m limit so the test does not depend on the ambient .env.
+
+    ``get_settings`` reads ``backend/.env``, where a deployment may raise
+    ACCESS_REQUEST_IP_LIMIT_PER_FIFTEEN_MINUTES above the count these tests
+    use — the limiter would then fall through to the daily window and the
+    fake's scripted results would run out.
+    """
+    limit = 3
+    settings = get_settings()
+    monkeypatch.setattr(
+        settings, "access_request_ip_limit_per_fifteen_minutes", limit, raising=False
+    )
+    return limit
 
 
 class FakeRedis:
@@ -36,8 +54,11 @@ async def test_access_request_limiter_counts_fifteen_minute_and_daily_windows() 
 
 
 @pytest.mark.asyncio
-async def test_access_request_limiter_surfaces_short_window_retry_after() -> None:
-    limiter = RedisAccessRequestRateLimiter(FakeRedis([(2, 417)]))
+async def test_access_request_limiter_surfaces_short_window_retry_after(
+    fifteen_minute_limit: int,
+) -> None:
+    over_limit = fifteen_minute_limit + 1
+    limiter = RedisAccessRequestRateLimiter(FakeRedis([(over_limit, 417)]))
 
     with pytest.raises(AccessRequestRateLimitExceeded) as exc_info:
         await limiter.check(client_ip="203.0.113.8")

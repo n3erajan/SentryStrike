@@ -103,6 +103,10 @@ class ScanRepository:
         """
         return await Scan.find(Scan.org_id == org_id).sort(-Scan.created_at).skip(skip).limit(limit).to_list()
 
+    async def count_by_org(self, org_id: str) -> int:
+        """Return the total number of scans for an organization."""
+        return await Scan.find(Scan.org_id == org_id).count()
+
     async def list_by_target_url(self, org_id: str, target_url: str, skip: int = 0, limit: int = 20) -> list[Scan]:
         """List scans for a specific target URL in an organization, newest first."""
         normalized_url = _normalize_target_url(target_url)

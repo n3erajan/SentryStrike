@@ -42,6 +42,34 @@ class ApplicationRepository:
         """Total number of applications for this org."""
         return await Application.find(Application.org_id == org_id).count()
 
+    async def list_by_ids(
+        self,
+        app_ids: list[str],
+        org_id: str,
+    ) -> dict[str, Application]:
+        """Fetch applications by id within an organization, keyed by string id.
+
+        Used to resolve names for scan serialization in a single query.
+        """
+        ids = []
+        for app_id in app_ids:
+            if not app_id:
+                continue
+            try:
+                oid = PydanticObjectId(app_id)
+            except Exception:
+                continue
+            ids.append(oid)
+        if not ids:
+            return {}
+        # Raw query: Beanie's ExpressionField in this version has no `in_`
+        # operator, so `$in` is expressed as a plain filter (same pattern as
+        # ScanRepository.list_by_application).
+        apps = await Application.find(
+            {"_id": {"$in": ids}, "org_id": org_id}
+        ).to_list()
+        return {str(app.id): app for app in apps}
+
     async def list_in_org(self, org_id: str, skip: int = 0, limit: int = 20) -> list[Application]:
         """List applications for an organization, newest first."""
         return (

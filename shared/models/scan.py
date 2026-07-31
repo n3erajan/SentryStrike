@@ -84,6 +84,7 @@ class ScanStatistics(BaseModel):
     total_vulnerabilities: int = 0
     active_vulnerabilities: int = 0
     suppressed_vulnerabilities: int = 0
+    raw_findings: int = 0
     severity_breakdown: SeverityBreakdown = Field(default_factory=SeverityBreakdown)
 
 

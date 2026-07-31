@@ -70,7 +70,6 @@ services:
     environment:
       MONGODB_URI: mongodb://mongo:27017
       REDIS_URL: redis://redis:6379/0
-      OAST_CALLBACK_BASE_URL: ${OAST_CALLBACK_BASE_URL:-http://host.docker.internal:${BACKEND_PORT:-8000}/oast}
       OAST_POLL_URL: ${OAST_POLL_URL:-http://backend:8000/oast/poll}
     volumes:
       - scanner_logs:/app/logs
