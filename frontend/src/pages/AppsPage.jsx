@@ -16,6 +16,7 @@ import { isValidUrl } from '../utils/helpers.js'
 import ErrorNotice from '../components/ErrorNotice.jsx'
 import useQuery from '../hooks/useQuery.js'
 import { invalidateQueries } from '../services/queryCache.js'
+import QuerySwap, { QuerySkeleton, QueryContent } from '../components/QuerySwap.jsx'
 
 // Create/edit dialog. `app` is null when creating. Mirrors the invite modal on
 // TeamPage; the scan-config half reuses the same field renderer as ScanPage.
@@ -165,7 +166,7 @@ function AppsPage() {
     data,
     error,
     hasData,
-    isFetchedAfterMount,
+    contentEntered,
     isLoading: loading,
     refetch,
   } = useQuery({
@@ -234,28 +235,33 @@ function AppsPage() {
           onRetry={refetch}
         />
       )}
+      <QuerySwap>
       {loading ? (
-        <div
+        <QuerySkeleton
           className='app-grid query-skeleton'
-          role='status'
           aria-label='Loading applications'
         >
           {[0, 1, 2].map((item) => (
             <article className='card skeleton-card' key={item} aria-hidden='true'>
               <span className='skeleton-block skeleton-heading' />
               <span className='skeleton-block skeleton-copy' />
-              <span className='skeleton-block skeleton-action' />
+              <div
+                className={`skeleton-cardfoot${canManage ? " has-actions" : ""}`}
+              >
+                <span className='skeleton-block skeleton-action' />
+              </div>
             </article>
           ))}
-        </div>
+        </QuerySkeleton>
       ) : error && !hasData ? (
         <ErrorNotice
+          key='error'
           error={error}
           fallback='Could not load applications.'
           onRetry={refetch}
         />
       ) : apps.length === 0 ? (
-        <div className='empty-state'>
+        <div className='empty-state' key='empty'>
           <Boxes size={30} />
           <h2>No applications yet</h2>
           <p>Add an app to save its target URL, defaults, and scan history.</p>
@@ -270,7 +276,7 @@ function AppsPage() {
           )}
         </div>
       ) : (
-        <div className={`app-grid${isFetchedAfterMount ? ' query-content-enter' : ''}`}>
+        <QueryContent settled={contentEntered} className='app-grid'>
           {apps.map((a) => (
             <article key={a.id} className='card'>
               <h2>{a.name}</h2>
@@ -318,8 +324,9 @@ function AppsPage() {
               </div>
             </article>
           ))}
-        </div>
+        </QueryContent>
       )}
+      </QuerySwap>
 
       {dialog && (
         <ApplicationDialog

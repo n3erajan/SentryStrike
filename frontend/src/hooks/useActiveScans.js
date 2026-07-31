@@ -70,7 +70,7 @@ export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
   const {
     data,
     error,
-    isFetchedAfterMount,
+    contentEntered,
     isLoading: loading,
     refetch,
   } = useQuery({
@@ -109,7 +109,7 @@ export function useActiveScans({ intervalMs = POLL_INTERVAL_MS } = {}) {
     loading,
     error,
     count: scans.length,
-    isFetchedAfterMount,
+    contentEntered,
     refresh,
   };
 }

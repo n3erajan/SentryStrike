@@ -36,8 +36,11 @@ function useScanStatus(scanId) {
   const [error, setError] = useState("");
   const [cancelling, setCancelling] = useState(false);
   const [siteTitle, setSiteTitle] = useState("");
+  const [applicationName, setApplicationName] = useState("");
   const [targetUrl, setTargetUrl] = useState("");
   const [statistics, setStatistics] = useState(null);
+  const [crawlMode, setCrawlMode] = useState("");
+  const [applicationId, setApplicationId] = useState("");
 
   const logRef = useRef(null);
   const lastPhaseRef = useRef("");
@@ -110,8 +113,11 @@ function useScanStatus(scanId) {
             : null,
         );
         if (scan.site_title) setSiteTitle(scan.site_title);
+        if (scan.application_name) setApplicationName(scan.application_name);
         if (scan.target_url) setTargetUrl(scan.target_url);
         if (scan.statistics) setStatistics(scan.statistics);
+        if (scan.crawl_mode) setCrawlMode(scan.crawl_mode);
+        if (scan.application_id) setApplicationId(scan.application_id);
 
         if (
           nextPhase !== lastPhaseRef.current &&
@@ -208,8 +214,11 @@ function useScanStatus(scanId) {
     eta,
     analysis,
     siteTitle,
+    applicationName,
     targetUrl,
     statistics,
+    crawlMode,
+    applicationId,
     logs,
     logRef,
     error,

@@ -4,6 +4,7 @@ import { useActiveScans } from "../hooks/useActiveScans.js";
 import useQuery from "../hooks/useQuery.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import { displayName } from "../components/Sidebar.jsx";
+import QuerySwap, { QuerySkeleton, QueryContent } from "../components/QuerySwap.jsx";
 
 function greeting() {
   const hour = new Date().getHours();
@@ -38,7 +39,7 @@ function HomePage() {
     allScans: scans,
     count,
     loading: scansLoading,
-    isFetchedAfterMount: scansFetchedAfterMount,
+    contentEntered: scansContentEntered,
   } = useActiveScans();
   const applicationsQuery = useQuery({
     queryKey: "applications:list:count",
@@ -47,7 +48,7 @@ function HomePage() {
   const appCount = applicationsQuery.data?.total ?? null;
   const loading = scansLoading || applicationsQuery.isLoading;
   const contentEntered =
-    scansFetchedAfterMount || applicationsQuery.isFetchedAfterMount;
+    scansContentEntered || applicationsQuery.contentEntered;
 
   const completed = scans.filter((s) => s.status === "completed");
   const latestPerApp = Object.values(
@@ -79,13 +80,10 @@ function HomePage() {
         </div>
       </div>
 
+      <QuerySwap>
       {loading ? (
-        <>
-          <div
-            className='summary query-skeleton'
-            role='status'
-            aria-label='Loading workspace overview'
-          >
+        <QuerySkeleton key='skeleton' aria-label='Loading workspace overview'>
+          <div className='summary query-skeleton'>
             {["Web applications", "Scans running", "High-risk findings", "Workspace grade"].map(
               (label) => (
                 <div className='stat' key={label}>
@@ -100,14 +98,16 @@ function HomePage() {
               <article className='card skeleton-card' key={item}>
                 <span className='skeleton-block skeleton-heading' />
                 <span className='skeleton-block skeleton-copy' />
-                <span className='skeleton-block skeleton-action' />
+                <div className='skeleton-cardfoot'>
+                  <span className='skeleton-block skeleton-action' />
+                </div>
               </article>
             ))}
           </div>
-        </>
+        </QuerySkeleton>
       ) : (
-        <>
-      <div className={`summary${contentEntered ? " query-content-enter" : ""}`}>
+        <QueryContent settled={contentEntered}>
+      <div className='summary'>
         <div className='stat'>
           <strong>{appCount ?? "N/A"}</strong>
           <span>Web applications</span>
@@ -128,7 +128,7 @@ function HomePage() {
         </div>
       </div>
 
-      <div className={`app-grid${contentEntered ? " query-content-enter" : ""}`}>
+      <div className='app-grid'>
         {latestCompleted && (
           <article className='card'>
             <h2>{latestCompleted.application_name || latestCompleted.site_title || hostnameOf(latestCompleted.target_url)} report ready</h2>
@@ -160,13 +160,18 @@ function HomePage() {
         )}
         {runningScan && (
           <article className='card'>
-            <h2>Scanning {hostnameOf(runningScan.target_url)}</h2>
+            <h2>
+              Scanning{" "}
+              {runningScan.application_name ||
+                runningScan.site_title ||
+                hostnameOf(runningScan.target_url)}
+            </h2>
             <p>
               {Math.round(runningScan.progress || 0)}% complete.
             </p>
             <div className='cardfoot'>
               <span>{runningScan.phase_message || "Scanning"}</span>
-              <Link className='text-btn' to={`/active/${runningScan.id}`}>
+              <Link className='text-btn' to={`/scans/${runningScan.id}`}>
                 View progress
               </Link>
             </div>
@@ -183,8 +188,9 @@ function HomePage() {
           </div>
         </article>
       </div>
-        </>
+        </QueryContent>
       )}
+      </QuerySwap>
     </div>
   );
 }

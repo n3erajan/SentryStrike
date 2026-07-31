@@ -13,7 +13,7 @@ import useQuery from "./useQuery.js";
 // `applicationId` is optional. When set, the target URL and config are seeded
 // from that application's stored defaults — the workspace-level default config
 // no longer exists; defaults live on the Application entity now.
-function useScanForm({ applicationId } = {}) {
+function useScanForm({ applicationId, retry } = {}) {
   const applicationQuery = useQuery({
     queryKey: `applications:detail:${applicationId || "none"}`,
     queryFn: () => getApplication(applicationId),
@@ -22,8 +22,10 @@ function useScanForm({ applicationId } = {}) {
   const selectedApplication = applicationQuery.data;
 
   // Inputs required by the backend CreateScanRequest.
-  const [url, setUrl] = useState(() => selectedApplication?.target_url || "");
-  const [crawlMode, setCrawlMode] = useState("full"); // full | single
+  const [url, setUrl] = useState(
+    () => retry?.targetUrl || selectedApplication?.target_url || "",
+  );
+  const [crawlMode, setCrawlMode] = useState(retry?.crawlMode || "full");
   const [consent, setConsent] = useState(false);
   const [touched, setTouched] = useState(false);
 
@@ -72,21 +74,22 @@ function useScanForm({ applicationId } = {}) {
   // whatever the user has already typed alone — only an explicit pick rewrites
   // the URL and config. `loadedApp` tracks which id the form currently
   // reflects, so the loading flag is derived rather than set synchronously.
-  const [loadedApp, setLoadedApp] = useState(() =>
-    selectedApplication ? applicationId : "",
-  );
+  const [loadedApp, setLoadedApp] = useState(() => {
+    if (retry?.applicationId) return retry.applicationId;
+    return selectedApplication ? applicationId : "";
+  });
   useEffect(() => {
     if (!applicationId) return undefined;
     if (applicationQuery.data) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setUrl(applicationQuery.data.target_url || "");
+      if (!retry?.targetUrl) setUrl(applicationQuery.data.target_url || "");
       setConfig(applicationQuery.data.default_scan_config || {});
       setLoadedApp(applicationId);
     } else if (applicationQuery.error) {
       setError(applicationQuery.error);
       setLoadedApp(applicationId);
     }
-  }, [applicationId, applicationQuery.data, applicationQuery.error]);
+  }, [applicationId, applicationQuery.data, applicationQuery.error, retry?.targetUrl]);
 
   const defaultsLoading = Boolean(applicationId) && loadedApp !== applicationId;
   const valid = isValidUrl(url);

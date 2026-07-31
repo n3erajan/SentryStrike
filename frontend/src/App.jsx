@@ -11,8 +11,8 @@ import HomePage from "./pages/HomePage.jsx";
 import AppsPage from "./pages/AppsPage.jsx";
 import ApplicationPage from "./pages/ApplicationPage.jsx";
 import ScanPage from "./pages/ScanPage.jsx";
-import ActiveScansPage from "./pages/ActiveScansPage.jsx";
-import ActiveScanPage from "./pages/ActiveScanPage.jsx";
+import ScansPage from "./pages/ScansPage.jsx";
+import ScanDetailPage from "./pages/ScanDetailPage.jsx";
 import ReportsPage from "./pages/ReportsPage.jsx";
 import ReportPage from "./pages/ReportPage.jsx";
 import TeamPage from "./pages/TeamPage.jsx";
@@ -37,8 +37,8 @@ function App() {
           <Route path='/apps' element={<AppsPage />} />
           <Route path='/apps/:appId' element={<ApplicationPage />} />
           <Route path='/scan' element={<ScanPage />} />
-          <Route path='/active' element={<ActiveScansPage />} />
-          <Route path='/active/:scanId' element={<ActiveScanPage />} />
+          <Route path='/scans' element={<ScansPage />} />
+          <Route path='/scans/:scanId' element={<ScanDetailPage />} />
           <Route path='/reports' element={<ReportsPage />} />
           <Route path='/report/:scanId' element={<ReportPage />} />
           <Route path='/team' element={<TeamPage />} />

@@ -53,4 +53,18 @@ async function copyToClipboard(text) {
   }
 }
 
-export { isValidUrl, downloadFile, saveBlob, copyToClipboard };
+function parseUTCDate(iso) {
+  if (iso == null) return null;
+  if (typeof iso === "number" || (typeof iso === "string" && /^\d+$/.test(iso))) {
+    const d = new Date(typeof iso === "number" ? iso : Number(iso));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const s = String(iso);
+  if (s.includes("T") && !/Z$/i.test(s) && !/[+-]\d{2}:\d{2}$/.test(s)) {
+    return new Date(s + "Z");
+  }
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+export { isValidUrl, downloadFile, saveBlob, copyToClipboard, parseUTCDate };

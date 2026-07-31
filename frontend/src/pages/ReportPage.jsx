@@ -11,7 +11,7 @@ import {
   Send,
 } from "lucide-react";
 import { downloadReportPdf, getReport } from "../services/reports.js";
-import { copyToClipboard, downloadFile, saveBlob } from "../utils/helpers.js";
+import { copyToClipboard, downloadFile, parseUTCDate, saveBlob } from "../utils/helpers.js";
 import { SEVERITIES, SEVERITY_META, severityClass } from "../data/constants.js";
 import { useToast } from "../components/Toast.jsx";
 import { useAuth } from "../context/AuthContext.jsx";
@@ -35,6 +35,7 @@ import { httpSnippetToCurl } from "../utils/httpToCurl.js";
 import ErrorNotice from "../components/ErrorNotice.jsx";
 import useQuery from "../hooks/useQuery.js";
 import { invalidateQueries } from "../services/queryCache.js";
+import QuerySwap, { QuerySkeleton, QueryContent } from "../components/QuerySwap.jsx";
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
@@ -51,17 +52,15 @@ function riskLine(score) {
 
 // Full date + time for the report header (the scan timestamp).
 function formatDateTime(iso) {
-  if (!iso) return "N/A";
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime())
-    ? "N/A"
-    : d.toLocaleString(undefined, {
-        year: "numeric",
-        month: "short",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-      });
+  const d = parseUTCDate(iso);
+  if (!d) return "N/A";
+  return d.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function crawlLabel(mode) {
@@ -645,7 +644,7 @@ function ReportPage() {
   const error = reportQuery.error || membersQuery.error;
   const hasData = reportQuery.hasData && membersQuery.hasData;
   const contentEntered =
-    reportQuery.isFetchedAfterMount || membersQuery.isFetchedAfterMount;
+    reportQuery.contentEntered || membersQuery.contentEntered;
 
   const load = useCallback(
     async (_signal, { silent = false } = {}) => {
@@ -719,18 +718,65 @@ function ReportPage() {
     }
   }, [scanId, toast, load]);
 
-  if (loading)
-    return (
-      <div className='view'>
-        <div className='report-skeleton query-skeleton' role='status' aria-label='Loading report'>
-          <span className='skeleton-block skeleton-heading' />
-          <span className='skeleton-block skeleton-copy' />
-          <div className='summary' aria-hidden='true'>
-            {[0, 1, 2, 3].map((item) => <div className='stat' key={item}><strong><span className='skeleton-block skeleton-value' /></strong><span className='skeleton-block skeleton-copy' /></div>)}
+  const reportSkeleton = (
+    <>
+          <div className='skeleton-back'>
+            <span className='skeleton-block skeleton-copy' style={{ width: 80 }} />
           </div>
-        </div>
-      </div>
-    );
+          <div className='head' aria-hidden='true'>
+            <div>
+              <span className='skeleton-block skeleton-heading' style={{ width: "min(60%, 280px)", height: 22, marginBottom: 8 }} />
+              <span className='skeleton-block skeleton-copy' style={{ width: "min(80%, 380px)", marginBottom: 6 }} />
+              <span className='skeleton-block skeleton-copy' style={{ width: "min(35%, 160px)" }} />
+            </div>
+            <div className='app-actions'>
+              <span className='skeleton-block' style={{ width: 72, height: 34, borderRadius: 6 }} />
+              <span className='skeleton-block' style={{ width: 72, height: 34, borderRadius: 6 }} />
+            </div>
+          </div>
+          <div className='reportgrid' aria-hidden='true'>
+            <div className='scorebox skeleton-scorebox'>
+              <span className='skeleton-block skeleton-value' style={{ width: "4rem", height: "2.6rem", marginBottom: 8 }} />
+              <span className='skeleton-block skeleton-copy' style={{ width: "85%", marginBottom: 14 }} />
+              {[0, 1, 2, 3, 4, 5].map((i) => (
+                <div className='skeleton-kv' key={i}>
+                  <span className='skeleton-block skeleton-copy' style={{ width: "55%" }} />
+                  <span className='skeleton-block skeleton-copy' style={{ width: "30%" }} />
+                </div>
+              ))}
+            </div>
+            <div className='reportbody'>
+              <span className='skeleton-block skeleton-copy' style={{ width: "90%", marginBottom: 6 }} />
+              <span className='skeleton-block skeleton-copy' style={{ width: "70%", marginBottom: 18 }} />
+              <div className='severity' aria-hidden='true'>
+                {[0, 1, 2, 3, 4].map((i) => (
+                  <div key={i}>
+                    <span className='skeleton-block skeleton-value' style={{ width: "1.2rem", height: "1.3rem", margin: "0 auto 4px" }} />
+                    <span className='skeleton-block skeleton-copy' style={{ width: "70%", margin: "0 auto" }} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className='metric-cols' aria-hidden='true'>
+            {[0, 1].map((t) => (
+              <div className='metric-table' key={t}>
+                <div className='metric-head'>
+                  <span className='skeleton-block skeleton-heading' style={{ width: "min(65%, 140px)" }} />
+                  <span />
+                </div>
+                {[0, 1, 2, 3, 4, 5, 6, 7].map((r) => (
+                  <div className='metric-row' key={r}>
+                    <span className='skeleton-block skeleton-copy' style={{ width: "min(70%, 160px)" }} />
+                    <b><span className='skeleton-block skeleton-copy' style={{ width: "min(45%, 80px)" }} /></b>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+    </>
+  );
+
   if (error && !hasData)
     return (
       <div className='view'>
@@ -740,8 +786,10 @@ function ReportPage() {
         <div style={{ maxWidth: 760 }}><ErrorNotice error={error} fallback='Could not load the report.' onRetry={refetchAll} /></div>
       </div>
     );
-  if (!report) return null;
 
+  // Everything below dereferences `report`, so it lives in a closure that only
+  // runs on the loaded branch — the skeleton branch never evaluates it.
+  function renderReport() {
   const stats = report.statistics || {};
   const breakdown = stats.severity_breakdown || {};
   const vulns = (report.vulnerabilities || [])
@@ -759,9 +807,12 @@ function ReportPage() {
   const score = Math.round(report.risk_score || 0);
   const targetUrl = report.target_url || target || "";
   const targetHost = hostnameOf(targetUrl);
-  // Prefer the crawled site's <title> when the scanner captured one; fall back
-  // to the URL hostname otherwise.
-  const siteTitle = (report.site_title || "").trim() || targetHost;
+  // Prefer the user-set application name, then the crawled site's <title>,
+  // then the URL hostname as the last resort.
+  const siteTitle =
+    (report.application_name || "").trim() ||
+    (report.site_title || "").trim() ||
+    targetHost;
   const scanTime =
     report.started_at || report.completed_at || report.generated_at;
   const tech = report.technology_stack || [];
@@ -785,7 +836,7 @@ function ReportPage() {
     ["owner", "admin", "analyst"].includes(user?.role);
 
   return (
-    <div className={`view${contentEntered ? " query-content-enter" : ""}`}>
+    <>
       <button className='back' onClick={() => navigate(-1)}>
         ← Back
       </button>
@@ -1059,6 +1110,24 @@ function ReportPage() {
           </div>
         </div>
       )}
+    </>
+  );
+  }
+
+  return (
+    <div className='view'>
+      <QuerySwap>
+        {loading ? (
+          <QuerySkeleton
+            className='report-skeleton query-skeleton'
+            aria-label='Loading report'
+          >
+            {reportSkeleton}
+          </QuerySkeleton>
+        ) : !report ? null : (
+          <QueryContent settled={contentEntered}>{renderReport()}</QueryContent>
+        )}
+      </QuerySwap>
     </div>
   );
 }

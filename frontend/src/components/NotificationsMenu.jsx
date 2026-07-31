@@ -21,6 +21,7 @@ import {
   markNotificationRead,
 } from "../services/notifications.js";
 import Tooltip from "./Tooltip.jsx";
+import { parseUTCDate } from "../utils/helpers.js";
 
 const PAGE_SIZE = 15;
 
@@ -45,14 +46,14 @@ function typeMeta(type) {
 }
 
 function timeAgo(iso) {
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return "";
-  const s = Math.max(0, (Date.now() - then) / 1000);
+  const d = parseUTCDate(iso);
+  if (!d) return "";
+  const s = Math.max(0, (Date.now() - d.getTime()) / 1000);
   if (s < 45) return "just now";
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
   if (s < 86400) return `${Math.round(s / 3600)}h ago`;
   if (s < 604800) return `${Math.round(s / 86400)}d ago`;
-  return new Date(iso).toLocaleDateString(undefined, { dateStyle: "medium" });
+  return d.toLocaleDateString(undefined, { dateStyle: "medium" });
 }
 
 function targetFor(item) {
@@ -62,7 +63,7 @@ function targetFor(item) {
   if (!scanId) return null;
   if (item.type === "scan_completed") return `/report/${scanId}`;
   return item.type?.startsWith("scan_")
-    ? `/active/${scanId}`
+    ? `/scans/${scanId}`
     : `/report/${scanId}`;
 }
 
@@ -220,10 +221,10 @@ export default function NotificationsMenu() {
                         <span className='notif-top'>
                           <b>{item.title}</b>
                           <small
-                            title={new Date(item.created_at).toLocaleString(
-                              undefined,
-                              { dateStyle: "medium", timeStyle: "short" },
-                            )}
+                            title={(() => {
+                              const dd = parseUTCDate(item.created_at);
+                              return dd ? dd.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "";
+                            })()}
                           >
                             {timeAgo(item.created_at)}
                           </small>

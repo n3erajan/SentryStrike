@@ -6,13 +6,18 @@ import Tooltip from "../components/Tooltip.jsx";
 import Select from "../components/Select.jsx";
 import { cancelInvite, changeMemberRole, inviteMember, listInvites, listMembers, removeMember } from "../services/workspace.js";
 import ErrorNotice from "../components/ErrorNotice.jsx";
+import { parseUTCDate } from "../utils/helpers.js";
 import useQuery from "../hooks/useQuery.js";
 import { invalidateQueries } from "../services/queryCache.js";
+import QuerySwap, { QuerySkeleton, QueryContent } from "../components/QuerySwap.jsx";
 
 const ROLES = ["admin", "analyst", "developer", "viewer"];
 const EMPTY_ITEMS = [];
 const title = (v) => (v || "").replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase());
-const date = (v) => v ? new Date(v).toLocaleDateString() : "N/A";
+const date = (v) => {
+  const d = parseUTCDate(v);
+  return d ? d.toLocaleDateString() : "N/A";
+};
 const inviteStatus = (s) => ({ not_attempted: "Pending", smtp_accepted: "Invited", failed: "Failed" })[s] || title(s);
 
 function TeamPage() {
@@ -41,8 +46,8 @@ function TeamPage() {
   const seatInfo = membersQuery.data || {};
   const loading = membersQuery.isLoading || (admin && invitesQuery.isLoading);
   const error = membersQuery.error || (admin && invitesQuery.error);
-  const isFetchedAfterMount =
-    membersQuery.isFetchedAfterMount || invitesQuery.isFetchedAfterMount;
+  const contentEntered =
+    membersQuery.contentEntered || invitesQuery.contentEntered;
   const removeBusy = memberToRemove?.id === busy;
 
   useEffect(() => {
@@ -108,9 +113,10 @@ function TeamPage() {
       {admin && <button className='btn primary' onClick={() => setShowInvite(true)} disabled={seatInfo.occupied_seats >= seatInfo.member_limit}><MailPlus className='ico' />Invite member</button>}
     </div>
     <ErrorNotice error={error} fallback='Could not load the workspace.' onRetry={refetch} />
-    {loading ? <div className='team-table query-skeleton' role='status' aria-label='Loading team members'><span className='skeleton-block skeleton-search' /><div className='team-head' aria-hidden='true'><span>Member</span><span>Role</span><span>Joined</span><span>Status</span><span></span></div>{[0, 1, 2].map((item) => <div className='team-row skeleton-table-row' key={item} aria-hidden='true'><span className='skeleton-block skeleton-heading' /><span className='skeleton-block skeleton-copy' /><span className='skeleton-block skeleton-copy' /><span className='skeleton-block skeleton-copy' /><span /></div>)}</div> : rows.length === 0 && !query && members.length === 0 ? (
-      <div className='empty-state'><Users size={30} /><h2>No team members</h2><p>Invite people who need access to this workspace.</p>{admin && <button className='btn primary' onClick={() => setShowInvite(true)}><MailPlus className='ico' />Invite member</button>}</div>
-    ) : <div className={`team-table${isFetchedAfterMount ? " query-content-enter" : ""}`}>
+    <QuerySwap>
+    {loading ? <QuerySkeleton className='team-table query-skeleton' aria-label='Loading team members'><span className='skeleton-block skeleton-search' /><div className='team-head' aria-hidden='true'><span>Member</span><span>Role</span><span>Joined</span><span>Status</span><span></span></div>{[0, 1, 2].map((item) => <div className='team-row skeleton-table-row' key={item} aria-hidden='true'><span className='skeleton-target'><span className='skeleton-block skeleton-heading' /><span className='skeleton-block skeleton-copy' /></span><span className='skeleton-block skeleton-copy' /><span className='skeleton-block skeleton-copy' /><span className='skeleton-block skeleton-copy' /><span /></div>)}</QuerySkeleton> : rows.length === 0 && !query && members.length === 0 ? (
+      <div className='empty-state' key='empty'><Users size={30} /><h2>No team members</h2><p>Invite people who need access to this workspace.</p>{admin && <button className='btn primary' onClick={() => setShowInvite(true)}><MailPlus className='ico' />Invite member</button>}</div>
+    ) : <QueryContent settled={contentEntered} className='team-table'>
       <label className='search'><Search className='ico' /><input placeholder='Search members' value={query} onChange={(e) => setQuery(e.target.value)} /></label>
       <div className='team-head'><span>Member</span><span>Role</span><span>Joined</span><span>Status</span><span></span></div>
       {rows.length === 0 ? <div className='empty-state'>No members match your search.</div> : rows.map((m) => { const immutable = !admin || m.role === "owner" || m.id === user?.id; return <article key={m.id} className='team-row'>
@@ -119,7 +125,8 @@ function TeamPage() {
         <span>{date(m.created_at)}</span><span className={m.is_active ? "low" : "muted-text"}>● {m.is_active ? "Active" : "Inactive"}</span>
         <span className='rowactions'>{!immutable && <Tooltip label={`Remove ${m.email}`}><button className='icon-btn danger' type='button' onClick={() => setMemberToRemove(m)} aria-label={`Remove ${m.email}`}><Trash2 className='ico' /></button></Tooltip>}</span>
       </article>; })}
-    </div>}
+    </QueryContent>}
+    </QuerySwap>
 
     {admin && invites.length > 0 && <div className='panel' style={{ marginTop: 20 }}><div className='panel-h'>Pending invitations</div><div className='panel-b compact-list'>{invites.map((i) => <div className='invite-row' key={i.id}><div><b>{i.email}</b><div className='small'>{title(i.role)} · expires {date(i.expires_at)}</div></div><span className='status-pill'>{inviteStatus(i.email_delivery_status)}</span><Tooltip label='Cancel invitation'><button className='icon-btn' onClick={() => cancel(i)} disabled={busy === i.id} aria-label='Cancel invitation'><X className='ico' /></button></Tooltip></div>)}</div></div>}
 

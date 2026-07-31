@@ -4,7 +4,7 @@ import { Download, FileBarChart, Search } from "lucide-react";
 import { listAllScans } from "../services/scan.js";
 import { listAllApplications } from "../services/applications.js";
 import { downloadReportPdf } from "../services/reports.js";
-import { saveBlob } from "../utils/helpers.js";
+import { parseUTCDate, saveBlob } from "../utils/helpers.js";
 import { useToast } from "../components/Toast.jsx";
 import { severityClass } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
@@ -13,6 +13,7 @@ import Select from "../components/Select.jsx";
 import { belongsToApplication } from "../utils/reportFilters.js";
 import ErrorNotice from "../components/ErrorNotice.jsx";
 import useQuery from "../hooks/useQuery.js";
+import QuerySwap, { QuerySkeleton, QueryContent } from "../components/QuerySwap.jsx";
 
 const EMPTY_ITEMS = [];
 
@@ -46,15 +47,16 @@ function crawlLabel(mode) {
   return mode === "single" ? "Single page" : "Full site";
 }
 
-function formatDate(iso) {
-  if (!iso) return "N/A";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "N/A";
-  return d.toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  });
+function formatRelative(iso) {
+  const d = parseUTCDate(iso);
+  if (!d) return "-";
+  const diff = Math.max(0, Date.now() - d.getTime());
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
 }
 
 function hostnameOf(url) {
@@ -95,7 +97,7 @@ function ReportsPage() {
   const error = scansQuery.error || applicationsQuery.error;
   const hasData = scansQuery.hasData && applicationsQuery.hasData;
   const contentEntered =
-    scansQuery.isFetchedAfterMount || applicationsQuery.isFetchedAfterMount;
+    scansQuery.contentEntered || applicationsQuery.contentEntered;
 
   function refetch() {
     return Promise.allSettled([
@@ -117,9 +119,10 @@ function ReportsPage() {
       .map((s) => ({
         id: s.id,
         target: s.target_url,
-        host: s.site_title || hostnameOf(s.target_url),
+        host:
+          s.application_name || s.site_title || hostnameOf(s.target_url),
         crawl: crawlLabel(s.crawl_mode),
-        date: formatDate(s.started_at || s.created_at),
+        date: formatRelative(s.completed_at || s.started_at || s.created_at),
         score: Math.round(s.risk_score ?? 0),
         band: severityBand(s.risk_level, Math.round(s.risk_score ?? 0)),
         count: s.total_findings ?? 0,
@@ -161,22 +164,20 @@ function ReportsPage() {
             onChange={(e) => { setQuery(e.target.value); setPage(1); }}
           />
         </label>
-        {applications.length > 0 && (
-          <div className='reports-app-filter'>
-            <Select
-              value={applicationId}
-              onChange={(id) => { setApplicationId(id); setPage(1); }}
-              ariaLabel='Filter reports by web application'
-              options={[
-                { value: "", label: "All reports" },
-                ...applications.map((application) => ({
-                  value: application.id,
-                  label: application.name,
-                })),
-              ]}
-            />
-          </div>
-        )}
+        <div className='reports-app-filter'>
+          <Select
+            value={applicationId}
+            onChange={(id) => { setApplicationId(id); setPage(1); }}
+            ariaLabel='Filter reports by web application'
+            options={[
+              { value: "", label: "All reports" },
+              ...applications.map((application) => ({
+                value: application.id,
+                label: application.name,
+              })),
+            ]}
+          />
+        </div>
       </div>
 
       {error && hasData && (
@@ -186,29 +187,36 @@ function ReportsPage() {
           onRetry={refetch}
         />
       )}
+      <QuerySwap>
       {loading ? (
-        <div
+        <QuerySkeleton
           className='reports-table query-skeleton'
-          role='status'
           aria-label='Loading reports'
         >
           <div className='reports-head' aria-hidden='true'>
-            <span>Target</span><span>Started</span><span>Score</span><span>Findings</span><span>Report</span>
+            <span>Target</span><span>Completed</span><span>Score</span><span>Findings</span><span>Report</span>
           </div>
           {[0, 1, 2, 3].map((item) => (
             <div className='reports-row skeleton-table-row' key={item} aria-hidden='true'>
-              <span className='skeleton-block skeleton-heading' />
+              <span className='skeleton-target'>
+                <span className='skeleton-block skeleton-heading' />
+                <span className='skeleton-block skeleton-copy' />
+                <span className='skeleton-block skeleton-copy' />
+              </span>
               <span className='skeleton-block skeleton-copy' />
+              <span className='skeleton-score'>
+                <span className='skeleton-block skeleton-copy' />
+                <span className='skeleton-block skeleton-action' />
+              </span>
               <span className='skeleton-block skeleton-copy' />
-              <span className='skeleton-block skeleton-copy' />
-              <span className='skeleton-block skeleton-action' />
+              <span className='skeleton-block skeleton-rowaction' />
             </div>
           ))}
-        </div>
+        </QuerySkeleton>
       ) : error && !hasData ? (
-        <ErrorNotice error={error} fallback='Could not load reports.' onRetry={refetch} />
-      ) : rows.length === 0 && !loading ? (
-        <div className='empty-state'>
+        <ErrorNotice key='error' error={error} fallback='Could not load reports.' onRetry={refetch} />
+      ) : rows.length === 0 ? (
+        <div className='empty-state' key='empty'>
           <FileBarChart size={30} />
           <h2>
             {applicationId ? "No reports for this application" : "No reports yet"}
@@ -228,10 +236,10 @@ function ReportsPage() {
           </button>}
         </div>
       ) : (
-        <div className={`reports-table${contentEntered ? " query-content-enter" : ""}`}>
+        <QueryContent settled={contentEntered} className='reports-table'>
           <div className='reports-head'>
             <span>Target</span>
-            <span>Started</span>
+            <span>Completed</span>
             <span>Score</span>
             <span>Findings</span>
             <span>Report</span>
@@ -275,31 +283,32 @@ function ReportsPage() {
               </span>
             </article>
           ))}
-        </div>
-      )}
-      {totalPages > 1 && (
-        <div className='pagination'>
-          <button className='btn page-btn' disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
-            ‹ Prev
-          </button>
-          {pages(page, totalPages).map((p, i) =>
-            p === "…" ? (
-              <span key={`ellipsis-${i}`} className='page-ellipsis'>…</span>
-            ) : (
-              <button
-                key={p}
-                className={`btn page-btn${p === page ? " active" : ""}`}
-                onClick={() => setPage(p)}
-              >
-                {p}
+          {totalPages > 1 && (
+            <div className='pagination'>
+              <button className='btn page-btn' disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
+                ‹ Prev
               </button>
-            ),
+              {pages(page, totalPages).map((p, i) =>
+                p === "…" ? (
+                  <span key={`ellipsis-${i}`} className='page-ellipsis'>…</span>
+                ) : (
+                  <button
+                    key={p}
+                    className={`btn page-btn${p === page ? " active" : ""}`}
+                    onClick={() => setPage(p)}
+                  >
+                    {p}
+                  </button>
+                ),
+              )}
+              <button className='btn page-btn' disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>
+                Next ›
+              </button>
+            </div>
           )}
-          <button className='btn page-btn' disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>
-            Next ›
-          </button>
-        </div>
+        </QueryContent>
       )}
+      </QuerySwap>
     </div>
   );
 }

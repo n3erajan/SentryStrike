@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { ChevronDown } from "lucide-react";
 import { useScanForm } from "../hooks/useScan.js";
 import { useToast } from "../components/Toast.jsx";
@@ -105,9 +105,17 @@ function credentialPresent(account = {}) {
 function ScanPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const toast = useToast();
   const [searchParams, setSearchParams] = useSearchParams();
   const applicationId = searchParams.get("app") || "";
+  const retry = location.state?.retry;
+
+  useEffect(() => {
+    if (retry?.applicationId && !searchParams.get("app")) {
+      setSearchParams({ app: retry.applicationId });
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const applicationsQuery = useQuery({
     queryKey: "applications:list:default",
     queryFn: listApplications,
@@ -137,7 +145,7 @@ function ScanPage() {
     valid,
     canStart,
     startScan,
-  } = useScanForm({ applicationId });
+  } = useScanForm({ applicationId, retry });
 
   if (user?.role === "viewer") {
     return (
@@ -173,7 +181,7 @@ function ScanPage() {
     if (result) {
       toast("Scan started");
       window.dispatchEvent(new CustomEvent("scan-started"));
-      navigate(`/active/${result.scanId}`, {
+      navigate(`/scans/${result.scanId}`, {
         state: { target: result.target },
       });
     }

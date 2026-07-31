@@ -41,6 +41,7 @@
   --danger: var(--bad);
   --danger-line: oklch(78% 0.13 28);
   --danger-weak: oklch(96% 0.03 28);
+
   --blue: var(--brand);
   --blue-solid: var(--brand);
   --blue-solid-hover: var(--brand2);
@@ -446,19 +447,28 @@
   font-size: 0.8rem;
 }
 .analysis-banner {
+  position: relative;
   margin-bottom: 18px;
   padding: 16px 18px;
+  padding-left: 22px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 20px;
   border: 1px solid var(--line);
-  border-left: 4px solid var(--primary);
   border-radius: 10px;
   background: color-mix(in srgb, var(--primary) 6%, var(--surface, #fff));
 }
-.analysis-banner.failed {
-  border-left-color: var(--danger);
+.analysis-banner::before {
+  content: '';
+  position: absolute;
+  inset: -1px auto -1px -1px;
+  width: 4px;
+  background: var(--primary);
+  border-radius: 10px 0 0 10px;
+}
+.analysis-banner.failed::before {
+  background: var(--danger);
 }
 .analysis-banner > div {
   display: grid;
@@ -667,7 +677,10 @@
     align-items: flex-start;
     flex-direction: column;
     border-radius: 0;
-    border-left-width: 0;
+    padding-left: 16px;
+  }
+  .analysis-banner::before {
+    display: none;
   }
   .reverification-list li {
     grid-template-columns: 10px minmax(0, 1fr);
@@ -2034,6 +2047,9 @@ footer.public-footer {
 .error-notice-retry:hover {
   background: color-mix(in srgb, var(--bad) 9%, transparent);
 }
+.scan-error-notice {
+  margin-bottom: 18px;
+}
 
 /* ============ APP SHELL ============ */
 .app-shell {
@@ -2096,8 +2112,19 @@ footer.public-footer {
   background: var(--brandsoft);
   color: var(--brand2);
 }
-.app-nav .nav-badge {
-  margin-left: auto;
+.nav-badge {
+  min-width: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--brand);
+  color: var(--on-brand);
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-align: center;
+  line-height: 18px;
+  display: inline-block;
+}
+.badge {
   min-width: 20px;
   padding: 0 6px;
   border-radius: 999px;
@@ -2108,6 +2135,10 @@ footer.public-footer {
     monospace;
   text-align: center;
   line-height: 18px;
+  display: inline-block;
+}
+.app-nav .nav-badge {
+  margin-left: auto;
 }
 .scanner-status {
   margin: auto 9px 0;
@@ -2355,43 +2386,135 @@ footer.public-footer {
     transform: translateX(120%);
   }
 }
+/* .stat strong is 1.3rem/1.55 → a 2.02rem line box. The bar keeps that full
+   height so the number lands in place, but padding + content-box clipping
+   keeps the visible bar text-sized rather than a heavy slab. */
 .skeleton-value {
   width: 2.3rem;
-  height: 1.05rem;
-  margin: 3px 0 5px;
+  height: 2.02rem;
+  margin: 0;
+  padding: 0.42rem 0;
+  background-clip: content-box;
+}
+.skeleton-value::after {
+  inset: 0.42rem 0;
 }
 .skeleton-heading {
   width: min(72%, 220px);
-  height: 14px;
+  height: 16px;
 }
 .skeleton-copy {
   width: min(58%, 180px);
-  height: 10px;
+  height: 13px;
 }
 .skeleton-action {
   width: 72px;
-  height: 11px;
+  height: 13px;
+}
+.skeleton-pill {
+  width: 70px;
+  height: 20px;
+  border-radius: 999px;
 }
 .skeleton-search {
-  width: min(100%, 280px);
-  height: 38px;
-  margin-bottom: 16px;
+  width: min(100%, 420px);
+  height: 43px;
+  margin-bottom: 17px;
 }
 .skeleton-input {
   width: min(100%, 280px);
   height: 42px;
 }
-.skeleton-card {
+/* Mirrors .card's block flow exactly: h2 line, p line (margin-top 3), then a
+   bordered .cardfoot. Heights below are real line boxes, so nothing shifts
+   when the content replaces the placeholder. Height comes from the content,
+   not a min-height, so the two stay locked together as type changes. */
+.skeleton-card .skeleton-heading {
+  height: 24px;
+}
+.skeleton-card .skeleton-copy {
+  height: 17px;
+  margin-top: 3px;
+}
+.skeleton-cardfoot {
   display: flex;
-  min-height: 124px;
-  flex-direction: column;
-  gap: 10px;
+  align-items: center;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+  margin-top: 15px;
 }
-.skeleton-card .skeleton-action {
-  margin-top: auto;
+/* Default foot holds a .text-btn, whose line box at 0.67rem/1.55 is 16.61px. */
+.skeleton-cardfoot .skeleton-action {
+  height: 16.61px;
 }
+/* AppsPage's foot also carries .rowactions, whose buttons are a fixed 33px.
+   That makes the real foot 12 + 1 + 33 = 46px — 16px taller than a text-only
+   foot — so cards with actions opt into this modifier. */
+.skeleton-cardfoot.has-actions {
+  min-height: 46px;
+}
+.skeleton-cardfoot.has-actions .skeleton-action {
+  width: 48px;
+  height: 33px;
+  border-radius: 5px;
+}
+/* Table cells: each bar occupies the real line box of the text it replaces, so
+   the column keeps its height and the row's vertical centring doesn't shift.
+   .small is 0.65rem/1.55 → 16.12px; .rowtitle is 0.72rem/1.55 → 17.86px. */
 .skeleton-table-row .skeleton-block {
   width: min(82%, 180px);
+  height: 17.86px;
+}
+.skeleton-target {
+  display: grid;
+  gap: 2px;
+  align-content: center;
+}
+.skeleton-target .skeleton-heading {
+  width: min(72%, 180px);
+  height: 17.86px;
+}
+.skeleton-target .skeleton-copy:nth-child(2) {
+  width: min(90%, 260px);
+  height: 16.12px;
+}
+.skeleton-target .skeleton-copy:nth-child(3) {
+  width: min(40%, 100px);
+  height: 16.12px;
+}
+.skeleton-score {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.skeleton-score .skeleton-copy {
+  width: 60px;
+}
+.skeleton-score .skeleton-action {
+  width: 52px;
+}
+/* Stands in for the .rowactions cell in a reports row: a single icon button,
+   which .rowactions sizes to a fixed 33px square, flush right in its column.
+   A text-sized bar here left the last column 15px short.
+   Scoped to .skeleton-table-row so it outranks that row's generic bar sizing. */
+.skeleton-table-row .skeleton-rowaction {
+  width: 33px;
+  height: 33px;
+  border-radius: 5px;
+}
+.skeleton-back {
+  margin-bottom: 6px;
+}
+.skeleton-scorebox {
+  display: grid;
+  gap: 6px;
+}
+.skeleton-kv {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid oklch(31% 0.03 255);
 }
 .skeleton-formsection {
   display: grid;
@@ -2399,10 +2522,13 @@ footer.public-footer {
   align-content: start;
   gap: 24px;
 }
-.app-detail-skeleton,
-.report-skeleton {
+.app-detail-skeleton {
   display: grid;
   gap: 14px;
+}
+.report-skeleton {
+  display: grid;
+  gap: 0;
 }
 .query-content-enter {
   animation: query-content-enter 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
@@ -2431,6 +2557,7 @@ footer.public-footer {
 .low {
   color: var(--sev-low);
 }
+
 .info {
   color: var(--sev-info);
 }
@@ -2674,11 +2801,15 @@ footer.public-footer {
     0.66rem/1.75 'IBM Plex Mono',
     monospace;
 }
-.scan-log .ok {
+.scan-log .ok,
+.ok {
   color: oklch(80% 0.11 150);
 }
 .scan-log .warn {
   color: oklch(80% 0.14 28);
+}
+.warn {
+  color: var(--bad);
 }
 
 .search {
@@ -2815,7 +2946,7 @@ footer.public-footer {
   grid-template-columns: minmax(240px, 2fr) 0.9fr 1fr 0.8fr 120px;
   gap: 16px;
   align-items: center;
-  padding: 0 4px;
+  padding: 0 14px;
 }
 .reports-head {
   min-height: 42px;
@@ -2897,7 +3028,7 @@ footer.public-footer {
   grid-template-columns: minmax(240px, 2fr) 120px 100px 1fr 60px;
   gap: 16px;
   align-items: center;
-  padding: 0 4px;
+  padding: 0 14px;
 }
 .scans-head {
   min-height: 42px;
@@ -2909,7 +3040,7 @@ footer.public-footer {
   color: var(--sub);
 }
 .scans-row {
-  min-height: 64px;
+  min-height: 68px;
   border-bottom: 1px solid var(--line);
   font-size: 0.72rem;
   cursor: pointer;
@@ -2929,7 +3060,7 @@ footer.public-footer {
   grid-template-columns: minmax(200px, 1.5fr) 0.8fr 0.8fr 0.8fr 60px;
   gap: 16px;
   align-items: center;
-  padding: 0 4px;
+  padding: 0 14px;
 }
 .team-head {
   min-height: 42px;
@@ -3130,7 +3261,7 @@ footer.public-footer {
   grid-template-columns: minmax(200px, 2fr) 1fr;
   gap: 16px;
   align-items: center;
-  padding: 0 4px;
+  padding: 0 14px;
 }
 .metric-head {
   min-height: 42px;
@@ -3403,16 +3534,16 @@ footer.public-footer {
   gap: 10px;
   width: min(390px, calc(100vw - 32px));
   border: 1px solid color-mix(in srgb, var(--paper) 14%, transparent);
-  background: var(--dark);
+  background: var(--ink);
   box-shadow: 0 16px 40px oklch(8% 0.025 255 / 0.24);
-  color: var(--light);
+  color: var(--paper);
   padding: 12px 10px 12px 13px;
   border-radius: 9px;
   animation: toast-in 0.25s var(--ease);
   font-size: 0.75rem;
 }
 .toast.error {
-  border-color: color-mix(in srgb, var(--bad) 55%, var(--dark));
+  border-color: color-mix(in srgb, var(--bad) 55%, var(--ink));
 }
 .toast-icon {
   width: 17px;

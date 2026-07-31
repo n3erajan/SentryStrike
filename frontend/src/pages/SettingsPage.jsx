@@ -11,11 +11,13 @@ import {
   updateWorkspace,
 } from "../services/workspace.js";
 import ErrorNotice from "../components/ErrorNotice.jsx";
+import { parseUTCDate } from "../utils/helpers.js";
 import useQuery from "../hooks/useQuery.js";
 import {
   invalidateQueries,
   setQueryData,
 } from "../services/queryCache.js";
+import QuerySwap, { QuerySkeleton, QueryContent } from "../components/QuerySwap.jsx";
 
 const title = (v) =>
   (v || "").replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase());
@@ -119,9 +121,9 @@ function SettingsPage() {
     retentionQuery.hasData &&
     (!admin || auditQuery.hasData);
   const contentEntered =
-    workspaceQuery.isFetchedAfterMount ||
-    retentionQuery.isFetchedAfterMount ||
-    auditQuery.isFetchedAfterMount;
+    workspaceQuery.contentEntered ||
+    retentionQuery.contentEntered ||
+    auditQuery.contentEntered;
 
   function refetch() {
     const requests = [workspaceQuery.refetch(), retentionQuery.refetch()];
@@ -169,17 +171,21 @@ function SettingsPage() {
         )}
       </div>
       <ErrorNotice error={error} fallback='Could not load workspace settings.' onRetry={refetch} />
-      {loading ? (
-        <div className='settings-stack query-skeleton' role='status' aria-label='Loading settings'>
-          {[0, 1, 2].map((item) => (
-            <section className='formsection skeleton-formsection' key={item} aria-hidden='true'>
-              <span className='skeleton-block skeleton-heading' />
-              <span className='skeleton-block skeleton-input' />
-            </section>
-          ))}
-        </div>
-      ) : error && !hasData ? null : (
-        <div className={`settings-stack${contentEntered ? " query-content-enter" : ""}`}>
+      <QuerySwap>
+        {loading ? (
+          <QuerySkeleton key='skeleton' aria-label='Loading settings'>
+            <div className='settings-stack query-skeleton'>
+              {[0, 1, 2].map((item) => (
+                <section className='formsection skeleton-formsection' key={item} aria-hidden='true'>
+                  <span className='skeleton-block skeleton-heading' />
+                  <span className='skeleton-block skeleton-input' />
+                </section>
+              ))}
+            </div>
+          </QuerySkeleton>
+        ) : error && !hasData ? null : (
+          <QueryContent settled={contentEntered}>
+            <div className='settings-stack'>
           <section className='formsection'>
             <h2>Account</h2>
             <div className='grid2'>
@@ -245,10 +251,10 @@ function SettingsPage() {
                       </div>
                       <div className='audit-meta'>
                         <time className='small' dateTime={a.created_at}>
-                          {new Date(a.created_at).toLocaleString(undefined, {
-                            dateStyle: "medium",
-                            timeStyle: "short",
-                          })}
+                          {(() => {
+                            const dd = parseUTCDate(a.created_at);
+                            return dd ? dd.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "N/A";
+                          })()}
                         </time>
                         {a.resource_path && (
                           <Link className='audit-resource' to={a.resource_path}>
@@ -305,8 +311,10 @@ function SettingsPage() {
               )}
             </section>
           )}
-        </div>
-      )}
+            </div>
+          </QueryContent>
+        )}
+      </QuerySwap>
     </div>
   );
 }

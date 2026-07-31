@@ -61,7 +61,11 @@ export default function useQuery({
     isLoading:
       enabled && !snapshot.hasData && snapshot.status !== "error",
     isRefreshing: snapshot.hasData && snapshot.isFetching,
-    isFetchedAfterMount: !hadDataAtMount && snapshot.hasData,
+    // True when this query already had cached data at mount, so the page's
+    // content appears without a loading skeleton (e.g. SPA navigation).
+    // Pages use this to play the entrance animation; a hard refresh shows a
+    // skeleton instead, so animating the swap there would look like a bug.
+    contentEntered: hadDataAtMount,
     refetch,
   };
 }
