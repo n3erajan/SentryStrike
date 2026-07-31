@@ -22,7 +22,7 @@ class FormAuthProbeMixin:
 
         for inp in raw_inputs:
             name = getattr(inp, "name", "")
-            inp_type = getattr(inp, "input_type", "text").lower()
+            inp_type = (getattr(inp, "input_type", None) or "text").lower()
             if not name:
                 continue
             name_lower = name.lower()
@@ -418,7 +418,7 @@ class FormAuthProbeMixin:
             try:
                 captcha_param = None
                 for inp in raw_inputs:
-                    name = getattr(inp, "name", "").lower()
+                    name = (getattr(inp, "name", None) or "").lower()
                     if any(tok in name for tok in [
                         "captcha", "recaptcha", "g-recaptcha-response",
                         "h-captcha-response", "cf-turnstile-response",

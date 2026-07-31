@@ -167,81 +167,6 @@ _AUTH_DIFF_KEYWORDS: tuple[str, ...] = (
     "forced browsing",
 )
 
-# Pattern-match methods — a regex hit on the response body could be a genuine
-# error, reflected payload, or normal page content. The AI must judge.
-_PATTERN_MATCH_METHODS: frozenset[str] = frozenset({
-    "observed_exception_evidence",
-    "path_bruteforce",
-    "api_response_reflection",
-    "content_type_bypass_response_evidence",
-    "double_extension_response_evidence",
-    "observed_response_content",
-    "path_content_fingerprint",
-    "observed_credential_disclosure",
-})
-
-_PATTERN_MATCH_KEYWORDS: tuple[str, ...] = (
-    "verbose error",
-    "exception handling",
-    "stack trace",
-    "error handling",
-    "credential",
-    "config disclosure",
-    "debug",
-    "metrics endpoint",
-)
-
-# Structural vuln types — the observation itself IS the proof (missing header,
-# TLS absence, admin path reachability, GET credentials, CSRF token absence,
-# brute-force absence, captcha absence, cookie attribute issues).
-_STRUCTURAL_VULN_KEYWORDS: tuple[str, ...] = (
-    "missing security header",
-    "weak content security policy",
-    "cors misconfiguration",
-    "missing cache-control",
-    "information disclosure in header",
-    "server banner",
-    "insecure transport",
-    "weak tls",
-    "ssl configuration",
-    "no tls configuration",
-    "no tls",
-    "credentials transmitted via http get",
-    "credential / token exposed",
-    "sensitive data in url",
-    "sensitive credential",
-    "password in get",
-    "credentials via get",
-    "insecure session cookie",
-    "cookie without secure flag",
-    "cookie attribute",
-    "admin / privileged endpoint",
-    "admin endpoint",
-    "privileged endpoint",
-    "well-known admin",
-    "sensitive path",
-    "admin panel",
-    "phpmyadmin",
-    "sensitive file exposure",
-    "authentication form may lack csrf",
-    "authentication form lacks csrf",
-    "mixed content",
-    "authentication endpoint served over plaintext",
-    "brute-force",
-    "brute force",
-    "captcha",
-    "mfa",
-    "rate limit",
-    "password change",
-    "horizontal authorization bypass",
-    "vertical privilege bypass",
-    "privilege escalation",
-    "privilege bypass",
-    "mass assignment",
-    "access control",
-    "authorization bypass",
-    "forced browsing",
-)
 
 # Pattern-match methods — a regex hit on the response body could be a genuine
 # error, reflected payload, or normal page content. The AI must judge.
@@ -330,24 +255,6 @@ _STRONG_EVIDENCE_KEYWORDS: tuple[str, ...] = (
 )
 
 # Ceiling and grade letter per proof type.
-_PROOF_CEILINGS: dict[str, float] = {
-    "active_output": 0.05,
-    "error_echo": 0.05,
-    "structural": 0.10,
-    "timing_strong": 0.15,
-    "timing_weak": 0.40,
-    "ssrf_differential": 0.49,
-    "auth_confirmed": 0.15,
-    "auth_differential": 1.00,
-    "pattern_match": 1.00,
-    "heuristic": 0.40,
-}
-
-def get_fp_ceiling(proof_type: str | None) -> float:
-    if not proof_type:
-        return 1.0
-    return _PROOF_CEILINGS.get(proof_type.lower(), 1.0)
-
 _PROOF_GRADE_LETTERS: dict[str, str] = {
     "active_output": "A",
     "error_echo": "A",
@@ -386,7 +293,7 @@ class EvidenceGrader:
         discriminative evidence brief so its judgment is grounded.
         """
         proof_type = self._classify_proof_type(vuln)
-        ceiling = _PROOF_CEILINGS.get(proof_type, 1.0)
+        ceiling = get_fp_ceiling(proof_type)
         grade_letter = _PROOF_GRADE_LETTERS.get(proof_type, "D")
 
         proof_summary = self._proof_summary(proof_type, vuln)

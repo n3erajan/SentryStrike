@@ -361,6 +361,13 @@ class WebSpider:
                             queue.task_done()
                             break
 
+                        # Prefer the post-redirect URL for HTML parsing and discovery.
+                        # Using the requested URL as the form base after a login bounce
+                        # turns relative actions like ``login.php`` into phantom paths
+                        # under the protected resource (``/vuln/fi/login.php``).
+                        final_url = str(response.url)
+                        record_url = final_url or url
+
                         # Detect the SPA shell fallback for EVERY discovery source
                         # and even file-like paths (``allow_file_like_path=True``).
                         # In a SPA the server returns the same ``index.html`` shell
@@ -375,18 +382,18 @@ class WebSpider:
                         # ``allow_file_like_path=False`` skipped extensioned paths,
                         # so shell-returning guesses like ``/.env`` slipped through.
                         fallback_signal = spa_detector.detect(
-                            url,
+                            record_url,
                             response.status_code,
                             response.headers.get("content-type", ""),
                             response.text if "text/html" in response.headers.get("content-type", "") else "",
                             allow_file_like_path=True,
                         )
-                        if url == root_url and "text/html" in response.headers.get("content-type", ""):
+                        if record_url == root_url and "text/html" in response.headers.get("content-type", ""):
                             spa_detector.configure_root(root_url, response.text)
                             spa_root_html = response.text
                             self._is_spa = self._is_spa or spa_detector.root_looks_like_spa()
 
-                        if fallback_signal.is_fallback and url != root_url:
+                        if fallback_signal.is_fallback and record_url != root_url:
                             # A shell fallback is kept OUT of the HTTP-testable URL
                             # set regardless of source. Brute-force guesses were
                             # probes for a resource that does not exist, so they are
@@ -398,7 +405,7 @@ class WebSpider:
                             if source == RouteSource.brute_force:
                                 dead_routes.append(
                                     RouteCandidate(
-                                        url=url,
+                                        url=record_url,
                                         source=source,
                                         priority=0,
                                         depth=depth,
@@ -412,9 +419,9 @@ class WebSpider:
 
                         # Add to discovered_urls if request was successful/interesting
                         if response.status_code in [200, 301, 302, 403]:
-                            if url not in discovered_set:
-                                discovered_set.add(url)
-                                discovered_urls.append(url)
+                            if record_url not in discovered_set:
+                                discovered_set.add(record_url)
+                                discovered_urls.append(record_url)
 
                     if "text/html" not in response.headers.get("content-type", ""):
                         queue.task_done()
@@ -428,7 +435,8 @@ class WebSpider:
                         # Update cookies in case session updated
                         self.session_cookies.update(self._snapshot_cookies(client.cookies))
 
-                    page_forms, links = self._parse_html(url, response.text)
+                    # ``record_url`` is the post-redirect URL captured under the lock above.
+                    page_forms, links = self._parse_html(str(response.url) or url, response.text)
                     page_forms = [
                         form
                         for form in page_forms
@@ -439,11 +447,12 @@ class WebSpider:
                         forms.extend(page_forms)
 
                     # Add form actions as links so we can scan the endpoints
+                    form_base = str(response.url) or url
                     for form in page_forms:
                         links.append(form.action)
 
                     for link in links:
-                        normalized = normalize_url(url, link)
+                        normalized = normalize_url(form_base, link)
                         if same_domain(root_url, normalized):
                             parsed_link = urlparse(normalized)
                             ext = pathlib.PurePosixPath(parsed_link.path).suffix.lower()
@@ -1294,12 +1303,30 @@ class WebSpider:
                 elif inp.name == "select":
                     inp_type = "select"
                 elif inp.name == "button":
-                    inp_type = getattr(inp, "type", "button") if hasattr(inp, "type") else "button"
+                    # Spec default for <button> inside a form is submit.
+                    inp_type = inp.get("type") or "submit"
                 else:
                     inp_type = inp.get("type", "text")
-                value = inp.get("value", "")
                 if inp.name == "textarea":
                     value = inp.get_text("", strip=False)
+                elif inp.name == "select":
+                    value = ""
+                    selected = None
+                    for opt in inp.find_all("option"):
+                        if opt.has_attr("selected"):
+                            selected = opt
+                            break
+                    if selected is None:
+                        options = inp.find_all("option")
+                        selected = options[0] if options else None
+                    if selected is not None:
+                        value = (
+                            str(selected.get("value", ""))
+                            if selected.has_attr("value")
+                            else selected.get_text(strip=True)
+                        )
+                else:
+                    value = inp.get("value", "")
                 inputs.append(FormInput(name=name, input_type=inp_type, value=value))
             forms.append(
                 HtmlForm(

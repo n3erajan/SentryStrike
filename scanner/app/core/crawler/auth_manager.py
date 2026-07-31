@@ -19,7 +19,7 @@ from app.core.crawler.spa import (
     install_resource_blocking,
     settle_page,
 )
-from app.core.crawler.url_parser import normalize_url, same_domain
+from app.core.crawler.url_parser import application_base_path, normalize_url, same_domain
 
 logger = logging.getLogger(__name__)
 
@@ -161,10 +161,11 @@ class ModernAuthManager:
 
             action = normalize_url(page_url, form.get("action", page_url))
             fields: dict[str, str] = {}
-            for inp in form.find_all(["input", "textarea", "select"]):
+            for inp in form.find_all(["input", "textarea", "select", "button"]):
                 name = inp.get("name")
-                if name:
-                    fields[name] = inp.get("value", "")
+                if not name:
+                    continue
+                fields[name] = SmartAuthenticator._control_submitted_value(inp)
             flows.append(
                 AuthFlowCandidate(
                     url=action,
@@ -217,10 +218,20 @@ class SmartAuthenticator:
     ) -> AuthResult:
         logger.info("[auth] Starting smart authentication cascade for %s", root_url)
         is_spa = await self._detect_spa(client, root_url)
+        best_unverified: AuthResult | None = None
+
+        def _keep_unverified(result: AuthResult | None) -> None:
+            nonlocal best_unverified
+            if (
+                result
+                and result.state == AuthVerificationState.authenticated_unverified
+                and best_unverified is None
+            ):
+                best_unverified = result
 
         # Strategy 1: Redirect Detection
         result = await self._try_redirect_login(client, root_url, username, password)
-        if result and result.authenticated:
+        if result and result.state == AuthVerificationState.authenticated_verified:
             result.is_spa = is_spa
             logger.info("[auth] Strategy 1 (Redirect Detection) succeeded")
             if is_spa and not result.storage_state:
@@ -228,10 +239,11 @@ class SmartAuthenticator:
                     root_url, result.cookies, result.bearer_token
                 )
             return result
+        _keep_unverified(result)
 
         # Strategy 2: HTML Form Extraction
         result = await self._try_html_form_login(client, root_url, username, password)
-        if result and result.authenticated:
+        if result and result.state == AuthVerificationState.authenticated_verified:
             result.is_spa = is_spa
             logger.info("[auth] Strategy 2 (HTML Form Extraction) succeeded")
             if is_spa and not result.storage_state:
@@ -239,10 +251,11 @@ class SmartAuthenticator:
                     root_url, result.cookies, result.bearer_token
                 )
             return result
+        _keep_unverified(result)
 
         # Strategy 3: JS API Discovery + Param Extraction
         result = await self._try_js_api_login(client, root_url, username, password)
-        if result and result.authenticated:
+        if result and result.state == AuthVerificationState.authenticated_verified:
             result.is_spa = is_spa
             logger.info("[auth] Strategy 3 (JS API Discovery) succeeded")
             if is_spa and not result.storage_state:
@@ -250,17 +263,19 @@ class SmartAuthenticator:
                     root_url, result.cookies, result.bearer_token
                 )
             return result
+        _keep_unverified(result)
 
         # Strategy 4: Playwright Browser Login
         result = await self._try_browser_spa_login(client, root_url, username, password)
-        if result and result.authenticated:
+        if result and result.state == AuthVerificationState.authenticated_verified:
             result.is_spa = True
             logger.info("[auth] Strategy 4 (Playwright Browser Login) succeeded")
             return result
+        _keep_unverified(result)
 
         # Strategy 5: Brute-Force Endpoints
         result = await self._try_brute_force_login(client, root_url, username, password)
-        if result and result.authenticated:
+        if result and result.state == AuthVerificationState.authenticated_verified:
             result.is_spa = is_spa
             logger.info("[auth] Strategy 5 (Brute-Force Endpoints) succeeded")
             if is_spa and not result.storage_state:
@@ -268,6 +283,16 @@ class SmartAuthenticator:
                     root_url, result.cookies, result.bearer_token
                 )
             return result
+        _keep_unverified(result)
+
+        if best_unverified is not None:
+            best_unverified.is_spa = is_spa or best_unverified.is_spa
+            logger.warning(
+                "[auth] Cascade finished without protected-resource proof; "
+                "keeping unverified session material (%s)",
+                best_unverified.verification_evidence or "cookies present",
+            )
+            return best_unverified
 
         logger.warning("[auth] All authentication strategies failed")
         return AuthResult(authenticated=False, is_spa=is_spa)
@@ -488,12 +513,23 @@ class SmartAuthenticator:
         self, client: httpx.AsyncClient, root_url: str, username: str, password: str
     ) -> AuthResult | None:
         logger.info("[auth] Trying Strategy 2: HTML Form Extraction")
-        login_paths = ["/login", "/signin", "/auth", "/session/new", "/login.php", "/login.html", "/"]
+        # Relative paths only — a leading slash replaces the entire URL path and
+        # escapes path-mounted apps (``http://host/app/`` + ``/login`` →
+        # ``http://host/login``). Resolve against the application base instead.
+        parsed_root = urlparse(root_url)
+        app_base = f"{parsed_root.scheme}://{parsed_root.netloc}{application_base_path(root_url)}"
+        login_rels = ["login", "signin", "auth", "session/new", "login.php", "login.html", ""]
+        login_paths: list[str] = [normalize_url(app_base, rel) for rel in login_rels]
         configured_login_url = getattr(self.settings, "authentication_login_url", None)
         if configured_login_url:
-            login_paths.insert(0, str(configured_login_url))
-        for path in login_paths:
-            url = path if str(path).startswith(("http://", "https://")) else normalize_url(root_url, path)
+            configured = str(configured_login_url)
+            configured_abs = (
+                configured
+                if configured.startswith(("http://", "https://"))
+                else normalize_url(app_base, configured.lstrip("/"))
+            )
+            login_paths.insert(0, configured_abs)
+        for url in login_paths:
             try:
                 resp = await client.get(url, follow_redirects=True)
                 if resp.status_code == 200:
@@ -527,40 +563,7 @@ class SmartAuthenticator:
 
             action = normalize_url(page_url, form.get("action", ""))
             method = form.get("method", "POST").upper()
-            payload = {}
-
-            for inp in form.find_all(["input", "select", "textarea"]):
-                name = inp.get("name")
-                if not name:
-                    continue
-                val = inp.get("value", "")
-                inp_type = inp.get("type", "text").lower()
-                autocomplete = inp.get("autocomplete", "").lower()
-                placeholder = inp.get("placeholder", "").lower()
-
-                field_classification = self._classify_field_name_and_attrs(name, inp_type, autocomplete, placeholder)
-                if field_classification == "username":
-                    payload[name] = username
-                elif field_classification == "password":
-                    payload[name] = password
-                elif inp_type == "hidden":
-                    payload[name] = val
-                elif inp_type in ["submit", "button"] and "submit" in name.lower():
-                    payload[name] = val or "Submit"
-
-            # Fallback if no matching fields mapped
-            if not any(v in payload.values() for v in (username, password)):
-                username_field_found = False
-                for inp in form.find_all("input"):
-                    name = inp.get("name")
-                    if not name:
-                        continue
-                    inp_type = inp.get("type", "text").lower()
-                    if inp_type == "password":
-                        payload[name] = password
-                    elif inp_type in ("text", "email") and not username_field_found:
-                        payload[name] = username
-                        username_field_found = True
+            payload = self._build_credential_form_payload(form, username, password)
 
             try:
                 if method == "POST":
@@ -586,6 +589,138 @@ class SmartAuthenticator:
     @staticmethod
     def _normalize_malformed_forms(html: str) -> str:
         return re.sub(r"<form\b([^>]*?)/>", r"<form\1>", html, flags=re.I)
+
+    @staticmethod
+    def _control_type(inp: Any) -> str:
+        """Return the effective HTML control type for an input/select/textarea/button."""
+        tag = (getattr(inp, "name", None) or "").lower()
+        if tag == "select":
+            return "select"
+        if tag == "textarea":
+            return "textarea"
+        raw = inp.get("type")
+        if tag == "button":
+            # Spec default for <button> inside a form is submit.
+            return (raw or "submit").lower()
+        return (raw or "text").lower()
+
+    @staticmethod
+    def _control_submitted_value(inp: Any) -> str:
+        """Return the value a browser would include for this successful control."""
+        tag = (getattr(inp, "name", None) or "").lower()
+        if tag == "select":
+            selected = None
+            for opt in inp.find_all("option"):
+                if opt.has_attr("selected"):
+                    selected = opt
+                    break
+            if selected is None:
+                options = inp.find_all("option")
+                selected = options[0] if options else None
+            if selected is None:
+                return ""
+            if selected.has_attr("value"):
+                return str(selected.get("value", ""))
+            return selected.get_text(strip=True)
+        if tag == "textarea":
+            return inp.get_text("", strip=False)
+        value = inp.get("value")
+        if value is not None and str(value) != "":
+            return str(value)
+        if tag == "button":
+            text = inp.get_text(" ", strip=True)
+            return text or "Submit"
+        return ""
+
+    @classmethod
+    def _named_submitter_candidates(cls, form: Any) -> list[tuple[int, str, str]]:
+        """Named submit controls a browser may include (Enter activates the first)."""
+        candidates: list[tuple[int, str, str]] = []
+        for inp in form.find_all(["input", "button"]):
+            name = inp.get("name")
+            if not name:
+                continue
+            inp_type = cls._control_type(inp)
+            if inp_type not in ("submit", "image"):
+                continue
+            value = cls._control_submitted_value(inp) or "Submit"
+            label = f"{name} {value} {inp.get_text(' ', strip=True)}".lower()
+            score = 0
+            for hint in ("submit", "login", "signin", "sign in", "log in", "continue", "go"):
+                if hint in label:
+                    score += 2
+            candidates.append((score, str(name), value))
+        return candidates
+
+    @classmethod
+    def _pick_default_submitter(cls, form: Any) -> tuple[str, str] | None:
+        """Pick one named submitter, mirroring Enter-key / first-submitter semantics.
+
+        Many PHP/legacy apps gate login on the clicked submit control's name/value
+        (``name=form value=submit``, ``name=Login``, …). Omitting it leaves a
+        pre-auth session cookie while the POST is ignored — so prefer a
+        submit/login-labelled control, else the first named submitter.
+        """
+        candidates = cls._named_submitter_candidates(form)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item[0],))
+        _, name, value = candidates[0]
+        return name, value
+
+    def _build_credential_form_payload(
+        self, form: Any, username: str, password: str
+    ) -> dict[str, str]:
+        """Build an application/x-www-form-urlencoded body for a credential form.
+
+        Includes username/password mappings, hidden fields, default ``<select>``
+        values, and one named submitter — the same successful controls a browser
+        sends on Enter / primary submit click. Does not invent app-specific fields.
+        """
+        payload: dict[str, str] = {}
+        for inp in form.find_all(["input", "select", "textarea"]):
+            name = inp.get("name")
+            if not name:
+                continue
+            inp_type = self._control_type(inp)
+            if inp_type in ("submit", "image", "button", "reset", "file"):
+                continue
+            autocomplete = inp.get("autocomplete", "").lower()
+            placeholder = inp.get("placeholder", "").lower()
+            field_classification = self._classify_field_name_and_attrs(
+                name, inp_type, autocomplete, placeholder
+            )
+            if field_classification == "username":
+                payload[name] = username
+            elif field_classification == "password":
+                payload[name] = password
+            elif inp_type == "hidden":
+                payload[name] = self._control_submitted_value(inp)
+            elif inp_type == "select":
+                payload[name] = self._control_submitted_value(inp)
+            elif inp_type in ("checkbox", "radio"):
+                if inp.has_attr("checked"):
+                    payload[name] = self._control_submitted_value(inp) or "on"
+
+        if not any(v in payload.values() for v in (username, password)):
+            username_field_found = False
+            for inp in form.find_all("input"):
+                name = inp.get("name")
+                if not name:
+                    continue
+                inp_type = self._control_type(inp)
+                if inp_type == "password":
+                    payload[name] = password
+                elif inp_type in ("text", "email") and not username_field_found:
+                    payload[name] = username
+                    username_field_found = True
+
+        submitter = self._pick_default_submitter(form)
+        if submitter is not None:
+            submit_name, submit_value = submitter
+            payload.setdefault(submit_name, submit_value)
+
+        return payload
 
     def _classify_field_name_and_attrs(
         self, name: str, inp_type: str = "", autocomplete: str = "", placeholder: str = ""
@@ -859,10 +994,14 @@ class SmartAuthenticator:
                 # If password input is not present, try direct navigation to common client-side login routes
                 if await page.locator("input[type='password']").count() == 0:
                     parsed_root = urlparse(root_url)
-                    base_origin = f"{parsed_root.scheme}://{parsed_root.netloc}"
-                    login_paths = ["/login", "/#/login", "/signin", "/#/signin", "/sign-in", "/#/sign-in", "/auth/login", "/#/auth/login"]
+                    app_base = f"{parsed_root.scheme}://{parsed_root.netloc}{application_base_path(root_url)}"
+                    # Prefer app-base path routes; keep hash-router variants on the same base.
+                    login_paths = [
+                        "login", "#/login", "signin", "#/signin",
+                        "sign-in", "#/sign-in", "auth/login", "#/auth/login",
+                    ]
                     for path in login_paths:
-                        target_login_url = base_origin + path
+                        target_login_url = normalize_url(app_base, path) if not path.startswith("#") else f"{app_base.rstrip('/')}/{path}"
                         try:
                             logger.info("[auth] Trying direct navigation to SPA login route: %s", target_login_url)
                             await page.goto(target_login_url, wait_until="domcontentloaded", timeout=8000)
@@ -1378,21 +1517,7 @@ class SmartAuthenticator:
 
             action = normalize_url(page_url, form.get("action", ""))
             method = form.get("method", "POST").upper()
-            payload: dict[str, str] = {}
-            for inp in form.find_all(["input", "select", "textarea"]):
-                name = inp.get("name")
-                if not name:
-                    continue
-                inp_type = inp.get("type", "text").lower()
-                classification = self._classify_field_name_and_attrs(
-                    name, inp_type, inp.get("autocomplete", ""), inp.get("placeholder", "")
-                )
-                if classification == "username":
-                    payload[name] = username
-                elif classification == "password":
-                    payload[name] = password
-                elif inp_type == "hidden":
-                    payload[name] = inp.get("value", "")
+            payload = self._build_credential_form_payload(form, username, password)
             if password not in payload.values():
                 continue
             try:

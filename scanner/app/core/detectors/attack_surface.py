@@ -1315,7 +1315,7 @@ def build_form_payload(form_inputs: list, target_param: str, target_value: str) 
         name = getattr(inp, "name", "")
         if not name:
             continue
-        inp_type = getattr(inp, "input_type", "text").lower()
+        inp_type = (getattr(inp, "input_type", None) or "text").lower()
         if name == target_param:
             payload[name] = target_value
         elif inp_type == "password":
@@ -1344,7 +1344,7 @@ def build_multipart_payload(
         name = getattr(inp, "name", "")
         if not name:
             continue
-        inp_type = getattr(inp, "input_type", "text").lower()
+        inp_type = (getattr(inp, "input_type", None) or "text").lower()
         if inp_type == "file":
             value = target_value if name == target_param else getattr(inp, "value", "") or b"SENTRY_UPLOAD_TEST_CANARY"
             files[name] = _multipart_file_tuple(value)

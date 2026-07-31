@@ -884,3 +884,56 @@ async def test_file_upload_flags_type_validation_on_post_sink(monkeypatch):
     findings = await detector.detect(urls=[], forms=[post_form])
 
     assert any(f.vuln_type == "Missing File Type Validation" for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_open_redirect_browser_sweep_with_scan_config(monkeypatch):
+    """The browser sweep reads its bounds from ScanConfig, which carries no
+    open-redirect fields at all — resolution must fall back to settings."""
+    import app.core.detectors.open_redirect as ormod
+    from shared.schemas.scan_schema import ScanConfig
+
+    detector = OpenRedirectDetector()
+    routes = [SimpleNamespace(url="http://h/#/redirect?to=x")]
+
+    class _FakeContext:
+        async def close(self):
+            pass
+
+    class _FakeBrowser:
+        async def new_context(self, **kwargs):
+            return _FakeContext()
+
+    class _FakeChromium:
+        async def launch(self, **kwargs):
+            return _FakeBrowser()
+
+    class _FakeP:
+        chromium = _FakeChromium()
+
+        async def stop(self):
+            pass
+
+    class _FakePlaywrightCM:
+        async def start(self):
+            return _FakeP()
+
+    monkeypatch.setattr(ormod, "async_playwright", lambda: _FakePlaywrightCM())
+    monkeypatch.setattr(ormod, "PLAYWRIGHT_AVAILABLE", True)
+
+    async def fake_ctx(self, browser, route_url, session_cookies, storage_state):
+        return _FakeContext()
+
+    async def fake_nav(self, context, probe_url):
+        return "sentrystrike.invalid" in probe_url
+
+    monkeypatch.setattr(OpenRedirectDetector, "_new_browser_context", fake_ctx)
+    monkeypatch.setattr(OpenRedirectDetector, "_navigate_and_detect_external", fake_nav)
+
+    findings = await detector.detect(
+        urls=[], forms=[], routes=routes, browser_available=True,
+        scan_config=ScanConfig(scanner_concurrency=10),
+    )
+
+    assert len(findings) == 1
+    assert findings[0].detection_method == "browser_client_side_redirect"

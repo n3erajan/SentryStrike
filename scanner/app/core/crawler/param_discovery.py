@@ -209,7 +209,7 @@ class ParamDiscovery:
             has_injectable_input = False
             for inp in form_inputs:
                 inp_name = getattr(inp, "name", "")
-                inp_type = getattr(inp, "input_type", "text").lower()
+                inp_type = (getattr(inp, "input_type", None) or "text").lower()
 
                 if not inp_name or inp_type in cls.SKIP_INPUT_TYPES:
                     continue

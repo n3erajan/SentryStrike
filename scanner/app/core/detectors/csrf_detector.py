@@ -16,6 +16,37 @@ logger = logging.getLogger(__name__)
 
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+# Parameter-name tokens (separator-stripped) for change-password forms.
+# Shared idea with SessionAuthProbeMixin — keep the sets aligned in spirit, not
+# by importing that mixin (csrf must stay usable without the auth package).
+_NEW_PASSWORD_PARAMS = frozenset({
+    "newpassword", "newpass", "passwordnew", "new",
+})
+_CONFIRM_PASSWORD_PARAMS = frozenset({
+    "passwordrepeat", "repeatpassword", "confirmpassword", "passwordconfirmation",
+    "passwordconfirm", "confirm", "repeat", "passwordconf",
+})
+_CURRENT_PASSWORD_PARAMS = frozenset({
+    "currentpassword", "oldpassword", "existingpassword", "currentpwd", "oldpwd",
+    "current", "old", "existing", "passwordcurr",
+})
+# Affirmative that a password-change *handler* ran. Business validation may still
+# fail (mismatch / wrong current) — that is enough CSRF proof and must not require
+# committing a new password on the scan account.
+_CREDENTIAL_ACTION_PROCESSED_RE = re.compile(
+    r"\b(?:"
+    r"passwords?\s+did\s+not\s+match|"
+    r"passwords?\s+do(?:\s+not|n'?t)\s+match|"
+    r"password\s+mismatch|"
+    r"(?:new\s+)?passwords?\s+(?:do\s+not|dont|don't)\s+match|"
+    r"current\s+password\s+(?:is\s+)?(?:incorrect|invalid|wrong)|"
+    r"incorrect\s+(?:current\s+)?password|"
+    r"password\s+(?:too\s+short|too\s+weak|required|changed|updated)|"
+    r"successfully\s+changed"
+    r")\b",
+    re.I,
+)
+
 
 class _FormInputView:
     """Attribute view of a browser-discovered form input (dict → object)."""
@@ -54,6 +85,111 @@ class CSRFDetector(BaseDetector):
         "login", "signin", "sign-in", "authenticate", "auth", "session",
         "logout", "signout", "sign-out", "logoff",
     }
+
+    @staticmethod
+    def _norm_param(name: object) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+    @classmethod
+    def _classify_password_fields(cls, raw_inputs: list) -> dict[str, list[str]]:
+        """Split password-related fields into current / new / confirm buckets."""
+        found: dict[str, list[str]] = {"current": [], "new": [], "confirm": []}
+        password_typed: list[str] = []
+        for inp in raw_inputs:
+            name = getattr(inp, "name", "") or ""
+            if not name:
+                continue
+            inp_type = (getattr(inp, "input_type", None) or "text").lower()
+            norm = cls._norm_param(name)
+            if inp_type == "password":
+                password_typed.append(name)
+            if norm in _CURRENT_PASSWORD_PARAMS:
+                found["current"].append(name)
+            elif norm in _CONFIRM_PASSWORD_PARAMS:
+                found["confirm"].append(name)
+            elif norm in _NEW_PASSWORD_PARAMS and norm != "password":
+                found["new"].append(name)
+
+        # Fallback: two+ password-typed fields without clear names → new + confirm.
+        classified = {n for group in found.values() for n in group}
+        leftover = [n for n in password_typed if n not in classified]
+        if not found["new"] and leftover:
+            found["new"].append(leftover[0])
+            leftover = leftover[1:]
+        if not found["confirm"] and leftover:
+            found["confirm"].append(leftover[0])
+        return found
+
+    @classmethod
+    def _is_credential_mutating_form(cls, raw_inputs: list) -> bool:
+        """True for change-password forms, false for login (identity + password).
+
+        Login forms are already filtered elsewhere; this guards password-change
+        CSRF probes so they cannot rewrite the scan account's credentials.
+        """
+        names = {(getattr(inp, "name", None) or "").lower() for inp in raw_inputs}
+        if names.intersection(cls.identity_fields) and names.intersection(cls.login_secret_fields):
+            return False
+        classified = cls._classify_password_fields(raw_inputs)
+        has_password_typed = any(
+            (getattr(inp, "input_type", None) or "").lower() == "password"
+            or any(tok in (getattr(inp, "name", None) or "").lower() for tok in ("password", "passwd", "pwd"))
+            for inp in raw_inputs
+        )
+        return bool(classified["new"] or classified["confirm"] or classified["current"] or has_password_typed)
+
+    @classmethod
+    def _credential_change_action_processed(cls, response: object) -> bool:
+        """Handler ran for a password-change request (success or validation failure)."""
+        if cls._response_rejected(response):
+            return False
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status not in {200, 201, 202, 204, 302, 303}:
+            return False
+        body = str(getattr(response, "body", "") or "")
+        return bool(_CREDENTIAL_ACTION_PROCESSED_RE.search(body))
+
+    @classmethod
+    def _build_csrf_form_payload(cls, raw_inputs: list) -> tuple[dict[str, object], str | None, bool]:
+        """Build probe fields for CSRF verification.
+
+        Credential-mutating forms deliberately use non-matching new/confirm values
+        (and a wrong current password when present) so a successful CSRF proof
+        cannot permanently change the scan account password. Login forms are not
+        expected here; callers already filter them.
+        """
+        credential_mutating = cls._is_credential_mutating_form(raw_inputs)
+        classified = cls._classify_password_fields(raw_inputs) if credential_mutating else {
+            "current": [], "new": [], "confirm": [],
+        }
+        csrf_param = None
+        inputs_payload: dict[str, object] = {}
+        for inp in raw_inputs:
+            inp_name = getattr(inp, "name", "") or ""
+            inp_type = (getattr(inp, "input_type", None) or "text").lower()
+            if not inp_name:
+                continue
+            if inp_name.lower() in cls.csrf_keywords:
+                csrf_param = inp_name
+                inputs_payload[inp_name] = str(getattr(inp, "value", "") or "")
+                continue
+            if credential_mutating and inp_name in classified["confirm"]:
+                inputs_payload[inp_name] = "sentry_new_password_b"
+            elif credential_mutating and inp_name in classified["current"]:
+                inputs_payload[inp_name] = "sentry_wrong_current_password"
+            elif credential_mutating and (
+                inp_name in classified["new"] or inp_type == "password"
+                or any(tok in inp_name.lower() for tok in ("password", "passwd", "pwd"))
+            ):
+                # New password (or unclassified password-typed field): distinct from confirm.
+                inputs_payload[inp_name] = "sentry_new_password_a"
+            elif inp_type == "password":
+                inputs_payload[inp_name] = "sentry_password123"
+            elif inp_type in {"submit", "button", "image"}:
+                inputs_payload[inp_name] = getattr(inp, "value", "Submit") or "Submit"
+            else:
+                inputs_payload[inp_name] = "sentry_test_val"
+        return inputs_payload, csrf_param, credential_mutating
 
     @staticmethod
     def _normalize_form(form: object) -> object:
@@ -103,7 +239,7 @@ class CSRFDetector(BaseDetector):
             form_url = getattr(form, "action", "") or getattr(form, "page_url", "")
             form_method = (getattr(form, "method", "POST") or "POST").upper()
             raw_inputs = list(getattr(form, "inputs", []))
-            input_names_lower = {getattr(inp, "name", "").lower() for inp in raw_inputs}
+            input_names_lower = {(getattr(inp, "name", None) or "").lower() for inp in raw_inputs}
             input_types_lower = {
                 str(getattr(inp, "input_type", "") or "").lower() for inp in raw_inputs
             }
@@ -512,30 +648,28 @@ class CSRFDetector(BaseDetector):
             cand_findings = []
 
             # Identify if a CSRF token parameter exists
-            csrf_param = None
-            inputs_payload = {}
-            for inp in raw_inputs:
-                inp_name = getattr(inp, "name", "")
-                inp_type = getattr(inp, "input_type", "text").lower()
-                if not inp_name:
-                    continue
-                if inp_name.lower() in self.csrf_keywords:
-                    csrf_param = inp_name
-                    inputs_payload[inp_name] = str(getattr(inp, "value", "") or "")
-                    continue
-                # Set dummy/default value for other inputs
-                if inp_type == "password":
-                    inputs_payload[inp_name] = "sentry_password123"
-                elif inp_type == "submit" or inp_type == "button":
-                    inputs_payload[inp_name] = getattr(inp, "value", "Submit") or "Submit"
-                else:
-                    inputs_payload[inp_name] = "sentry_test_val"
+            inputs_payload, csrf_param, credential_mutating = self._build_csrf_form_payload(raw_inputs)
 
             # Setup/reset actions are destructive scanner targets. Their markup may
             # still lack a token, but actively replaying them is not an acceptable
             # way to prove CSRF and can invalidate the rest of the scan.
             if is_setup_route:
                 return []
+
+            # A lone new-password field with no confirm/current gate can permanently
+            # rewrite the scan account if we submit a matching value. Without a
+            # non-committing pair, skip active mutation (same safety bar as the
+            # auth detector's disposable-only password-change probe). CSRF on
+            # new+confirm forms still runs with mismatched values below.
+            if credential_mutating:
+                classified = self._classify_password_fields(raw_inputs)
+                if classified["new"] and not classified["confirm"] and not classified["current"]:
+                    logger.debug(
+                        "CSRF: skipping single-field password-change probe on %s "
+                        "(would mutate scan credentials)",
+                        form_url,
+                    )
+                    return []
 
             async with semaphore:
                 try:
@@ -553,6 +687,14 @@ class CSRFDetector(BaseDetector):
                         else:
                             injected_params = payload
                         return injected_url, injected_params, injected_data, None, None
+
+                    def _action_accepted(response: object) -> bool:
+                        if self._response_indicates_processing(response):
+                            return True
+                        # Password-change handlers often return a validation error
+                        # (mismatch / wrong current) instead of a success word —
+                        # that still proves the forged request reached app logic.
+                        return credential_mutating and self._credential_change_action_processed(response)
 
                     control_response = None
                     if csrf_param:
@@ -572,7 +714,7 @@ class CSRFDetector(BaseDetector):
                             json_body=control_json,
                             test_phase="valid_token_control",
                         )
-                        if not self._response_indicates_processing(control_response):
+                        if not _action_accepted(control_response):
                             return []
 
                     test_payload = inputs_payload.copy()
@@ -597,7 +739,7 @@ class CSRFDetector(BaseDetector):
                     if control_response is not None:
                         accepted = self._responses_equivalent(control_response, bypass_response)
                     else:
-                        accepted = self._response_indicates_processing(bypass_response)
+                        accepted = _action_accepted(bypass_response)
                     if not accepted:
                         return []
 

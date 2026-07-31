@@ -91,7 +91,7 @@ class FileUploadDetector(BaseDetector):
             # Accept both "file" and "FILE" - normalise to lower-case.
             file_inputs = [
                 inp for inp in raw_inputs
-                if getattr(inp, "input_type", "").lower() == "file"
+                if (getattr(inp, "input_type", None) or "").lower() == "file"
             ]
             if file_inputs:
                 candidates.append(
@@ -910,7 +910,7 @@ class FileUploadDetector(BaseDetector):
             name = getattr(inp, "name", "")
             if not name:
                 continue
-            inp_type = getattr(inp, "input_type", "text").lower()
+            inp_type = (getattr(inp, "input_type", None) or "text").lower()
             if inp_type == "file":
                 # Exclude all file fields - they are passed via the `files=` kwarg.
                 continue

@@ -322,8 +322,16 @@ class OpenRedirectDetector(BaseDetector):
         if not browser_available or not PLAYWRIGHT_AVAILABLE:
             return []
         settings = get_settings()
-        max_jobs = max(0, scan_config.open_redirect_browser_max_jobs if scan_config else getattr(settings, "open_redirect_browser_max_jobs", 10))
-        budget = float(scan_config.open_redirect_browser_budget_seconds if scan_config else getattr(settings, "open_redirect_browser_budget_seconds", 45.0))
+        default_max_jobs = int(getattr(settings, "open_redirect_browser_max_jobs", 10))
+        default_budget = float(getattr(settings, "open_redirect_browser_budget_seconds", 45.0))
+        max_jobs = max(0, int(
+            scan_config.get_val("open_redirect_browser_max_jobs", default_max_jobs)
+            if scan_config else default_max_jobs
+        ))
+        budget = float(
+            scan_config.get_val("open_redirect_browser_budget_seconds", default_budget)
+            if scan_config else default_budget
+        )
         if max_jobs == 0 or budget <= 0:
             return []
 

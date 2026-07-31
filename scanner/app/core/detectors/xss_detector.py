@@ -217,7 +217,10 @@ class XSSDetector(BaseDetector):
 
         scan_config = kwargs.get("scan_config")
         settings = get_settings()
-        effective_concurrency = scan_config.scanner_concurrency if scan_config else settings.scanner_concurrency
+        effective_concurrency = (
+            scan_config.get_val("scanner_concurrency", settings.scanner_concurrency)
+            if scan_config else settings.scanner_concurrency
+        )
         worker_count = max(1, min(4, effective_concurrency // 2 or 1))
         stored_probe_urls = XSSVerifier.select_stored_probe_urls(
             list(dict.fromkeys([*urls, *(target.url for target in targets)]))
@@ -451,8 +454,16 @@ class XSSDetector(BaseDetector):
             return []
 
         settings = get_settings()
-        max_jobs = max(0, scan_config.xss_browser_dom_max_jobs if scan_config else int(getattr(settings, "xss_browser_dom_max_jobs", 12)))
-        budget = float(scan_config.xss_browser_dom_budget_seconds if scan_config else getattr(settings, "xss_browser_dom_budget_seconds", 60.0))
+        default_max_jobs = int(getattr(settings, "xss_browser_dom_max_jobs", 12))
+        default_budget = float(getattr(settings, "xss_browser_dom_budget_seconds", 60.0))
+        max_jobs = max(0, int(
+            scan_config.get_val("xss_browser_dom_max_jobs", default_max_jobs)
+            if scan_config else default_max_jobs
+        ))
+        budget = float(
+            scan_config.get_val("xss_browser_dom_budget_seconds", default_budget)
+            if scan_config else default_budget
+        )
         if max_jobs == 0 or budget <= 0:
             return []
 

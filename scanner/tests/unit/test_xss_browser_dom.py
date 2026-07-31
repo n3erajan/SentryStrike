@@ -958,3 +958,78 @@ def test_probe_stored_browser_oracle_skipped_without_canary(monkeypatch):
     )
     assert result[0] is False
 
+
+
+# --- per-scan config resolution -------------------------------------------------------
+
+
+def test_sweep_runs_when_scan_config_omits_dom_fields(monkeypatch):
+    """A ScanConfig that sets only unrelated fields must not kill the DOM sweep.
+
+    Every ScanConfig field is Optional/None-by-default, so reading
+    ``scan_config.xss_browser_dom_max_jobs`` directly yields None and blows up
+    the whole detector before the sweep ever runs.
+    """
+    from shared.schemas.scan_schema import ScanConfig
+
+    detector = XSSDetector()
+    targets = [_qtarget("http://x/#/search", "q")]
+
+    class _FakeContext:
+        async def close(self):
+            pass
+
+    class _FakeBrowser:
+        async def new_context(self, **kwargs):
+            return _FakeContext()
+
+    class _FakeChromium:
+        async def launch(self, **kwargs):
+            return _FakeBrowser()
+
+    class _FakeP:
+        chromium = _FakeChromium()
+
+        async def stop(self):
+            pass
+
+    class _FakePlaywrightCM:
+        async def start(self):
+            return _FakeP()
+
+    monkeypatch.setattr("app.core.detectors.xss_detector.async_playwright", lambda: _FakePlaywrightCM())
+    monkeypatch.setattr("app.core.detectors.xss_detector.PLAYWRIGHT_AVAILABLE", True)
+
+    async def fake_new_ctx(self, browser, route_url, storage_state=None):
+        return _FakeContext()
+
+    async def fake_verify(self, route_url, parameter, location, *, canary=None, context=None):
+        return {"fired": True, "vector": "svg_onload", "surface": "hash_query"}
+
+    monkeypatch.setattr(XSSVerifier, "_new_reflection_context", fake_new_ctx)
+    monkeypatch.setattr(XSSVerifier, "verify_reflected_dom", fake_verify)
+
+    findings = asyncio.run(
+        detector._browser_dom_reflection_sweep(
+            targets, [], {}, browser_available=True, existing_findings=[],
+            scan_config=ScanConfig(scanner_concurrency=10),
+        )
+    )
+
+    assert len(findings) == 1
+    assert findings[0].detection_method == "dom_xss_browser_execution"
+
+
+def test_detect_survives_scan_config_without_concurrency():
+    """`scanner_concurrency` unset must fall back, not raise a TypeError."""
+    from shared.schemas.scan_schema import ScanConfig
+
+    detector = XSSDetector()
+    findings = asyncio.run(
+        detector.detect(
+            ["http://x/"], [],
+            browser_available=False,
+            scan_config=ScanConfig(crawl_depth=2),
+        )
+    )
+    assert isinstance(findings, list)

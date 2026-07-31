@@ -170,6 +170,67 @@ async def test_csrf_actively_verifies_get_password_change_form(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_csrf_password_change_probe_uses_non_committing_mismatched_passwords(monkeypatch):
+    """Password-change CSRF must not submit matching new/confirm values.
+
+    Matching values permanently rewrite the scan account password while leaving
+    the session valid — poisoning the next scan's login. Proof still holds when
+    the handler runs and rejects a mismatch (or accepts a disposable change).
+    """
+    captured: list[dict] = []
+
+    class _RecordingVerifier(_FakeVerifier):
+        async def send_request(self, url, method, params, data, headers=None, test_phase="", **kwargs):
+            payload = params if method.upper() == "GET" else data
+            if isinstance(payload, dict):
+                captured.append(dict(payload))
+            # Application processed the change attempt but rejected the mismatch.
+            return _FakeResponse(status_code=200, body="<pre>Passwords did not match.</pre>")
+
+    monkeypatch.setattr(csrf_module, "HttpVerifier", _RecordingVerifier)
+
+    detector = CSRFDetector()
+    form = SimpleNamespace(
+        action="http://target.test/account/password",
+        page_url="http://target.test/account/password",
+        method="GET",
+        inputs=[
+            SimpleNamespace(name="password_new", input_type="password", value=""),
+            SimpleNamespace(name="password_conf", input_type="password", value=""),
+            SimpleNamespace(name="Change", input_type="submit", value="Change"),
+        ],
+    )
+
+    findings = await detector.detect(
+        ["http://target.test/account/password"],
+        [form],
+        session_cookies={"session": "abc123"},
+        auth_headers={},
+        browser_forms=[],
+    )
+
+    assert findings, "mismatch validation still proves the forged request hit the handler"
+    assert captured, "expected an active CSRF probe"
+    probe = captured[0]
+    assert probe["password_new"] != probe["password_conf"], probe
+    assert probe["Change"] == "Change"
+
+
+def test_csrf_password_change_payload_builder_mismatches_confirm():
+    detector = CSRFDetector()
+    inputs = [
+        SimpleNamespace(name="password_new", input_type="password", value=""),
+        SimpleNamespace(name="password_conf", input_type="password", value=""),
+        SimpleNamespace(name="Change", input_type="submit", value="Change"),
+    ]
+    payload, csrf_param, mutating = detector._build_csrf_form_payload(inputs)
+    assert mutating is True
+    assert csrf_param is None
+    assert payload["password_new"] != payload["password_conf"]
+    assert payload["Change"] == "Change"
+
+
+@pytest.mark.asyncio
 async def test_csrf_ignores_generic_login_form_with_field_aliases(monkeypatch):
     monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
 

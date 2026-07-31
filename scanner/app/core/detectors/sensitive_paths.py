@@ -285,6 +285,11 @@ class SensitivePathsDetector(BaseDetector):
         request_snippet: str | None = None,
         confidence_score: float = 90.0,
     ) -> Finding:
+        # `proof_type` here is descriptive detail for the AI evidence brief only.
+        # The calibrated proof type that drives the false-positive floor and
+        # ceiling is derived from `detection_method` by EvidenceGrader and
+        # overwrites Evidence.proof_type during finding processing, so a value
+        # passed here never reaches the calibration tables.
         return Finding(
             category=OwaspCategory.a02,
             vuln_type=vuln_type,

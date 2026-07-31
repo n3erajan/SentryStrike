@@ -242,12 +242,14 @@ async def test_scanner_workflow_reports_unreachable_target() -> None:
 
     assert scan.status == ScanStatus.failed
     assert scan.current_phase == ScanPhase.failed
+    # The raw exception (with the target host) stays in the logs; the stored
+    # message is the safe, actionable copy from public_scan_failure.
     assert scan.error_message == (
-        "Target is unreachable: example.com (connection timed out)"
+        "We couldn't connect to the target. Confirm that it is reachable "
+        "from the scanner, then try again."
     )
-    assert scan.phase_message == (
-        "Scan failed: Target is unreachable: example.com (connection timed out)"
-    )
+    assert "example.com" not in scan.error_message
+    assert scan.phase_message == "Scan failed"
     assert scan.vulnerabilities == []
 
 

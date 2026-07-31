@@ -40,6 +40,11 @@ def public_scan_failure(exc: Exception) -> str:
     return "The scan stopped before it could finish. Please try again."
 
 
+def _count_label(count: int, noun: str) -> str:
+    """Humanized count label, e.g. "1 finding" vs "34 findings"."""
+    return f"{count} {noun}{'s' if count != 1 else ''}"
+
+
 class PipelineMixin:
     async def _run_scan_pipeline(
         self,
@@ -285,7 +290,7 @@ class PipelineMixin:
                 detector_parallelism,
             )
 
-            await self._set_phase_progress(scan, ScanPhase.vulnerability_detection, 0.0, f"Running {len(active_detectors)} active detector(s)")
+            await self._set_phase_progress(scan, ScanPhase.vulnerability_detection, 0.0, f"Running {_count_label(len(active_detectors), 'active detector')}")
             detector_metrics: list[DetectorCoverageMetric] = []
             metric_by_detector: dict[str, DetectorCoverageMetric] = {}
 
@@ -329,6 +334,9 @@ class PipelineMixin:
                 _governor_settings.scanner_per_detector_request_cap,
                 _governor_settings.scanner_per_parameter_request_cap,
             )
+            detector_total = max(1, len(active_detectors))
+            detector_done = 0
+
             async def _detector_progress_ticker():
                 try:
                     while True:
@@ -354,12 +362,12 @@ class PipelineMixin:
                         )
                         total_work = max(self._eta_state.detector_total_work, 1e-9)
                         self._eta_state.detector_fraction = self._eta_state.detector_completed_work / total_work
-                        
+                        scan.statistics.raw_findings = len(findings)
                         await self._set_phase_progress(
                             scan,
                             ScanPhase.vulnerability_detection,
                             self._eta_state.detector_fraction,
-                            f"Detectors running... {len(findings)} raw finding(s)",
+                            f"Running detectors {detector_done}/{detector_total}: {_count_label(len(findings), 'raw finding')}",
                         )
                 except asyncio.CancelledError:
                     pass
@@ -374,8 +382,6 @@ class PipelineMixin:
                 ]
                 # Run detectors concurrently but consume them as they finish so
                 # progress ticks on work completed (not detector headcount).
-                detector_total = max(1, len(active_detectors))
-                detector_done = 0
                 for coro in asyncio.as_completed(detector_tasks):
                     result = await coro
                     detector_done += 1
@@ -415,11 +421,12 @@ class PipelineMixin:
                     self._eta_state.detector_fraction = (
                         self._eta_state.detector_completed_work / total_work
                     )
+                    scan.statistics.raw_findings = len(findings)
                     await self._set_phase_progress(
                         scan,
                         ScanPhase.vulnerability_detection,
                         self._eta_state.detector_fraction,
-                        f"Detectors {detector_done}/{detector_total} complete: {len(findings)} raw finding(s)",
+                        f"Detectors {detector_done}/{detector_total} complete: {_count_label(len(findings), 'raw finding')}",
                     )
                     
                 exception_detector = next((detector for detector in scan_detectors if isinstance(detector, ExceptionHandlingDetector)), None)
@@ -524,11 +531,12 @@ class PipelineMixin:
                 coverage_context.get("attack_planner"),
             )
 
+            scan.statistics.raw_findings = len(findings)
             await self._set_phase_progress(
                 scan,
                 ScanPhase.vulnerability_detection,
                 1.0,
-                f"Detector phase complete: {len(findings)} raw finding(s)",
+                f"Detector phase complete: {_count_label(len(findings), 'raw finding')}",
             )
             await self._check_cancelled(scan_id)
 
@@ -674,7 +682,7 @@ class PipelineMixin:
             vulnerabilities = [
                 self._to_vulnerability(f, extra_secrets=redaction_secrets) for f in findings
             ]
-            await self._set_phase_progress(scan, ScanPhase.deduplication, 1.0, f"Deduplication complete: {len(vulnerabilities)} finding(s)")
+            await self._set_phase_progress(scan, ScanPhase.deduplication, 1.0, f"Deduplication complete: {_count_label(len(vulnerabilities), 'finding')}")
 
             # Sync severity labels from the deterministic CVSS score.
             for v in vulnerabilities:

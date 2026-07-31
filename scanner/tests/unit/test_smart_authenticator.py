@@ -221,3 +221,158 @@ async def test_verify_auth_with_json_token():
     assert result.authenticated
     assert result.state == AuthVerificationState.authenticated_verified
     assert result.bearer_token == "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjF9"
+
+
+def test_build_credential_form_payload_includes_select_and_named_submit_button():
+    """Login forms often gate on a named <button type=submit> and a security <select>.
+
+    Browsers include those successful controls; credential POSTs that omit them
+    leave only a pre-auth session cookie. This is framework-agnostic HTML behavior,
+    not an app-specific rule.
+    """
+    from bs4 import BeautifulSoup
+
+    html = """
+    <form method="POST" action="/login.php">
+      <input type="text" name="login" />
+      <input type="password" name="password" />
+      <select name="security_level">
+        <option value="0">low</option>
+        <option value="1" selected>medium</option>
+        <option value="2">high</option>
+      </select>
+      <button type="submit" name="form" value="submit">Login</button>
+    </form>
+    """
+    form = BeautifulSoup(html, "html.parser").find("form")
+    auth = SmartAuthenticator(MockSettings())
+
+    payload = auth._build_credential_form_payload(form, "alice", "s3cret")
+
+    assert payload == {
+        "login": "alice",
+        "password": "s3cret",
+        "security_level": "1",
+        "form": "submit",
+    }
+
+
+def test_build_credential_form_payload_prefers_login_labelled_submitter():
+    from bs4 import BeautifulSoup
+
+    html = """
+    <form method="POST" action="/auth">
+      <input name="email" type="email" />
+      <input name="password" type="password" />
+      <button type="submit" name="cancel" value="1">Cancel</button>
+      <input type="submit" name="commit" value="Sign in" />
+    </form>
+    """
+    form = BeautifulSoup(html, "html.parser").find("form")
+    auth = SmartAuthenticator(MockSettings())
+
+    payload = auth._build_credential_form_payload(form, "a@b.c", "pw")
+
+    assert payload["email"] == "a@b.c"
+    assert payload["password"] == "pw"
+    assert payload.get("commit") == "Sign in"
+    assert "cancel" not in payload
+
+
+def test_build_credential_form_payload_keeps_input_submit_with_submit_in_name():
+    """Regression: prior logic only kept submitters whose *name* contained submit."""
+    from bs4 import BeautifulSoup
+
+    html = """
+    <form method="POST" action="/login">
+      <input name="username" />
+      <input name="password" type="password" />
+      <input type="submit" name="submit" value="Log in" />
+    </form>
+    """
+    form = BeautifulSoup(html, "html.parser").find("form")
+    auth = SmartAuthenticator(MockSettings())
+
+    payload = auth._build_credential_form_payload(form, "u", "p")
+
+    assert payload == {"username": "u", "password": "p", "submit": "Log in"}
+
+
+@pytest.mark.asyncio
+async def test_html_form_login_paths_stay_under_application_base(monkeypatch):
+    """Leading-slash login guesses must not escape a path-mounted app root."""
+    auth = SmartAuthenticator(MockSettings())
+    requested: list[str] = []
+
+    class _Client:
+        cookies = httpx.Cookies()
+        headers: dict = {}
+
+        async def get(self, url, follow_redirects=True):
+            requested.append(url)
+            return httpx.Response(
+                404,
+                text="missing",
+                request=httpx.Request("GET", url),
+            )
+
+    async def _no_form(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(auth, "_parse_and_submit_form", _no_form)
+    await auth._try_html_form_login(
+        _Client(),
+        "http://target.test/app/",
+        "user",
+        "pass",
+    )
+
+    assert requested
+    assert all(u.startswith("http://target.test/app/") for u in requested), requested
+    assert not any(u.startswith("http://target.test/login") for u in requested)
+
+
+@pytest.mark.asyncio
+async def test_authenticate_cascade_continues_past_unverified_cookies(monkeypatch):
+    """Pre-auth session cookies must not stop the cascade before a verified login."""
+    auth = SmartAuthenticator(MockSettings())
+    calls: list[str] = []
+
+    async def _spa(client, root_url):
+        return False
+
+    async def _unverified(*args, **kwargs):
+        calls.append("s1")
+        return AuthResult(
+            authenticated=True,
+            state=AuthVerificationState.authenticated_unverified,
+            cookies={"PHPSESSID": "preauth"},
+            verification_evidence="cookies present but no protected-resource proof",
+        )
+
+    async def _none(*args, **kwargs):
+        calls.append("later")
+        return None
+
+    async def _verified(*args, **kwargs):
+        calls.append("browser")
+        return AuthResult(
+            authenticated=True,
+            state=AuthVerificationState.authenticated_verified,
+            cookies={"PHPSESSID": "authed"},
+            verification_evidence="post-login success marker",
+        )
+
+    monkeypatch.setattr(auth, "_detect_spa", _spa)
+    monkeypatch.setattr(auth, "_try_redirect_login", _unverified)
+    monkeypatch.setattr(auth, "_try_html_form_login", _none)
+    monkeypatch.setattr(auth, "_try_js_api_login", _none)
+    monkeypatch.setattr(auth, "_try_browser_spa_login", _verified)
+    monkeypatch.setattr(auth, "_try_brute_force_login", _none)
+
+    result = await auth.authenticate(httpx.AsyncClient(), "http://target.test/app/", "u", "p")
+
+    assert result.state == AuthVerificationState.authenticated_verified
+    assert result.cookies == {"PHPSESSID": "authed"}
+    assert calls == ["s1", "later", "later", "browser"]
+

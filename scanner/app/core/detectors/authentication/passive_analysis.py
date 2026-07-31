@@ -24,7 +24,7 @@ class PassiveAuthAnalysisMixin:
         for form in forms:
             raw_inputs  = list(getattr(form, "inputs", []))
             input_names = {i.name.lower() for i in raw_inputs}
-            input_types = {getattr(i, "input_type", "text").lower() for i in raw_inputs}
+            input_types = {(getattr(i, "input_type", None) or "text").lower() for i in raw_inputs}
             form_url    = getattr(form, "action", getattr(form, "page_url", ""))
             form_method = getattr(form, "method", "POST").upper()
 

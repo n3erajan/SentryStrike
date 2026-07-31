@@ -351,6 +351,53 @@ def test_parse_html_self_closing_form_includes_file_input():
     assert forms[0].content_type == "multipart/form-data"
 
 
+def test_parse_html_relative_login_action_uses_final_page_url_not_protected_path():
+    """After a login bounce, forms must be resolved against the login page URL.
+
+    Resolving ``action="login.php"`` against the protected request URL invents
+    phantom endpoints like ``/vulnerabilities/fi/login.php`` and floods auth
+    detectors with noise.
+    """
+    spider = WebSpider()
+    html = """
+    <form action="login.php" method="POST">
+      <input name="username" type="text" />
+      <input name="password" type="password" />
+      <input name="Login" type="submit" value="Login" />
+    </form>
+    """
+
+    forms, _ = spider._parse_html("http://example.com/app/login.php", html)
+
+    assert len(forms) == 1
+    assert forms[0].action == "http://example.com/app/login.php"
+    assert forms[0].page_url == "http://example.com/app/login.php"
+
+
+def test_parse_html_captures_select_default_and_named_button_submitter():
+    spider = WebSpider()
+    html = """
+    <form method="POST" action="/login.php">
+      <input type="text" name="login" />
+      <input type="password" name="password" />
+      <select name="security_level">
+        <option value="0">low</option>
+        <option value="1" selected>medium</option>
+      </select>
+      <button type="submit" name="form" value="submit">Login</button>
+    </form>
+    """
+
+    forms, _ = spider._parse_html("http://example.com/app/login.php", html)
+
+    assert len(forms) == 1
+    by_name = {inp.name: inp for inp in forms[0].inputs}
+    assert by_name["security_level"].input_type == "select"
+    assert by_name["security_level"].value == "1"
+    assert by_name["form"].input_type == "submit"
+    assert by_name["form"].value == "submit"
+
+
 class FakeSessionClient:
     def __init__(self) -> None:
         self.request_count = 0
