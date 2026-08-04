@@ -40,6 +40,43 @@ class AIClient:
     def __init__(self) -> None:
         self.settings = get_settings()
 
+    async def list_models(self) -> list[str] | None:
+        """Return model ids the provider advertises, or None if it cannot be asked.
+
+        None means "unknown", not "empty": a provider that omits /v1/models, or is
+        unreachable right now, must not be reported as missing the model.
+        """
+        headers = {}
+        if self.settings.ai_api_key:
+            headers["Authorization"] = f"Bearer {self.settings.ai_api_key}"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    f"{self.settings.ai_base_url.rstrip('/')}/models",
+                    headers=headers,
+                )
+            if response.status_code >= 400:
+                return None
+            data = response.json().get("data")
+            if not isinstance(data, list):
+                return None
+            return [str(entry["id"]) for entry in data if isinstance(entry, dict) and "id" in entry]
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return None
+
+    async def check_model_available(self) -> bool | None:
+        """Whether the configured model is advertised. None when undetermined."""
+        available = await self.list_models()
+        if available is None:
+            return None
+        wanted = self.settings.ai_model
+        # Ollama reports an untagged name as "<name>:latest"; treat that as a match
+        # so AI_MODEL=llama3 is not reported missing when llama3:latest is installed.
+        candidates = {wanted, f"{wanted}:latest"}
+        if wanted.endswith(":latest"):
+            candidates.add(wanted[: -len(":latest")])
+        return any(name in candidates for name in available)
+
     async def generate_json(self, prompt: str) -> ProviderResult:
         last_error: ProviderError | None = None
         attempts = self.settings.ai_max_retries + 1
@@ -62,6 +99,7 @@ class AIClient:
                         "provider call failed non-retryably (%s): %s",
                         exc.code,
                         exc,
+                        exc_info=exc.__cause__,
                     )
                     raise
                 logger.warning(
@@ -70,6 +108,7 @@ class AIClient:
                     attempts,
                     exc.code,
                     exc,
+                    exc_info=exc.__cause__,
                 )
         if last_error is not None:
             raise last_error
@@ -102,7 +141,7 @@ class AIClient:
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             raise ProviderError(
                 "provider_unavailable",
-                "The AI provider could not be reached",
+                f"The AI provider at {self.settings.ai_base_url} could not be reached",
                 retryable=True,
             ) from exc
 

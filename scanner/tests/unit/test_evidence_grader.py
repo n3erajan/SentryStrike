@@ -13,8 +13,11 @@ from shared.models.vulnerability import (
     EvidenceStrength,
     LocationInfo,
     OwaspCategory,
+    PROOF_CEILINGS,
     SeverityLevel,
     Vulnerability,
+    get_fp_ceiling,
+    get_fp_floor,
 )
 
 grader = EvidenceGrader()
@@ -90,7 +93,7 @@ class TestActiveOutputMethods:
     def test_active_output_method(self, method):
         grade = grader.grade(_vuln("Test Vuln", detection_method=method))
         assert grade.proof_type == "active_output"
-        assert grade.fp_ceiling == 0.05
+        assert grade.fp_ceiling == get_fp_ceiling("active_output")
         assert grade.grade == "A"
 
 
@@ -101,7 +104,7 @@ class TestErrorEchoMethods:
     def test_error_echo_method(self, method):
         grade = grader.grade(_vuln("SQL Injection (Error-Based)", detection_method=method))
         assert grade.proof_type == "error_echo"
-        assert grade.fp_ceiling == 0.05
+        assert grade.fp_ceiling == get_fp_ceiling("error_echo")
         assert grade.grade == "A"
 
 
@@ -113,7 +116,7 @@ class TestTimingMethods:
                      detection_evidence={"baseline_mean_ms": 300, "delta_ms": 4800, "expected_sleep_ms": 5000})
         grade = grader.grade(vuln)
         assert grade.proof_type == "timing_strong"
-        assert grade.fp_ceiling == 0.15
+        assert grade.fp_ceiling == get_fp_ceiling("timing_strong")
 
     def test_timing_strong_no_baseline_large_absolute(self):
         vuln = _vuln("SQL Injection (Time-Based Blind)", detection_method="time_based_blind",
@@ -126,7 +129,7 @@ class TestTimingMethods:
                      detection_evidence={"baseline_mean_ms": 300, "delta_ms": 600, "expected_sleep_ms": 5000})
         grade = grader.grade(vuln)
         assert grade.proof_type == "timing_weak"
-        assert grade.fp_ceiling == 0.40
+        assert grade.fp_ceiling == get_fp_ceiling("timing_weak")
 
     def test_timing_weak_small_absolute_no_baseline(self):
         vuln = _vuln("SQL Injection (Time-Based Blind)", detection_method="time_based",
@@ -157,7 +160,7 @@ class TestConfirmedAuthMethods:
         grade = grader.grade(_vuln("Insecure Direct Object Reference (IDOR)",
                                    detection_method=method, category=OwaspCategory.a01))
         assert grade.proof_type == "auth_confirmed"
-        assert grade.fp_ceiling == 0.15
+        assert grade.fp_ceiling == get_fp_ceiling("auth_confirmed")
         assert grade.grade == "A"
 
 
@@ -172,7 +175,7 @@ class TestAuthDifferentialMethods:
         grade = grader.grade(_vuln("Unauthenticated API Data Exposure",
                                    detection_method=method, category=OwaspCategory.a01))
         assert grade.proof_type == "auth_differential"
-        assert grade.fp_ceiling == 1.0
+        assert grade.fp_ceiling == get_fp_ceiling("auth_differential")
 
     @pytest.mark.parametrize("vuln_type", [
         "Unauthenticated API Data Exposure",
@@ -186,7 +189,7 @@ class TestAuthDifferentialMethods:
         grade = grader.grade(_vuln(vuln_type, detection_method="unknown_method",
                                    category=OwaspCategory.a01))
         assert grade.proof_type == "auth_differential"
-        assert grade.fp_ceiling == 1.0
+        assert grade.fp_ceiling == get_fp_ceiling("auth_differential")
 
 
 class TestPatternMatchMethods:
@@ -205,13 +208,13 @@ class TestPatternMatchMethods:
     def test_pattern_match_method(self, method):
         grade = grader.grade(_vuln("Verbose Error Handling", detection_method=method))
         assert grade.proof_type == "pattern_match"
-        assert grade.fp_ceiling == 1.0
+        assert grade.fp_ceiling == get_fp_ceiling("pattern_match")
 
     def test_reflection_prefix_is_pattern_match(self):
         """XSS reflection_* methods: reflection without execution — AI judges."""
         grade = grader.grade(_vuln("Reflected XSS", detection_method="reflection_attribute"))
         assert grade.proof_type == "pattern_match"
-        assert grade.fp_ceiling == 1.0
+        assert grade.fp_ceiling == get_fp_ceiling("pattern_match")
 
     @pytest.mark.parametrize("vuln_type", [
         "Verbose Error Handling",
@@ -222,7 +225,7 @@ class TestPatternMatchMethods:
     def test_pattern_match_keyword_match(self, vuln_type):
         grade = grader.grade(_vuln(vuln_type, detection_method="unknown"))
         assert grade.proof_type == "pattern_match"
-        assert grade.fp_ceiling == 1.0
+        assert grade.fp_ceiling == get_fp_ceiling("pattern_match")
 
 
 def test_ssrf_inband_is_indirect_differential_not_pattern_match() -> None:
@@ -246,7 +249,7 @@ def test_ssrf_inband_is_indirect_differential_not_pattern_match() -> None:
     brief = grader.build_evidence_brief(vulnerability, grade)
 
     assert grade.proof_type == "ssrf_differential"
-    assert grade.fp_ceiling == 0.49
+    assert grade.fp_ceiling == get_fp_ceiling("ssrf_differential")
     assert "not confirmed" in grade.reason.lower()
     assert "control_samples" in brief
     assert "internal_samples" in brief
@@ -274,7 +277,7 @@ class TestStructuralVulnTypes:
         grade = grader.grade(_vuln(vuln_type, detection_method="some_method",
                                    category=OwaspCategory.a02))
         assert grade.proof_type == "structural"
-        assert grade.fp_ceiling == 0.10
+        assert grade.fp_ceiling == get_fp_ceiling("structural")
         assert grade.grade == "B"
 
     def test_upload_allowlist_differential_is_structural_proof(self):
@@ -286,7 +289,7 @@ class TestStructuralVulnTypes:
         )
 
         assert grade.proof_type == "structural"
-        assert grade.fp_ceiling == 0.10
+        assert grade.fp_ceiling == get_fp_ceiling("structural")
 
 
 class TestHeuristicFallback:
@@ -296,7 +299,7 @@ class TestHeuristicFallback:
         grade = grader.grade(_vuln("Some Unknown Vulnerability",
                                    detection_method="totally_unknown_method"))
         assert grade.proof_type == "heuristic"
-        assert grade.fp_ceiling == 0.40
+        assert grade.fp_ceiling == get_fp_ceiling("heuristic")
 
 
 # ---------------------------------------------------------------------------
@@ -547,40 +550,33 @@ class TestEvidenceBrief:
 class TestCeilingBehavior:
 
     def test_auth_differential_allows_full_fp_from_ai(self):
-        """The whole point: auth_differential has no ceiling so the AI can
-        flag detector-verified false positives freely."""
+        """auth_differential has no ceiling so the AI can flag detector-verified
+        false positives freely."""
         vuln = _vuln("Unauthenticated API Data Exposure",
                      detection_method="authorization_matrix",
                      verified=True, confidence=88.0, category=OwaspCategory.a01)
         grade = grader.grade(vuln)
         assert grade.fp_ceiling == 1.0
-        # Even though verified=True + confidence=88, the AI can output fp=0.9
-
-    def test_error_echo_protects_real_sqli(self):
-        """Genuine SQLi error echo is protected — AI cannot dismiss it."""
-        vuln = _vuln("SQL Injection (Error-Based)", detection_method="error_based",
-                     verified=True, confidence=95.0,
-                     detection_evidence={"errors_detected": ["syntax error at or near"]})
-        grade = grader.grade(vuln)
-        assert grade.fp_ceiling == 0.05
-
-    def test_timing_strong_protects_real_sqli(self):
-        vuln = _vuln("SQL Injection (Time-Based Blind)", detection_method="time_based",
-                     verified=True, confidence=90.0,
-                     detection_evidence={"baseline_mean_ms": 200, "delta_ms": 4800})
-        grade = grader.grade(vuln)
-        assert grade.fp_ceiling == 0.15
-
-    def test_timing_weak_allows_ai_judgment(self):
-        """Borderline timing — AI should be able to flag as FP."""
-        vuln = _vuln("SQL Injection (Time-Based Blind)", detection_method="time_based",
-                     verified=True, confidence=75.0,
-                     detection_evidence={"baseline_mean_ms": 300, "delta_ms": 600})
-        grade = grader.grade(vuln)
-        assert grade.fp_ceiling == 0.40
 
     def test_pattern_match_allows_full_fp_from_ai(self):
         vuln = _vuln("Verbose Error Handling", detection_method="observed_exception_evidence",
                      verified=True, confidence=85.0)
         grade = grader.grade(vuln)
         assert grade.fp_ceiling == 1.0
+
+    @pytest.mark.parametrize("proof_type", sorted(PROOF_CEILINGS))
+    def test_every_proof_type_can_reach_the_verdict_gate(self, proof_type):
+        """The analyzer requires fp >= 0.50 before accepting a likely_false_positive
+        verdict. A ceiling below that makes the verdict unreachable and silently
+        discards the adjudication pass for that proof type."""
+        assert get_fp_ceiling(proof_type) >= 0.50
+
+    @pytest.mark.parametrize("proof_type", sorted(PROOF_CEILINGS))
+    def test_floor_never_exceeds_ceiling(self, proof_type):
+        assert get_fp_floor(proof_type) <= get_fp_ceiling(proof_type)
+
+    def test_strong_proof_retains_a_lower_ceiling_than_interpretive_proof(self):
+        """Ceilings still encode proof quality: dynamic exploitation proof is
+        harder to dismiss than a regex hit, just no longer impossible."""
+        assert get_fp_ceiling("active_output") < get_fp_ceiling("pattern_match")
+        assert get_fp_ceiling("error_echo") < get_fp_ceiling("heuristic")

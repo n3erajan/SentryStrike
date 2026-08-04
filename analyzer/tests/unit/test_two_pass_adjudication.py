@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 import pytest
 
@@ -117,10 +118,19 @@ async def test_two_pass_analysis_documentation_fp():
 
 
 @pytest.mark.asyncio
-async def test_active_output_ceiling_clamping():
-    # Model mistakenly marks FP on active output, but code ceiling (0.05) clamps it!
-    axes = {"CONTENT_PRE_EXISTING": "yes"}
-    client = MockTwoPassClient(axes, "likely_false_positive", "Looks like pre-existing text.")
+async def test_active_output_ceiling_allows_reasoned_downgrade():
+    # Ceilings bound overconfidence but must stay above the 0.50 verdict gate, or
+    # the adjudication pass can never downgrade a finding on this proof type.
+    axes = {
+        "EVIDENTIAL_ALIGNMENT": "no",
+        "SCANNER_CLAIM_CONTRADICTED": "yes",
+        "CAUSALLY_CONNECTED": "no",
+    }
+    client = MockTwoPassClient(
+        axes,
+        "likely_false_positive",
+        "The passwd listing is present in the control response, so the payload did not cause it.",
+    )
     service = FindingAnalysisService(client)
     service.settings = SimpleNamespace(
         ai_analysis_enabled=True,
@@ -144,6 +154,72 @@ async def test_active_output_ceiling_clamping():
 
     analysis, result = await service.analyze(vuln, revision=1, technology_stack="Linux/Bash")
 
-    # Probability was clamped by active_output ceiling (0.05), so verdict fell back to uncertain
-    assert analysis.false_positive_probability <= 0.05
+    assert analysis.verdict.value == "likely_false_positive"
+    assert analysis.false_positive_probability == 0.80
+
+
+@pytest.mark.asyncio
+async def test_weak_reasoning_still_blocks_downgrade():
+    # The gate rejects a downgrade that is not justified, independent of the ceiling.
+    axes = {
+        "EVIDENTIAL_ALIGNMENT": "no",
+        "SCANNER_CLAIM_CONTRADICTED": "yes",
+        "CAUSALLY_CONNECTED": "no",
+    }
+    client = MockTwoPassClient(axes, "likely_false_positive", "Looks wrong.")
+    service = FindingAnalysisService(client)
+    service.settings = SimpleNamespace(
+        ai_analysis_enabled=True,
+        analysis_finding_evidence_max_chars=3000,
+        ai_model="gemma4-e4b-it-qat",
+    )
+
+    vuln = Vulnerability(
+        id="v-rce-2",
+        category=OwaspCategory.a05,
+        vuln_type="Command Injection",
+        severity=SeverityLevel.critical,
+        cvss_score=9.8,
+        location=LocationInfo(url="https://target.test/exec"),
+        evidence=Evidence(
+            response_snippet="uid=33(www-data)",
+            evidence_strength=EvidenceStrength.confirmed_exploit,
+            proof_type="active_output",
+        ),
+    )
+
+    analysis, _ = await service.analyze(vuln, revision=1, technology_stack="Linux/Bash")
+
     assert analysis.verdict.value == "uncertain"
+    assert analysis.false_positive_probability <= 0.49
+
+
+def test_evidence_json_keeps_metadata_when_snippet_is_huge():
+    from app.services.finding_analysis import build_evidence_json
+
+    vuln = Vulnerability(
+        id="v-big",
+        category=OwaspCategory.a03,
+        vuln_type="SQL Injection",
+        severity=SeverityLevel.high,
+        cvss_score=8.1,
+        location=LocationInfo(url="https://target.test/item?id=1"),
+        evidence=Evidence(
+            response_snippet="A" * 50_000,
+            detection_method="error_based_sqli",
+            evidence_strength=EvidenceStrength.confirmed_observation,
+            evidence_grade="A",
+            evidence_grade_reason="DB error echoed.",
+            proof_type="error_echo",
+        ),
+    )
+
+    raw = build_evidence_json(vuln, 6000)
+
+    # Valid JSON, within budget, and the adjudicator's decision inputs survived.
+    parsed = json.loads(raw)
+    assert len(raw) <= 6000
+    assert parsed["proof_type"] == "error_echo"
+    assert parsed["detection_method"] == "error_based_sqli"
+    assert parsed["evidence_grade"] == "A"
+    assert len(parsed["response_snippet"]) < 50_000

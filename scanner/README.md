@@ -64,6 +64,8 @@ Candidate findings pass through [`app/core/verification/`](app/core/verification
 
 Every stored result carries an evidence-strength grade — `confirmed_exploit`, `confirmed_observation`, `probable`, `possible`, or `informational` — plus confidence, reproducibility, review status, detector attribution, and supporting request/response evidence where available.
 
+Grading also classifies the proof type behind a finding and records an evidence brief stating what that proof establishes, where it is weak, and the question a reviewer should answer. The analyzer consumes the brief as trusted context when adjudicating false positives.
+
 > [!NOTE]
 > Evidence-driven means the scanner distinguishes an observed signal from a confirmed exploit. It does not mean every vulnerability class can be proven automatically. Review coverage warnings and validate high-impact findings manually.
 

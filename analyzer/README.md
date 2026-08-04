@@ -10,8 +10,8 @@ The analyzer does not discover vulnerabilities. Scanner evidence remains the sou
 2. A worker atomically claims due work and obtains a renewable lease.
 3. Each finding is processed in two provider passes:
    - enrichment for description, exploitability, impact, remediation, and references;
-   - adjudication for categorical false-positive axes, verdict, and reasoning.
-4. Deterministic floors, ceilings, and downgrade rules calibrate the provider's false-positive probability.
+   - adjudication for categorical false-positive axes, verdict, and reasoning. The scanner's evidence brief, which states what the proof type establishes and where it is weak, is supplied as trusted input alongside the untrusted target evidence.
+4. Deterministic floors and ceilings bound the provider's false-positive probability by proof type, and a downgrade rule requires a probability of at least 0.50 with supporting reasoning before a `likely_false_positive` verdict is accepted. Ceilings stay above that threshold so the adjudication pass can act on every proof type; they remain ordered by proof quality, so dismissing dynamic exploitation proof requires more than dismissing a pattern match.
 5. Progress and per-finding analysis are published with revision and lease guards.
 6. A final report summary is generated and the job becomes terminal.
 
@@ -20,6 +20,18 @@ Provider and schema failures use bounded retries. Expired leases are recovered o
 ## Provider requirements
 
 The default provider is Ollama at `http://localhost:11434/v1`, using the configured `AI_MODEL`. Docker Compose uses `host.docker.internal` to reach Ollama running on the host. With this default, scanner evidence is sent only to the local Ollama service. Any provider implementing an OpenAI-compatible chat-completions API can be used by changing `AI_BASE_URL`, `AI_MODEL`, and credentials when required; its data-handling policy then applies.
+
+Build the default model once before the first scan:
+
+```bash
+ollama create gemma4:e4b-it-qat-16k -f analyzer/ollama/Modelfile
+```
+
+The Modelfile pins the context window the analyzer's prompts require. An
+undersized window is not a visible failure: Ollama drops the overflow and the
+model answers from what remains, so a truncated adjudication reaches the API
+looking identical to a real one. See [`ollama/README.md`](ollama/README.md) for
+the measured prompt sizes and model comparison.
 
 The selected model should reliably return JSON matching the analyzer's Pydantic schemas. Provider request IDs and available token counts are retained on the analysis job for observability.
 
@@ -62,7 +74,7 @@ Shared infrastructure and queue variables live in [`../.env.example`](../.env.ex
 | `ANALYSIS_LEASE_RENEW_SECONDS` | Lease renewal cadence |
 | `ANALYSIS_POLL_SECONDS` | Redis wait and MongoDB polling cadence |
 | `ANALYSIS_RECONCILE_INTERVAL_SECONDS` | Missing-job repair cadence |
-| `ANALYSIS_FINDING_EVIDENCE_MAX_CHARS` | Per-finding prompt input bound |
+| `ANALYSIS_FINDING_EVIDENCE_MAX_CHARS` | Per-finding prompt input bound. Detection metadata is always retained; the response excerpt is fitted to the remaining budget |
 | `ANALYSIS_REPORT_INPUT_MAX_CHARS` | Report-summary prompt input bound |
 
 ## Project structure

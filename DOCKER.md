@@ -125,14 +125,25 @@ The analyzer is configured for Ollama by default and accepts any provider implem
 
 ```dotenv
 AI_BASE_URL=http://host.docker.internal:11434/v1
-AI_MODEL=gemma4-e4b-it-qat
+AI_MODEL=gemma4:e4b-it-qat-16k
 AI_API_KEY=
 AI_TIMEOUT_SECONDS=120
 AI_MAX_RETRIES=3
 AI_JSON_MODE=true
 ```
 
-Make sure the configured model exists in Ollama and the service is reachable from Docker. With the default local Ollama configuration, scan evidence stays within the deployment. For a hosted or separately deployed provider, replace `AI_BASE_URL`, `AI_MODEL`, and `AI_API_KEY` as required; that provider receives the analysis input, so review its data-handling terms. Provider responses must support the analyzer's structured JSON contract.
+Build the default model once on the Ollama host before the first scan:
+
+```bash
+ollama create gemma4:e4b-it-qat-16k -f analyzer/ollama/Modelfile
+```
+
+It pins the context window the analyzer's prompts require. A stock build with a
+smaller window does not reject an oversized prompt; it silently drops the
+overflow and answers from what remains, which produces confident analysis of
+evidence the model never saw. See [`analyzer/ollama/README.md`](analyzer/ollama/README.md).
+
+Make sure the configured model exists in Ollama and the service is reachable from Docker. With the default local Ollama configuration, scan evidence stays within the deployment. For a hosted or separately deployed provider, replace `AI_BASE_URL`, `AI_MODEL`, and `AI_API_KEY` as required; that provider receives the analysis input, so review its data-handling terms. Provider responses must support the analyzer's structured JSON contract and the context window must cover the analyzer's prompt sizes.
 
 ### OAST routing
 

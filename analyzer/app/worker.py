@@ -125,6 +125,7 @@ async def _record_failure(
         job.max_attempts,
         error.code,
         error,
+        exc_info=error.__cause__,
     )
     return projection_failed and job_failed
 
@@ -511,6 +512,40 @@ async def recover_expired_analysis_jobs(
     return recovered_count
 
 
+async def _log_model_availability(client: AIClient) -> None:
+    """Warn once at startup when the configured model is not installed.
+
+    Advisory only. The worker keeps consuming the durable queue and jobs fail
+    visibly per-attempt, matching the healthcheck contract that provider
+    readiness must not restart-loop the queue consumer.
+    """
+    settings = get_settings()
+    if not settings.ai_analysis_enabled:
+        return
+    try:
+        available = await client.check_model_available()
+    except Exception:  # noqa: BLE001 - advisory check must never block startup
+        logger.debug("startup model check failed", exc_info=True)
+        return
+    if available is None:
+        logger.info(
+            "could not list models at %s; skipping the startup model check",
+            settings.ai_base_url,
+        )
+        return
+    if available:
+        logger.info("model %s is available at %s", settings.ai_model, settings.ai_base_url)
+        return
+    logger.warning(
+        "model %s was not found at %s; analysis jobs will fail until it exists. "
+        "Build the default model with: "
+        "ollama create gemma4:e4b-it-qat-16k -f analyzer/ollama/Modelfile "
+        "(or set AI_MODEL to an installed model, or AI_ANALYSIS_ENABLED=false)",
+        settings.ai_model,
+        settings.ai_base_url,
+    )
+
+
 async def run_worker() -> None:
     settings = get_settings()
     configure_logging(log_level=settings.log_level)
@@ -534,6 +569,7 @@ async def run_worker() -> None:
         settings.ai_model if settings.ai_analysis_enabled else FALLBACK_MODEL,
         settings.analysis_poll_seconds,
     )
+    await _log_model_availability(client)
 
     try:
         while True:

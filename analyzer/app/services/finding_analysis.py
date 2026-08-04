@@ -25,6 +25,7 @@ from shared.models.vulnerability import (
 
 FALLBACK_MODEL = "deterministic-fallback"
 FALLBACK_FINDING_PROMPT_VERSION = "finding-fallback-v1"
+RESPONSE_SNIPPET_MAX_CHARS = 3000
 
 
 def extract_page_title(html_snippet: str | None) -> str | None:
@@ -42,11 +43,7 @@ def has_code_blocks(html_snippet: str | None) -> bool:
     return bool(re.search(r"<code|<pre|```", html_snippet, re.IGNORECASE))
 
 
-def compute_fp_probability(
-    axes: dict[str, str],
-    proof_type: str | None = None,
-    vuln_type: str | None = None,
-) -> float:
+def compute_fp_probability(axes: dict[str, str]) -> float:
     """Calculate FP probability deterministically from universal semantic axes.
 
     The axes evaluate:
@@ -94,6 +91,59 @@ def compute_fp_probability(
     return 0.25
 
 
+def build_evidence_json(vulnerability: Vulnerability, max_chars: int) -> str:
+    """Serialize finding evidence, truncating only the response snippet.
+
+    The response snippet is the sole unbounded, target-controlled field. Building
+    the envelope first and fitting the snippet into the remaining budget keeps the
+    detection metadata the adjudicator relies on (detection_method, proof_type,
+    evidence_grade) present, and keeps the output valid JSON — slicing the
+    serialized string did neither.
+
+    ``matched_text``/``match_location``/``match_entropy`` are promoted out of
+    ``detection_evidence`` into named fields because they are the whole basis of
+    a pattern-match finding: the adjudicator is asked whether a regex hit is
+    genuine, which it cannot answer from a truncated page window that need not
+    even contain the hit. Naming them keeps them out of the truncation path and
+    lets the prompt refer to them directly.
+    """
+    response_snippet = vulnerability.evidence.response_snippet or ""
+    detection_evidence = vulnerability.evidence.detection_evidence or {}
+
+    def primary(key: str):
+        """Deduplication merges evidence values into lists; take the primary."""
+        value = detection_evidence.get(key)
+        if isinstance(value, list):
+            return value[0] if value else None
+        return value
+
+    envelope = {
+        "type": vulnerability.vuln_type,
+        "category": vulnerability.category.value if vulnerability.category else "",
+        "url": vulnerability.location.url,
+        "http_method": vulnerability.location.http_method,
+        "parameter": vulnerability.location.parameter,
+        "payload": vulnerability.evidence.payload,
+        "request_snippet": vulnerability.evidence.request_snippet,
+        "page_title": extract_page_title(response_snippet),
+        "has_code_blocks": has_code_blocks(response_snippet),
+        "detection_method": vulnerability.evidence.detection_method,
+        "detection_evidence": detection_evidence,
+        "matched_text": primary("matched"),
+        "match_location": primary("match_location"),
+        "match_entropy": primary("entropy"),
+        "evidence_strength": vulnerability.evidence_strength.value,
+        "evidence_grade": vulnerability.evidence.evidence_grade,
+        "evidence_grade_reason": vulnerability.evidence.evidence_grade_reason,
+        "proof_type": vulnerability.evidence.proof_type,
+        "response_snippet": "",
+    }
+    overhead = len(json.dumps(envelope, default=str))
+    budget = max(0, max_chars - overhead)
+    envelope["response_snippet"] = response_snippet[: min(budget, RESPONSE_SNIPPET_MAX_CHARS)]
+    return json.dumps(envelope, default=str)
+
+
 class FindingAnalysisService:
     def __init__(self, client: AIClient | None = None) -> None:
         self.client = client or AIClient()
@@ -109,32 +159,10 @@ class FindingAnalysisService:
         if not self.settings.ai_analysis_enabled:
             return self._fallback(vulnerability, revision=revision)
 
-        # Prepare evidence package with extended context (up to max chars)
-        response_snippet = vulnerability.evidence.response_snippet or ""
-        page_title = extract_page_title(response_snippet)
-        code_blocks = has_code_blocks(response_snippet)
-
-        evidence = {
-            "type": vulnerability.vuln_type,
-            "category": vulnerability.category.value if vulnerability.category else "",
-            "url": vulnerability.location.url,
-            "http_method": vulnerability.location.http_method,
-            "parameter": vulnerability.location.parameter,
-            "payload": vulnerability.evidence.payload,
-            "request_snippet": vulnerability.evidence.request_snippet,
-            "response_snippet": response_snippet[:3000],  # expanded up to 3KB
-            "page_title": page_title,
-            "has_code_blocks": code_blocks,
-            "detection_method": vulnerability.evidence.detection_method,
-            "detection_evidence": vulnerability.evidence.detection_evidence,
-            "evidence_strength": vulnerability.evidence_strength.value,
-            "evidence_grade": vulnerability.evidence.evidence_grade,
-            "evidence_grade_reason": vulnerability.evidence.evidence_grade_reason,
-            "proof_type": vulnerability.evidence.proof_type,
-        }
-        evidence_json = json.dumps(evidence, default=str)[
-            : self.settings.analysis_finding_evidence_max_chars
-        ]
+        evidence_json = build_evidence_json(
+            vulnerability,
+            self.settings.analysis_finding_evidence_max_chars,
+        )
 
         # ── PASS 1: Enrichment (Description, Impact, Remediation) ───────────
         enrichment_result = await self.client.generate_json(
@@ -148,10 +176,9 @@ class FindingAnalysisService:
         # ── PASS 2: FP Adjudication (Generic Verification & Categorical Axes) ─
         adjudication_result = await self.client.generate_json(
             build_adjudication_prompt(
-                proof_type=vulnerability.evidence.proof_type or "heuristic",
                 evidence_json=evidence_json,
-                vuln_type=vulnerability.vuln_type,
                 enrichment_description=enrichment.description,
+                evidence_brief=vulnerability.evidence.evidence_brief or "",
             )
         )
         adjudication = FindingAdjudicationResponse.model_validate(adjudication_result.data)
@@ -160,7 +187,7 @@ class FindingAnalysisService:
         proof_type = vulnerability.evidence.proof_type or "heuristic"
         ceiling = get_fp_ceiling(proof_type)
         floor = get_fp_floor(proof_type)
-        raw_prob = compute_fp_probability(adjudication.fp_axes, proof_type, vuln_type=vulnerability.vuln_type)
+        raw_prob = compute_fp_probability(adjudication.fp_axes)
 
         # Clamp: ceiling prevents pessimism on strong proof, floor prevents
         # overconfidence on weak proof (e.g. heuristic CVE lookups).

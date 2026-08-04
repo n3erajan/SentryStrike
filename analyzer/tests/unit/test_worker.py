@@ -514,3 +514,104 @@ async def test_recover_expired_analysis_jobs(monkeypatch) -> None:
     assert proj_2["scan_id"] == "scan-2"
     assert proj_2["status"] == AnalysisStatus.failed
 
+
+
+# ---------------------------------------------------------------------------
+# Startup model availability check
+# ---------------------------------------------------------------------------
+
+
+class _FakeModelClient:
+    def __init__(self, available):
+        self._available = available
+
+    async def check_model_available(self):
+        return self._available
+
+
+def _model_settings(monkeypatch, *, enabled=True, model="gemma4:e4b-it-qat-16k"):
+    import app.worker as worker_module
+
+    monkeypatch.setattr(
+        worker_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            ai_analysis_enabled=enabled,
+            ai_model=model,
+            ai_base_url="http://localhost:11434/v1",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_model_warns_with_build_command(monkeypatch, caplog):
+    from app.worker import _log_model_availability
+
+    _model_settings(monkeypatch, model="gemma4:e4b-it-qat-99k")
+    with caplog.at_level("WARNING"):
+        await _log_model_availability(_FakeModelClient(False))
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "gemma4:e4b-it-qat-99k was not found" in message
+    # The remedy must name the model the repo ships, not the misconfigured value.
+    assert "ollama create gemma4:e4b-it-qat-16k -f analyzer/ollama/Modelfile" in message
+
+
+@pytest.mark.asyncio
+async def test_present_model_does_not_warn(monkeypatch, caplog):
+    from app.worker import _log_model_availability
+
+    _model_settings(monkeypatch)
+    with caplog.at_level("WARNING"):
+        await _log_model_availability(_FakeModelClient(True))
+
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_undeterminable_provider_does_not_warn(monkeypatch, caplog):
+    """A provider without /v1/models must not be reported as missing the model."""
+    from app.worker import _log_model_availability
+
+    _model_settings(monkeypatch)
+    with caplog.at_level("WARNING"):
+        await _log_model_availability(_FakeModelClient(None))
+
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_disabled_analysis_skips_the_check(monkeypatch, caplog):
+    from app.worker import _log_model_availability
+
+    _model_settings(monkeypatch, enabled=False)
+    contacted = []
+
+    class _Recorder:
+        async def check_model_available(self):
+            contacted.append(True)
+            return False
+
+    with caplog.at_level("INFO"):
+        await _log_model_availability(_Recorder())
+
+    assert contacted == []
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_check_failure_never_blocks_startup(monkeypatch, caplog):
+    """The check is advisory; a client that cannot answer must not raise."""
+    from app.worker import _log_model_availability
+
+    _model_settings(monkeypatch)
+
+    class _Broken:
+        async def check_model_available(self):
+            raise RuntimeError("provider exploded")
+
+    with caplog.at_level("WARNING"):
+        await _log_model_availability(_Broken())
+
+    assert caplog.records == []
