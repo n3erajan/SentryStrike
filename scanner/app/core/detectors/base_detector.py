@@ -4,6 +4,57 @@ from datetime import datetime, timezone
 
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 
+# Section headers detectors have used to narrate their own evidence. Scanner-
+# authored prose must never live in `verification_response_snippet`, but a
+# detector that composes one anyway would silently poison every harvester that
+# mines other findings' responses for secondary disclosures.
+_SCANNER_AUTHORED_PREAMBLES: tuple[str, ...] = (
+    "VERIFICATION EVIDENCE:",
+    "INTERACTION ID:",
+    "INTERACTIONS (",
+    "EXTERNAL CONTROL SAMPLES",
+    "INTERNAL TARGET SAMPLES",
+)
+
+# Markers that introduce the real server bytes inside such a composite.
+_SERVER_RESPONSE_MARKERS: tuple[str, ...] = (
+    "TARGET ENDPOINT RESPONSE:",
+    "LAST INTERNAL PROBE RESPONSE:",
+    "RESPONSE EXCERPT:",
+)
+
+
+def observed_response_body(finding: "Finding") -> str:
+    """Return only the bytes the TARGET sent, never the scanner's own narrative.
+
+    Harvester detectors (exception handling, credential disclosure) mine other
+    findings' responses for secondary disclosures. That is only sound while the
+    text is server-origin: a scanner-authored line naming an internal IP,
+    hostname, or error string would otherwise be reported as the application
+    disclosing it.
+
+    This happened in production. The SSRF detector wrote its OAST narrative into
+    `verification_response_snippet`, including the collaborator's record of the
+    callback source IP (the Docker bridge gateway, 172.20.0.1). The exception
+    handler matched its private-IP pattern against that line and raised a
+    "Verbose Error Handling" finding for a response that contained no error --
+    then inherited SSRF's url, method, payload and request snippet, so no field
+    on the finding agreed with any other.
+
+    Writers now keep narrative in `evidence`, which the report layer already
+    renders. This stays as a backstop: when a composite is detected, the text
+    after the server-response marker is returned, and a composite with no marker
+    yields "" rather than prose a harvester would mistake for target output.
+    """
+    text = finding.verification_response_snippet or ""
+    if not text.startswith(_SCANNER_AUTHORED_PREAMBLES):
+        return text
+    for marker in _SERVER_RESPONSE_MARKERS:
+        index = text.find(marker)
+        if index >= 0:
+            return text[index + len(marker):].lstrip("\n")
+    return ""
+
 
 @dataclass
 class Finding:
@@ -20,7 +71,7 @@ class Finding:
     payload: str | None = None
     evidence: str | None = None
     detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    
+
     # Active verification fields
     confidence_score: float = field(default=0.0)  # 0-100, where 100 is confirmed exploitation
     detection_method: str = field(default="heuristic")  # heuristic/boolean/error/time/union/reflection/command_output
@@ -30,7 +81,9 @@ class Finding:
     detection_evidence: dict = field(default_factory=dict)  # Detailed metadata: baseline_resp, injected_resp, timing_data, error_patterns, etc.
     verified: bool = field(default=False)  # Distinguish confirmed vs suspected
     verification_request_snippet: str | None = field(default=None)  # The actual HTTP request sent
-    verification_response_snippet: str | None = field(default=None)  # The relevant response excerpt
+    # SERVER BYTES ONLY. Narrative belongs in `evidence`; the report layer
+    # composes the two. See `observed_response_body` for why this matters.
+    verification_response_snippet: str | None = field(default=None)
 
 
 class BaseDetector(ABC):

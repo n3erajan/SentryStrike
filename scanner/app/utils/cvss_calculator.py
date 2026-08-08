@@ -28,6 +28,11 @@ class CvssCalculator:
         "IDOR": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
         "Forced Browsing": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
         "Sensitive File": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
+        # A web-served version-control directory yields the full source tree and
+        # commit history, not merely the sibling filenames a plain autoindex
+        # leaks, so it is scored on confidentiality like the other file-read
+        # exposures rather than falling to the C:L/I:L default.
+        "Version Control Repository": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
         "Brute-Force": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
         "Credentials": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},
         "Token Exposed": {"ac": "L", "ui": "N", "s": "U", "c": "H", "i": "N", "a": "N"},

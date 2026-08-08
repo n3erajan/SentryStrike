@@ -67,4 +67,30 @@ function parseUTCDate(iso) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-export { isValidUrl, downloadFile, saveBlob, copyToClipboard, parseUTCDate };
+// Resolves a "back" link from router state so a detail page returns to the list
+// the user actually came from. Pages that can be reached from more than one list
+// (a scan is reachable from /scans and from an application's own history) pass
+// `state.from = { to, label }` when navigating; anything that arrives without it
+// — a deep link, a notification, a refresh, which all drop router state — falls
+// back to the page's default list.
+function resolveBackTarget(state, fallbackTo, fallbackLabel) {
+  const to = state?.from?.to;
+  const label = state?.from?.label;
+  // `to` is handed straight to navigate(), so only accept an in-app path.
+  // "//host" and "/\host" both start with "/" yet resolve off-site.
+  const isInAppPath =
+    typeof to === "string" && /^\/(?![/\\])/.test(to);
+  if (!isInAppPath) {
+    return { to: fallbackTo, label: fallbackLabel };
+  }
+  return { to, label: label || fallbackLabel };
+}
+
+export {
+  isValidUrl,
+  downloadFile,
+  saveBlob,
+  copyToClipboard,
+  parseUTCDate,
+  resolveBackTarget,
+};

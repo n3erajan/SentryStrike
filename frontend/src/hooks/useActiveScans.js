@@ -46,8 +46,28 @@ export function findFinishedScans(previousItems, nextItems) {
   });
 }
 
-export async function invalidateFinishedScanQueries(finishedScans) {
-  if (finishedScans.length === 0) return;
+// Overlays freshly-polled records onto a list that isn't polled itself.
+//
+// The scans table reads `scans:list:all`, which is only refetched when a scan
+// reaches a terminal status — so an in-flight scan's progress and phase columns
+// would sit frozen at their mount-time values. `scans:list:25` is already being
+// polled every few seconds for the active count, so reuse those records rather
+// than issuing a second request.
+//
+// Only *active* scans are overlaid. Once a scan finishes it drops out of the
+// polled set at the same moment `scans:list:all` is invalidated, so the base
+// list is authoritative again and a stale poll result can't overwrite it.
+export function mergeLiveScans(baseItems, polledItems) {
+  const base = baseItems || [];
+  const live = new Map();
+  for (const scan of polledItems || []) {
+    if (isActive(scan)) live.set(scan.id, scan);
+  }
+  if (live.size === 0) return base;
+  return base.map((scan) => live.get(scan.id) || scan);
+}
+
+export async function invalidateFinishedScanQueries(finishedScans) {  if (finishedScans.length === 0) return;
 
   const invalidations = [
     invalidateQueries("scans:list:all"),

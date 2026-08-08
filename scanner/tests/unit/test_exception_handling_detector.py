@@ -334,3 +334,74 @@ def test_observed_evidence_line_does_not_fabricate_http_200() -> None:
     assert len(findings) == 1
     assert "HTTP 200" not in findings[0].evidence
     assert "status unrecorded" in findings[0].evidence
+
+
+def test_scanner_authored_oast_narrative_does_not_become_a_verbose_error() -> None:
+    """Regression: the detector must not mine SentryStrike's own evidence text.
+
+    Reproduces a production false positive. The SSRF detector composed its OAST
+    narrative into `verification_response_snippet`, and that narrative embeds the
+    collaborator's record of the callback source IP -- the Docker bridge gateway,
+    172.20.0.1. The private-IP pattern matched it and a "Verbose Error Handling"
+    finding was raised for a response containing no error at all, inheriting
+    SSRF's url, method, payload and request snippet so no two fields agreed.
+
+    The IP here appears ONLY in scanner-authored text; the server's own bytes are
+    an ordinary HTML page.
+    """
+    detector = ExceptionHandlingDetector()
+    source_finding = Finding(
+        category=OwaspCategory.a01,
+        vuln_type="Blind Server-Side Request Forgery (SSRF)",
+        severity=SeverityLevel.high,
+        url="http://192.168.16.200:3000/profile/image/url",
+        parameter="imageUrl",
+        method="POST",
+        payload="http://192.168.16.200/oast/ssrf-4968bfd2",
+        evidence="Blind SSRF confirmed by a correlated callback.",
+        detection_method="ssrf_oast_callback",
+        verified=True,
+        verification_response_snippet=(
+            "VERIFICATION EVIDENCE:\n"
+            "Blind SSRF confirmed by a correlated callback to the SentryStrike "
+            "OAST collaborator.\n\n"
+            "INTERACTION ID: ssrf-4968bfd2\n"
+            "INTERACTIONS (1):\n"
+            '[\n  {\n    "source_ip": "172.20.0.1",\n'
+            '    "path": "/oast/ssrf-4968bfd2"\n  }\n]\n\n'
+            "TARGET ENDPOINT RESPONSE:\n"
+            '<form action="./profile/image/url" method="post">'
+            '<label for="url">Image URL:</label></form>'
+        ),
+    )
+
+    findings = detector.findings_from_observed_evidence([source_finding])
+
+    assert findings == []
+
+
+def test_server_side_private_ip_disclosure_is_still_derived() -> None:
+    """The guard must not blind the detector to a genuine leak."""
+    detector = ExceptionHandlingDetector()
+    source_finding = Finding(
+        category=OwaspCategory.a05,
+        vuln_type="SQL Injection (Error-Based)",
+        severity=SeverityLevel.high,
+        url="https://example.test/search?id=1",
+        parameter="id",
+        method="GET",
+        payload="'",
+        evidence="Injection confirmed.",
+        detection_method="error_based",
+        verified=True,
+        verification_response_snippet=(
+            "HTTP/1.1 500 Internal Server Error\n\n"
+            "Warning: mysqli_connect(): failed to connect to backend "
+            "10.4.7.22:3306 in /var/www/db.php on line 12"
+        ),
+    )
+
+    findings = detector.findings_from_observed_evidence([source_finding])
+
+    assert len(findings) == 1
+    assert findings[0].vuln_type == "Verbose Error Handling"

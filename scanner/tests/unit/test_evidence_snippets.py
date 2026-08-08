@@ -278,3 +278,58 @@ def test_deduplicated_bypass_evidence_keeps_each_url_on_its_own_line() -> None:
     assert evidence_lines == [
         f"Extension-filter bypass: {url} is forbidden directly." for url in urls
     ]
+
+
+def test_proof_offset_outranks_marker_heuristics() -> None:
+    """The window must contain the text the finding actually rests on.
+
+    Observed in production: a secret-pattern finding on DVWA's brute-force page
+    stored a snippet centered on the site navigation, so the excerpt sent to the
+    AI adjudicator did not contain the matched text at all. The model was asked
+    to rule on a pattern match it could not see, and confirmed it by reasoning
+    about unrelated content. A detector that matched a pattern knows where the
+    proof is; that offset must beat the marker lists.
+    """
+    decoy = "You have an error in your SQL syntax near ''"
+    real_match = 'client_secret = "aG7xQ2mZpL9vRt4WsYb8"'
+    body = decoy + "C" * 3000 + real_match + "D" * 3000
+    offset = body.index(real_match)
+
+    snippet = ResponseAnalyzer.build_evidence_response_snippet(
+        status_code=200,
+        headers={"content-type": "text/html"},
+        body=body,
+        proof_offset=offset,
+    )
+
+    assert real_match in snippet
+    # The strong-evidence marker sits at byte 0 and would otherwise win.
+    assert decoy not in snippet
+
+
+def test_snippet_falls_back_to_markers_without_proof_offset() -> None:
+    """Detectors that pass no offset keep the existing centering behavior."""
+    decoy = "You have an error in your SQL syntax near ''"
+    body = decoy + "C" * 3000
+
+    snippet = ResponseAnalyzer.build_evidence_response_snippet(
+        status_code=200,
+        headers={"content-type": "text/html"},
+        body=body,
+    )
+
+    assert decoy in snippet
+
+
+def test_out_of_range_proof_offset_is_ignored() -> None:
+    """A stale or bogus offset must not blank the evidence."""
+    body = "You have an error in your SQL syntax near ''" + "C" * 500
+
+    snippet = ResponseAnalyzer.build_evidence_response_snippet(
+        status_code=200,
+        headers={"content-type": "text/html"},
+        body=body,
+        proof_offset=999_999,
+    )
+
+    assert "You have an error in your SQL syntax" in snippet

@@ -799,5 +799,9 @@ async def test_ssrf_detector_verifies_blind_via_oast_client():
     ]
     assert oast_findings and oast_findings[0].verified
     assert oast_findings[0].category == OwaspCategory.a01
-    assert "OAST collaborator" in oast_findings[0].verification_response_snippet
+    # The OAST narrative is scanner-authored, so it belongs in `evidence`; the
+    # response field carries only what the target sent. Keeping the narrative in
+    # the response field let harvester detectors mine SentryStrike's own text.
+    assert "OAST collaborator" in oast_findings[0].evidence
+    assert "OAST collaborator" not in (oast_findings[0].verification_response_snippet or "")
     assert oast_findings[0].detection_evidence["interaction_count"] == 1

@@ -11,15 +11,7 @@ import { useScanStatus } from '../hooks/useScanStatus.js'
 import { SCAN_PHASES } from '../data/constants.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import ErrorNotice from '../components/ErrorNotice.jsx'
-import { parseUTCDate } from '../utils/helpers.js'
-
-const STATUS_LABEL = {
-  queued: 'Queued',
-  running: 'Scanning',
-  completed: 'Complete',
-  failed: 'Failed',
-  cancelled: 'Cancelled',
-}
+import { parseUTCDate, resolveBackTarget } from '../utils/helpers.js'
 
 const ANALYSIS_LABEL = {
   not_requested: 'Queueing AI analysis',
@@ -60,10 +52,10 @@ function ScanDetailPage() {
   const navigate = useNavigate()
   const location = useLocation()
   const target = location.state?.target || ''
+  const back = resolveBackTarget(location.state, '/scans', 'All scans')
   const {
     status,
     progress,
-    phaseMessage,
     stageIdx,
     eta,
     analysis,
@@ -91,8 +83,8 @@ function ScanDetailPage() {
 
   return (
     <div className='view'>
-      <button className='back' onClick={() => navigate('/scans')}>
-        ← All scans
+      <button className='back' onClick={() => navigate(back.to)}>
+        ← {back.label}
       </button>
       <div className='head'>
         <div>
@@ -250,10 +242,6 @@ function ScanDetailPage() {
           </div>
         </div>
       </div>
-
-      <p className='muted-text' style={{ marginTop: 12 }}>
-        Current phase: <b>{phaseMessage || STATUS_LABEL[status] || 'Queued'}</b>
-      </p>
     </div>
   )
 }

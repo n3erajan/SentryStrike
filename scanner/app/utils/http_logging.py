@@ -150,12 +150,21 @@ def make_httpx_response_logger(module: str, test_phase: str = "request"):
 
     async def _log_response(response) -> None:
         request = response.request
+        # httpx only populates `elapsed` once the response has been read, and
+        # this hook can fire before that. Detectors on HttpVerifier time their
+        # own requests; without this, every raw-client module logged with no
+        # `time=` field at all, so slow endpoints were invisible in the logs.
+        try:
+            response_time_ms = response.elapsed.total_seconds() * 1000
+        except RuntimeError:
+            response_time_ms = 0
         log_http_response(
             request.method,
             str(request.url),
             response.status_code,
             module=module,
             test_phase=test_phase,
+            response_time_ms=response_time_ms,
         )
 
     return _log_response

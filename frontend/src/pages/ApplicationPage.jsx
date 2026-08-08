@@ -154,7 +154,12 @@ function ApplicationPage() {
                         className='reports-row'
                         onClick={() =>
                           navigate(`/scans/${s.id}`, {
-                            state: { target: s.target_url },
+                            state: {
+                              target: s.target_url,
+                              // Send the scan detail page back here rather than
+                              // to the global scan list.
+                              from: { to: `/apps/${appId}`, label: app.name },
+                            },
                           })
                         }
                       >

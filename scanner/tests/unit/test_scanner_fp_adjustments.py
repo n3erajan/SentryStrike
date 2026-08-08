@@ -7,6 +7,7 @@ from app.core.scanner import (
     SPECIALIZED_INPUT_DETECTORS,
     ScanOrchestrator,
 )
+from app.utils.cvss_calculator import CvssCalculator
 from shared.models.scan import (
     AuthCoverage,
     DetectorCoverageMetric,
@@ -17,6 +18,7 @@ from shared.models.scan import (
 )
 from shared.models.vulnerability import (
     AiAnalysis,
+    AuthContext,
     Evidence,
     EvidenceStrength,
     Exploitability,
@@ -672,3 +674,80 @@ def test_protected_targets_zero_when_unverified_session() -> None:
     assert ac.authenticated_url_count == 0
     assert ac.unauthenticated_url_count == 2
     assert ac.protected_targets_verified == 0
+
+
+# ---------------------------------------------------------------------------
+# Anonymous access drives PR:N, which decides the CVSS band
+# ---------------------------------------------------------------------------
+
+def _vcs_finding(**overrides) -> Finding:
+    """An exposed .git repository, as sensitive_paths emits it."""
+    kwargs = dict(
+        category=OwaspCategory.a02,
+        vuln_type="Version Control Repository Exposed",
+        severity=SeverityLevel.high,
+        url="http://target.test/dvwa/.git/",
+        evidence="Version-control directory served over HTTP.",
+        confidence_score=95.0,
+        detection_method="path_content_fingerprint",
+        detection_evidence={
+            "proof_type": "content_verified_path_probe",
+            "anonymous_access": True,
+        },
+        verified=True,
+        # The scan session rides along on every probe, so the evidence always
+        # carries a Cookie header regardless of what the server required.
+        verification_request_snippet=(
+            "GET /dvwa/.git/ HTTP/1.1\nHost: target.test\nCookie: PHPSESSID=abc\n\n"
+        ),
+    )
+    kwargs.update(overrides)
+    return Finding(**kwargs)
+
+
+def test_proven_anonymous_access_outranks_the_scanners_own_cookie() -> None:
+    """A Cookie header records what the scanner sent, not what the server demanded."""
+    vulnerability = _orchestrator()._to_vulnerability(_vcs_finding())
+
+    assert vulnerability.auth_context == AuthContext.unauthenticated
+
+
+def test_exposed_repository_scores_high_not_medium() -> None:
+    """Regression guard on the original inversion.
+
+    A browsable .git was reported as a Medium directory listing. Severity comes
+    solely from the CVSS score (pipeline overwrites whatever the detector set),
+    and PR:L caps a C:H profile at 6.5/Medium. Only proven anonymous access
+    yields PR:N and the 7.5 the exposure actually warrants.
+    """
+    vulnerability = _orchestrator()._to_vulnerability(_vcs_finding())
+
+    assert "PR:N" in vulnerability.cvss_vector
+    assert vulnerability.cvss_score == 7.5
+    assert CvssCalculator.get_severity(vulnerability.cvss_score) == "High"
+
+
+def test_unproven_anonymous_access_falls_back_to_existing_inference() -> None:
+    """Absence of the flag means unproven, never 'reachable by anyone'."""
+    finding = _vcs_finding(
+        detection_evidence={"proof_type": "content_verified_path_probe"},
+    )
+
+    vulnerability = _orchestrator()._to_vulnerability(finding)
+
+    assert vulnerability.auth_context == AuthContext.authenticated
+    assert "PR:L" in vulnerability.cvss_vector
+
+
+def test_deduplication_merged_anonymous_flag_is_honored() -> None:
+    """Dedup rewrites evidence values into lists; the primary entry still counts."""
+    finding = _vcs_finding(
+        detection_evidence={
+            "proof_type": ["content_verified_path_probe"],
+            "anonymous_access": [True],
+        },
+    )
+
+    vulnerability = _orchestrator()._to_vulnerability(finding)
+
+    assert vulnerability.auth_context == AuthContext.unauthenticated

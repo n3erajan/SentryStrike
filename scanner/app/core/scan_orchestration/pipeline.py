@@ -45,6 +45,19 @@ def _count_label(count: int, noun: str) -> str:
     return f"{count} {noun}{'s' if count != 1 else ''}"
 
 
+def _detector_progress_message(done: int, total: int, findings_count: int) -> str:
+    """Phase message for the detector stage.
+
+    ``done`` counts detectors that have *finished*. Every detector is launched
+    concurrently, so this is never a "currently running" count — phrasing it as
+    one (the old "Running detectors 3/13") read as though only 3 of 13 were
+    working. The heartbeat ticker and the per-completion update share this one
+    string: both counts only change when a detector completes, so emitting the
+    same text from both keeps the activity log to one line per completion.
+    """
+    return f"Detectors {done}/{total} complete: {_count_label(findings_count, 'raw finding')}"
+
+
 class PipelineMixin:
     async def _run_scan_pipeline(
         self,
@@ -367,7 +380,7 @@ class PipelineMixin:
                             scan,
                             ScanPhase.vulnerability_detection,
                             self._eta_state.detector_fraction,
-                            f"Running detectors {detector_done}/{detector_total}: {_count_label(len(findings), 'raw finding')}",
+                            _detector_progress_message(detector_done, detector_total, len(findings)),
                         )
                 except asyncio.CancelledError:
                     pass
@@ -426,7 +439,7 @@ class PipelineMixin:
                         scan,
                         ScanPhase.vulnerability_detection,
                         self._eta_state.detector_fraction,
-                        f"Detectors {detector_done}/{detector_total} complete: {_count_label(len(findings), 'raw finding')}",
+                        _detector_progress_message(detector_done, detector_total, len(findings)),
                     )
                     
                 exception_detector = next((detector for detector in scan_detectors if isinstance(detector, ExceptionHandlingDetector)), None)
@@ -692,6 +705,7 @@ class PipelineMixin:
                 v.evidence.evidence_grade = grade.grade
                 v.evidence.evidence_grade_reason = grade.reason
                 v.evidence.proof_type = grade.proof_type
+                v.evidence.evidence_brief = self.evidence_grader.build_evidence_brief(v, grade)
 
             vulnerabilities = self._compute_priority_ranks(vulnerabilities)
             vulnerabilities.sort(key=lambda v: v.cvss_score, reverse=True)

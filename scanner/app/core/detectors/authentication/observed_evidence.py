@@ -1,6 +1,6 @@
 import re
 
-from app.core.detectors.base_detector import Finding
+from app.core.detectors.base_detector import Finding, observed_response_body
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 
 
@@ -64,7 +64,7 @@ class ObservedAuthEvidenceMixin:
         seen: set[tuple] = set()
 
         for source in observed_findings or []:
-            observed_text = source.verification_response_snippet or ""
+            observed_text = observed_response_body(source)
             if not observed_text:
                 continue
 

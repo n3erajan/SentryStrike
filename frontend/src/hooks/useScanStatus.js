@@ -19,6 +19,17 @@ function stageForProgress(progress, status, currentPhase) {
   return Math.max(1, Math.min(SCAN_PHASES.length - 1, idx));
 }
 
+// The worker reports several distinct messages under one phase key — detector
+// progress alone walks from "Running 12 active detectors" to "Detectors 7/12
+// complete". Deduping on the phase key would freeze the log at each phase's
+// first message, so key on the phase and message together. Returns the key to
+// record, or null when this poll adds nothing new.
+function nextPhaseLogKey(status, phase, message, lastKey) {
+  if (status !== "running" || !message) return null;
+  const key = `${phase}|${message}`;
+  return key === lastKey ? null : key;
+}
+
 // Polls one scan's backend-owned lifecycle. Terminal statuses stop polling;
 // cancellation remains pending until the scanner worker acknowledges it.
 //
@@ -29,7 +40,6 @@ function useScanStatus(scanId) {
   const [status, setStatus] = useState(null);
   const [progress, setProgress] = useState(0);
   const [phase, setPhase] = useState("queued");
-  const [phaseMessage, setPhaseMessage] = useState("Scan queued");
   const [eta, setEta] = useState(null);
   const [analysis, setAnalysis] = useState(null);
   const [logs, setLogs] = useState([]);
@@ -105,7 +115,6 @@ function useScanStatus(scanId) {
         setProgress(nextProgress);
         setStatus(scan.status);
         setPhase(nextPhase);
-        setPhaseMessage(nextMessage);
         setAnalysis(nextAnalysis);
         setEta(
           typeof scan.eta_seconds === "number" && scan.eta_seconds >= 0
@@ -119,11 +128,14 @@ function useScanStatus(scanId) {
         if (scan.crawl_mode) setCrawlMode(scan.crawl_mode);
         if (scan.application_id) setApplicationId(scan.application_id);
 
-        if (
-          nextPhase !== lastPhaseRef.current &&
-          scan.status === "running"
-        ) {
-          lastPhaseRef.current = nextPhase;
+        const phaseLogKey = nextPhaseLogKey(
+          scan.status,
+          nextPhase,
+          nextMessage,
+          lastPhaseRef.current,
+        );
+        if (phaseLogKey) {
+          lastPhaseRef.current = phaseLogKey;
           pushLog("ok", `[phase] ${nextMessage}`);
         }
 
@@ -209,7 +221,6 @@ function useScanStatus(scanId) {
     status,
     progress,
     phase,
-    phaseMessage,
     stageIdx,
     eta,
     analysis,
@@ -228,5 +239,5 @@ function useScanStatus(scanId) {
   };
 }
 
-export { useScanStatus, stageForProgress };
+export { useScanStatus, stageForProgress, nextPhaseLogKey };
 export default useScanStatus;

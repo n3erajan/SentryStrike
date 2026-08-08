@@ -93,8 +93,11 @@ async def test_ssrf_inband_fallback_reports_probable_when_strong_differential():
     assert probable[0].detection_method == "ssrf_inband_differential"
     assert probable[0].confidence_score == 60.0
     assert probable[0].category == OwaspCategory.a01
-    assert "EXTERNAL CONTROL SAMPLES" in probable[0].verification_response_snippet
-    assert "INTERNAL TARGET SAMPLES" in probable[0].verification_response_snippet
+    # Sample tables are scanner-authored and live in `evidence`; the response
+    # field holds only the target's own bytes.
+    assert "EXTERNAL CONTROL SAMPLES" in probable[0].evidence
+    assert "EXTERNAL CONTROL SAMPLES" not in (probable[0].verification_response_snippet or "")
+    assert "INTERNAL TARGET SAMPLES" in probable[0].evidence
     assert probable[0].detection_evidence["control_samples"]
     assert probable[0].detection_evidence["internal_samples"]
 

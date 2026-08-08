@@ -180,15 +180,12 @@ class SSRFDetector(BaseDetector):
                 )
                 trigger_response = getattr(last_resp, "response_snippet", None) or ""
                 verification = (
-                    "VERIFICATION EVIDENCE:\n"
                     f"Probable SSRF via {signal_strength} in-band differential ({desc}): "
                     f"{reason}. This repeated differential is indirect evidence only; "
                     "no internal response content or OAST callback was observed.\n\n"
                     f"EXTERNAL CONTROL SAMPLES ({self.INBAND_CONTROL_TARGET}):\n{control_lines}\n\n"
                     f"INTERNAL TARGET SAMPLES ({target}):\n{internal_lines}"
                 )
-                if trigger_response:
-                    verification += f"\n\nLAST INTERNAL PROBE RESPONSE:\n{trigger_response}"
                 return Finding(
                     category=OwaspCategory.a01,
                     vuln_type="Server-Side Request Forgery (SSRF) - Probable",
@@ -200,14 +197,17 @@ class SSRFDetector(BaseDetector):
                     evidence=(
                         f"Probable SSRF via {signal_strength} in-band differential "
                         f"({desc}): {reason}. No callback or internal content was "
-                        "observed, so this remains unverified."
+                        "observed, so this remains unverified.\n\n"
+                        f"{verification}"
                     ),
                     confidence_score=60.0 if is_strong else 50.0,
                     detection_method="ssrf_inband_differential",
                     reproducible=True,
                     verified=False,
                     verification_request_snippet=getattr(last_resp, "request_snippet", None),
-                    verification_response_snippet=verification,
+                    # Server bytes only; the sample tables above are scanner-authored
+                    # and live in `evidence`.
+                    verification_response_snippet=trigger_response,
                     detection_evidence={
                         "proof_type": "inband_differential",
                         "control_target": self.INBAND_CONTROL_TARGET,
@@ -393,23 +393,26 @@ class SSRFDetector(BaseDetector):
                                     method=cand.method,
                                     payload=callback_url,
                                     evidence=(
-                                        "Blind SSRF verified through an out-of-band callback interaction "
-                                        f"for interaction id '{interaction_id}'."
+                                        "Blind SSRF confirmed by a correlated callback to the "
+                                        "SentryStrike OAST collaborator, for interaction id "
+                                        f"'{interaction_id}'.\n"
+                                        f"INTERACTIONS ({len(interactions)}):\n"
+                                        f"{json.dumps([interaction.raw for interaction in interactions], default=str, indent=2)[:2000]}"
                                     ),
                                     confidence_score=95.0,
                                     detection_method="ssrf_oast_callback",
                                     reproducible=True,
                                     verified=True,
                                     verification_request_snippet=callback_response.request_snippet,
+                                    # Server bytes only. The narrative above lives in
+                                    # `evidence`, which the report layer renders alongside
+                                    # this excerpt. Composing them here put the OAST
+                                    # collaborator's own record of the callback source IP
+                                    # inside the "response" field, where the exception
+                                    # handler mined it and reported the application as
+                                    # leaking an internal address it never sent.
                                     verification_response_snippet=(
-                                        "VERIFICATION EVIDENCE:\n"
-                                        "Blind SSRF confirmed by a correlated callback to the "
-                                        "SentryStrike OAST collaborator.\n\n"
-                                        f"INTERACTION ID: {interaction_id}\n"
-                                        f"INTERACTIONS ({len(interactions)}):\n"
-                                        f"{json.dumps([interaction.raw for interaction in interactions], default=str, indent=2)[:2000]}\n\n"
-                                        "TARGET ENDPOINT RESPONSE:\n"
-                                        f"{callback_response.response_snippet or '(no immediate response evidence)'}"
+                                        callback_response.response_snippet or ""
                                     ),
                                     detection_evidence={
                                         "interaction_id": interaction_id,

@@ -7,7 +7,7 @@ import ipaddress
 from app.config import get_settings
 from app.core.crawler.url_parser import is_static_asset
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
-from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.detectors.base_detector import BaseDetector, Finding, observed_response_body
 from app.core.verification.response_analyzer import ResponseAnalyzer
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 from app.utils.http_logging import make_httpx_response_logger
@@ -348,8 +348,10 @@ def _build_evidence(
     return " | ".join(parts)
 
 def _observed_text_from_finding(finding: Finding) -> str:
-    # Only evaluate the actual HTTP response body snippet returned by the server
-    return finding.verification_response_snippet or ""
+    # Only evaluate the actual HTTP response body returned by the server. A
+    # scanner-authored narrative naming an internal IP or error string would
+    # otherwise be reported as the application disclosing it.
+    return observed_response_body(finding)
 
 def _reflection_guard(
     body: str,

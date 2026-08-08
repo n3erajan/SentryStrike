@@ -1,6 +1,9 @@
 import asyncio
 import logging
+import math
 import re
+from collections import Counter
+from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -17,6 +20,39 @@ from app.utils.scan_http import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ContentMatch:
+    """One content classification, carrying the exact text that triggered it.
+
+    A regex hit is only as trustworthy as the substring it captured, but that
+    substring used to be discarded the moment the branch returned. Every
+    consumer downstream then re-derived "what was the proof?" independently:
+    the snippet builder guessed with its own marker lists, and the AI
+    adjudicator was handed a window that need not contain the match at all —
+    so it judged pattern-match findings without ever seeing the pattern's
+    output. Capturing the span once, here, is what makes those findings
+    adjudicable.
+
+    ``matched_text`` is empty for structural classifications (an autoindex, a
+    known filename) where the proof is the response's shape rather than a
+    captured substring.
+    """
+
+    matched: bool
+    vuln_type: str = ""
+    evidence: str = ""
+    severity: SeverityLevel = SeverityLevel.low
+    matched_text: str = ""
+    match_offset: int = -1
+    match_location: str = ""
+
+    def __bool__(self) -> bool:
+        return self.matched
+
+
+_NO_MATCH = ContentMatch(matched=False)
 
 
 class SensitivePathsDetector(BaseDetector):
@@ -131,11 +167,90 @@ class SensitivePathsDetector(BaseDetector):
         re.compile(p, re.IGNORECASE)
         for p in [
             r"['\"]?\b(?:api[_-]?key|secret|secret[_-]?key|client[_-]?secret|private[_-]?key)\b['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9_\-./+=]{8,}",
-            r"['\"]?\b(?:password|passwd|db_password|database_password)\b['\"]?\s*[:=]\s*['\"]?[^'\"\s,;}{]{8,}",
+            # The value class is defined by exclusion, so angle brackets must be
+            # excluded explicitly: without them a visible form label followed by
+            # markup (``Password:<br><input``) satisfies "8+ value characters"
+            # and every login page reports a leaked credential.
+            r"['\"]?\b(?:password|passwd|db_password|database_password)\b['\"]?\s*[:=]\s*['\"]?[^'\"\s,;}{<>]{8,}",
             r"['\"]?\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|jwt)\b['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+",
             r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
         ]
     ]
+
+    # Longest matched span quoted into evidence and forwarded to the adjudicator.
+    _MAX_MATCHED_TEXT_CHARS: int = 200
+
+    @staticmethod
+    def _first_pattern_match(patterns: list[re.Pattern], body: str) -> re.Match | None:
+        """First hit across ``patterns``, preserving their declared priority."""
+        for pattern in patterns:
+            match = pattern.search(body)
+            if match:
+                return match
+        return None
+
+    @staticmethod
+    def _shannon_entropy(text: str) -> float:
+        """Bits per character — separates real secrets from prose and markup.
+
+        A high-entropy token looks like a key; ``Password:<br><input`` and
+        ``YOUR_API_KEY_HERE`` do not. The adjudicator weighs this alongside the
+        span itself.
+        """
+        if not text:
+            return 0.0
+        total = len(text)
+        counts = Counter(text)
+        return round(
+            -sum((n / total) * math.log2(n / total) for n in counts.values()), 2
+        )
+
+    @staticmethod
+    def _match_location(body: str, offset: int, matched_text: str) -> str:
+        """Where a match sits, which often decides whether it is real.
+
+        A key inside a ``<pre>``/``<code>`` block is usually documentation; one
+        inside form markup is usually a field label, not a value.
+        """
+        if offset < 0:
+            return ""
+        if re.search(r"<(?:input|form|label|br|td|th)\b", matched_text, re.IGNORECASE):
+            return "form_markup"
+        before = body[:offset].lower()
+        for opener, closer, name in (
+            ("<code", "</code>", "code_block"),
+            ("<pre", "</pre>", "code_block"),
+            ("<script", "</script>", "script"),
+            ("<!--", "-->", "comment"),
+        ):
+            start = before.rfind(opener)
+            if start >= 0 and before.rfind(closer, start) < 0:
+                return name
+        if re.search(r"<[a-z/][^>]*>", matched_text, re.IGNORECASE):
+            return "html_markup"
+        return "body_text"
+
+    @classmethod
+    def _from_pattern(
+        cls,
+        match: re.Match,
+        body: str,
+        vuln_type: str,
+        evidence: str,
+        severity: SeverityLevel,
+    ) -> ContentMatch:
+        """Build a ContentMatch that carries the span the pattern captured."""
+        matched_text = (match.group(0) or "")[: cls._MAX_MATCHED_TEXT_CHARS]
+        return ContentMatch(
+            matched=True,
+            vuln_type=vuln_type,
+            evidence=evidence,
+            severity=severity,
+            matched_text=matched_text,
+            match_offset=match.start(),
+            match_location=cls._match_location(body, match.start(), matched_text),
+        )
+
 
     _SOURCE_MAP_PATTERNS: list[re.Pattern] = [
         re.compile(r'"version"\s*:\s*3', re.IGNORECASE),
@@ -172,6 +287,71 @@ class SensitivePathsDetector(BaseDetector):
     # Backup/temp permutations appended to discovered files.
     _BACKUP_SUFFIXES: tuple[str, ...] = (".bak", ".old", ".orig", "~", ".swp", ".save", ".zip", ".tar.gz")
 
+    # Version-control metadata directories. Serving one over HTTP discloses the
+    # full source tree and commit history, so it is classified ahead of the
+    # generic autoindex branch rather than being reported as a plain listing.
+    # Matched as an exact path SEGMENT: `/docs/.git-tutorial/` is an ordinary
+    # directory that merely starts with the same letters.
+    _VCS_DIR_NAMES: frozenset[str] = frozenset({".git", ".svn", ".hg"})
+
+    # Repository entries that prove an autoindex really is version-control
+    # storage. Matched against the listing's own hrefs (never the raw body, so
+    # an HTML `<head>` cannot be mistaken for git's `HEAD`), and at least two
+    # must appear, so a directory that merely happens to sit under a `.git/`
+    # path cannot trip the escalation on its name alone.
+    _VCS_STRUCTURE_MARKERS: frozenset[str] = frozenset({
+        "objects", "refs", "head", "logs", "branches", "hooks",
+        "config", "description", "index", "info", "packed-refs", "pack",
+    })
+
+    # Finding types derived from an autoindex body. One enabled autoindex yields
+    # a listing for every directory the crawler subsequently walks into, so
+    # these collapse to their shallowest exposed ancestor.
+    _VCS_VULN_TYPE: str = "Version Control Repository Exposed"
+    _LISTING_VULN_TYPES: frozenset[str] = frozenset({
+        "Directory Listing Exposed",
+        _VCS_VULN_TYPE,
+    })
+
+    @classmethod
+    def _has_vcs_path_segment(cls, path: str) -> bool:
+        """True when any path segment is exactly a VCS metadata directory."""
+        return any(
+            segment.lower() in cls._VCS_DIR_NAMES
+            for segment in (path or "").split("/")
+        )
+
+    # Folded descendant paths quoted verbatim in the surviving finding's
+    # evidence; the remainder is summarized as a count.
+    _MAX_FOLDED_PATHS_SHOWN: int = 12
+
+    @staticmethod
+    def _listing_entry_names(body: str) -> set[str]:
+        """Last path segment of every anchor href in a listing, lowercased."""
+        names: set[str] = set()
+        for href in re.findall(r'<a\s+[^>]*href=["\']?([^"\'>\s]+)', body, re.IGNORECASE):
+            name = (href or "").strip().rstrip("/")
+            if not name or name.startswith("?"):
+                continue
+            names.add(name.rsplit("/", 1)[-1].lower())
+        return names
+
+    def _looks_like_vcs_repository(self, path: str, body: str, content_type: str = "") -> bool:
+        """True when an autoindex response is version-control storage.
+
+        Demands an exact VCS path segment AND structural proof from the listing
+        itself, so the escalation rests on observed repository contents rather
+        than on a directory's name. A partial listing that clears the path test
+        but not the marker test still escalates its tree: proof found in any
+        descendant is promoted to the tree root during collapse.
+        """
+        if not self._has_vcs_path_segment(path):
+            return False
+        if not self._looks_like_autoindex(body, content_type):
+            return False
+        entries = self._listing_entry_names(body)
+        return len(entries & self._VCS_STRUCTURE_MARKERS) >= 2
+
     def _looks_like_autoindex(self, body: str, content_type: str = "") -> bool:
         if content_type and not any(tok in content_type.lower() for tok in ("html", "text/plain")):
             return False
@@ -185,58 +365,77 @@ class SensitivePathsDetector(BaseDetector):
             return True
         return False
 
-    def _classify_content(self, path: str, body: str, content_type: str = "") -> tuple[bool, str, str, SeverityLevel]:
+    def _classify_content(self, path: str, body: str, content_type: str = "") -> ContentMatch:
         body_lower = body.lower()
         path_lower = path.lower()
 
+        def structural(vuln_type: str, evidence: str, severity: SeverityLevel) -> ContentMatch:
+            """Proof is the response's shape, so there is no captured span."""
+            return ContentMatch(
+                matched=True, vuln_type=vuln_type, evidence=evidence, severity=severity
+            )
+
+        if self._looks_like_vcs_repository(path, body, content_type):
+            return structural(
+                "Version Control Repository Exposed",
+                "Version-control directory served over HTTP: the autoindex lists repository "
+                "internals, so the full source tree and commit history are retrievable.",
+                SeverityLevel.high,
+            )
         if self._looks_like_autoindex(body, content_type):
-            return True, "Directory Listing Exposed", "Directory listing/autoindex response exposes sibling file and directory names.", SeverityLevel.medium
+            return structural("Directory Listing Exposed", "Directory listing/autoindex response exposes sibling file and directory names.", SeverityLevel.medium)
         if ".git/config" in path_lower and "[core]" in body_lower:
-            return True, "Sensitive File Exposure", "Git configuration file exposed.", SeverityLevel.high
+            return structural("Sensitive File Exposure", "Git configuration file exposed.", SeverityLevel.high)
         if ".htaccess" in path_lower and any(
             directive in body_lower
             for directive in ("rewriteengine", "rewriterule", "authtype", "require ",
                               "order ", "deny from", "allow from", "options ",
                               "<files", "<directory", "addhandler", "sethandler")
         ):
-            return True, "Sensitive File Exposure", "Apache .htaccess configuration file exposed.", SeverityLevel.medium
-        if ".env" in path_lower and (
-            any(pattern.search(body) for pattern in self._SECRET_PATTERNS)
-            or re.search(r"\b(?:db_password|database_password|app_key|secret)\b\s*=", body, re.I)
-        ):
-            return True, "Sensitive File Exposure", "Environment file with secret-like values exposed.", SeverityLevel.high
+            return structural("Sensitive File Exposure", "Apache .htaccess configuration file exposed.", SeverityLevel.medium)
+        if ".env" in path_lower:
+            env_match = self._first_pattern_match(self._SECRET_PATTERNS, body) or re.search(
+                r"\b(?:db_password|database_password|app_key|secret)\b\s*=", body, re.I
+            )
+            if env_match:
+                return self._from_pattern(
+                    env_match, body,
+                    "Sensitive File Exposure",
+                    "Environment file with secret-like values exposed.",
+                    SeverityLevel.high,
+                )
         if "phpinfo" in path_lower and "<title>phpinfo()</title>" in body_lower:
-            return True, "Debug / Metrics Endpoint Exposed", "PHP configuration details (phpinfo) exposed.", SeverityLevel.medium
+            return structural("Debug / Metrics Endpoint Exposed", "PHP configuration details (phpinfo) exposed.", SeverityLevel.medium)
         if (".sql" in path_lower or "backup" in path_lower or "dump" in path_lower) and (
             "insert into" in body_lower or "create table" in body_lower or "mysqldump" in body_lower
         ):
-            return True, "Backup / Database Dump Exposed", "Database dump or backup content exposed.", SeverityLevel.high
+            return structural("Backup / Database Dump Exposed", "Database dump or backup content exposed.", SeverityLevel.high)
         if (path_lower.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".bak", ".old", ".orig", ".swp", ".save", "~")) or "backup" in path_lower) and len(body) > 0:
             if "application" in content_type.lower() or "octet-stream" in content_type.lower() or "<html" not in body_lower:
-                return True, "Backup / Archive File Exposed", "Backup/archive-like file content is reachable.", SeverityLevel.high
+                return structural("Backup / Archive File Exposed", "Backup/archive-like file content is reachable.", SeverityLevel.high)
         if ("docker" in path_lower or path_lower.endswith((".yml", ".yaml"))) and (
             "services:" in body_lower or "image:" in body_lower or "version:" in body_lower
         ):
-            return True, "Sensitive File Exposure", "Docker or YAML configuration file exposed.", SeverityLevel.medium
+            return structural("Sensitive File Exposure", "Docker or YAML configuration file exposed.", SeverityLevel.medium)
         if "web.xml" in path_lower and "<web-app" in body_lower:
-            return True, "Sensitive File Exposure", "Java web.xml configuration file exposed.", SeverityLevel.medium
+            return structural("Sensitive File Exposure", "Java web.xml configuration file exposed.", SeverityLevel.medium)
         if self._looks_like_source_map(path, body, content_type):
-            return True, "Exposed Source Map", "JavaScript source map content is reachable.", SeverityLevel.info
+            return structural("Exposed Source Map", "JavaScript source map content is reachable.", SeverityLevel.info)
         if self._looks_like_api_docs(path, body, content_type):
             # Reachable API documentation is often intentional. Promote it only
             # when separate evidence proves sensitive disclosure or unauthorized
             # access; reachability alone is an informational posture observation.
-            return True, "Exposed API Documentation", "OpenAPI/Swagger/GraphQL documentation content is reachable.", SeverityLevel.info
+            return structural("Exposed API Documentation", "OpenAPI/Swagger/GraphQL documentation content is reachable.", SeverityLevel.info)
         if self._looks_like_dependency_manifest(path, body, content_type):
-            return True, "Sensitive File Exposure", "Dependency manifest or lockfile content is reachable.", SeverityLevel.info
-        if any(pattern.search(body) for pattern in self._DEBUG_METRICS_PATTERNS):
-            return True, "Debug / Metrics Endpoint Exposed", "Debug, metrics, or actuator content exposed.", SeverityLevel.medium
-        if any(pattern.search(body) for pattern in self._STACK_TRACE_PATTERNS):
-            return True, "Verbose Stack Trace Exposure", "Verbose exception stack trace exposed.", SeverityLevel.medium
-        if any(pattern.search(body) for pattern in self._SECRET_PATTERNS):
-            return True, "Secret-Like Value Exposure", "Secret-like key, token, or credential value exposed.", SeverityLevel.high
+            return structural("Sensitive File Exposure", "Dependency manifest or lockfile content is reachable.", SeverityLevel.info)
+        if (match := self._first_pattern_match(self._DEBUG_METRICS_PATTERNS, body)):
+            return self._from_pattern(match, body, "Debug / Metrics Endpoint Exposed", "Debug, metrics, or actuator content exposed.", SeverityLevel.medium)
+        if (match := self._first_pattern_match(self._STACK_TRACE_PATTERNS, body)):
+            return self._from_pattern(match, body, "Verbose Stack Trace Exposure", "Verbose exception stack trace exposed.", SeverityLevel.medium)
+        if (match := self._first_pattern_match(self._SECRET_PATTERNS, body)):
+            return self._from_pattern(match, body, "Secret-Like Value Exposure", "Secret-like key, token, or credential value exposed.", SeverityLevel.high)
 
-        return False, "", "", SeverityLevel.low
+        return _NO_MATCH
 
     def _looks_like_source_map(self, path: str, body: str, content_type: str = "") -> bool:
         path_lower = path.lower()
@@ -284,12 +483,27 @@ class SensitivePathsDetector(BaseDetector):
         response_snippet: str | None = None,
         request_snippet: str | None = None,
         confidence_score: float = 90.0,
+        anonymous_access: bool | None = None,
+        match: ContentMatch | None = None,
     ) -> Finding:
         # `proof_type` here is descriptive detail for the AI evidence brief only.
         # The calibrated proof type that drives the false-positive floor and
         # ceiling is derived from `detection_method` by EvidenceGrader and
         # overwrites Evidence.proof_type during finding processing, so a value
         # passed here never reaches the calibration tables.
+        detection_evidence: dict = {"proof_type": proof_type}
+        # Only recorded when a credential-free re-probe actually ran and
+        # succeeded. Its absence means "unproven", not "requires auth", so
+        # auth-context classification falls back to its own inference.
+        if anonymous_access:
+            detection_evidence["anonymous_access"] = True
+        # The captured span is what makes a regex hit adjudicable: the AI can
+        # only rule on whether a pattern match is genuine if it is shown what
+        # the pattern actually matched, where it sat, and how random it looks.
+        if match is not None and match.matched_text:
+            detection_evidence["matched"] = match.matched_text
+            detection_evidence["match_location"] = match.match_location
+            detection_evidence["entropy"] = self._shannon_entropy(match.matched_text)
         return Finding(
             category=OwaspCategory.a02,
             vuln_type=vuln_type,
@@ -298,7 +512,7 @@ class SensitivePathsDetector(BaseDetector):
             evidence=evidence,
             confidence_score=confidence_score,
             detection_method=detection_method,
-            detection_evidence={"proof_type": proof_type},
+            detection_evidence=detection_evidence,
             verified=True,
             reproducible=True,
             verification_request_snippet=request_snippet,
@@ -315,10 +529,10 @@ class SensitivePathsDetector(BaseDetector):
                 continue
             headers = getattr(request, "response_headers", {}) or {}
             content_type = str(getattr(request, "response_content_type", "") or headers.get("content-type", ""))
-            matched, vuln_type, evidence, severity = self._classify_content(urlparse(url).path, body, content_type)
-            if not matched:
+            match = self._classify_content(urlparse(url).path, body, content_type)
+            if not match:
                 continue
-            key = (url, vuln_type)
+            key = (url, match.vuln_type)
             if key in seen:
                 continue
             seen.add(key)
@@ -331,20 +545,60 @@ class SensitivePathsDetector(BaseDetector):
             )
             findings.append(
                 self._finding(
-                    vuln_type=vuln_type,
-                    severity=severity,
+                    vuln_type=match.vuln_type,
+                    severity=match.severity,
                     url=url,
-                    evidence=f"Observed response disclosure: {evidence}",
+                    evidence=f"Observed response disclosure: {match.evidence}",
                     detection_method="observed_response_content",
                     proof_type="content_verified_observed_response",
                     response_snippet=body[:500],
                     request_snippet=request_snippet,
+                    match=match,
                 )
             )
         return findings
 
     def _spa_fallback_context_findings(self, kwargs: dict[str, object]) -> list[Finding]:
         return []
+
+    async def _confirm_anonymous_access(
+        self,
+        client: httpx.AsyncClient,
+        target_url: str,
+        classify_path: str,
+        expected_vuln_type: str,
+    ) -> bool:
+        """Re-fetch a confirmed path with no session material.
+
+        Every probe in this detector carries the scan session, so a ``Cookie:``
+        header in the evidence records what the scanner sent, not what the
+        server demanded — and downstream that header is read as proof the
+        target is privilege-gated, costing a full CVSS band. One credential-free
+        GET settles the question with evidence: if the same classification still
+        holds, the exposure is open to anyone and the finding earns ``PR:N``.
+
+        Callers invoke this while already holding the probe semaphore, so this
+        must NOT acquire it again: ``asyncio.Semaphore`` is not reentrant, and
+        re-entering deadlocks the whole detector once every permit is held by a
+        task waiting for one more.
+
+        Returns False on any error, non-200, or changed classification, so a
+        failed probe leaves the existing inference in place rather than
+        inventing an anonymous-access claim.
+        """
+        try:
+            response = await client.get(target_url)
+        except Exception as exc:
+            logger.debug("anonymous re-probe failed for %s: %s", target_url, exc)
+            return False
+        if response.status_code != 200:
+            return False
+        matched = self._classify_content(
+            classify_path,
+            response.text,
+            response.headers.get("content-type", ""),
+        )
+        return bool(matched) and matched.vuln_type == expected_vuln_type
 
     async def detect(self, urls: list[str], forms: list[object], **kwargs: object) -> list[Finding]:
         findings: list[Finding] = []
@@ -392,9 +646,22 @@ class SensitivePathsDetector(BaseDetector):
         if auth_headers:
             client_kwargs["headers"] = dict(auth_headers)
 
+        # Companion client carrying no session material, used to prove that a
+        # confirmed exposure is reachable anonymously. When the scan itself is
+        # unauthenticated every probe was already credential-free, so the extra
+        # request is skipped entirely.
+        sends_credentials = bool(session_cookies or auth_headers)
+        anon_client_kwargs = {
+            key: value
+            for key, value in client_kwargs.items()
+            if key not in ("cookies", "headers")
+        }
+
         async with create_scan_client(
             **client_kwargs,
-        ) as client:
+        ) as client, create_scan_client(
+            **anon_client_kwargs,
+        ) as anon_client:
             if spa_root_html:
                 spa_detector.configure_root(str(root_url), spa_root_html)
                 is_spa = is_spa or spa_detector.root_looks_like_spa()
@@ -449,32 +716,55 @@ class SensitivePathsDetector(BaseDetector):
                         if "<html" in body_lower and ("404" in body_lower or "not found" in body_lower):
                             return None
 
-                        matched, vuln_type, evidence, severity = self._classify_content(
+                        match = self._classify_content(
                             classify_path,
                             response.text,
                             content_type,
                         )
-                        if matched:
+                        if match:
+                            anonymous_access = (
+                                await self._confirm_anonymous_access(
+                                    anon_client,
+                                    target_url,
+                                    classify_path,
+                                    match.vuln_type,
+                                )
+                                if sends_credentials
+                                else True
+                            )
                             pcfr_request_snippet, pcfr_response_snippet = (
                                 build_httpx_evidence_snippets(
                                     response,
                                     fallback_url=target_url,
                                     fallback_method="GET",
+                                    proof_offset=match.match_offset,
                                 )
                             )
                             return self._finding(
-                                vuln_type=vuln_type,
-                                severity=severity,
+                                vuln_type=match.vuln_type,
+                                severity=match.severity,
                                 url=target_url,
                                 evidence=(
-                                    f"Accessible sensitive path with content proof: {evidence} "
-                                    f"Snippet: {response.text[:200]}..."
+                                    f"Accessible sensitive path with content proof: {match.evidence} "
+                                    + (
+                                        "Reachable with no session cookie or authorization header. "
+                                        if anonymous_access
+                                        else ""
+                                    )
+                                    + (
+                                        f"Matched text ({match.match_location}): {match.matched_text!r}. "
+                                        if match.matched_text
+                                        else ""
+                                    )
+                                    + f"Snippet: {response.text[:200]}..."
                                 ),
                                 detection_method="path_content_fingerprint",
                                 proof_type="content_verified_path_probe",
                                 request_snippet=pcfr_request_snippet,
                                 response_snippet=pcfr_response_snippet or response.text[:500],
                                 confidence_score=95.0,
+                                anonymous_access=anonymous_access,
+                                match=match,
                             )
                     except Exception as e:
                         logger.debug("Error checking path %s: %s", target_url, e)
@@ -522,7 +812,110 @@ class SensitivePathsDetector(BaseDetector):
                 if res:
                     findings.append(res)
 
-        return findings
+        return self._collapse_listing_trees(findings)
+
+    @staticmethod
+    def _directory_path(url: str) -> str:
+        """Path of ``url`` normalized to a trailing slash for prefix matching."""
+        path = urlparse(url).path or "/"
+        return path if path.endswith("/") else path + "/"
+
+    @classmethod
+    def _collapse_listing_trees(cls, findings: list[Finding]) -> list[Finding]:
+        """Fold descendant directory listings into their shallowest exposed ancestor.
+
+        A single ``Options +Indexes`` produces one finding per directory the
+        crawler walks into, and an autoindex body is itself a page of links, so
+        the crawler keeps descending: one exposed ``.git`` tree yielded 18
+        findings against DVWA. Those are one misconfiguration demonstrated 18
+        times, not 18 vulnerabilities.
+
+        Grouping is per origin and by path containment on directory boundaries
+        (both sides normalized to a trailing slash), so ``/config/`` can never
+        absorb ``/config2/``. Only listings actually produced are considered, so
+        when a parent directory is forbidden its deepest reachable descendant
+        becomes the root. The survivor keeps the ancestor's URL — the right
+        place to point a reader — and carries the folded paths as evidence.
+
+        Repository proof is promoted rather than discarded: a tree containing a
+        confirmed version-control listing IS an exposed repository, even when
+        the root's own listing was too partial to prove it (a truncated or
+        paginated index shows only its first entries). Without this the strongest
+        evidence in the tree would be folded away and the finding would report a
+        browsable folder instead of a retrievable source repository.
+
+        Non-listing findings pass through untouched, and the original ordering is
+        preserved for callers that rely on it.
+        """
+        listings = [f for f in findings if f.vuln_type in cls._LISTING_VULN_TYPES]
+        if len(listings) < 2:
+            return findings
+
+        # Shallowest first so ancestors are always chosen as roots; the path
+        # tiebreak keeps the result deterministic across runs.
+        ordered = sorted(
+            listings,
+            key=lambda f: (cls._directory_path(f.url).count("/"), cls._directory_path(f.url)),
+        )
+
+        roots: list[Finding] = []
+        folded: dict[int, list[Finding]] = {}
+        for finding in ordered:
+            origin = urlparse(finding.url)[:2]
+            path = cls._directory_path(finding.url)
+            parent = next(
+                (
+                    root
+                    for root in roots
+                    if urlparse(root.url)[:2] == origin
+                    and path != cls._directory_path(root.url)
+                    and path.startswith(cls._directory_path(root.url))
+                ),
+                None,
+            )
+            if parent is None:
+                roots.append(finding)
+            else:
+                folded.setdefault(id(parent), []).append(finding)
+
+        for root in roots:
+            children = folded.get(id(root), [])
+            if not children:
+                continue
+            paths = sorted(cls._directory_path(child.url) for child in children)
+            shown = paths[: cls._MAX_FOLDED_PATHS_SHOWN]
+            summary = ", ".join(shown)
+            if len(paths) > len(shown):
+                summary += f", and {len(paths) - len(shown)} more"
+            noun = "directory" if len(paths) == 1 else "directories"
+            notes = [
+                f"The same exposure covers {len(paths)} descendant {noun}: {summary}."
+            ]
+
+            promoted = root.vuln_type != cls._VCS_VULN_TYPE and any(
+                child.vuln_type == cls._VCS_VULN_TYPE for child in children
+            )
+            if promoted:
+                proof = next(
+                    child for child in children if child.vuln_type == cls._VCS_VULN_TYPE
+                )
+                root.vuln_type = cls._VCS_VULN_TYPE
+                root.severity = SeverityLevel.high
+                notes.append(
+                    f"Repository structure confirmed at {cls._directory_path(proof.url)}, "
+                    f"so this tree is a version-control repository served over HTTP: "
+                    f"the full source and commit history are retrievable."
+                )
+
+            root.evidence = "\n".join([root.evidence or "", *notes]).strip()
+            root.detection_evidence = {
+                **(root.detection_evidence or {}),
+                "folded_directory_count": len(paths),
+                "folded_directories": shown,
+            }
+
+        dropped = {id(f) for f in listings} - {id(r) for r in roots}
+        return [f for f in findings if id(f) not in dropped]
 
     def _permutation_targets(
         self,

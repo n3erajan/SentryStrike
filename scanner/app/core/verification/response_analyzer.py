@@ -533,6 +533,7 @@ class ResponseAnalyzer:
         max_body_chars: int = 1200,
         context_chars: int = 450,
         include_headers: bool = False,
+        proof_offset: int = -1,
     ) -> str:
         """Build a response snippet centered around proof, not byte zero.
 
@@ -540,6 +541,12 @@ class ResponseAnalyzer:
         finding is real. For long HTML pages, that means selecting an excerpt
         around SQL errors, canaries, command output, file contents, CSRF status
         text, or the injected payload instead of taking the first N chars.
+
+        ``proof_offset`` is the caller's own match position and outranks every
+        heuristic below. The marker lists are guesses about where the proof
+        lies; a detector that matched a pattern already KNOWS. Without this the
+        window could exclude the very text a finding rests on, leaving the AI
+        adjudicator to rule on evidence it was never shown.
         """
         headers = headers or {}
         body = body or ""
@@ -591,6 +598,10 @@ class ResponseAnalyzer:
             focus_positions = payload_positions or generic_positions or proof_positions or extra_positions
         else:
             focus_positions = proof_positions or payload_positions or generic_positions or extra_positions
+        # An explicit offset from the caller is authoritative: it is where the
+        # match actually is, not where a marker list guessed it might be.
+        if 0 <= proof_offset < len(body):
+            focus_positions = [proof_offset]
         if focus_positions:
             focus = min(focus_positions)
             start = max(0, focus - context_chars)

@@ -8,6 +8,11 @@
   --muted: oklch(58% 0.03 255);
   --brand: oklch(55% 0.2 255);
   --brand2: oklch(44% 0.19 255);
+  /* Solid-button hover. Kept separate from --brand2, which doubles as an accent
+     *text* color and so must go lighter in dark mode — the opposite of what a
+     solid button under near-white --on-brand text needs. Both themes deepen the
+     blue on hover so the label keeps AA contrast. */
+  --brand-hover: oklch(44% 0.19 255);
   --brandsoft: oklch(93% 0.045 255);
   --good: oklch(55% 0.14 150);
   --warn: oklch(70% 0.15 72);
@@ -44,7 +49,7 @@
 
   --blue: var(--brand);
   --blue-solid: var(--brand);
-  --blue-solid-hover: var(--brand2);
+  --blue-solid-hover: var(--brand-hover);
   --blue-weak: var(--brandsoft);
   --blue-line: oklch(80% 0.09 255);
   --text: var(--ink);
@@ -430,12 +435,16 @@
   cursor: pointer;
 }
 .page-btn:hover:not(:disabled) {
-  background: var(--hover-bg);
+  background: var(--soft);
 }
 .page-btn.active {
   background: var(--brand);
   color: var(--on-brand);
   border-color: var(--brand);
+}
+.page-btn.active:hover:not(:disabled) {
+  background: var(--brand-hover);
+  border-color: var(--brand-hover);
 }
 .page-btn:disabled {
   opacity: 0.35;
@@ -457,14 +466,14 @@
   gap: 20px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: color-mix(in srgb, var(--primary) 6%, var(--surface, #fff));
+  background: color-mix(in srgb, var(--brand) 6%, var(--paper));
 }
 .analysis-banner::before {
   content: '';
   position: absolute;
   inset: -1px auto -1px -1px;
   width: 4px;
-  background: var(--primary);
+  background: var(--brand);
   border-radius: 10px 0 0 10px;
 }
 .analysis-banner.failed::before {
@@ -702,6 +711,7 @@
   --brand: oklch(55% 0.2 255);
   --brand2: oklch(78% 0.13 255);
   /* --brand2: oklch(44% 0.19 255); */
+  --brand-hover: oklch(48% 0.21 255);
   --brandsoft: oklch(27% 0.07 255);
   --good: oklch(72% 0.14 150);
   --warn: oklch(78% 0.14 72);
@@ -1058,7 +1068,7 @@ svg {
   color: var(--on-brand);
 }
 .btn.primary:hover {
-  background: var(--brand2);
+  background: var(--brand-hover);
   box-shadow: 0 7px 16px oklch(44% 0.19 255/0.14);
 }
 .btn.danger {
@@ -2040,6 +2050,7 @@ footer.public-footer {
   padding: 5px 9px;
   border: 1px solid var(--danger-line);
   border-radius: 6px;
+  background: transparent;
   color: var(--bad);
   font-size: 0.7rem;
   font-weight: 650;
@@ -2112,7 +2123,12 @@ footer.public-footer {
   background: var(--brandsoft);
   color: var(--brand2);
 }
-.nav-badge {
+/* Sidebar count chip and the "N active" chip beside a page heading share one
+   treatment. Set font-size/weight rather than the `font:` shorthand — the
+   shorthand also resets font-family, which is how .badge drifted onto the mono
+   stack (and onto a mono weight the app doesn't load, giving it a faux bold). */
+.nav-badge,
+.badge {
   min-width: 20px;
   padding: 0 6px;
   border-radius: 999px;
@@ -2120,19 +2136,12 @@ footer.public-footer {
   color: var(--on-brand);
   font-size: 0.7rem;
   font-weight: 700;
-  text-align: center;
-  line-height: 18px;
-  display: inline-block;
-}
-.badge {
-  min-width: 20px;
-  padding: 0 6px;
-  border-radius: 999px;
-  background: var(--brand);
-  color: var(--on-brand);
-  font:
-    700 0.62rem 'IBM Plex Mono',
-    monospace;
+  /* .head h1 sets letter-spacing: -0.035em, which inherits as a computed
+     length (~-1.5px at the heading's clamped size). On 11px chip text that
+     eats the gaps between glyphs and collapses the space in "1 active" —
+     reset it rather than inherit a value scaled for 2.7rem type. */
+  letter-spacing: normal;
+  white-space: nowrap;
   text-align: center;
   line-height: 18px;
   display: inline-block;
@@ -2780,7 +2789,9 @@ footer.public-footer {
   display: grid;
   grid-template-columns: 85px 1fr auto;
   gap: 12px;
-  padding: 12px 0;
+  /* Inset to match .scans-row so the phase rows don't sit flush against the
+     row divider's ends. */
+  padding: 12px 14px;
   border-bottom: 1px solid var(--line);
   font-size: 0.68rem;
   align-items: center;
@@ -3561,6 +3572,7 @@ footer.public-footer {
   width: 30px;
   height: 30px;
   place-items: center;
+  border: 0;
   border-radius: 6px;
   color: currentColor;
   background: color-mix(in srgb, currentColor 8%, transparent);

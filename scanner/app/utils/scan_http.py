@@ -25,6 +25,7 @@ def build_httpx_evidence_snippets(
     fallback_method: str | None = None,
     fallback_headers: Mapping[str, object] | None = None,
     fallback_body: object = None,
+    proof_offset: int = -1,
 ) -> tuple[str | None, str | None]:
     """Reconstruct ``(request_snippet, response_snippet)`` evidence from a
     completed ``httpx.Response``.
@@ -69,6 +70,7 @@ def build_httpx_evidence_snippets(
         payload=payload,
         extra_markers=extra_markers or [],
         include_headers=True,
+        proof_offset=proof_offset,
     )
 
     try:

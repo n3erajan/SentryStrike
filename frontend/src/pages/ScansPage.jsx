@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ShieldCheck } from "lucide-react";
-import { useActiveScans } from "../hooks/useActiveScans.js";
+import { mergeLiveScans, useActiveScans } from "../hooks/useActiveScans.js";
 import { listAllScans } from "../services/scan.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import ErrorNotice from "../components/ErrorNotice.jsx";
@@ -59,7 +59,7 @@ function pages(current, total) {
 function ScansPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
-  const { count } = useActiveScans();
+  const { count, allScans } = useActiveScans();
   const [page, setPage] = useState(1);
   const [statusFilter, setStatusFilter] = useState("");
 
@@ -76,9 +76,12 @@ function ScansPage() {
     staleTime: 30_000,
   });
 
+  // `scans:list:all` only refetches when a scan finishes, so fold in the
+  // records from the polled active-scans query to keep the progress and phase
+  // columns moving while a scan is in flight.
   const allItems = useMemo(
-    () => (Array.isArray(data?.items) ? data.items : []),
-    [data],
+    () => mergeLiveScans(Array.isArray(data?.items) ? data.items : [], allScans),
+    [data, allScans],
   );
 
   const filtered = useMemo(

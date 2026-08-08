@@ -324,6 +324,22 @@ class FindingProcessingMixin:
         return EvidenceStrength.possible
 
     def _classify_auth_context(self, finding: Finding) -> AuthContext:
+        # A detector that re-fetched the target with no session material and saw
+        # the same exposure has PROVEN anonymous reachability. Trust that proof
+        # over the inference below: detectors attach the scan session to every
+        # probe, so a `Cookie:` header in the evidence records what the scanner
+        # sent, not what the server required. Without this branch an exposure
+        # open to the whole internet is scored PR:L, which costs a full CVSS
+        # band (e.g. C:H lands at 6.5/Medium instead of 7.5/High).
+        detection_evidence = getattr(finding, "detection_evidence", None) or {}
+        anonymous_access = detection_evidence.get("anonymous_access")
+        if isinstance(anonymous_access, list):
+            # Deduplication merges evidence values into lists; the first entry
+            # belongs to the primary (highest-confidence) finding.
+            anonymous_access = anonymous_access[0] if anonymous_access else None
+        if anonymous_access is True:
+            return AuthContext.unauthenticated
+
         evidence_blob = " ".join(
             str(part or "")
             for part in (
