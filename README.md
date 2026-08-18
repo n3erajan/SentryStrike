@@ -1,246 +1,211 @@
 <div align="center">
 
-<img src="frontend/public/sentrystrike-logo.svg" alt="SentryStrike logo" width="112" />
+<img src="frontend/public/sentrystrike-logo.svg" alt="SentryStrike" width="88">
 
 # SentryStrike
 
 **An Evidence-Driven Web Application DAST and Collaborative Vulnerability Management Platform with AI-Powered Finding Analysis and Report Generation**
 
-[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![FastAPI 0.115](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev/)
-[![Playwright 1.60](https://img.shields.io/badge/Playwright-1.60-2EAD33?logo=playwright&logoColor=white)](https://playwright.dev/python/)
-[![MongoDB 7](https://img.shields.io/badge/MongoDB-7-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
-[![Redis 7](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
-[![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev)
+[![MongoDB](https://img.shields.io/badge/MongoDB-7-47A248?logo=mongodb&logoColor=white)](https://mongodb.com)
+[![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io)
+[![Playwright](https://img.shields.io/badge/Playwright-1.60-2EAD33?logo=playwright&logoColor=white)](https://playwright.dev)
+[![Ollama](https://img.shields.io/badge/Ollama-local%20LLM-000000?logo=ollama&logoColor=white)](https://ollama.com)
+[![Docker](https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white)](https://docker.com)
 
 </div>
 
-> [!CAUTION]
-> SentryStrike sends active security-testing payloads and can exercise application workflows. Use it only on systems you own or are explicitly authorized to assess. The operator is responsible for scope, test windows, data handling, and legal compliance.
+---
 
-## What SentryStrike is
+SentryStrike is a dynamic application security testing (DAST) platform. Point it at a running web application and it crawls the attack surface (including JavaScript-heavy single-page apps), fires a battery of vulnerability detectors, verifies each finding with replayable proof, and has a local LLM adjudicate every result so your team triages real issues instead of scanner noise. Findings land in a multi-tenant workspace where your team can assign, discuss, re-verify, and export them as a PDF report.
 
-SentryStrike is an authorized Dynamic Application Security Testing (DAST) platform for web applications. It brings scanning, AI-assisted analysis, finding review, remediation tracking, and reporting into one workspace.
+## Why SentryStrike
 
-It assesses traditional websites and JavaScript-heavy single-page applications. HTTP crawling maps server-rendered pages. For an SPA, Playwright drives the browser through client-side routes, forms, interactions, and network activity, so the scan can work from the application surface that users actually reach.
+Traditional DAST tools drown teams in false positives. SentryStrike is built around one idea: **a finding is only as good as its evidence.**
 
-Findings include reproducible evidence and an evidence grade. The AI worker uses that context to explain a finding, assess exploitability and business impact, suggest remediation, and flag likely false positives. Teams can then assign findings, discuss them, mark false positives, track remediation, request focused re-verification, and produce reports from the workspace.
-
-SentryStrike supports repeatable web-security checks; it does not replace threat modeling, source review, business-logic testing, or manual penetration testing.
-
-## From scan result to remediation work
-
-Most scanners end at a list of possible issues. SentryStrike keeps the scan, its evidence, the AI analysis, and the work around a finding in the same workspace:
-
-- **Grounded findings.** The scanner retains reproducible request/response evidence and uses response differentials, timing checks, browser execution, and OAST callbacks when the check supports them. Each finding records what the proof does and does not establish.
-- **Private, bounded AI analysis.** The default analyzer uses local Ollama. Evidence stays inside the deployment unless the operator deliberately configures an external OpenAI-compatible provider. The analyzer produces structured descriptions, impact, remediation guidance, references, an executive summary, and a calibrated false-positive assessment.
-- **Team workflow.** Workspace members can assign a finding, comment on it, mark it as a false positive, update remediation status, or request a focused re-verification.
-- **Short-lived test credentials.** Test-account credentials are included only in the Redis scan-job payload and worker memory. The job leaves Redis when a worker claims it; credentials are never written to MongoDB.
-
-## How a team uses it
-
-1. A prospective owner requests access. After CLI approval, accepting the single-use owner invitation creates the workspace; the owner can then invite the people who will manage, analyze, and fix findings.
-2. An owner, administrator, analyst, or developer adds an application and starts an authorized scan, optionally supplying dedicated test accounts for that scan. Viewers have read-only access.
-3. The scanner builds an attack surface from pages, SPA routes, forms, and browser-observed requests; it then performs bounded checks, verifies candidates, and saves the evidence and scan progress.
-4. The analyzer enriches completed findings and prepares the report summary. When AI analysis is intentionally disabled, it publishes deterministic fallback guidance; provider failures are recorded for retry and review.
-5. Every workspace member can review evidence and AI output. Owners, administrators, and analysts can assign and triage findings; non-viewers can comment and update non-terminal remediation states.
-6. Developers can move work to `fixed_pending_verification`. An owner, administrator, or analyst requests focused re-verification and closes or waives the finding. Any workspace member can export the completed PDF report.
-
-### One assessment, three useful views
-
-The same assessment must make sense to the person accepting the risk, the person fixing the code, and the person checking the security evidence. SentryStrike presents the results with the detail each of them needs:
-
-| View                  | What it provides                                                                                                                                                                   |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Business owner**    | A plain-language explanation, business impact, severity, overall risk, and an executive summary for decision-making.                                                               |
-| **Developer**         | The affected URL, method and parameters, request and response snippets, payload details, remediation guidance, assignment, comments, and fix status.                               |
-| **Security reviewer** | Verification method, evidence strength, reproducibility, confidence, CVSS and OWASP mapping, AI false-positive assessment, coverage warnings, and focused re-verification results. |
-
-## Security testing scope
-
-SentryStrike uses HTTP crawling for traditional websites and Playwright for JavaScript-heavy SPAs. Browser observation supplies endpoints, methods, headers, request bodies, and parameters that can be safely replayed as part of the web-application assessment. The scanner can fingerprint technologies and enrich version evidence with NVD CVE data.
-
-Active checks are mapped to the OWASP Top 10 (2025) where a web DAST scan can produce meaningful evidence. They cover authentication and access control, SQL/NoSQL/command injection, XSS, SSRF, CSRF, file inclusion and upload, open redirects, TLS and headers, sensitive paths, known component vulnerabilities, and exposed exceptional conditions.
-
-Three OWASP categories are reported as outside active automated detector scope:
-
-| Category                                        | Why it is outside automated DAST scope                                                                                                                                                                             |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **A06: Insecure Design**                        | Identifying a flawed design requires business rules, architecture, trust boundaries, abuse cases, and threat-model context that cannot be inferred reliably from black-box requests and responses.                 |
-| **A08: Software or Data Integrity Failures**    | Assessing update trust, build and deployment pipelines, artifact signing, and internal data-integrity controls requires access to development and operational systems beyond the running web application.          |
-| **A09: Security Logging and Alerting Failures** | Verifying what the application logs, whether monitoring detects an event, and whether an alert reaches the right responder requires access to server-side logs, monitoring tools, and incident-response processes. |
-
-Coverage still depends on what the target exposes, the configured limits, available authentication, and the evidence that can be gathered safely. Reports include coverage warnings instead of treating untested areas as passes. A clean scan is not proof that an application is secure.
+- **Proof-carrying findings.** Every detector records the exact request, payload, and response that triggered it as an immutable verification target. Any finding can be replayed later, by a human or by the one-click re-verification job, to confirm it still reproduces.
+- **Deterministic evidence grading.** Findings are graded by proof type (`active_output`, `timing_strong`, `auth_differential`, and more) with calibrated confidence floors and ceilings, so a regex coincidence can never outrank a confirmed exploit.
+- **AI false-positive adjudication.** A local LLM (Ollama) reviews each finding's evidence brief and returns a calibrated false-positive probability. Weak evidence is mathematically capped so the model cannot talk itself into dismissing a real bug or confirming a phantom one.
+- **Built for teams.** Organizations, role-based access, seat management, finding assignment, remediation workflow, comments, and audit logging are first-class.
 
 ## Architecture
 
-![SentryStrike system architecture](./sentrystrike-architecture.svg)
+Four services backed by MongoDB and Redis:
 
-| Component                | Technology                        | Responsibility                                                                                          |
-| ------------------------ | --------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| [`frontend/`](frontend/) | React 19, Vite 8, Tailwind CSS 4  | Workspace UI for scans, finding review, collaboration, and reports                                      |
-| [`backend/`](backend/)   | FastAPI, Beanie, Motor, ReportLab | Authentication, workspace policy, scan coordination, notifications, PDF reports, and OAST callbacks     |
-| [`scanner/`](scanner/)   | Python, Playwright, HTTPX         | Web and SPA discovery, bounded detection, verification, evidence grading, and re-verification           |
-| [`analyzer/`](analyzer/) | Python, HTTPX                     | Local-Ollama-first AI enrichment, false-positive assessment, remediation guidance, and report summaries |
-| [`shared/`](shared/)     | Pydantic, Beanie, Redis           | Domain models, tenant-scoped repositories, queue contracts, and cross-service policy                    |
-| MongoDB                  | Document store                    | Workspaces, users, scans, evidence, analysis jobs, notifications, and audit records                     |
-| Redis                    | Ephemeral coordination            | Scan jobs, analysis signals, cancellation keys, leases, and worker heartbeats                           |
+<div align="center">
+<img src="sentrystrike-architecture.svg" alt="SentryStrike system architecture" width="900">
+</div>
 
-The backend creates the scan record before it places a compact job on Redis. A scanner worker claims the job, persists progress and evidence to MongoDB, and creates a durable analysis handoff on completion. Redis wakes an analyzer worker, while MongoDB remains the source of truth for analysis retries and recovery. The frontend accesses this state only through the backend API.
+The data plane is MongoDB (durable state) and Redis (queues, leases, heartbeats, cancellation signals). The `shared` package holds the models, repositories, and queue clients used by all three Python services, which is what keeps the scan-to-analysis hand-off transactional and crash-safe.
 
-## Repository layout
+## Components
 
-```text
-SentryStrike/
-|-- frontend/       React workspace application
-|-- backend/        FastAPI control plane and management CLI
-|-- scanner/        DAST crawl, detection, verification, and re-verification worker
-|-- analyzer/       Durable AI analysis worker
-|-- shared/         Shared models, repositories, queues, and policies
-|-- docs/assets/    Documentation assets and editable diagrams
-|-- docker-compose.yml
-|-- start-dev.ps1   Optional Windows multi-service development launcher
-`-- .env.example    Shared deployment configuration template
-```
+| Directory                         | What it is                                                                        |
+| --------------------------------- | --------------------------------------------------------------------------------- |
+| [`backend/`](backend/README.md)   | FastAPI REST API: auth, workspaces, scans, findings, reports, OAST callbacks      |
+| [`scanner/`](scanner/README.md)   | Headless DAST worker: crawler, 16 detectors, verifiers, evidence grading          |
+| [`analyzer/`](analyzer/README.md) | AI analysis worker: LLM enrichment, false-positive adjudication, report summaries |
+| [`frontend/`](frontend/README.md) | React SPA: dashboards, scan launch, triage, team management, reports              |
+| [`shared/`](shared/README.md)     | Shared Python package: MongoDB models, repositories, Redis queues, config         |
 
-## Quick start for local development
+## Feature tour
 
-### Prerequisites
+- **Crawling.** Depth-limited spider with a Playwright browser engine for SPAs: route extraction from JS bundles, API endpoint discovery, form interaction, workflow exploration, and per-route budgets so a heavy app cannot stall the scan.
+- **Detection.** 16 detectors covering the automatable slice of the OWASP Top 10 (2025): A01 Broken Access Control (IDOR, forced browsing, mass assignment, authorization matrix), A02 Security Misconfiguration (security headers, sensitive paths), A03 Supply Chain (technology fingerprinting + NVD CVE lookup), A04 Cryptographic Failures (TLS via SSLyze), A05 Injection (SQLi, NoSQLi, XSS including DOM, command injection, file inclusion, file upload, SSRF, open redirect), A07 Authentication Failures (form/session/JWT/API auth, CSRF), and A10 Mishandling of Exceptional Conditions (stack traces, error pages).
+- **Verification.** Raw findings are replayed against a control before they are published, so a result has to survive an attack-versus-benign comparison rather than a single suspicious response. Blind vulnerabilities (SSRF, blind SQLi) are confirmed out-of-band through the built-in OAST collaborator: the scanner mints a unique callback URL, the target's server-side fetch calls home, and the scanner polls the backend for the interaction.
+- **Evidence grading.** A deterministic grader scores each finding by proof type and auth context, producing the `confirmed_exploit` through `informational` strength ladder and the false-positive probability floors and ceilings the analyzer must respect.
+- **AI analysis.** Per-finding enrichment (plain-language description, business impact, exploitability, stack-specific remediation) plus a second adjudication pass that scores false-positive probability on calibrated axes, then a whole-scan report summary. Fully local via Ollama; no target data leaves your infrastructure.
+- **Re-verification.** One click re-runs the stored verification target with fresh credentials and records an immutable outcome (`still_present`, `resolved`, `inconclusive`) with its own evidence.
+- **Team workflow.** Findings carry a remediation state machine (`open` → `in_progress` → `fixed_pending_verification` → `verified_fixed`, or `wont_fix`), assignment, threaded comments, and per-org audit logs. Roles (`owner`, `admin`, `analyst`, `developer`, `viewer`) gate actions, not visibility.
+- **Reporting.** Per-scan reports with severity rollups, scanner-limitation disclosure, and a generated PDF export.
+- **Operations.** Scan cancellation with sub-second Redis pub/sub delivery, per-scan worker leases for dead-worker detection, durable analysis jobs with leases, retry backoff, and crash recovery, scan-data retention purging (30-day compliance floor), Cloudflare Turnstile on public endpoints, and rate-limited invites and access requests.
 
-- Python 3.12
-- Node.js 20.19+ or 22.12+
-- Docker with Docker Compose for MongoDB and Redis
-- A POSIX-compatible shell such as Bash or Zsh (or PowerShell with the equivalent commands)
+## Quick start (Docker)
 
-### 1. Create configuration files
+You need Docker. MongoDB and Redis are provided by the compose file.
 
 ```bash
-cp .env.example .env
+git clone <this-repo> && cd SentryStrike
+cp .env.example .env                      # set PUBLIC_HOSTNAME; the rest has working defaults
+cp backend/.env.example backend/.env      # cookies, SMTP, Turnstile
+cp scanner/.env.example scanner/.env      # crawl and request budgets
+cp analyzer/.env.example analyzer/.env    # AI provider
+docker compose up -d --build
+```
+
+Copy all four. Compose loads each service's `.env` only if it exists and otherwise falls back to code defaults, and one of those defaults is wrong in a container: `AI_BASE_URL` defaults to `http://localhost:11434/v1`, which inside the analyzer container is the container itself, not your Ollama host. `analyzer/.env.example` uses `host.docker.internal` instead, which compose maps to the host gateway.
+
+Then open `http://localhost` (port `80` by default, override with `FRONTEND_PORT`).
+
+### Creating the first workspace
+
+Registration is invite-only; there is no self-serve signup. The first owner is approved from the backend CLI by design: owner onboarding is a vendor operation, so it has no HTTP surface to attack.
+
+1. Open `http://localhost/request-access` and submit the form. `backend/.env.example` ships Cloudflare's Turnstile test keys, so the widget passes locally.
+2. Approve the request from inside the backend container:
+
+   ```bash
+   docker compose exec backend python -m app.cli list
+   docker compose exec backend python -m app.cli approve <request-id> --member-limit 10
+   ```
+
+   Approval creates the owner invite and prints the signup link, and emails it when SMTP is configured. Locally, use the printed link. `python -m app.cli reject <request-id>` discards a request instead.
+
+3. Register with the invited email. That creates the workspace and the owner account together; the owner then invites teammates from **Team**.
+
+Useful commands:
+
+```bash
+docker compose logs -f backend scanner analyzer   # follow the pipeline
+docker compose down                               # stop (add -v to drop mongo data)
+```
+
+The compose stack is single-origin: the frontend container's nginx serves the SPA and proxies `/api/` and `/oast/` to the backend, so there is nothing else to expose.
+
+### Set PUBLIC_HOSTNAME before you trust a blind finding
+
+`PUBLIC_HOSTNAME` is the one value with no usable default. The scanner derives both OAST URLs from it, and if it is empty they stay unset — the out-of-band checks are skipped rather than failed, so blind SSRF and blind SQL injection quietly go undetected and the scan still reports success. Set it to a base URL the _target_ can reach:
+
+```dotenv
+PUBLIC_HOSTNAME=https://sentry.example.com
+```
+
+For a public deployment, route `/oast/` at your external reverse proxy to the backend the same way you route `/api/`. Override `OAST_CALLBACK_BASE_URL` (what the target calls) and `OAST_POLL_URL` (what the scanner polls) in the root `.env` when they differ — compose interpolates the root `.env` before service `env_file` values load, so Compose-specific OAST overrides belong there, not in `scanner/.env`. See [DOCKER.md](DOCKER.md#oast-callbacks-in-compose) for the two mistakes that break it.
+
+## Local development
+
+Prerequisites: Python 3.12, Node 20+, MongoDB, Redis, and (for AI analysis) Ollama.
+
+```bash
+# 1. Python environment with the shared package installed
+python -m venv .venv
+.venv\Scripts\activate                       # Windows; or source .venv/bin/activate
+pip install -e .                             # the `shared` package
+pip install -r backend/requirements-dev.txt -r scanner/requirements-dev.txt -r analyzer/requirements-dev.txt
+playwright install chromium                  # scanner browser engine
+
+# 2. Frontend deps
+cd frontend && npm install && cd ..
+
+# 3. Environment
+cp .env.example .env                         # shared infra + queue keys
 cp backend/.env.example backend/.env
 cp scanner/.env.example scanner/.env
 cp analyzer/.env.example analyzer/.env
+cp frontend/.env.example frontend/.env       # VITE_API_URL for the dev server
 ```
 
-The frontend needs no `.env` file for the normal local setup: Vite proxies `/api` to the backend. Create `frontend/.env` only when the frontend must call an API at a different origin; see [frontend configuration](#configuration).
+The `-dev` requirement files pull in each service's runtime dependencies plus the test toolchain; production images install `requirements.txt` only, so pytest never ships.
 
-### 2. Start MongoDB and Redis
-
-```bash
-docker compose up -d mongo redis
-```
-
-### 3. Install dependencies
+On Windows, `start-dev.ps1` launches all four processes (backend on :8000, scanner worker, analyzer worker, Vite dev server on :5173) in separate terminals, and pre-sets the scanner's two OAST URLs for a localhost backend. On any platform you can start them by hand:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-pip install -r backend/requirements-dev.txt -r scanner/requirements-dev.txt -r analyzer/requirements-dev.txt
-python -m playwright install chromium
-npm --prefix frontend ci
-```
-
-### 4. Start the services
-
-Start each service in a separate terminal from the repository root. Activate the virtual environment in each Python-service terminal first.
-
-```bash
-# backend
-cd backend && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-# scanner
-cd scanner && python -m app.worker
-
-# analyzer
+cd backend  && uvicorn app.main:app --reload --port 8000
+cd scanner  && python -m app.worker
 cd analyzer && python -m app.worker
-
-# frontend
 cd frontend && npm run dev
 ```
 
-Windows users can instead run `./start-dev.ps1` in PowerShell to open the four services in separate windows.
+Starting by hand, give the scanner the OAST URLs yourself (or set `PUBLIC_HOSTNAME`), otherwise the out-of-band checks are skipped:
 
-| Service               | Local URL                             |
-| --------------------- | ------------------------------------- |
-| Frontend              | <http://localhost:5173>               |
-| Backend API           | <http://localhost:8000/api/v1>        |
-| OpenAPI documentation | <http://localhost:8000/docs>          |
-| Health endpoint       | <http://localhost:8000/api/v1/health> |
-
-### 5. Request and approve the first workspace owner
-
-Registration is invitation-only. With the frontend and backend running, open
-<http://localhost:5173/request-access> and submit a workspace-access request.
-The development configuration uses Cloudflare Turnstile's official test keys.
-
-Review the pending request and approve it from the backend CLI:
-
-```bash
-cd backend
-python -m app.cli list
-python -m app.cli approve <request-id> --member-limit 10
+```dotenv
+# scanner/.env
+OAST_CALLBACK_BASE_URL=http://host.docker.internal:8000/oast
+OAST_POLL_URL=http://localhost:8000/oast/poll
 ```
 
-Approval creates the owner invitation, prints its link or token, and attempts to
-email it. A rejected request can instead be removed with:
+Then bootstrap the first workspace exactly as in the Docker flow above, dropping `docker compose exec backend`: run `python -m app.cli list` and `python -m app.cli approve <request-id>` from the `backend/` directory.
+
+### The analyzer model
+
+The analyzer defaults to a custom Ollama model that pins a 16k context window and a low temperature. A stock Ollama install silently truncates the report prompt otherwise, and truncation produces confident verdicts about evidence the model never saw. Build it once:
 
 ```bash
-python -m app.cli reject <request-id>
+ollama pull gemma4:e4b-it-qat
+ollama create gemma4:e4b-it-qat-16k -f analyzer/ollama/Modelfile
 ```
 
-Pending access requests are limited by IP in Redis, deduplicated by normalized
-email address, and automatically removed from MongoDB after 30 days. Approved
-and rejected requests are removed immediately.
+Set `AI_ANALYSIS_ENABLED=false` to run the analyzer in deterministic-fallback mode (no LLM calls; findings are published without AI enrichment).
 
-## Configuration
+## API at a glance
 
-Configuration is split by service so that scanner limits, email credentials, and AI-provider credentials do not end up in one catch-all file. Copy the templates above, then change only what your setup needs.
+All endpoints are under `/api/v1` and return a uniform envelope (`{ success, message, ... }`) with an `X-Request-ID` support reference on every response. Interactive docs are available at `/docs` when `APP_DEBUG=true`.
 
-### Required for a basic local setup
+| Group           | Endpoints                                                                                                                                                       |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Auth            | `POST /auth/register` (invite-only) · `POST /auth/login` · `POST /auth/logout` · `GET /auth/session` · `GET /auth/me` · `GET /auth/invite` · `GET /auth/config` |
+| Access requests | `POST /access-requests` (202, public, rate-limited) · `GET /access-requests/config`                                                                             |
+| Applications    | `POST/GET /applications` · `GET/PUT/DELETE /applications/{id}` · `GET /applications/{id}/scans`                                                                 |
+| Scans           | `POST /scans` (202, queued) · `GET /scans` · `GET /scans/{id}` · `GET /scans/{id}/status` · `POST /scans/{id}/cancel`                                           |
+| Findings        | `GET /scans/{id}/vulnerabilities` · review / assignment / comments / remediation under `…/vulnerabilities/{vid}` · re-verification `POST …/reverifications`     |
+| Analysis        | `POST /analysis/scans/{id}/retry`                                                                                                                               |
+| Reports         | `GET /reports/{scan_id}` · `GET /reports/{scan_id}/pdf`                                                                                                         |
+| Workspace       | members, invites, settings, `GET /workspace/audit-log`, retention                                                                                               |
+| Notifications   | list, unread count, mark read, mark all read                                                                                                                    |
+| Health          | `GET /health` (liveness + live scanner-worker count)                                                                                                            |
+| OAST (no auth)  | `GET /oast/{interaction_id}` (callback) · `GET /oast/poll?id=…`                                                                                                 |
 
-| File                                             | What to set                                     | Notes                                                                                                                                                      |
-| ------------------------------------------------ | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Root [`.env.example`](.env.example)              | Usually nothing                                 | The localhost MongoDB, Redis, queue, and port defaults work with the quick start. Set `PUBLIC_HOSTNAME` when invite and OAST links need a public base URL. |
-| [`backend/.env.example`](backend/.env.example)   | Usually nothing                                 | Development cookie, CORS, SMTP, and Turnstile test defaults work locally. Production requires real Turnstile keys.                                         |
-| [`scanner/.env.example`](scanner/.env.example)   | Usually nothing                                 | Start with the supplied crawl and request limits; lower them for fragile applications.                                                                     |
-| [`analyzer/.env.example`](analyzer/.env.example) | `AI_BASE_URL` and `AI_MODEL` only if you use AI | Defaults expect Ollama on the host. Set `AI_ANALYSIS_ENABLED=false` to run without provider calls.                                                         |
-
-### Optional configuration
-
-| Area                                | Variables                                                                                                 | When to change them                                                                                           |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| Email invitations and notifications | `EMAIL_SMTP_*`, `EMAIL_FROM`                                                                              | Required for delivery by email; otherwise use the locally printed invitation link.                            |
-| AI provider                         | `AI_BASE_URL`, `AI_MODEL`, `AI_API_KEY`, `AI_TIMEOUT_SECONDS`, `AI_MAX_RETRIES`, `AI_JSON_MODE`           | Use a hosted or self-hosted OpenAI-compatible provider, choose a model, or tune provider behavior.            |
-| Scan safety and capacity            | `CRAWL_*`, `REQUEST_TIMEOUT_SECONDS`, `SCANNER_CONCURRENCY`, request caps, access-control safety settings | Match scan intensity to the authorized target and test window.                                                |
-| CVE enrichment                      | `NVD_API_KEY`, `NVD_API_URL`                                                                              | Add an NVD API key if needed for your rate limit.                                                             |
-| Deployment security                 | `AUTH_COOKIE_SECURE`, `CORS_ORIGINS`, `PUBLIC_HOSTNAME`                                                   | Set secure cookies, explicit origins, and the public address used for invitation links and backend callbacks. |
-
-For Docker-specific variables, production hardening, OAST routing, scaling, and backup guidance, read [DOCKER.md](DOCKER.md). Treat scan evidence, logs, notifications, and PDF reports as sensitive assessment data.
+There is also an operator CLI in the backend for access-request approval, invite status, retention purges, and seat management: `python -m app.cli --help`.
 
 ## Testing
 
 ```bash
-python -m pytest backend/tests
-python -m pytest scanner/tests
-python -m pytest analyzer/tests
-
-npm --prefix frontend test
-npm --prefix frontend run lint
-npm --prefix frontend run build
+pytest backend/tests scanner/tests analyzer/tests        # Python suites
+cd frontend && npm test                                  # node --test unit tests
+cd frontend && npm run lint
 ```
-
-Browser and integration suites may require Chromium, MongoDB, Redis, or isolated network-visible test targets. The component guides include narrower commands and settings.
 
 ## Documentation
 
+- [Docker deployment and operations](DOCKER.md)
 - [Frontend guide](frontend/README.md)
 - [Backend guide](backend/README.md)
 - [Scanner guide](scanner/README.md)
 - [Analyzer guide](analyzer/README.md)
 - [Shared package guide](shared/README.md)
-- [Docker deployment guide](DOCKER.md)
 
 ## Responsible use
 
-Obtain written authorization, define allowed hosts and methods, agree on test windows, use dedicated accounts and data, and establish escalation contacts before scanning. Review the evidence and coverage manually. A missing automated finding does not prove that a target is secure.
+SentryStrike is an **active** scanner: it submits forms, fires exploit payloads, and probes sensitive paths. Only run it against applications you own or have explicit written authorization to test. Authenticated scanning uses the test accounts you supply; credentials travel inside the Redis job payload, are removed when a worker claims the job, and are never written to the database.

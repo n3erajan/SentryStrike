@@ -76,10 +76,10 @@ def test_multiple_zero_request_detectors_each_warned():
             skipped_reasons={"no_candidates_matched": 5},
         ),
         DetectorCoverageMetric(
-            detector="supply_chain",
+            detector="open_redirect",
             candidates_built=3,
             requests_sent=0,
-            skipped_reasons={"no_version_extracted": 3},
+            skipped_reasons={"no_replayable_attack_targets": 3},
         ),
         DetectorCoverageMetric(
             detector="xss",
@@ -89,8 +89,80 @@ def test_multiple_zero_request_detectors_each_warned():
     ]
     warnings = _orchestrator()._detector_coverage_warnings(metrics)
     assert len(warnings) == 2
-    warned_detectors = [w for w in warnings if "command_injection" in w or "supply_chain" in w]
+    warned_detectors = [w for w in warnings if "command_injection" in w or "open_redirect" in w]
     assert len(warned_detectors) == 2
+
+
+def test_non_http_detector_never_warned():
+    """supply_chain reaches its verdict by correlating the fingerprinted
+    technology stack against CVEs — it dispatches no HTTP request at all. A
+    0-request metric is its normal complete state, so warning about it would
+    report a guaranteed false gap on every scan."""
+    metrics = [
+        DetectorCoverageMetric(
+            detector="supply_chain",
+            candidates_built=7,
+            requests_sent=0,
+            skipped_reasons={"no_findings_after_verification": 1},
+        ),
+    ]
+    assert _orchestrator()._detector_coverage_warnings(metrics) == []
+
+
+def test_inapplicable_skip_reason_suppresses_warning():
+    """crypto_failures gates its active probes on an https:// scheme. On a
+    plain-HTTP target the transport checks are inapplicable, not skipped, so the
+    recorded exempt reason must suppress the gap warning."""
+    metrics = [
+        DetectorCoverageMetric(
+            detector="crypto_failures",
+            candidates_built=12,
+            requests_sent=0,
+            skipped_reasons={"https_only_checks_not_applicable": 1},
+        ),
+    ]
+    assert _orchestrator()._detector_coverage_warnings(metrics) == []
+
+
+def test_crypto_failures_still_warned_on_https_target():
+    """Without the inapplicability reason — i.e. an https target where the
+    transport checks should have run — crypto_failures is a real gap and must
+    still be warned about."""
+    metrics = [
+        DetectorCoverageMetric(
+            detector="crypto_failures",
+            candidates_built=12,
+            requests_sent=0,
+            skipped_reasons={"no_findings_after_verification": 1},
+        ),
+    ]
+    warnings = _orchestrator()._detector_coverage_warnings(metrics)
+    assert len(warnings) == 1
+    assert "crypto_failures" in warnings[0]
+
+
+def test_http_target_records_crypto_inapplicability_reason():
+    """On a plain-HTTP target the skip-reason builder must record the exempt
+    reason, so the suppression above actually engages end to end."""
+    reasons = _orchestrator()._detector_skip_reasons(
+        "crypto_failures",
+        candidates_built=4,
+        findings=[],
+        crawl_context={"root_url": "http://localhost:8080", "urls": ["http://localhost:8080/login.php"]},
+    )
+    assert reasons.get("https_only_checks_not_applicable") == 1
+
+
+def test_https_target_does_not_record_crypto_inapplicability_reason():
+    """An https target means the transport checks were applicable, so the exempt
+    reason must not be recorded and a 0-request metric stays a real gap."""
+    reasons = _orchestrator()._detector_skip_reasons(
+        "crypto_failures",
+        candidates_built=4,
+        findings=[],
+        crawl_context={"root_url": "https://example.com", "urls": ["https://example.com/login"]},
+    )
+    assert "https_only_checks_not_applicable" not in reasons
 
 
 def test_zero_request_detector_without_skip_reason_still_warned():

@@ -22,4 +22,11 @@ backend/tests
 scanner/tests
 analyzer/tests
 
+# Dev-time only: the analyzer benchmark harness and the Ollama Modelfile are not
+# shipped in any image. The Python images COPY only requirements.txt, shared/,
+# and their own app/, so these never reach a layer regardless; excluding them
+# here keeps the build context lean and makes the intent explicit.
+analyzer/benchmark
+analyzer/ollama
+
 *.log

@@ -63,8 +63,10 @@ faster than a character count suggests. Re-measure before increasing them.
 
 ## Accuracy
 
-Scored against the 30-case labelled corpus in [`../benchmark/`](../benchmark/),
-15 genuine findings and 15 spurious ones across all ten proof types:
+The labelled corpus in [`../benchmark/`](../benchmark/) holds 31 cases — 21 in
+`corpus.py` plus 10 in `corpus_adversarial.py`, run together with
+`--corpus all` — split 15 genuine and 16 spurious across all ten proof types.
+Metrics use FP-flagging as the positive class, matching `run_benchmark.py`:
 
 | Metric | Value |
 | --- | --- |
@@ -73,9 +75,16 @@ Scored against the 30-case labelled corpus in [`../benchmark/`](../benchmark/),
 | F1 | 0.929 |
 | Genuine findings discarded | 0 of 15 |
 
+> [!NOTE]
+> These figures were measured when the corpus held 15 spurious cases (recall
+> 0.867 is 13 of 15). One spurious case has been added since, so re-run the
+> benchmark before quoting them.
+
 Verdicts were stable across three repeated runs of the primary corpus, with no
 case changing verdict. `temperature` is pinned low for that reproducibility;
-raising it reintroduces variance between runs on identical evidence.
+raising it reintroduces variance between runs on identical evidence. Raw
+benchmark outputs are kept out of the repo under `docs/benchmark-results/`
+(local only).
 
 ## Using a different model
 
@@ -86,8 +95,9 @@ will work. Two cautions from testing:
   the failure mode, not an error, and `prompt_tokens` in the response is the way
   to check it.
 - A security-specialised model is not automatically better. `Foundation-Sec-8B-Instruct`
-  scored F1 0.640 against this corpus and discarded two genuine findings, because
-  its categorical axis answers contradicted its own verdicts.
+  scored F1 0.640 on its raw verdicts against this corpus and discarded two
+  genuine findings, because its categorical axis answers contradicted its own
+  verdicts.
 
 Re-run the benchmark before switching:
 

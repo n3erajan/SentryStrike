@@ -33,6 +33,22 @@ SPECIALIZED_INPUT_DETECTORS = frozenset(
     }
 )
 
+# Detectors that reach a verdict without dispatching a single HTTP request.
+# They correlate evidence another phase already collected (supply_chain reads
+# the fingerprinted technology stack and maps versions to CVEs), so a
+# ``requests_sent == 0`` metric is their normal, complete state — not a gap.
+# The 0-request coverage warning must never fire for these, or it reports a
+# guaranteed false gap on every scan. A detector belongs here only if it holds
+# no HttpVerifier and opens no scan client; anything that tags requests with a
+# ``module=`` label (security_headers, crypto_failures) does not qualify.
+NON_HTTP_DETECTORS = frozenset({"supply_chain"})
+
+# Skip reasons that explain a 0-request metric as inapplicability rather than a
+# coverage gap, suppressing the warning without hiding a genuine one.
+COVERAGE_WARNING_EXEMPT_SKIP_REASONS = frozenset(
+    {"https_only_checks_not_applicable"}
+)
+
 
 class DetectorExecutionMixin:
     def _detector_name(self, detector: object) -> str:
@@ -183,6 +199,25 @@ class DetectorExecutionMixin:
             skipped_reasons=skipped_reasons,
         )
 
+    @staticmethod
+    def _any_https_target(crawl_context: dict) -> bool:
+        """True when any crawled URL uses https, mirroring CryptoFailuresDetector.
+
+        The detector only probes the first 5 URLs, but this checks the whole set
+        deliberately: an https URL anywhere means the transport checks were
+        applicable and a 0-request metric is a real gap worth warning about.
+        """
+        from urllib.parse import urlparse
+
+        candidates = [
+            crawl_context.get("root_url") or "",
+            *(crawl_context.get("urls") or []),
+        ]
+        for url in candidates:
+            if url and urlparse(str(url)).scheme == "https":
+                return True
+        return False
+
     def _detector_skip_reasons(
         self,
         detector_name: str,
@@ -239,6 +274,12 @@ class DetectorExecutionMixin:
             skipped["no_replayable_attack_targets"] = 1
         if detector_name in {"xss", "authentication_failures", "access_control"} and browser_available is False:
             skipped["browser_unavailable"] = 1
+        if detector_name == "crypto_failures" and not self._any_https_target(crawl_context):
+            # CryptoFailuresDetector gates its active probes on an https:// scheme
+            # and reports transport weakness by inspection instead. Over plain
+            # HTTP its mixed-content and cookie-attribute checks are inapplicable,
+            # not skipped, so the 0-request metric is not a coverage gap.
+            skipped["https_only_checks_not_applicable"] = 1
         if (
             detector_name in {"injection_sql_command", "xss", "file_inclusion"}
             and not replayable_body_count
@@ -398,9 +439,23 @@ class DetectorExecutionMixin:
         gap to a top-level ``coverage_warning`` so an operator reading the report
         sees it without drilling into per-detector metrics. Detectors that built
         0 candidates are not warned here (no gap — there was nothing to test).
+
+        Two classes are exempt, because for them a 0-request metric is the normal
+        complete state rather than a gap: detectors in ``NON_HTTP_DETECTORS``,
+        which never dispatch a request at all, and detectors carrying a skip
+        reason in ``COVERAGE_WARNING_EXEMPT_SKIP_REASONS``, which recorded that
+        their request-based checks were inapplicable to this target.
         """
         warnings: list[str] = []
         for metric in detector_metrics:
+            if metric.detector in NON_HTTP_DETECTORS:
+                continue
+            if any(
+                reason in COVERAGE_WARNING_EXEMPT_SKIP_REASONS
+                for reason, count in metric.skipped_reasons.items()
+                if count
+            ):
+                continue
             if metric.candidates_built > 0 and metric.requests_sent == 0:
                 # Prefer the most informative skip reason when available.
                 reason = (

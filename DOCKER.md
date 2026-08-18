@@ -1,414 +1,175 @@
-<div align="center">
-
 # Running SentryStrike with Docker
 
-**Container topology, configuration, operations, and production hardening.**
+[![Docker Compose](https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-7-47A248?logo=mongodb&logoColor=white)](https://mongodb.com)
+[![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io)
 
-[![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
-[![MongoDB](https://img.shields.io/badge/MongoDB-7-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
-[![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
-[![Playwright](https://img.shields.io/badge/Playwright-1.60-2EAD33?logo=playwright&logoColor=white)](https://playwright.dev/python/)
+Operating the compose stack: what each container is, what its healthcheck actually proves, how to scale workers, how to back up, and what to check when something is wrong. For install and first-run, see the [root README](README.md#quick-start-docker).
 
-</div>
+This is a deployment baseline, not a security boundary. TLS termination, secret management, authenticated data stores, and backups are yours.
 
-This guide covers the repository's [`docker-compose.yml`](docker-compose.yml), which defines the frontend, backend, scanner, analyzer, MongoDB, and Redis services. It is a deployment baseline, not a complete production security boundary: TLS termination, secret management, authenticated data stores, monitoring, and backups remain operator responsibilities.
+## Topology
 
-> [!CAUTION]
-> SentryStrike actively probes web applications. Containerization does not make unauthorized scanning safe or legal. Only scan targets covered by explicit written authorization.
+| Service | Image / build | Published |
+|---|---|---|
+| `frontend` | Vite build on `node:24-alpine`, served by `nginx-unprivileged` | `${FRONTEND_PORT:-80}` → `8080` |
+| `backend` | `python:3.12-slim`, multi-stage | **none** |
+| `scanner` | `mcr.microsoft.com/playwright/python:v1.60.0-noble` | none |
+| `analyzer` | `python:3.12-slim`, multi-stage | none |
+| `mongo` | `mongo:7` | internal |
+| `redis` | `redis:7-alpine` | internal |
 
-## Architecture
+Only the frontend is reachable from the host. Its nginx serves the SPA and proxies `/api/` and `/oast/` to `backend:8000`, so a single-origin deploy needs nothing else exposed. Every application image runs as a non-root user (`app`, `pwuser`, `nginx`).
 
-![SentryStrike system architecture](./sentrystrike-architecture.svg)
+MongoDB is the durable source of truth on the `mongo_data` volume. Redis runs with `--save '' --appendonly no` and **has no volume on purpose**: it holds queue payloads, cancel keys, leases, and heartbeats, all TTL'd and all safe to lose. Losing Redis costs you in-flight dispatch, not state.
 
-| Service    | Image or build                                    | Responsibility                                                                          | Published port                   |
-| ---------- | ------------------------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------- |
-| `frontend` | Vite build on Node 24; nginx-unprivileged runtime | Serves the React SPA and proxies `/api/` to the backend                                 | `${FRONTEND_PORT:-80}` → `8080`  |
-| `backend`  | Python 3.12 slim                                  | FastAPI control plane, auth, workspaces, reports, PDF, and OAST callbacks               | `${BACKEND_PORT:-8000}` → `8000` |
-| `scanner`  | Playwright Python 1.60                            | Crawl, detection, verification, grading, and re-verification workers                    | None                             |
-| `analyzer` | Python 3.12 slim                                  | Durable AI analysis through Ollama or another OpenAI-compatible provider                | None                             |
-| `mongo`    | MongoDB 7                                         | Durable tenants, scans, evidence, analysis jobs, OAST records, audit, and notifications | Internal only                    |
-| `redis`    | Redis 7 Alpine                                    | Scan jobs, wake-up signals, cancellation, leases, and heartbeats                        | Internal only                    |
+> [!NOTE]
+> `BACKEND_PORT` in `.env.example` is vestigial — the compose file no longer publishes the backend. Set `FRONTEND_PORT` to move the only host-facing port.
 
-MongoDB is the durable source of truth. Redis is deliberately configured without RDB snapshots or AOF persistence and has no named volume; treat its queues and coordination keys as ephemeral.
+## OAST callbacks in compose
 
-All application images run as non-root users.
-
-## Prerequisites
-
-- Docker Engine or Docker Desktop with Compose v2.24 or newer
-- At least 4 GB of available memory; browser-heavy scans may require more
-- An Ollama instance with the configured model, or another reachable OpenAI-compatible provider, when AI analysis is enabled
-- A public HTTPS endpoint when OAST callbacks must be received from remote targets
-
-Confirm Docker and Compose are available:
-
-```bash
-docker version
-docker compose version
-docker compose config --services
-```
-
-The final command should list `redis`, `mongo`, `scanner`, `analyzer`, `backend`, and `frontend`.
-
-## Configuration
-
-Create local configuration files from the committed templates:
-
-```bash
-cp .env.example .env
-cp backend/.env.example backend/.env
-cp scanner/.env.example scanner/.env
-cp analyzer/.env.example analyzer/.env
-```
-
-These files are ignored by Git. Review them before starting containers; example values are development defaults, not production secrets.
-
-### Shared deployment settings
-
-The root `.env` coordinates infrastructure and values used by more than one service:
+This is the setting most likely to be silently wrong. The backend receives target callbacks at `/oast/{interaction_id}` and answers scanner polls at `/oast/poll`. The scanner needs two different addresses for them because they are reached from different places:
 
 ```dotenv
-MONGODB_DB_NAME=sentrystrike
-SCAN_QUEUE_NAME=sentrystrike:scans
-ANALYSIS_QUEUE_NAME=sentrystrike:analysis
-PUBLIC_HOSTNAME=https://sentry.example.com
-FRONTEND_PORT=80
-BACKEND_PORT=8000
-VITE_API_URL=/api/v1
+# root .env
+OAST_CALLBACK_BASE_URL=https://sentry.example.com/oast   # what the TARGET calls
+OAST_POLL_URL=http://backend:8000/oast/poll              # what the SCANNER polls
 ```
 
-Compose overrides `MONGODB_URI` and `REDIS_URL` inside Python containers with the internal service addresses `mongo:27017` and `redis:6379`. The localhost values in `.env.example` remain useful when Python services run directly on the host.
+Both derive from `PUBLIC_HOSTNAME` when unset. If that is empty too, they stay `None` and the out-of-band checks are **skipped rather than failed** — blind SSRF and blind SQLi go undetected and the scan still reports success.
 
-`VITE_API_URL` is a frontend build argument, not a runtime setting. Rebuild the frontend whenever it changes.
+Two things to get right:
 
-### Backend settings
+- **The callback goes through nginx, not the backend port.** In this stack nothing listens on host `:8000`, so a callback aimed at `host.docker.internal:8000/oast` cannot connect. Route it at `${FRONTEND_PORT}` or your public hostname; nginx already proxies `/oast/`. (The `host.docker.internal:8000` value commented in `scanner/.env.example` is for host-run development, where uvicorn does bind `:8000`.)
+- **Put compose OAST overrides in the root `.env`.** Compose interpolates the root `.env` before service `env_file` values load, so a value set only in `scanner/.env` will not reach the interpolation.
 
-Review at least these values in `backend/.env`:
+A localhost callback can never be reached by a remote target. Use an authorized public hostname or a controlled tunnel, and restart the scanner after changing it.
 
-```dotenv
-APP_DEBUG=false
-CORS_ORIGINS=["https://sentry.example.com"]
-AUTH_COOKIE_SECURE=true
-AUTH_COOKIE_SAMESITE=lax
-EMAIL_FROM=SentryStrike <security@example.com>
-EMAIL_SMTP_HOST=smtp.example.com
-EMAIL_SMTP_PORT=587
-EMAIL_SMTP_USER=
-EMAIL_SMTP_PASSWORD=
-EMAIL_SMTP_STARTTLS=true
-```
-
-Registration is invitation-only. SMTP credentials are required when invitation and notification email must be delivered rather than inspected through local CLI output.
-
-### Scanner settings
-
-Scanner traffic and browser budgets belong in `scanner/.env`:
-
-```dotenv
-CRAWL_DEPTH=3
-CRAWL_MAX_URLS=200
-CRAWL_RATE_LIMIT_PER_SECOND=8.0
-CRAWL_BROWSER_MODE=auto
-CRAWL_BROWSER_MAX_INTERACTIONS=25
-CRAWL_BROWSER_BUDGET_SECONDS=300.0
-REQUEST_TIMEOUT_SECONDS=10.0
-SCANNER_CONCURRENCY=8
-SCAN_MODE=verified
-NVD_API_KEY=
-```
-
-Start conservatively for fragile targets. Authenticated target credentials are submitted per scan, not read from environment files, and never persisted to MongoDB. They exist only in the Redis job payload and worker memory; Redis removes the payload when a worker claims it.
-
-### AI analysis provider
-
-The analyzer is configured for Ollama by default and accepts any provider implementing an OpenAI-compatible chat-completions API:
-
-```dotenv
-AI_BASE_URL=http://host.docker.internal:11434/v1
-AI_MODEL=gemma4:e4b-it-qat-16k
-AI_API_KEY=
-AI_TIMEOUT_SECONDS=120
-AI_MAX_RETRIES=3
-AI_JSON_MODE=true
-```
-
-Build the default model once on the Ollama host before the first scan:
-
-```bash
-ollama create gemma4:e4b-it-qat-16k -f analyzer/ollama/Modelfile
-```
-
-It pins the context window the analyzer's prompts require. A stock build with a
-smaller window does not reject an oversized prompt; it silently drops the
-overflow and answers from what remains, which produces confident analysis of
-evidence the model never saw. See [`analyzer/ollama/README.md`](analyzer/ollama/README.md).
-
-Make sure the configured model exists in Ollama and the service is reachable from Docker. With the default local Ollama configuration, scan evidence stays within the deployment. For a hosted or separately deployed provider, replace `AI_BASE_URL`, `AI_MODEL`, and `AI_API_KEY` as required; that provider receives the analysis input, so review its data-handling terms. Provider responses must support the analyzer's structured JSON contract and the context window must cover the analyzer's prompt sizes.
-
-### OAST routing
-
-The backend is the OAST collaborator. It receives target callbacks at `/oast/{interaction_id}`, stores them in MongoDB, and answers scanner polling requests at `/oast/poll`.
-
-Docker Compose gives the scanner two addresses for those backend routes because they are reached from different network locations:
-
-```dotenv
-OAST_CALLBACK_BASE_URL=http://host.docker.internal:8000/oast
-OAST_POLL_URL=http://backend:8000/oast/poll
-```
-
-- `OAST_CALLBACK_BASE_URL` is the backend callback route as seen by the target receiving the test payload.
-- `OAST_POLL_URL` is the same backend service as seen by the scanner on the Compose network.
-- The backend validates interaction IDs before it stores or returns a callback.
-
-Set Compose-specific OAST overrides in the root `.env`, not `scanner/.env`.
-Compose interpolation occurs before service `env_file` values are loaded. The
-default callback follows `BACKEND_PORT`, and both scanner and analyzer containers
-map `host.docker.internal` through Docker's host gateway for Linux portability.
-
-For a public deployment, set `OAST_CALLBACK_BASE_URL=https://sentry.example.com/oast` in the root `.env` and route `/oast/` at the external reverse proxy directly to `backend:8000`. The bundled frontend nginx configuration proxies `/api/`, but it does not expose `/oast/`.
-
-## Data-store-only development
-
-To run the application services directly on the host, start only the data stores:
-
-```bash
-docker compose up -d mongo redis
-docker compose ps
-```
-
-Then start the backend, scanner, analyzer, and frontend on the host using the [local development instructions](README.md#quick-start-for-local-development). The root `.env.example` already uses localhost addresses for this topology.
-
-Stop the data stores without deleting MongoDB data:
-
-```bash
-docker compose down
-```
-
-## Full-stack workflow
-
-Build and start the complete stack with:
-
-```bash
-docker compose config
-docker compose build
-docker compose up -d
-docker compose ps
-```
-
-Follow startup logs in another terminal:
-
-```bash
-docker compose logs -f backend scanner analyzer
-```
-
-Open the UI at <http://localhost> when `FRONTEND_PORT=80`. The API is also published directly at <http://localhost:8000/api/v1> unless `BACKEND_PORT` is changed.
-
-Useful lifecycle commands:
-
-```bash
-docker compose up -d
-docker compose restart scanner analyzer
-docker compose stop
-docker compose down
-```
-
-Rebuild after source, dependency, Dockerfile, frontend build-variable, or base-image changes:
-
-```bash
-docker compose build --pull
-docker compose up -d
-```
-
-## Health checks
-
-| Service    | Health signal                                                 | What it proves                                                                                    |
-| ---------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `frontend` | HTTP request to `http://localhost:8080/` inside the container | nginx can serve the built SPA                                                                     |
-| `backend`  | `GET /api/v1/health`                                          | API process is responding after MongoDB and Redis startup                                         |
-| `scanner`  | Redis `PING` from the scanner container                       | The container can reach Redis; it does not independently prove the worker loop is processing jobs |
-| `analyzer` | Signal check against PID 1                                    | Analyzer process is alive; provider readiness is surfaced through durable job failures            |
-| `mongo`    | `db.runCommand({ ping: 1 })`                                  | MongoDB accepts commands                                                                          |
-| `redis`    | `redis-cli ping`                                              | Redis accepts commands                                                                            |
-
-Inspect health and recent failures:
+## Healthchecks: what they prove
 
 ```bash
 docker compose ps
-docker compose logs --tail=200 backend scanner analyzer
-curl http://localhost:8000/api/v1/health
+curl http://localhost/api/v1/health
 ```
+
+| Service | Probe | Proves | Does **not** prove |
+|---|---|---|---|
+| `frontend` | HTTP `:8080/` in-container | nginx serves the bundle | backend reachable |
+| `backend` | `GET /api/v1/health` | API responds after Mongo + Redis | — |
+| `scanner` | Redis `PING` | container can reach its queue | the worker loop is consuming |
+| `analyzer` | signal to PID 1 | process alive | provider is configured or reachable |
+| `mongo` | `db.runCommand({ping:1})` | accepts commands | — |
+| `redis` | `redis-cli ping` | accepts commands | — |
+
+The last two columns matter. A green `scanner` says nothing about whether scans are progressing — heartbeat keys and worker logs do. A green `analyzer` says nothing about the LLM; provider misconfiguration fails durable jobs visibly instead of restart-looping the worker, which is deliberate.
+
+`GET /api/v1/health` returns the live scanner-worker count from Redis heartbeats. That is the real capacity signal.
 
 ## Logs
 
-Container logs are the primary operational stream:
-
 ```bash
-docker compose logs -f
-docker compose logs -f backend
-docker compose logs -f scanner
-docker compose logs -f analyzer
-```
-
-Scanner file logs are stored in the `scanner_logs` named volume at `/app/logs`. Inspect them from a running worker:
-
-```bash
+docker compose logs -f backend scanner analyzer
 docker compose exec scanner sh -c 'tail -n 200 /app/logs/scanner.log'
 ```
 
-Treat logs as sensitive because they may contain target URLs and security evidence.
+Scanner file logs live in the `scanner_logs` volume at `/app/logs` (set `LOG_FILE` to enable). Replicas share that volume, so prefer container stdout when diagnosing one replica.
+
+Treat logs as sensitive: they carry target URLs and security evidence. Secrets are redacted (`scanner/app/utils/redaction.py`), targets are not.
 
 ## Scaling workers
 
-Scanner and analyzer workers can scale independently because they consume shared queues and use leases and guarded durable updates:
+Both workers are safe to scale — they claim from shared queues under leases with revision-guarded writes, so two workers cannot double-publish.
 
 ```bash
 docker compose up -d --scale scanner=4 --scale analyzer=2
 ```
 
-Monitor MongoDB, Redis, host memory, browser processes, target load, and provider throughput before increasing worker counts. Scanner replicas share the `scanner_logs` volume, so container stdout is preferable when diagnosing an individual replica.
-
-For browser-heavy workloads, add resource controls through a local Compose override:
+Scanner replicas are the expensive ones: each runs Chromium. Watch host memory and target load before raising the count. For browser-heavy work, add an override and validate it with `docker compose config` first:
 
 ```yaml
+# docker-compose.override.yml
 services:
   scanner:
     shm_size: 1gb
     deploy:
       resources:
-        limits:
-          cpus: '2.0'
-          memory: 4g
-  analyzer:
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 1g
+        limits: { cpus: '2.0', memory: 4g }
 ```
 
-Validate overrides with `docker compose config` before applying them.
+Analyzer throughput is bounded by your LLM provider, not by replica count. More analyzers against one Ollama instance mostly queues.
 
-## Data persistence and backup
+## Backup and restore
 
-Compose creates two named volumes:
-
-- `mongo_data` stores all durable SentryStrike data.
-- `scanner_logs` stores rotating scanner log files.
-
-`docker compose down` preserves named volumes. `docker compose down -v` permanently deletes them and should only be used when a complete reset is intended.
-
-Create a compressed MongoDB backup:
+`mongo_data` holds everything durable. `docker compose down` keeps volumes; `down -v` destroys them.
 
 ```bash
-docker compose exec mongo mongodump --db sentrystrike --archive=/tmp/sentrystrike.archive --gzip
-docker compose cp mongo:/tmp/sentrystrike.archive ./sentrystrike.archive
-```
+# backup
+docker compose exec mongo mongodump --db sentrystrike --archive=/tmp/ss.archive --gzip
+docker compose cp mongo:/tmp/ss.archive ./ss.archive
 
-Restore into the configured database:
-
-```bash
-docker compose cp ./sentrystrike.archive mongo:/tmp/sentrystrike.archive
-docker compose exec mongo mongorestore --archive=/tmp/sentrystrike.archive --gzip --drop
+# restore
+docker compose cp ./ss.archive mongo:/tmp/ss.archive
+docker compose exec mongo mongorestore --archive=/tmp/ss.archive --gzip --drop
 ```
 
 > [!WARNING]
-> `mongorestore --drop` deletes matching collections before restoring them. Verify the target deployment and backup file before running it.
+> `--drop` deletes matching collections before restoring. Check which deployment you are pointed at first.
 
-Backups should be encrypted, access-controlled, tested through periodic restoration, and stored separately from the Docker host.
+Encrypt backups, store them off the Docker host, and actually test a restore. Retention purging (`retention_worker.py`, 30-day floor) trims scan data on its own schedule — that is not a backup.
 
 ## Production hardening
 
-Before exposing SentryStrike outside an isolated development environment:
-
-1. Put a reverse proxy or ingress in front of the stack and terminate HTTPS there.
-2. Set `AUTH_COOKIE_SECURE=true` and restrict `CORS_ORIGINS` to trusted origins.
-3. Keep MongoDB and Redis off public interfaces; add authentication and network policy appropriate to the environment.
-4. Move SMTP and provider credentials to the deployment platform's secret manager instead of baking them into images.
-5. Restrict direct access to the published backend port or remove that publication through a Compose override when only the frontend proxy and OAST ingress need it.
-6. Keep every application container on its configured non-root runtime user.
-7. Set CPU, memory, process, request, crawl, and browser limits based on measured workloads.
-8. Pin and scan base images, rebuild regularly, and review dependency CVEs.
-9. Centralize logs and alert on unhealthy containers, worker-heartbeat loss, repeated analysis failures, and queue growth.
-10. Schedule MongoDB backups and restoration tests.
-
-The scanner requires outbound access to authorized targets, NVD when enrichment is enabled, and the OAST polling endpoint. The analyzer requires access to its configured AI provider. Restrict other egress where practical.
+1. Terminate HTTPS at a reverse proxy or ingress in front of the stack.
+2. Set `AUTH_COOKIE_SECURE=true`, `APP_DEBUG=false`, and restrict `CORS_ORIGINS` to real origins. Debug mode exposes `/docs`.
+3. Replace the Turnstile test keys with real ones — the shipped defaults always pass.
+4. Route `/oast/` at the external proxy and set `PUBLIC_HOSTNAME`, or blind detection stays off.
+5. Keep Mongo and Redis off public interfaces; add auth appropriate to the environment.
+6. Move SMTP and provider credentials to your platform's secret manager, not into images.
+7. Keep containers on their non-root users; set CPU, memory, and crawl budgets from measured load.
+8. Pin and rescan base images; rebuild on CVE churn.
+9. Alert on unhealthy containers, heartbeat loss, repeated analysis failures, and queue growth.
+10. Restrict egress to authorized targets, NVD, and your AI provider.
 
 ## Troubleshooting
 
-### An application image fails to build
+**Build fails.** Build from the repo root; the backend, scanner, and analyzer contexts are `.` because they install the `shared` package. `docker compose build --no-cache <service>`.
 
-Confirm the build is running from the repository root and inspect the failing
-service without using cached layers:
-
-```bash
-docker compose build --no-cache backend
-docker compose build --no-cache scanner
-docker compose build --no-cache analyzer
-docker compose build --no-cache frontend
-```
-
-### Frontend returns `502 Bad Gateway`
-
-Check backend state and internal connectivity:
+**Frontend returns 502.** nginx cannot reach the backend:
 
 ```bash
-docker compose ps backend
-docker compose logs --tail=200 backend
+docker compose ps backend && docker compose logs --tail=200 backend
 docker compose exec frontend wget -qO- http://backend:8000/api/v1/health
 ```
 
-### Scanner or analyzer cannot reach Redis
+**Scans stay queued.** The scanner healthcheck only proves Redis reachability. Check for live heartbeats:
 
 ```bash
-docker compose ps redis
-docker compose logs redis
-docker compose exec scanner python -c "import os,redis; print(redis.Redis.from_url(os.environ['REDIS_URL']).ping())"
-```
-
-Inside containers, `REDIS_URL` must use the Compose service name, not localhost. The Compose file sets it to `redis://redis:6379/0`.
-
-### AI analysis reports provider failures
-
-Confirm the provider is running, the configured model exists, and the endpoint is reachable from the analyzer container:
-
-```bash
-docker compose exec analyzer python -c "import os,urllib.request; print(urllib.request.urlopen(os.environ['AI_BASE_URL'].rstrip('/') + '/models', timeout=10).status)"
-docker compose logs --tail=200 analyzer
-```
-
-For Ollama on the Docker host, ensure it accepts connections from Docker and that `AI_BASE_URL` uses `host.docker.internal`, not `localhost`.
-
-### Scans remain queued
-
-Check scanner replicas, logs, and heartbeat keys:
-
-```bash
-docker compose ps scanner
-docker compose logs --tail=200 scanner
 docker compose exec redis redis-cli --scan --pattern 'sentrystrike:worker:heartbeat:*'
+docker compose logs --tail=200 scanner
 ```
 
-The scanner Compose health check validates Redis connectivity only. Heartbeat keys and worker logs provide stronger evidence that the worker loop is alive.
+No keys means no worker is running the loop, whatever `docker compose ps` says.
 
-### OAST callbacks are not recorded
+**Worker cannot reach Redis.** Inside containers `REDIS_URL` must use the service name; compose sets `redis://redis:6379/0`. A `localhost` value leaked from a `.env` file is the usual cause.
 
-Verify that the callback URL is publicly routable from the target environment, `/oast/` reaches the backend, and the scanner can poll internally:
+**AI analysis fails.** Confirm the endpoint resolves from inside the container and the model exists:
 
 ```bash
-docker compose logs --tail=200 backend scanner
-docker compose exec scanner python -c "import os; print(os.environ.get('OAST_CALLBACK_BASE_URL')); print(os.environ.get('OAST_POLL_URL'))"
+docker compose exec analyzer python -c "import os,urllib.request; print(urllib.request.urlopen(os.environ['AI_BASE_URL'].rstrip('/')+'/models', timeout=10).status)"
 ```
 
-Localhost URLs embedded in payloads cannot be reached by a remote target. Use an authorized public hostname or controlled tunnel and restart the scanner after changing callback configuration.
+For host-installed Ollama, `AI_BASE_URL` must use `host.docker.internal`, not `localhost`, and Ollama must accept connections from Docker. Build the pinned model first — see [`analyzer/ollama/README.md`](analyzer/ollama/README.md).
 
-### Playwright browser processes fail or are killed
+**Analysis verdicts look confident but wrong.** Suspect a truncated prompt. Check `prompt_tokens` on the job; a stock model tag loads a 4096-token window and drops the overflow silently. That is what `gemma4:e4b-it-qat-16k` exists to prevent.
 
-Increase scanner memory and shared memory, reduce `SCANNER_CONCURRENCY`, and lower browser interaction and time budgets. Confirm the scanner base image tag still matches the pinned Playwright Python version.
+**OAST callbacks never arrive.** See [OAST callbacks in compose](#oast-callbacks-in-compose). Confirm what the scanner is actually minting:
 
-## Related documentation
+```bash
+docker compose exec scanner python -c "import os; print(os.environ.get('OAST_CALLBACK_BASE_URL'), os.environ.get('OAST_POLL_URL'))"
+```
 
-- [Project overview](README.md)
-- [Backend guide](backend/README.md)
-- [Scanner guide](scanner/README.md)
-- [Analyzer guide](analyzer/README.md)
-- [Frontend guide](frontend/README.md)
+**Chromium is killed mid-crawl.** Out of shared memory. Raise `shm_size`, lower `SCANNER_CONCURRENCY` and the `CRAWL_BROWSER_*` budgets. If you changed the scanner base image, its Chromium build must still match the pinned `playwright==1.60.0` wheel.
+
+## Related
+
+- [Project overview](README.md) · [Backend](backend/README.md) · [Scanner](scanner/README.md) · [Analyzer](analyzer/README.md) · [Frontend](frontend/README.md) · [Shared](shared/README.md)
