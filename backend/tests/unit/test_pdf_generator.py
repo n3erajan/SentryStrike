@@ -8,6 +8,7 @@ from app.utils.pdf_generator import (
     build_remediation_roadmap,
     build_scan_pdf,
     build_statistics,
+    build_technology_detected,
     build_tested_surface,
     build_styles,
     build_vulnerability_summary,
@@ -684,3 +685,81 @@ def test_pdf_tested_surface_separates_404_probes_from_tested_surface() -> None:
     assert "not established in either direction" in text
     # The honest request total is still shown.
     assert "6974" in text
+
+
+# --------------------------------------------------------------------------- #
+# Technology section: an empty CVE list must not read as "clean"
+# --------------------------------------------------------------------------- #
+
+def _tech_section(technologies: list[dict]) -> str:
+    styles = build_styles()
+    return _flowable_text(
+        build_technology_detected({"data": {"technology_stack": technologies}}, styles)
+    )
+
+
+def test_pdf_distinguishes_an_assessed_clean_component_from_an_unassessed_one() -> None:
+    """"None found" for a component nobody looked up is misinformation.
+
+    PHP and MySQL reach the report version-less, inferred from WordPress's
+    ``implies`` list. Neither can be CVE-matched, and the old table printed
+    "None found" against both.
+    """
+    text = _tech_section([
+        {
+            "name": "WordPress", "version": "7.1", "category": "cms", "cves": [],
+            "cve_assessment": "assessed", "cve_source": "nvd-cpe",
+        },
+        {
+            "name": "PHP", "version": None, "category": "language", "cves": [],
+            "cve_assessment": "not_assessed",
+            "cve_assessment_reason": "no version detected for PHP",
+        },
+    ])
+
+    assert "None found" in text
+    assert "Not assessed" in text
+    assert "no version detected for PHP" in text
+
+
+def test_pdf_reports_a_failed_lookup_as_failed() -> None:
+    text = _tech_section([{
+        "name": "Nginx", "version": "1.24.0", "category": "server", "cves": [],
+        "cve_assessment": "failed",
+        "cve_assessment_reason": "NVD returned HTTP 429 for f5:nginx",
+    }])
+
+    assert "Lookup failed" in text
+    assert "HTTP 429" in text
+    assert "None found" not in text
+
+
+def test_pdf_names_the_source_behind_each_cve_list() -> None:
+    text = _tech_section([{
+        "name": "Express", "version": "4.18.2", "category": "framework",
+        "cves": ["CVE-2024-43796"], "cve_assessment": "assessed", "cve_source": "osv",
+    }])
+
+    assert "CVE-2024-43796" in text
+    assert "OSV.dev" in text
+
+
+def test_pdf_flags_known_exploited_cves_in_the_technology_table() -> None:
+    text = _tech_section([{
+        "name": "Nginx", "version": "1.24.0", "category": "server",
+        "cves": ["CVE-2021-44228", "CVE-2024-0001"],
+        "cve_assessment": "assessed", "cve_source": "nvd-cpe",
+        "cve_kev": ["CVE-2021-44228"],
+    }])
+
+    assert "CVE-2021-44228 (exploited)" in text
+    assert "CVE-2024-0001 (exploited)" not in text
+
+
+def test_pdf_technology_section_tolerates_legacy_records_without_assessment_fields() -> None:
+    """Scans stored before this field existed must still render."""
+    text = _tech_section([
+        {"name": "jQuery", "version": "3.6.0", "category": "library", "cves": []},
+    ])
+
+    assert "jQuery" in text

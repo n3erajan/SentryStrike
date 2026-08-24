@@ -1484,12 +1484,52 @@ def build_tested_surface(data: dict, styles: dict) -> list:
     return elems
 
 
+_CVE_SOURCE_LABELS = {
+    "osv": "OSV.dev",
+    "nvd-cpe": "NVD (CPE match)",
+    "wordfence": "Wordfence Intelligence",
+}
+
+
+def _cve_cell_text(tech: dict) -> str:
+    """Describe a component's CVE status without ever implying an unchecked one is clean.
+
+    "None found" is only true when a source that covers the component was queried
+    and answered. When no source could identify it - no version, no CPE, no
+    ecosystem package - or when the query failed, the report has to say so;
+    otherwise an unassessed component is indistinguishable from a patched one.
+    """
+    cves = tech.get("cves", []) or []
+    # Records written before assessment tracking existed carry no status field.
+    # Treat them as assessed so historical scans still render as they used to.
+    status = tech.get("cve_assessment") or "assessed"
+    reason = tech.get("cve_assessment_reason")
+
+    if status == "not_assessed":
+        return f"Not assessed - {reason}" if reason else "Not assessed"
+    if status == "failed":
+        return f"Lookup failed - {reason}" if reason else "Lookup failed"
+
+    if not cves:
+        source = _CVE_SOURCE_LABELS.get(tech.get("cve_source") or "")
+        return f"None found ({source})" if source else "None found"
+
+    kev = set(tech.get("cve_kev", []) or [])
+    listed = ", ".join(f"{c} (exploited)" if c in kev else c for c in cves)
+    source = _CVE_SOURCE_LABELS.get(tech.get("cve_source") or "")
+    return f"{listed} - via {source}" if source else listed
+
+
 def build_technology_detected(data: dict, styles: dict) -> list:
     d = data.get("data", {})
     technologies = d.get("technology_stack", [])
     elems = section_header("Technology Detected", styles, "4")
     elems.append(Paragraph(
-        "The scanner identified the following technologies and checked each detected component for known CVEs.",
+        "The scanner identified the following technologies. Each component with a resolved "
+        "version and a known product identity was checked for CVEs that apply to that exact "
+        "version; components that could not be identified are marked as not assessed rather "
+        "than reported as clean. \"Exploited\" marks a CVE in CISA's Known Exploited "
+        "Vulnerabilities catalogue.",
         styles["body"],
     ))
     elems.append(Spacer(1, 3*mm))
@@ -1505,12 +1545,11 @@ def build_technology_detected(data: dict, styles: dict) -> list:
         Paragraph("Known CVEs", styles["th"]),
     ]]
     for tech in technologies:
-        cves = tech.get("cves", []) or []
         rows.append([
             Paragraph(_para_escape(tech.get("name") or "Unknown"), styles["body_sm"]),
             Paragraph(_para_escape(tech.get("version") or "Unknown"), styles["body_sm"]),
             Paragraph(_para_escape(tech.get("category") or "Unknown"), styles["body_sm"]),
-            Paragraph(_para_escape(", ".join(cves) if cves else "None found"), styles["body_sm"]),
+            Paragraph(_para_escape(_cve_cell_text(tech)), styles["body_sm"]),
         ])
 
     tbl = Table(rows, colWidths=[42*mm, 28*mm, 32*mm, None])
@@ -1745,8 +1784,11 @@ def build_detailed_findings(data: dict, styles: dict) -> list:
 
         elems.append(KeepTogether(block[:keep_together_count]))  # keep header + details together
         elems.extend(block[keep_together_count:])
-        elems.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER,
-                                spaceBefore=4, spaceAfter=2))
+        # Divider only between findings - a trailing divider after the final
+        # finding can spill alone onto the next page and render a blank page.
+        if idx < len(sorted_vulns):
+            elems.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER,
+                                    spaceBefore=4, spaceAfter=2))
 
     return elems
 

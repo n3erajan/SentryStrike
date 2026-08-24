@@ -128,7 +128,12 @@ Encrypt backups, store them off the Docker host, and actually test a restore. Re
 7. Keep containers on their non-root users; set CPU, memory, and crawl budgets from measured load.
 8. Pin and rescan base images; rebuild on CVE churn.
 9. Alert on unhealthy containers, heartbeat loss, repeated analysis failures, and queue growth.
-10. Restrict egress to authorized targets, NVD, and your AI provider.
+10. Restrict egress to authorized targets, your AI provider, and the vulnerability
+    feeds the scanner queries: `services.nvd.nist.gov`, `api.osv.dev`,
+    `api.first.org` (EPSS), `www.cisa.gov` (KEV), and `www.wordfence.com` if a
+    Wordfence key is configured. Blocking any of these does not produce wrong
+    findings — the affected components report as `not_assessed` or `failed` — but
+    it does mean no CVE coverage for that class of component.
 
 ## Troubleshooting
 

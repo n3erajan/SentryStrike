@@ -157,6 +157,7 @@ class _CompiledTech:
     dom: dict  # raw dom spec, evaluated against Evidence.dom
     implies: list[str]
     excludes: list[str]
+    cpe: str | None = None
 
 
 def _normalize_dom(value: Any) -> dict:
@@ -234,6 +235,7 @@ def _load_db() -> tuple[dict[str, _CompiledTech], int]:
             dom=_normalize_dom(spec.get("dom", {})),
             implies=[i.split("\\;")[0] for i in (spec.get("implies", []) or [])],
             excludes=[e.split("\\;")[0] for e in (spec.get("excludes", []) or [])],
+            cpe=spec.get("cpe") or None,
         )
 
     logger.debug("Fingerprint DB loaded: %d technologies (%d patterns skipped)", len(compiled), skipped)
@@ -454,3 +456,52 @@ def db_stats() -> tuple[int, int]:
     """(technology_count, skipped_pattern_count) - for diagnostics/tests."""
     techs, skipped = _load_db()
     return len(techs), skipped
+
+
+# --------------------------------------------------------------------------- #
+# CPE lookup (for CVE matching)
+# --------------------------------------------------------------------------- #
+
+# Canonical component names emitted by ``version_probe`` / ``error_fingerprints``
+# that do not match a fingerprint-DB key verbatim. A Server header says "Apache",
+# the DB calls it "Apache HTTP Server".
+_CPE_NAME_ALIASES: dict[str, str] = {
+    "apache": "Apache HTTP Server",
+    "apache httpd": "Apache HTTP Server",
+    "httpd": "Apache HTTP Server",
+    "tomcat": "Apache Tomcat",
+    "microsoft-iis": "IIS",
+    "nodejs": "Node.js",
+    "node": "Node.js",
+    "vue": "Vue.js",
+}
+
+
+@lru_cache(maxsize=1)
+def _cpe_index() -> dict[str, str]:
+    """Lowercased technology name -> CPE, for the entries that declare one.
+
+    Only about 6% of the 7,539 fingerprint entries carry a ``cpe`` field, but
+    they are the version-bearing servers, languages and CMS cores whose CVEs
+    matter. Everything else has to be assessed via an ecosystem package index or
+    reported as unassessed.
+    """
+    techs, _ = _load_db()
+    return {name.lower(): tech.cpe for name, tech in techs.items() if tech.cpe}
+
+
+def cpe_for(name: str) -> str | None:
+    """Return the CPE 2.3 URI for a detected technology, or None if unmapped.
+
+    Used to pin NVD queries to a vendor:product identity. Returning None is a
+    meaningful answer: it means this component cannot be CVE-matched against NVD
+    and must not be queried by name.
+    """
+    if not name:
+        return None
+    key = name.strip().lower()
+    index = _cpe_index()
+    if key in index:
+        return index[key]
+    alias = _CPE_NAME_ALIASES.get(key)
+    return index.get(alias.lower()) if alias else None

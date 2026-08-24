@@ -223,3 +223,39 @@ def test_evidence_json_keeps_metadata_when_snippet_is_huge():
     assert parsed["detection_method"] == "error_based_sqli"
     assert parsed["evidence_grade"] == "A"
     assert len(parsed["response_snippet"]) < 50_000
+
+
+def test_evidence_json_strips_scanner_conclusion_from_snippet():
+    """The model must judge the server's bytes, not the scanner's own verdict.
+
+    Composite evidence snippets begin with a ``VERIFICATION EVIDENCE:`` preamble
+    that states the scanner's conclusion; feeding that to the adjudicator produced
+    circular agreement. Only the text after ``RESPONSE EXCERPT:`` should reach it.
+    """
+    from app.services.finding_analysis import build_evidence_json
+
+    server_bytes = "<rss><channel><atom:link href='...feed?id=1' rel='self'/></channel></rss>"
+    vuln = Vulnerability(
+        id="v-reflect",
+        category=OwaspCategory.a03,
+        vuln_type="SQL Injection (UNION-Based)",
+        severity=SeverityLevel.critical,
+        cvss_score=9.1,
+        location=LocationInfo(url="https://target.test/feed?id=1"),
+        evidence=Evidence(
+            response_snippet=(
+                "VERIFICATION EVIDENCE:\n"
+                "UNION canary 'sentryprobe_abc123' reflected in response body. "
+                "Value absent from baseline - confirms data extraction.\n\n"
+                f"RESPONSE EXCERPT:\n{server_bytes}"
+            ),
+            detection_method="union_based",
+            proof_type="active_output",
+        ),
+    )
+
+    parsed = json.loads(build_evidence_json(vuln, 6000))
+
+    assert "VERIFICATION EVIDENCE" not in parsed["response_snippet"]
+    assert "confirms data extraction" not in parsed["response_snippet"]
+    assert parsed["response_snippet"].strip() == server_bytes

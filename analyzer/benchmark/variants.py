@@ -3,13 +3,15 @@
 baseline - the production prompt, imported directly from app.prompts so the
            measurement tracks real code.
 brief    - baseline plus the EvidenceGrader brief (proof summary, weaknesses,
-           judge question) that the scanner already computes but discards.
+           judge question), read live from the scanner's grader for the same
+           reason.
 """
 from __future__ import annotations
 
 import json
 
 from app.prompts.finding_analysis import build_adjudication_prompt
+from scanner.app.core.evidence_grader import EvidenceGrader as _EvidenceGrader
 
 VARIANTS = ("baseline", "brief", "brief_locus")
 
@@ -32,46 +34,26 @@ _LOCUS_RULE = (
 )
 
 
-# Proof-type briefs, lifted from scanner/app/core/evidence_grader.py. These are
-# already produced by build_evidence_brief() but never reach the analyzer.
-_PROOF_SUMMARY = {
-    "active_output": "Active exploitation confirmed - the proof is in the response (command output, file contents, or code execution).",
-    "error_echo": "A database/framework error string was echoed in the response, causally connected to the injected payload.",
-    "structural": "The vulnerability is structural - the observation itself IS the proof (missing header, TLS absence, admin path reachability, etc.).",
-    "timing_strong": "Strong timing differential - the response delay is large enough to clearly indicate sleep-based SQL injection.",
-    "timing_weak": "Weak timing differential - the response delay is small and could be network jitter rather than SQL injection.",
-    "ssrf_differential": "Repeated internal-target versus external-control behavior differed, but no outbound callback or internal response content was observed.",
-    "auth_confirmed": "Confirmed authorization differential - distinct users or privilege levels received the same restricted object, fields, or privileged capability.",
-    "auth_differential": "Access-control finding - responses from different authentication or user contexts indicate a possible boundary bypass. This is real only when a less-privileged context receives restricted data or the same object as another user.",
-    "pattern_match": "A pattern was matched in the response body - this could be a genuine error disclosure, reflected payload text, or normal page content.",
-    "heuristic": "Heuristic observation without active exploitation proof - the finding is based on observation alone.",
-}
+# Proof-type brief text, read live from the scanner's EvidenceGrader so the
+# measurement tracks the prompt production actually sends. These used to be
+# hardcoded copies "lifted from" the grader, which meant a change to the shipped
+# brief (for example replacing the active_output "do not flag as false positive"
+# instruction with a neutral reflection-vs-extraction discriminator) left the
+# benchmark scoring the OLD wording - the opposite of a regression check.
+_grader = _EvidenceGrader()
 
-_PROOF_WEAKNESSES = {
-    "active_output": "None - the proof is in the response output. This is undeniable.",
-    "error_echo": "None - the database error text is causally connected to the payload. This is strong proof.",
-    "structural": "Minimal - the observation is the proof. A false positive would require the scanner to have misconfigured its request.",
-    "timing_strong": "Time deltas can have non-SQL causes (network jitter, lock contention, background load). But a large delta matching the SLEEP argument is strong. This would be a false positive only if the delta does not scale with the sleep duration.",
-    "timing_weak": "The timing delta is small and could be caused by network jitter, database load, or connection overhead rather than SQL SLEEP. If the delta does not clearly exceed normal latency variation, this is likely a false positive.",
-    "ssrf_differential": "A timeout, status, or body-length difference can also be caused by URL validation, denylisting, application timeouts, DNS behavior, or upstream filtering. It does not prove that the server issued an outbound request.",
-    "auth_confirmed": "The proof compares distinct authenticated identities or roles, not merely HTTP success. Treat it as false only if the evidence shows the sessions were not distinct, the identifiers were not shared, or the returned data was explicitly public.",
-    "auth_differential": "For anonymous-access findings, identical anonymous and authenticated responses with no restricted fields can mean the endpoint is public by design. For horizontal or vertical findings, compare authenticated identities or roles instead: shared object identifiers, sensitive fields, or privileged capabilities in the less-privileged response support a real boundary bypass.",
-    "pattern_match": "The matched pattern could be (a) a genuine error disclosure, (b) reflected payload text that happens to contain the pattern, or (c) normal page content. If the matched text is the injected payload echoed back, or if it appears in navigation HTML / normal page content, this is a false positive.",
-    "heuristic": "The finding is based on observation without active exploitation. Evaluate whether the observation truly constitutes a vulnerability or is a benign application behavior.",
-}
 
-_JUDGE_QUESTION = {
-    "active_output": "Is the proof in the response genuine? (It should be - do not flag as false positive.)",
-    "error_echo": "Is the error string a genuine database/framework error, or could it be a benign message?",
-    "structural": "Is this observation a genuine security gap? (It should be - do not flag as false positive.)",
-    "timing_strong": "Does the timing delta clearly indicate SQL SLEEP execution, or could it be network noise?",
-    "timing_weak": "Is the timing delta clearly caused by SQL SLEEP, or could it be network jitter or normal latency variation?",
-    "ssrf_differential": "Do the repeated control and internal samples support a probable server-side fetch, while remaining short of confirmation without an OAST callback or reflected internal content?",
-    "auth_confirmed": "Do the markers show distinct identities or roles crossing an object or privilege boundary? Do not require a further exploit chain once that boundary crossing is proven.",
-    "auth_differential": "Did a less-privileged context receive genuinely restricted data or the same object/capability as another user or privileged role, or do the responses only show public/benign behavior?",
-    "pattern_match": "Is the matched text a genuine error disclosure causally connected to the payload, or could it be reflected payload text or normal page content?",
-    "heuristic": "Does this observation constitute a real vulnerability, or is it a benign application behavior?",
-}
+def _brief_text(proof_type: str) -> tuple[str, str, str]:
+    """(summary, weaknesses, judge question) for a proof type, from the grader.
+
+    ``_proof_summary`` takes a vulnerability for signature compatibility but
+    resolves purely from ``proof_type``, so ``None`` is safe here.
+    """
+    return (
+        _grader._proof_summary(proof_type, None),
+        _grader._proof_weaknesses(proof_type),
+        _grader._judge_question(proof_type),
+    )
 
 
 def _evidence_json(case: dict, max_chars: int = 6000) -> str:
@@ -86,11 +68,12 @@ def build_prompt(variant: str, case: dict) -> str:
         return build_adjudication_prompt(evidence_json=ev)
 
     if variant in ("brief", "brief_locus"):
+        summary, weaknesses, judge = _brief_text(proof_type)
         brief = (
             f"PROOF TYPE: {proof_type}\n"
-            f"PROOF SUMMARY: {_PROOF_SUMMARY.get(proof_type, '')}\n"
-            f"PROOF WEAKNESSES: {_PROOF_WEAKNESSES.get(proof_type, '')}\n"
-            f"JUDGE THIS: {_JUDGE_QUESTION.get(proof_type, '')}"
+            f"PROOF SUMMARY: {summary}\n"
+            f"PROOF WEAKNESSES: {weaknesses}\n"
+            f"JUDGE THIS: {judge}"
         )
         if variant == "brief_locus":
             brief += "\n\n" + _LOCUS_RULE

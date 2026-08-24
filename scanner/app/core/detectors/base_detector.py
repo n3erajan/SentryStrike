@@ -4,24 +4,12 @@ from datetime import datetime, timezone
 
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 
-# Section headers detectors have used to narrate their own evidence. Scanner-
-# authored prose must never live in `verification_response_snippet`, but a
-# detector that composes one anyway would silently poison every harvester that
-# mines other findings' responses for secondary disclosures.
-_SCANNER_AUTHORED_PREAMBLES: tuple[str, ...] = (
-    "VERIFICATION EVIDENCE:",
-    "INTERACTION ID:",
-    "INTERACTIONS (",
-    "EXTERNAL CONTROL SAMPLES",
-    "INTERNAL TARGET SAMPLES",
-)
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
-# Markers that introduce the real server bytes inside such a composite.
-_SERVER_RESPONSE_MARKERS: tuple[str, ...] = (
-    "TARGET ENDPOINT RESPONSE:",
-    "LAST INTERNAL PROBE RESPONSE:",
-    "RESPONSE EXCERPT:",
-)
+from shared.models.vulnerability import OwaspCategory, SeverityLevel
+from shared.utils.evidence import server_response_bytes
 
 
 def observed_response_body(finding: "Finding") -> str:
@@ -44,16 +32,11 @@ def observed_response_body(finding: "Finding") -> str:
     Writers now keep narrative in `evidence`, which the report layer already
     renders. This stays as a backstop: when a composite is detected, the text
     after the server-response marker is returned, and a composite with no marker
-    yields "" rather than prose a harvester would mistake for target output.
+    yields "" rather than prose a harvester would mistake for target output. The
+    preamble/marker lists and the extraction itself live in
+    ``shared.utils.evidence`` so the analyzer service reuses the exact same rule.
     """
-    text = finding.verification_response_snippet or ""
-    if not text.startswith(_SCANNER_AUTHORED_PREAMBLES):
-        return text
-    for marker in _SERVER_RESPONSE_MARKERS:
-        index = text.find(marker)
-        if index >= 0:
-            return text[index + len(marker):].lstrip("\n")
-    return ""
+    return server_response_bytes(finding.verification_response_snippet)
 
 
 @dataclass

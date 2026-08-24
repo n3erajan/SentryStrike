@@ -113,6 +113,74 @@ async def test_union_canary_with_literal_query_syntax_is_reflection_not_sqli():
 
 
 @pytest.mark.asyncio
+async def test_union_canary_reflected_in_percent_encoded_url_is_not_sqli():
+    """A request URL echoed back (canonical/self link, og:url, Location, ...) carries
+    the payload PERCENT-ENCODED. The alphanumeric canary survives encoding, so it is
+    found in the body, but ``UNION SELECT`` appears only as ``union%20select`` - which
+    the raw literal guard misses. This reproduces the WordPress RSS ``<atom:link
+    rel="self">`` false positive and must be suppressed on ANY stack that reflects the
+    request URL."""
+    import re
+    from urllib.parse import quote
+
+    verifier = SQLiVerifier()
+    baseline = ResponseData(200, {}, "<rss><channel><title>Feed</title></channel></rss>", 1.0)
+
+    async def mock_send(url, method, params=None, data=None, **kwargs):
+        payload = kwargs.get("payload", "")
+        if kwargs.get("test_phase") == "union_canary":
+            # Reflect the full request URL exactly as an RSS self-link does: the
+            # value ("1" baseline + payload) percent-encoded inside an href.
+            encoded = quote(f"1{payload}")
+            body = (
+                '<?xml version="1.0"?><rss><channel>'
+                f'<atom:link href="http://example.com/feed?id={encoded}" rel="self"/>'
+                '<title>Feed</title></channel></rss>'
+            )
+        else:
+            body = baseline.body
+        return ResponseData(200, {}, body, 1.0, "GET /", body)
+
+    verifier._send = mock_send
+    result = await verifier._verify_union_based(
+        "http://example.com/feed", "id", "GET", "1",
+        pre_test_baseline=baseline,
+    )
+
+    assert result.is_vulnerable is False
+
+
+@pytest.mark.asyncio
+async def test_union_canary_genuinely_extracted_still_detected():
+    """Positive control: the encoding-aware guard must not over-suppress. A real UNION
+    is consumed by the DB and returns ONLY the extracted canary value - no ``UNION
+    SELECT`` echo - so this must still be reported as vulnerable."""
+    import re
+
+    verifier = SQLiVerifier()
+    baseline = ResponseData(200, {}, "<html><body>Product 1</body></html>", 1.0)
+
+    async def mock_send(url, method, params=None, data=None, **kwargs):
+        payload = kwargs.get("payload", "")
+        if kwargs.get("test_phase") == "union_canary":
+            match = re.search(r"sentryprobe_[0-9a-f]+", payload)
+            extracted = match.group(0) if match else "missing"
+            # Only the extracted value comes back - the query text does not.
+            body = f"<html><body><td>{extracted}</td></body></html>"
+        else:
+            body = baseline.body
+        return ResponseData(200, {}, body, 1.0, "GET /", body)
+
+    verifier._send = mock_send
+    result = await verifier._verify_union_based(
+        "http://example.com/product", "id", "GET", "1",
+        pre_test_baseline=baseline,
+    )
+
+    assert result.is_vulnerable is True
+
+
+@pytest.mark.asyncio
 async def test_sqli_verifier_suppresses_null_differential_without_extraction_proof():
     verifier = SQLiVerifier()
     baseline = ResponseData(

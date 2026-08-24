@@ -11,9 +11,11 @@ Replaces the previous header-only stub with a robust, Wappalyzer-schema engine
    This is what identifies modern SPAs (e.g. Angular via ``[ng-version]``) that
    emit no ``Server`` / ``X-Powered-By`` header.
 
-Output is ``list[TechnologyComponent]`` - unchanged, so CVE enrichment
-(:meth:`app.integrations.cve_database.CveDatabaseService.enrich_components`) is
-untouched.
+Output is ``list[TechnologyComponent]``. Beyond the fingerprint matches, WordPress
+plugins and themes discovered from ``/wp-content/`` asset paths are folded in with
+their slug and version, because the Wordfence Intelligence feed consumed by
+:meth:`app.integrations.cve_database.CveDatabaseService.enrich_components` is keyed
+on slug and fingerprints supply only a display name.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from bs4 import BeautifulSoup
 
 from app.config import get_settings
 from app.integrations import wappalyzer_engine as engine
+from app.integrations import wordpress_assets
 from shared.models.vulnerability import TechnologyComponent
 from app.utils.scan_http import create_scan_client
 
@@ -78,8 +81,52 @@ class TechnologyDetector:
             TechnologyComponent(name=c.name, version=c.version, category=c.category)
             for c in components
         ]
+        self._attach_wordpress_extensions(results, evidence)
         logger.debug("Technology detection for %s: %d component(s)", url, len(results))
         return results
+
+    @staticmethod
+    def _attach_wordpress_extensions(
+        results: list[TechnologyComponent], evidence: engine.Evidence
+    ) -> None:
+        """Resolve WordPress plugin/theme slugs from ``/wp-content/`` asset paths.
+
+        Fingerprints name extensions ("Smart Slider 3") but carry no slug, and the
+        Wordfence Intelligence feed - the only source that covers the plugin and
+        theme ecosystem properly - is keyed on slug. Asset paths supply both the
+        slug and usually the extension's own version.
+
+        A slug found for an already-detected extension is back-filled onto it
+        rather than added as a second row.
+        """
+        core_version = next(
+            (c.version for c in results if c.name == "WordPress" and c.version), None
+        )
+        try:
+            extensions = wordpress_assets.extract_extensions(
+                evidence.html, evidence.script_src, core_version=core_version
+            )
+        except Exception as exc:
+            logger.debug("WordPress extension extraction failed: %s", exc)
+            return
+        if not extensions:
+            return
+
+        existing = {wordpress_assets.merge_key(c.name): c for c in results}
+        added = 0
+        for extension in extensions:
+            match = existing.get(wordpress_assets.merge_key(extension.slug or ""))
+            if match is not None:
+                match.slug = extension.slug
+                if extension.version and not match.version:
+                    match.version = extension.version
+                continue
+            results.append(extension)
+            added += 1
+        logger.debug(
+            "WordPress extensions: %d slug(s) resolved (%d new component(s))",
+            len(extensions), added,
+        )
 
     # ------------------------------------------------------------------ #
     # Passive evidence

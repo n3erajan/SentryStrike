@@ -580,3 +580,38 @@ class TestCeilingBehavior:
         harder to dismiss than a regex hit, just no longer impossible."""
         assert get_fp_ceiling("active_output") < get_fp_ceiling("pattern_match")
         assert get_fp_ceiling("error_echo") < get_fp_ceiling("heuristic")
+
+
+class TestActiveOutputBriefIsNeutral:
+    """The brief must let the adjudicator judge, not pre-state the verdict."""
+
+    def test_brief_does_not_instruct_the_model_to_confirm(self):
+        vuln = _vuln("SQL Injection (UNION-Based)", detection_method="union_based")
+        grade = grader.grade(vuln)
+        brief = grader.build_evidence_brief(vuln, grade).lower()
+        # The old brief said "this is undeniable" / "do not flag as false positive",
+        # which the model obediently followed. It must not tell the model the answer.
+        assert "undeniable" not in brief
+        assert "do not flag as false positive" not in brief
+        # It must still hand the model the real discriminator to check.
+        assert "reflect" in brief
+
+    def test_brief_excerpt_shows_server_bytes_not_scanner_conclusion(self):
+        """The response excerpt in the brief must be the target's bytes, never the
+        scanner's own 'VERIFICATION EVIDENCE: ... confirms data extraction' line."""
+        server_bytes = "<rss><channel><atom:link href='...?id=1' rel='self'/></channel></rss>"
+        composite = (
+            "VERIFICATION EVIDENCE:\n"
+            "UNION canary 'sentryprobe_abc123' reflected in response body. "
+            "Value absent from baseline - confirms data extraction.\n\n"
+            f"RESPONSE EXCERPT:\n{server_bytes}"
+        )
+        vuln = _vuln(
+            "SQL Injection (UNION-Based)",
+            detection_method="union_based",
+            response_snippet=composite,
+        )
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        assert "confirms data extraction" not in brief
+        assert "VERIFICATION EVIDENCE" not in brief
+        assert "atom:link" in brief

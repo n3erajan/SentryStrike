@@ -193,8 +193,37 @@ class ScannerSettings(
         default="https://services.nvd.nist.gov/rest/json/cves/2.0",
         alias="NVD_API_URL",
     )
+    # Strongly recommended. Unkeyed, NVD allows only 5 requests per rolling 30
+    # seconds and answers 403/429 beyond that; a key raises it to 50. A free key
+    # is issued instantly at https://nvd.nist.gov/developers/request-an-api-key
     nvd_api_key: str | None = Field(default=None, alias="NVD_API_KEY")
     cve_cache_ttl_seconds: int = Field(default=3600, alias="CVE_CACHE_TTL_SECONDS")
+
+    # OSV.dev - ecosystem package advisories (npm, PyPI, Packagist, RubyGems...).
+    # Keyless and unmetered; the primary source for library components.
+    osv_api_url: str = Field(default="https://api.osv.dev/v1/query", alias="OSV_API_URL")
+
+    # Exploitation-in-the-wild overlays, used to rank findings rather than
+    # truncate them. Both are keyless.
+    kev_feed_url: str = Field(
+        default="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+        alias="KEV_FEED_URL",
+    )
+    epss_api_url: str = Field(default="https://api.first.org/data/v1/epss", alias="EPSS_API_URL")
+    threat_intel_cache_ttl_seconds: int = Field(
+        default=21600, alias="THREAT_INTEL_CACHE_TTL_SECONDS"
+    )
+
+    # Wordfence Intelligence v3 - WordPress plugin/theme vulnerabilities, which
+    # NVD covers late and incompletely. Optional: without a key the WordPress
+    # plugin/theme path reports those components as unassessed rather than
+    # guessing. v1/v2 of this feed were switched off on 2026-03-09 and now
+    # answer HTTP 410. Free keys: https://www.wordfence.com/help/wordfence-intelligence
+    wordfence_api_url: str = Field(
+        default="https://www.wordfence.com/api/intelligence/v3/vulnerabilities/production",
+        alias="WORDFENCE_API_URL",
+    )
+    wordfence_api_key: str | None = Field(default=None, alias="WORDFENCE_API_KEY")
 
 
 @lru_cache

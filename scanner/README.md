@@ -48,7 +48,7 @@ Sixteen detectors, mapped to the automatable OWASP Top 10 (2025) categories. A06
 | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A01   | `access_control/`                                                                                                                                                  | IDOR, forced browsing, mass assignment, mutating authorization, and a full authorization matrix across the supplied roles (main / second / admin). Can auto-provision a throwaway second identity. |
 | A02   | `security_headers.py`, `sensitive_paths.py`                                                                                                                        | Header analysis; path permutation probing with per-scan caps                                                                                                                                       |
-| A03   | `supply_chain.py`                                                                                                                                                  | Detected component versions → NVD CVE lookup (cache-aware, optional `NVD_API_KEY`)                                                                                                                 |
+| A03   | `supply_chain.py`                                                                                                                                                  | Detected component versions → CVE match by product identity and version range (see [Vulnerability intelligence](#vulnerability-intelligence))                                                       |
 | A04   | `crypto_failures.py`                                                                                                                                               | TLS / HTTPS via SSLyze                                                                                                                                                                             |
 | A05   | `sql_injection.py`, `nosql_injection.py`, `xss_detector.py`, `command_injection.py`, `file_inclusion.py`, `file_upload.py`, `ssrf_detector.py`, `open_redirect.py` | Error-based + blind timing SQLi; DOM XSS via browser probes; OAST + in-band timing-differential SSRF                                                                                               |
 | A07   | `authentication/`                                                                                                                                                  | Form / session / JWT / API auth, JWT forgery, passive analysis; plus `csrf_detector.py`                                                                                                            |
@@ -88,10 +88,65 @@ Layered env: repo-root `.env`, then `scanner/.env`. See `scanner/.env.example` f
 | `BLIND_INJECTION_TIMING_THRESHOLD`                      | none                           | Fraction of expected delay treated as a blind hit                      |
 | `SSRF_INBAND_TIMING_DELTA_MS`                           | `1500`                         | Internal-versus-control response delta for in-band SSRF                |
 | `OAST_CALLBACK_BASE_URL` / `OAST_POLL_URL`              | derived from `PUBLIC_HOSTNAME` | Callback URL minted into payloads; poll endpoint on the backend        |
-| `NVD_API_URL` / `NVD_API_KEY` / `CVE_CACHE_TTL_SECONDS` | none                           | Supply-chain CVE lookups                                               |
+| `NVD_API_URL` / `NVD_API_KEY` / `CVE_CACHE_TTL_SECONDS` | none                           | NVD CPE lookups. **Set the key**: unkeyed NVD allows 5 requests / 30s and 403s past that |
+| `OSV_API_URL`                                           | `api.osv.dev/v1/query`         | Ecosystem package advisories (keyless)                                 |
+| `WORDFENCE_API_URL` / `WORDFENCE_API_KEY`               | v3 production feed / none      | WordPress plugin+theme vulns; without a key they report as not assessed |
+| `KEV_FEED_URL` / `EPSS_API_URL`                         | CISA / FIRST                   | Exploited-in-the-wild ranking overlays (keyless)                       |
+| `THREAT_INTEL_CACHE_TTL_SECONDS`                        | `21600`                        | KEV catalogue and Wordfence feed cache lifetime                        |
 | `LOG_FILE`                                              | none                           | Optional file logging (the compose stack mounts `scanner_logs`)        |
 
 Every crawl and scan knob also has a per-scan override in `ScanConfig` (`shared/schemas/scan_schema.py`), settable from the UI or as an application default. Per-scan values win over env.
+
+## Vulnerability intelligence
+
+Components are matched to CVEs by **product identity and version range**, never by
+description keyword. This matters more than it sounds. NVD's `keywordSearch`
+parameter is a full-text search over CVE prose, and using it fails in both
+directions at once:
+
+- **False positives on loosely-versioned components.** `keywordSearch="WordPress 7.1"`
+  returns 84 results, none of which are WordPress core. The top five are CVEs for
+  the *wp-google-maps* and *wp-live-chat-support* plugins, matched because their
+  descriptions read "before 7.1.03 for WordPress". WordPress 7.1 is the current
+  release with no applicable CVEs. Likewise a version-less "PHP" entry returns
+  12,324 results starting in 1999, and attaching the first five yields CVEs for
+  TYPO3, NoneCms and Selesta Visual Access Manager.
+- **Silent false negatives on precisely-versioned ones.** `"Express 4.18.2"`,
+  `"Nginx 1.24.0"` and `"Node.js 18.16.0"` each return **zero** results, because NVD
+  prose rarely spells out a full patch version — so a vulnerable component is
+  reported as clean.
+
+Each component routes to the source that actually covers it:
+
+| Component kind | Source | Why |
+| -------------- | ------ | --- |
+| Ecosystem package (Express, Django, Laravel, jQuery) | OSV.dev (`osv_client.py`) | Resolves ranges with each ecosystem's own version semantics; lands advisories before NVD assigns CPEs. Keyless. |
+| Server, language, CMS core (Nginx, PHP, WordPress) | NVD by CPE (`nvd_client.py`) | `virtualMatchString=cpe:2.3:a:f5:nginx:1.24.0` returns exactly the two CVEs covering that version |
+| WordPress plugin / theme | Wordfence Intelligence v3 (`wordfence_client.py`) | Where nearly all WordPress risk lives, and where NVD is weakest. Needs a free key |
+| Ranking overlay | CISA KEV + EPSS (`threat_intel.py`) | Rank by real-world exploitation instead of truncating the list. Keyless |
+
+Four rules hold throughout:
+
+1. **No version, no query.** A component whose version was never resolved cannot be
+   range-matched, so it is reported `not_assessed` — not as an empty CVE list.
+2. **Applicability is re-verified locally.** Every returned `cpeMatch` is re-checked
+   against the detected version by `cpe_match.py`, which compares versions
+   *numerically* (nginx 1.24.0 is newer than 1.9.5, though it sorts earlier as a
+   string) and rejects legacy CPEs carrying no version bounds at all — the reason
+   CVE-2007-2627 otherwise matches every WordPress release ever shipped.
+3. **An empty list is never ambiguous.** Every component carries
+   `cve_assessment` ∈ `assessed` / `not_assessed` / `failed` plus the reason and the
+   source that answered. A rate-limited lookup and a genuinely clean component are
+   different facts and the report states which one it has.
+4. **Nothing is invented.** Missing CVSS scores are computed from the advisory's
+   CVSS vector (`cvss.py`) or left absent; the supply-chain detector grades an
+   unscored CVE medium and says so rather than defaulting it to 7.5.
+
+WordPress plugin and theme slugs — which the Wordfence feed is keyed on, and which
+fingerprints do not supply — are resolved from `/wp-content/plugins/<slug>/` asset
+paths by `wordpress_assets.py`. A `?ver=` value is only accepted as the extension's
+version when it looks like a version and differs from the WordPress core version,
+since WordPress stamps its own version onto assets whose extension declares none.
 
 ## Request governance
 
@@ -117,7 +172,9 @@ app/
     request_governor.py      rate limiting / governance
     payload_profile.py
   reverification_strategies/ per-family replay strategies
-  integrations/              wappalyzer, SSLyze, NVD/CVE, version probe, error fingerprints
+  integrations/              wappalyzer, SSLyze, version probe, error fingerprints
+                             cve_database (routing), nvd_client, osv_client,
+                             wordfence_client, threat_intel, cpe_match, cvss
   utils/                     cvss_calculator, scan_http, redaction, throttles, metrics
 tests/                       unit + integration suites
 ```

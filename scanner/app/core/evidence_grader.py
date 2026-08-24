@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from shared.models.vulnerability import PROOF_CEILINGS, get_fp_ceiling
+from shared.utils.evidence import server_response_bytes
 
 if TYPE_CHECKING:
     from shared.models.vulnerability import Vulnerability
@@ -429,9 +430,12 @@ class EvidenceGrader:
             # If no structured evidence, fall back to the response snippet so
             # the AI has SOMETHING to evaluate (detectors that only set prose
             # evidence - e.g. file_upload before this pass - still surface it
-            # via _finding_response_snippet into response_snippet).
-            if not lines and vuln.evidence.response_snippet:
-                lines.append(f"  - response_excerpt: {self._truncate_value(vuln.evidence.response_snippet, 300)}")
+            # via _finding_response_snippet into response_snippet). Server bytes
+            # only: the scanner's own verdict is not evidence for the model.
+            if not lines:
+                server_bytes = server_response_bytes(vuln.evidence.response_snippet)
+                if server_bytes:
+                    lines.append(f"  - response_excerpt: {self._truncate_value(server_bytes, 300)}")
             if not lines and vuln.evidence.payload:
                 lines.append(f"  - payload: {self._truncate_value(vuln.evidence.payload)}")
 
@@ -571,8 +575,12 @@ class EvidenceGrader:
             lines.append(f"  - http_status: {http_status}")
         if vuln.evidence.payload:
             lines.append(f"  - payload_sent: {self._truncate_value(vuln.evidence.payload)}")
-        # Whether the matched text is the reflected payload (key FP signal)
-        response_snippet = (vuln.evidence.response_snippet or "").lower()
+        # Whether the matched text is the reflected payload (key FP signal).
+        # Compare against the TARGET's bytes only: the composite snippet's
+        # "VERIFICATION EVIDENCE: ... triggered by '<payload>'" preamble quotes the
+        # payload itself, which would otherwise report reflection that the server
+        # never produced.
+        response_snippet = server_response_bytes(vuln.evidence.response_snippet).lower()
         payload_lower = (vuln.evidence.payload or "").lower()
         if payload_lower and response_snippet and payload_lower in response_snippet:
             lines.append("  - payload_reflected_in_response: true (match may be echoed payload, not a genuine error)")
@@ -666,9 +674,13 @@ class EvidenceGrader:
                 f"false_status={family.get('false_status', '?')}, "
                 f"similarity={family.get('similarity', '?')}"
             )
-        if vuln.evidence.response_snippet:
-            snippet = vuln.evidence.response_snippet[:300]
-            lines.append(f"  - response_excerpt: {snippet}")
+        # Show the model only the bytes the TARGET sent - never the scanner's own
+        # "VERIFICATION EVIDENCE: ... confirms data extraction" preamble. Feeding it
+        # the scanner's conclusion invites circular agreement (the model reads the
+        # verdict and echoes it) instead of independent judgment of the response.
+        server_bytes = server_response_bytes(vuln.evidence.response_snippet)
+        if server_bytes:
+            lines.append(f"  - response_excerpt: {server_bytes[:300]}")
         return lines or [f"  - detection_evidence: {self._truncate_value(de)}"]
 
     # ------------------------------------------------------------------
@@ -692,7 +704,16 @@ class EvidenceGrader:
 
     def _proof_weaknesses(self, proof_type: str) -> str:
         weaknesses = {
-            "active_output": "None - the proof is in the response output. This is undeniable.",
+            "active_output": (
+                "The proof holds only if the response contains output the TARGET produced - "
+                "command output, file contents, or a value the database returned. Input echoed "
+                "back is NOT extraction: a reflected request URL (canonical or self-referential "
+                "links, og:url, Location, pagination or form-action hrefs), a reflected parameter, "
+                "or an error quoting the request all replay the payload. An alphanumeric marker "
+                "survives percent- and HTML-encoding, so it can read as 'absent from baseline' "
+                "while being pure reflection. Confirm the matched value is data the target "
+                "generated, not our own request echoed back."
+            ),
             "error_echo": "None - the database error text is causally connected to the payload. This is strong proof.",
             "structural": "Minimal - the observation is the proof. A false positive would require the scanner to have misconfigured its request.",
             "timing_strong": "Time deltas can have non-SQL causes (network jitter, lock contention, background load). But a large delta matching the SLEEP argument is strong. This would be a false positive only if the delta does not scale with the sleep duration.",
@@ -707,7 +728,12 @@ class EvidenceGrader:
 
     def _judge_question(self, proof_type: str) -> str:
         questions = {
-            "active_output": "Is the proof in the response genuine? (It should be - do not flag as false positive.)",
+            "active_output": (
+                "Does the response contain output the target itself generated (command output, "
+                "file contents, or a database-returned value), or does the matched token appear "
+                "only inside a reflection of our own request/payload (a URL echoed into a link, a "
+                "reflected parameter), possibly percent- or HTML-encoded?"
+            ),
             "error_echo": "Is the error string a genuine database/framework error, or could it be a benign message?",
             "structural": "Is this observation a genuine security gap? (It should be - do not flag as false positive.)",
             "timing_strong": "Does the timing delta clearly indicate SQL SLEEP execution, or could it be network noise?",

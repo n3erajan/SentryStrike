@@ -21,6 +21,7 @@ from shared.models.vulnerability import (
     get_fp_ceiling,
     get_fp_floor,
 )
+from shared.utils.evidence import server_response_bytes
 
 
 FALLBACK_MODEL = "deterministic-fallback"
@@ -106,8 +107,14 @@ def build_evidence_json(vulnerability: Vulnerability, max_chars: int) -> str:
     genuine, which it cannot answer from a truncated page window that need not
     even contain the hit. Naming them keeps them out of the truncation path and
     lets the prompt refer to them directly.
+
+    The snippet is reduced to the bytes the TARGET actually sent
+    (``server_response_bytes``): the composite evidence field can begin with the
+    scanner's own ``VERIFICATION EVIDENCE: ... confirms ...`` conclusion, and
+    handing the model that verdict as "evidence" produces circular agreement
+    rather than an independent judgment of the response.
     """
-    response_snippet = vulnerability.evidence.response_snippet or ""
+    response_snippet = server_response_bytes(vulnerability.evidence.response_snippet)
     detection_evidence = vulnerability.evidence.detection_evidence or {}
 
     def primary(key: str):

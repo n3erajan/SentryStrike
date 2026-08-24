@@ -943,7 +943,10 @@ class SQLiVerifier(BaseVerifier):
                     url, parameter, method, value, form_inputs, target=target
                 )
                 baseline_body = baseline.body or ""
-                baseline_body_low = baseline_body.lower()
+                # Encoding-collapsed baseline: lets the reflection guards below tell an
+                # echoed request URL (percent-/entity-encoded query string) from real
+                # extraction, regardless of how the target encoded the reflection.
+                baseline_decoded_low = ResponseAnalyzer.decoded_reflection_view(baseline_body)
 
                 # ----------------------------------------------------------------
                 # Pass 1: Canary probes (strongest signal - no similarity gate needed)
@@ -983,10 +986,18 @@ class SQLiVerifier(BaseVerifier):
                             )
                             continue
                         inj_body_low = (inj_resp.body or "").lower()
-                        if "union select" in inj_body_low and "union select" not in baseline_body_low:
+                        inj_decoded_low = ResponseAnalyzer.decoded_reflection_view(inj_resp.body or "")
+                        # A genuine UNION is consumed by the database and never returns as
+                        # literal query text; the injected "UNION SELECT" reappearing in the
+                        # response - in ANY transport encoding (raw, or percent-/entity-encoded
+                        # via a reflected request URL such as a canonical/self link, og:url,
+                        # Location, or form action) - means the request was echoed, not that
+                        # data was extracted. Compare on the decoded view so the encoded echo
+                        # (union%20select) is caught, not just the raw literal.
+                        if "union select" in inj_decoded_low and "union select" not in baseline_decoded_low:
                             logger.debug(
-                                "UNION canary '%s' accompanied by literal query syntax; "
-                                "suppressing text reflection/storage false positive.",
+                                "UNION canary '%s' accompanied by echoed query syntax (any encoding); "
+                                "suppressing request-reflection false positive.",
                                 canary,
                             )
                             continue
@@ -994,7 +1005,7 @@ class SQLiVerifier(BaseVerifier):
                         # UNIVERSAL ANTI-XSS GUARD: Detect literal text reflection
                         # --------------------------------------------------------
                         canary_low = canary.lower()
-                        
+
                         xss_indicators = [
                             f"'{canary_low}'",         # Raw single quotes
                             f"\\'{canary_low}\\'",     # Escaped single quotes
@@ -1004,11 +1015,16 @@ class SQLiVerifier(BaseVerifier):
                             f'\\"{canary_low}\\"',     # Escaped double quotes
                             f"&quot;{canary_low}&quot;" # HTML entity double quotes
                         ]
-                        
-                        if any(indicator in inj_body_low for indicator in xss_indicators):
+
+                        # Check raw AND decoded: a canary reflected inside a percent-encoded
+                        # URL arrives as %27canary%27, which only matches after decoding.
+                        if any(
+                            indicator in inj_body_low or indicator in inj_decoded_low
+                            for indicator in xss_indicators
+                        ):
                             logger.debug(
                                 "UNION canary '%s' found, but it is wrapped in payload quote syntax. "
-                                "Suppressing false positive caused by XSS reflection/storage.", 
+                                "Suppressing false positive caused by XSS reflection/storage.",
                                 canary
                             )
                             continue
@@ -1063,11 +1079,11 @@ class SQLiVerifier(BaseVerifier):
                     # ------------------------------------------------------------
                     # GUARD #1: Stop Stored XSS text pollution from impacting Pass 2 / 4
                     # ------------------------------------------------------------
-                    inj_body_low = (inj_resp.body or "").lower()
-                    if "union select" in inj_body_low and "union select" not in baseline_body_low:
+                    if "union select" in ResponseAnalyzer.decoded_reflection_view(inj_resp.body or "") \
+                            and "union select" not in baseline_decoded_low:
                         logger.debug(
-                            "UNION NULL payload keywords 'UNION SELECT' detected literally in response body. "
-                            "Suppressing false positive caused by literal text storage/reflection."
+                            "UNION NULL payload keywords 'UNION SELECT' echoed in response body "
+                            "(any encoding). Suppressing false positive caused by request/text reflection."
                         )
                         continue
 
@@ -1137,11 +1153,12 @@ class SQLiVerifier(BaseVerifier):
                             # ------------------------------------------------------------
                             # GUARD #2: Stop 'sqlite_version()' payload from text mirroring
                             # ------------------------------------------------------------
-                            ver_body_low = (ver_resp.body or "").lower()
-                            if "union select" in ver_body_low and "union select" not in baseline_body_low:
+                            ver_decoded_low = ResponseAnalyzer.decoded_reflection_view(ver_resp.body or "")
+                            if "union select" in ver_decoded_low and "union select" not in baseline_decoded_low:
                                 logger.debug(
-                                    "Version extract payload keywords 'UNION SELECT' detected literally. "
-                                    "Suppressing false positive caused by literal text storage/reflection."
+                                    "Version extract payload keywords 'UNION SELECT' echoed in response "
+                                    "(any encoding). Suppressing false positive caused by "
+                                    "request/text reflection."
                                 )
                                 continue
 

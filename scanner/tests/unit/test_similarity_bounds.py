@@ -228,3 +228,42 @@ async def test_event_loop_keeps_running_during_a_slow_comparison():
         f"only {ticks_during} ticks ran during a 0.6s comparison - "
         "the work is blocking the event loop again"
     )
+
+
+class TestDecodedReflectionView:
+    """Reflection guards must see an echoed payload in any transport encoding.
+
+    An app that reflects the request URL (canonical/self links, og:url, Location,
+    pagination hrefs, form action) emits the query string percent-encoded, so a
+    raw substring check for the injected keywords misses it while the bare
+    alphanumeric canary still matches - which reads as extraction when it is only
+    reflection.
+    """
+
+    def test_percent_encoded_payload_becomes_matchable(self):
+        body = (
+            '<atom:link href="https://t.test/feed'
+            '?id=1%27%20UNION%20SELECT%20%27sentryprobe_abc123%27--" rel="self"/>'
+        )
+        assert "union select" not in body.lower()
+        decoded = ResponseAnalyzer.decoded_reflection_view(body)
+        assert "union select" in decoded
+        assert "'sentryprobe_abc123'" in decoded
+
+    def test_html_entity_encoded_payload_becomes_matchable(self):
+        body = "<p>&#39;sentryprobe_abc123&#39; UNION SELECT</p>"
+        decoded = ResponseAnalyzer.decoded_reflection_view(body)
+        assert "'sentryprobe_abc123'" in decoded
+
+    def test_plain_extraction_output_is_left_alone(self):
+        """A genuinely extracted value contains no encoded query text, so the
+        decoded view must not manufacture one."""
+        body = "<html><body><td>sentryprobe_abc123</td></body></html>"
+        decoded = ResponseAnalyzer.decoded_reflection_view(body)
+        assert "union select" not in decoded
+        assert "'sentryprobe_abc123'" not in decoded
+        assert "sentryprobe_abc123" in decoded
+
+    def test_empty_and_none_bodies_are_safe(self):
+        assert ResponseAnalyzer.decoded_reflection_view("") == ""
+        assert ResponseAnalyzer.decoded_reflection_view(None) == ""

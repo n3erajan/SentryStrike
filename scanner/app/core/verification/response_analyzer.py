@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
+from urllib.parse import unquote_plus
 from uuid import uuid4
 from zlib import crc32
 
@@ -287,6 +288,24 @@ class ResponseAnalyzer:
     def generate_probe_canary() -> str:
         """Return a unique per-request canary for unambiguous reflection proof."""
         return f"sentryprobe_{uuid4().hex[:8]}"
+
+    @staticmethod
+    def decoded_reflection_view(body: str) -> str:
+        """Lowercased body with transport encodings collapsed to their literal text.
+
+        Reflection-suppression guards look for the injected payload echoed back
+        (``union select``, the canary wrapped in its own quotes, ...). But an
+        application that reflects the request URL - canonical ``<link>``, RSS/Atom
+        ``<atom:link rel="self">``, OpenGraph ``og:url``, ``Location``, pagination
+        or breadcrumb hrefs, form ``action`` - emits the query string
+        percent-encoded, so ``UNION SELECT`` reappears as ``union%20select`` and a
+        quoted canary as ``%27canary%27``. A raw ``in`` check misses those while the
+        bare alphanumeric canary still matches, which reads as extraction when it is
+        only reflection. Decoding once (percent- then HTML-entity-decoding) lets the
+        same guards see the echo in any encoding. Stack-agnostic: it is about how
+        HTTP carries a reflected query string, not any particular framework.
+        """
+        return html.unescape(unquote_plus(body or "")).lower()
 
     @staticmethod
     def verify_reflection(
