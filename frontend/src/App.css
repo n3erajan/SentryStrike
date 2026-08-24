@@ -9,7 +9,7 @@
   --brand: oklch(55% 0.2 255);
   --brand2: oklch(44% 0.19 255);
   /* Solid-button hover. Kept separate from --brand2, which doubles as an accent
-     *text* color and so must go lighter in dark mode — the opposite of what a
+     *text* color and so must go lighter in dark mode - the opposite of what a
      solid button under near-white --on-brand text needs. Both themes deepen the
      blue on hover so the label keeps AA contrast. */
   --brand-hover: oklch(44% 0.19 255);
@@ -19,7 +19,7 @@
   --bad: oklch(60% 0.2 28);
   --on-brand: oklch(98% 0.006 255);
 
-  /* Severity palette — single source of truth for critical/high/medium/low/info.
+  /* Severity palette - single source of truth for critical/high/medium/low/info.
      Every severity tag, dot, text utility, and breakdown cell reads these so a
      given severity is the same color everywhere. Each level has a foreground
      color (readable on light backgrounds) and a soft tint for pill backgrounds. */
@@ -1747,7 +1747,7 @@ textarea:focus-visible {
 }
 /* Stage stacks the animated pane on top of an invisible copy of every
    pane, so the container always keeps the tallest pane's height and
-   switching tabs never shifts the content below — at any width. */
+   switching tabs never shifts the content below - at any width. */
 .pane-stage {
   display: grid;
 }
@@ -2124,7 +2124,7 @@ footer.public-footer {
   color: var(--brand2);
 }
 /* Sidebar count chip and the "N active" chip beside a page heading share one
-   treatment. Set font-size/weight rather than the `font:` shorthand — the
+   treatment. Set font-size/weight rather than the `font:` shorthand - the
    shorthand also resets font-family, which is how .badge drifted onto the mono
    stack (and onto a mono weight the app doesn't load, giving it a faux bold). */
 .nav-badge,
@@ -2138,7 +2138,7 @@ footer.public-footer {
   font-weight: 700;
   /* .head h1 sets letter-spacing: -0.035em, which inherits as a computed
      length (~-1.5px at the heading's clamped size). On 11px chip text that
-     eats the gaps between glyphs and collapses the space in "1 active" —
+     eats the gaps between glyphs and collapses the space in "1 active" -
      reset it rather than inherit a value scaled for 2.7rem type. */
   letter-spacing: normal;
   white-space: nowrap;
@@ -2457,8 +2457,8 @@ footer.public-footer {
   height: 16.61px;
 }
 /* AppsPage's foot also carries .rowactions, whose buttons are a fixed 33px.
-   That makes the real foot 12 + 1 + 33 = 46px — 16px taller than a text-only
-   foot — so cards with actions opt into this modifier. */
+   That makes the real foot 12 + 1 + 33 = 46px - 16px taller than a text-only
+   foot - so cards with actions opt into this modifier. */
 .skeleton-cardfoot.has-actions {
   min-height: 46px;
 }
@@ -3259,7 +3259,7 @@ footer.public-footer {
   margin-top: 0;
 }
 
-/* Borderless label/value table — same visual language as the reports and
+/* Borderless label/value table - same visual language as the reports and
    active-scans tables: a bold header rule over thin horizontal row rules. */
 .metric-table {
   width: 100%;
@@ -3329,6 +3329,61 @@ footer.public-footer {
   gap: 6px;
   font-size: 0.7rem;
   color: var(--sub);
+}
+/* Tested-surface inventory - same header-rule/row-rule language as
+   .metric-table, widened to a real column table for path/param detail. */
+.coverage-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 16px;
+  font-size: 0.7rem;
+  table-layout: fixed;
+}
+.coverage-table th {
+  text-align: left;
+  padding: 0 10px 8px;
+  border-bottom: 1px solid var(--ink);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sub);
+}
+.coverage-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  color: var(--sub);
+  overflow-wrap: anywhere;
+}
+.coverage-table td:first-child {
+  color: var(--ink);
+}
+.coverage-table th:nth-child(2),
+.coverage-table td:nth-child(2) {
+  width: 92px;
+}
+.coverage-table th:last-child,
+.coverage-table td:last-child {
+  width: 120px;
+}
+.coverage-more {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+.coverage-gaps {
+  margin-top: 26px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+}
+.coverage-gaps > b {
+  font-size: 0.72rem;
 }
 .findings {
   display: grid;
@@ -3432,7 +3487,7 @@ footer.public-footer {
   color: var(--muted);
 }
 /* Findings the model flagged as likely false positives read as de-emphasised
-   without being hidden — the user can still expand and review them. */
+   without being hidden - the user can still expand and review them. */
 .finding.dimmed {
   opacity: 0.62;
 }

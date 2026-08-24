@@ -20,7 +20,7 @@ class ScanAccountCredential(BaseModel):
     Either supply ``username`` + ``password`` (the scanner logs in against the
     target to obtain a live session, which handles multi-cookie / SPA logins
     automatically) or paste a raw ``cookie`` / ``header`` string. ``username``
-    accepts an email too — it is submitted as-is into the login form's
+    accepts an email too - it is submitted as-is into the login form's
     identifier field (frontend may label it "username / email").
     """
 
@@ -92,7 +92,7 @@ def scan_auth_accounts_from_credentials(
 
 
 class ScanConfig(BaseModel):
-    """Per-scan configuration overrides. Every field is optional — when unset
+    """Per-scan configuration overrides. Every field is optional - when unset
     the global ``.env`` / ``config.py`` default is used."""
 
     model_config = ConfigDict(extra="forbid")

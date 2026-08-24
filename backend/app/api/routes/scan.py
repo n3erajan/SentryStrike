@@ -78,7 +78,7 @@ def _is_private_target(url: str) -> tuple[bool, str]:
     ``127.x.x.x``, or ``169.254.x.x`` are caught.
 
     Returns ``(blocked: bool, reason: str)``. On DNS failure the target
-    is allowed through — the scanner will fail later if the host is
+    is allowed through - the scanner will fail later if the host is
     genuinely unreachable.
     """
     try:
@@ -223,7 +223,7 @@ async def create_scan(
         ):
             # The application is missing or its stored url no longer matches
             # the submitted target. Don't reject the scan and don't misattribute
-            # it — run it as a plain non-application scan instead, so it keeps
+            # it - run it as a plain non-application scan instead, so it keeps
             # its own group in the reports section.
             application_id = None
     active = await repo.find_active_by_target(

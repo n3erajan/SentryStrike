@@ -4,7 +4,7 @@ Each workspace keeps its scans for ``Organization.retention_days`` (never below
 the ``MIN_RETENTION_DAYS`` compliance floor, enforced on write). This service
 sweeps every org, deletes scans older than that window, and records one
 ``scan_purged`` audit entry per deleted scan so the deletion is itself
-accountable. It is pure application logic — a caller (the periodic worker or the
+accountable. It is pure application logic - a caller (the periodic worker or the
 management CLI) drives *when* it runs.
 """
 
@@ -34,19 +34,22 @@ class RetentionService:
         self.scans = scan_repository or ScanRepository()
         self.audit = audit_repository or AuditRepository()
 
-    async def purge_once(self) -> dict[str, int]:
+    async def purge_once(self, now: datetime | None = None) -> dict[str, int]:
         """Run one purge pass over every org. Returns ``{org_id: scans_deleted}``.
 
-        A failure purging one org is logged and skipped so it cannot stall the
-        sweep for the others. Each deleted scan is audited before removal.
+        ``now`` lets callers pin the reference time (tests); it defaults to the
+        current UTC time. A failure purging one org is logged and skipped so it
+        cannot stall the sweep for the others. Each deleted scan is audited
+        before removal.
         """
-        now = datetime.now(timezone.utc)
+        if now is None:
+            now = datetime.now(timezone.utc)
         summary: dict[str, int] = {}
         for org in await self.orgs.list_all():
             org_id = str(org.id)
             try:
                 summary[org_id] = await self._purge_org(org_id, org.retention_days, now)
-            except Exception:  # noqa: BLE001 — one org's failure must not stall the sweep
+            except Exception:  # noqa: BLE001 - one org's failure must not stall the sweep
                 logger.exception("retention purge failed for org %s", org_id)
                 summary[org_id] = 0
         total = sum(summary.values())

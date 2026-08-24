@@ -81,7 +81,7 @@ def test_to_vulnerability_preserves_detector_verification_metadata() -> None:
 
 def test_to_vulnerability_redacts_credentials_in_evidence() -> None:
     """Evidence snippets must never persist real auth tokens, cookies, or the
-    scan account password — they would leak durable credentials into the stored
+    scan account password - they would leak durable credentials into the stored
     report and PDF, outliving the scan session."""
     secret_password = "#Yatra@9821"
     jwt = (
@@ -126,7 +126,7 @@ def test_to_vulnerability_redacts_credentials_in_evidence() -> None:
 def test_vulnerability_no_longer_carries_detected_at() -> None:
     """detected_at was identical across every finding (stamped at assembly time,
     not real detection time) and carried no signal beyond the report's
-    generated_at — removed to avoid a misleading field."""
+    generated_at - removed to avoid a misleading field."""
     assert "detected_at" not in Vulnerability.model_fields
 
 
@@ -578,7 +578,7 @@ def test_priority_rank_does_not_use_ai_false_positive_probability() -> None:
 def test_auth_coverage_uses_real_spa_surface_not_collapsed_url_list() -> None:
     """A browser-crawled SPA collapses ``urls`` to the shell (~1). Auth-coverage
     must report the true scanned surface (routes + API endpoints), and a real
-    protected-target count from authorized 2xx data responses — not a hardcoded 1."""
+    protected-target count from authorized 2xx data responses - not a hardcoded 1."""
 
     class Route:
         def __init__(self, url):

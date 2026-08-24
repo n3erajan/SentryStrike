@@ -14,7 +14,7 @@ from app.utils.redaction import REDACTED, redact_secrets
     "cookie_name",
     [
         # framework session cookies whose marker is concatenated (no word
-        # boundary) — the historic \b-anchored regex missed all of these.
+        # boundary) - the historic \b-anchored regex missed all of these.
         "PHPSESSID",
         "JSESSIONID",
         "ASPSESSIONIDABCD",
@@ -52,7 +52,7 @@ def test_session_cookie_value_is_masked(cookie_name):
     [
         "language",
         "theme",
-        "security",  # e.g. a difficulty/feature-level flag — not a secret
+        "security",  # e.g. a difficulty/feature-level flag - not a secret
         "lang",
         "currency",
         "timezone",

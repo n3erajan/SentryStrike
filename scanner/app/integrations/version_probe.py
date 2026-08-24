@@ -1,25 +1,25 @@
 """Generic component-version extraction from manifests, lockfiles, and headers.
 
-The scanner's supply-chain gate (``supply_chain.py``) — correctly — refuses to
+The scanner's supply-chain gate (``supply_chain.py``) - correctly - refuses to
 emit an A03 finding without a component *version*: a CVE against "Express" is
 meaningless until you know the target's Express version. Error/HTML/runtime
 fingerprinting frequently identifies a technology but not its version. This
 module fills that gap from the version-bearing surfaces almost every app
 exposes:
 
-* **Package manifests / lockfiles** — ``/package.json``, ``/package-lock.json``,
+* **Package manifests / lockfiles** - ``/package.json``, ``/package-lock.json``,
   ``/composer.json``, ``/composer.lock``, ``/requirements.txt``, ``/Gemfile.lock``.
   When reachable, these static files give exact dependency versions. Each path
   is an *ecosystem standard* (npm/Composer/pip/Bundler), never a target rule.
-* **Version-bearing response headers** — ``Server``, ``X-Powered-By``,
+* **Version-bearing response headers** - ``Server``, ``X-Powered-By``,
   ``X-AspNet-Version``, ``X-Generator``: standard ``name/version`` carriers.
 
 Every mapping here encodes a *universal property of a technology* (the npm
-package ``express`` IS the "Express" framework, in any app) — the same identity
+package ``express`` IS the "Express" framework, in any app) - the same identity
 aliasing an ecosystem's own registry uses. Nothing is Juice-Shop-specific.
 
 Design contract: **never raises** (best-effort, debug-logs on failure) and adds
-**near-zero cost** when nothing is exposed — manifests are only fetched for
+**near-zero cost** when nothing is exposed - manifests are only fetched for
 ecosystems whose components were already detected, and the total request count
 is bounded.
 """
@@ -34,7 +34,7 @@ from app.integrations.wappalyzer_engine import TechComponent
 
 logger = logging.getLogger(__name__)
 
-# Hard cap on manifest fetches per probe — keeps cost bounded on any target.
+# Hard cap on manifest fetches per probe - keeps cost bounded on any target.
 _MAX_PROBE_REQUESTS = 8
 
 
@@ -168,7 +168,7 @@ def _emit(alias: tuple[str, str], raw_version: str | None) -> TechComponent | No
 
 
 # --------------------------------------------------------------------------- #
-# Manifest parsers — each maps a manifest body to versioned components.
+# Manifest parsers - each maps a manifest body to versioned components.
 # --------------------------------------------------------------------------- #
 
 def _parse_package_json(body: str) -> list[TechComponent]:

@@ -430,7 +430,7 @@ def _profile(sensitive=frozenset(), identifiers=frozenset(), item_count=0, secre
 
 def test_admin_like_url_alone_is_not_data_exposure():
     """An /admin/* URL returning a bare public value (no secret fields, no
-    object-scoped data) is NOT a data leak — the URL substring is not evidence.
+    object-scoped data) is NOT a data leak - the URL substring is not evidence.
     Prevents e.g. {"version":"x"} on /rest/admin/* being flagged.
 
     A bare public collection (a record list or stable identifiers) is likewise
@@ -474,7 +474,7 @@ def test_admin_like_url_alone_is_not_data_exposure():
 # identities is not scoped to its owner: any authenticated user reads another
 # user's object. The id-mutation path drops this (identical values look like a
 # "generic template" under val_sim==1.0); the matrix consumes {unauth, low,
-# second} directly. Generic — keyed on structure, never a Juice Shop path.
+# second} directly. Generic - keyed on structure, never a Juice Shop path.
 # ---------------------------------------------------------------------------
 
 _BASKET_6 = json.dumps({"id": 6, "userId": 42, "email": "victim@test", "items": ["a", "b"]})
@@ -567,7 +567,7 @@ async def test_cross_identity_ignores_error_body():
 
 def test_credential_bearing_request_is_recognised_as_auth_endpoint():
     """A request whose body carries a password-like field authenticates via the
-    body, so a 200 under the unauth verifier is expected — not exposure. Keyed on
+    body, so a 200 under the unauth verifier is expected - not exposure. Keyed on
     the body shape, not any specific /login path."""
     det = AccessControlDetector()
     login = _PAR(
@@ -806,7 +806,7 @@ def test_different_jwts_for_same_principal_are_not_distinct_identities():
 
 def test_idor_verdict_owner_guard_inactive_without_owner_reference():
     """Resources keyed only by their own primary key (bare `id`, e.g. /api/Users)
-    have no owner-reference field, so the same-owner guard never suppresses them —
+    have no owner-reference field, so the same-owner guard never suppresses them -
     a low-priv user reading another user record is still flagged."""
     own = '{"data":{"id":24,"email":"me@x.co","role":"customer"}}'
     other = '{"data":{"id":1,"email":"admin@x.co","role":"admin"}}'

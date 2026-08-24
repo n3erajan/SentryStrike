@@ -50,7 +50,7 @@ UNION detection hierarchy (confidence order):
 """
 
 import asyncio
-import difflib
+import dataclasses
 import logging
 from typing import Optional
 
@@ -77,10 +77,33 @@ _HIGH_CONFIDENCE_THRESHOLD = 85.0
 # Boolean differential response clustering
 # ---------------------------------------------------------------------------
 
-# Minimum separation used only when two identical baseline requests are byte-for-
-# byte stable. On naturally dynamic pages the required separation scales from the
-# measured baseline noise instead of relying on a universal page-similarity cutoff.
-_BOOL_MIN_SEPARATION = 0.000001
+# How far above the page's own measured variance a differential must sit.
+#
+# This was ``0.25`` - the separation only had to exceed a *quarter* of the noise
+# the stability probe had just measured. Any page whose variance is systematic
+# rather than random therefore passed automatically, because a systematic
+# difference is the same size as the noise that produced it.
+#
+# Measured on a guestbook-style form that appends a row on every POST: two
+# submissions of an identical benign value drifted apart by 0.000287, and the
+# TRUE/FALSE payload pair drifted by 0.000288 - the same number. The page simply
+# grows by one row per write, and because the loop always sends TRUE before
+# FALSE, FALSE is always one row further from the baseline. That yielded a small,
+# positive, perfectly reproducible "differential" that survived the independent
+# confirmation round precisely because it is deterministic.
+#
+# Requiring the separation to *exceed* the measured variance rather than a
+# fraction of it rejects that class outright, on any accumulating page, with no
+# page-specific knowledge: at 2x, the observed 0.000288 needed 0.000574.
+# Non-accumulating pages measure ~0 noise and are unaffected.
+_BOOL_NOISE_MULTIPLE = 2.0
+
+# Absolute floor on the TRUE/FALSE separation, for pages that measure zero
+# variance. The previous value (0.000001) meant "any nonzero difference counts".
+# The smallest genuine signal observed - a single row disappearing from a
+# boilerplate-heavy page - scored 0.000937, so this sits below that while still
+# being 500x stricter than the value it replaces.
+_BOOL_MIN_SEPARATION = 0.0005
 
 # ---------------------------------------------------------------------------
 # Page stability
@@ -178,17 +201,21 @@ _BOOL_PAYLOAD_PAIRS = [
 # Utility
 # ---------------------------------------------------------------------------
 
-def _body_similarity(a: Optional[str], b: Optional[str]) -> float:
+async def _body_similarity(a: Optional[str], b: Optional[str]) -> float:
     """
     Sequence-matcher similarity between two response bodies.
     Returns 1.0 for None/empty inputs (treat missing as identical to avoid
     false volatility signals on probe failures).
+
+    Runs off the event loop via the bounded shared implementation: comparing
+    full bodies inline was quadratic *and* uninterruptible, which stalled lease
+    renewal long enough for the backend to reap the scan as orphaned.
     """
     a = a or ""
     b = b or ""
     if not a and not b:
         return 1.0
-    return difflib.SequenceMatcher(None, a, b).ratio()
+    return await ResponseAnalyzer.calculate_similarity_async(a, b)
 
 
 def _boolean_pair_is_directional(analysis: dict, baseline_stability: float) -> bool:
@@ -197,7 +224,9 @@ def _boolean_pair_is_directional(analysis: dict, baseline_stability: float) -> b
     false_sim = float(analysis.get("baseline_similarity_to_false", 0.0))
     true_false_sim = float(analysis.get("true_vs_false_similarity", 1.0))
     natural_noise = max(0.0, 1.0 - baseline_stability)
-    required_separation = max(_BOOL_MIN_SEPARATION, natural_noise * 0.25)
+    required_separation = max(
+        _BOOL_MIN_SEPARATION, natural_noise * _BOOL_NOISE_MULTIPLE,
+    )
     true_floor = max(_STABILITY_FLOOR, baseline_stability - max(0.005, natural_noise))
     return (
         true_sim >= true_floor
@@ -218,23 +247,19 @@ def _has_sql_specific_error(text: str) -> bool:
 # portion reappearing. Also strip %28/%29 hex-encoded parentheses.
 # ---------------------------------------------------------------------------
 
-def _new_sql_errors(
-    baseline_body: str,
-    injected_body: str,
-    payload: str,
-    baseline_value: str = "",
-) -> list[str]:
+def _payload_echo_variants(payload: str, baseline_value: str = "") -> set[str]:
+    """Every lowercase form the injected value can take when echoed back.
+
+    A target may reflect the value raw, URL-encoded, or HTML-escaped, so a single
+    literal comparison misses most echoes.
+    """
     import urllib.parse
     import html
-
-    bl  = baseline_body.lower()
-    inj = injected_body.lower()
 
     full_injected = (baseline_value + payload).lower()
     payload_lower = payload.lower()
 
-    # Generate an exhaustive array of reflection combinations
-    candidates = {
+    return {
         full_injected,
         urllib.parse.quote_plus(full_injected),
         urllib.parse.quote(full_injected),
@@ -242,7 +267,7 @@ def _new_sql_errors(
         html.escape(full_injected),
         full_injected.replace("'", "&#39;").replace('"', "&quot;"),
         full_injected.replace("'", "&#039;"),
-        
+
         # Suffix fallbacks
         payload_lower,
         urllib.parse.quote_plus(payload_lower),
@@ -252,12 +277,55 @@ def _new_sql_errors(
         payload_lower.replace("'", "&#039;"),
     }
 
-    # Atomically strip all potential echo signatures
-    for candidate in candidates:
-        if candidate:
-            inj = inj.replace(candidate, "")
 
+def _strip_payload_echo(body: str, payload: str, baseline_value: str = "") -> str:
+    """Remove every echoed form of the injected value from ``body``.
+
+    Used before comparing TRUE/FALSE bodies. On a page that stores and redisplays
+    what was submitted (guestbook, comment list, profile field), the two payloads
+    are themselves the only difference between the responses - ``' AND '1'='1``
+    versus ``' AND '1'='2`` differ by one character. That yields a tiny but
+    perfectly *reproducible* similarity gap which has nothing to do with how the
+    database evaluated the condition, and which survives the independent
+    confirmation round precisely because it is deterministic. Removing the echo
+    first means only genuine server-side differences remain.
+    """
+    stripped = body.lower()
+    for variant in _payload_echo_variants(payload, baseline_value):
+        if variant:
+            stripped = stripped.replace(variant, "")
+    return stripped
+
+
+def _without_payload_echo(
+    resp: ResponseData, payload: str, baseline_value: str = "",
+) -> ResponseData:
+    """Copy of ``resp`` with every echoed form of the payload removed.
+
+    ``_strip_payload_echo`` lowercases, so the baseline must be passed through
+    ``_lowered`` for the same comparison - otherwise case differences alone would
+    dominate the similarity.
+    """
+    return dataclasses.replace(
+        resp, body=_strip_payload_echo(resp.body or "", payload, baseline_value),
+    )
+
+
+def _lowered(resp: ResponseData) -> ResponseData:
+    """Copy of ``resp`` with a lowercased body, to match stripped comparands."""
+    return dataclasses.replace(resp, body=(resp.body or "").lower())
+
+
+def _new_sql_errors(
+    baseline_body: str,
+    injected_body: str,
+    payload: str,
+    baseline_value: str = "",
+) -> list[str]:
+    bl = baseline_body.lower()
+    inj = _strip_payload_echo(injected_body, payload, baseline_value)
     return [m for m in _SQL_SPECIFIC_MARKERS if m in inj and m not in bl]
+
 
 def _new_version_indicators(baseline_body: str, injected_body: str) -> list[str]:
     """
@@ -333,7 +401,7 @@ class SQLiVerifier(BaseVerifier):
 
         # Gate 0.5: Dead-baseline abort. When the UNMODIFIED baseline is
         # 401/403/404/405 the target is unreachable/unauthorized/wrong-shape as
-        # sent, so no injection differential can exist — firing the full payload
+        # sent, so no injection differential can exist - firing the full payload
         # matrix (boolean/error/UNION/time) only produces 4xx noise. Login-style
         # SQLi is unaffected: its baseline is a healthy 200 (only the deliberate
         # false payload returns 401). A None/governor-denied baseline is not dead
@@ -514,7 +582,7 @@ class SQLiVerifier(BaseVerifier):
                 json_body=probe_json,
                 test_phase="stability_probe",
             )
-            stability = _body_similarity(pre_test_baseline.body, probe_resp.body)
+            stability = await _body_similarity(pre_test_baseline.body, probe_resp.body)
             return stability
         except Exception as e:
             return 1.0
@@ -577,8 +645,10 @@ class SQLiVerifier(BaseVerifier):
                 if true_resp.not_tested or false_resp.not_tested:
                     continue
 
-                _, analysis = ResponseAnalyzer.analyze_boolean_differential(
-                    baseline, true_resp, false_resp
+                _, analysis = await ResponseAnalyzer.analyze_boolean_differential_async(
+                    _lowered(baseline),
+                    _without_payload_echo(true_resp, true_payload, value),
+                    _without_payload_echo(false_resp, false_payload, value),
                 )
                 true_sim  = analysis.get("baseline_similarity_to_true",  1.0)
                 false_sim = analysis.get("baseline_similarity_to_false", 1.0)
@@ -642,14 +712,16 @@ class SQLiVerifier(BaseVerifier):
                 test_phase="boolean_confirm_false", payload=confirm_false,
             )
 
-            _, confirm_analysis = ResponseAnalyzer.analyze_boolean_differential(
-                baseline, ct_resp, cf_resp
+            _, confirm_analysis = await ResponseAnalyzer.analyze_boolean_differential_async(
+                _lowered(baseline),
+                _without_payload_echo(ct_resp, confirm_true, value),
+                _without_payload_echo(cf_resp, confirm_false, value),
             )
             ct_sim = confirm_analysis.get("baseline_similarity_to_true",  1.0)
             cf_sim = confirm_analysis.get("baseline_similarity_to_false", 1.0)
 
-            first_true_to_confirm = _body_similarity(confirmed_true_resp.body, ct_resp.body)
-            first_false_to_confirm = _body_similarity(confirmed_false_resp.body, cf_resp.body)
+            first_true_to_confirm = await _body_similarity(confirmed_true_resp.body, ct_resp.body)
+            first_false_to_confirm = await _body_similarity(confirmed_false_resp.body, cf_resp.body)
             natural_noise = max(0.0, 1.0 - baseline_stability)
             repeat_floor = max(_STABILITY_FLOOR, baseline_stability - max(0.01, natural_noise))
             if (
@@ -1006,7 +1078,7 @@ class SQLiVerifier(BaseVerifier):
                         )
                         continue
 
-                    sim = _body_similarity(baseline_body, inj_resp.body or "")
+                    sim = await _body_similarity(baseline_body, inj_resp.body or "")
 
                     if sim < _UNION_SIM_MIN:
                         logger.debug(
@@ -1073,7 +1145,7 @@ class SQLiVerifier(BaseVerifier):
                                 )
                                 continue
 
-                            ver_sim = _body_similarity(baseline_body, ver_resp.body or "")
+                            ver_sim = await _body_similarity(baseline_body, ver_resp.body or "")
                             if not _similarity_in_union_window(ver_sim):
                                 logger.debug(
                                     "Version extract '%s' similarity %.2f outside window %s:%s - skip",
@@ -1157,7 +1229,7 @@ class SQLiVerifier(BaseVerifier):
                     json_body=conf_json,
                     test_phase="union_cross_column_confirm", payload=confirm_payload,
                 )
-                conf_sim = _body_similarity(baseline_body, conf_resp.body or "")
+                conf_sim = await _body_similarity(baseline_body, conf_resp.body or "")
 
                 if not _similarity_in_union_window(conf_sim):
                     logger.debug(
@@ -1238,7 +1310,7 @@ class SQLiVerifier(BaseVerifier):
         which otherwise look exactly like a database sleep when detectors overlap.
         """
         sleep_payloads = [
-            # Standard — uses baseline_value as the prefix
+            # Standard - uses baseline_value as the prefix
             ("' AND SLEEP(3)--",                     3000),
             ("' AND SLEEP(3)#",                      3000),
             (" AND SLEEP(3)--",                      3000),

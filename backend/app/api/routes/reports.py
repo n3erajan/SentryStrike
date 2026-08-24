@@ -19,6 +19,8 @@ SCANNER_LIMITATIONS = [
     "OWASP A06, A08, and A09 are disclosed as outside active automated detector scope.",
     "SPA/API coverage depends on crawl visibility and whether browser-based discovery was enabled.",
     "Authenticated coverage is verified only when the scanner proves access to a protected target.",
+    "Absence of a finding on a tested surface is not proof of absence; surfaces this scan never "
+    "reached are listed nowhere and must be assumed untested.",
 ]
 
 
@@ -95,6 +97,13 @@ def _build_report_payload(
         "evidence_strength_breakdown": report_metadata.get("evidence_strength_breakdown", {}),
         "spa_api_coverage": report_metadata.get("spa_api_coverage", {}),
         "auth_coverage": report_metadata.get("auth_coverage", {}),
+        # Promoted from report_metadata so the itemised "what was actually
+        # tested" inventory and the scan's own coverage caveats are findable at
+        # the top level of the JSON report rather than buried in metadata. The
+        # PDF carries only the counts; this is where the full inventory lives.
+        "tested_surface": report_metadata.get("tested_surface", {}),
+        "coverage_warnings": report_metadata.get("coverage_warnings", []),
+        "detector_coverage": report_metadata.get("detector_coverage", []),
         "attack_chains": attack_chains,
         "scanner_limitations": SCANNER_LIMITATIONS,
     }

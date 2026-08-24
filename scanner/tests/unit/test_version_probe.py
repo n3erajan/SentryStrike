@@ -2,7 +2,7 @@
 
 Locks in the requirement that *actual* component versions a target reveals
 (package manifests, lockfiles, version-bearing headers) are captured so the
-supply-chain version gate can emit true A03 findings — for ANY stack, never a
+supply-chain version gate can emit true A03 findings - for ANY stack, never a
 target-specific path. Also covers the scanner merge semantics (back-fill
 versions onto existing components, add versioned new ones, CVE-enrich only what
 newly resolved).

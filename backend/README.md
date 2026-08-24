@@ -92,7 +92,7 @@ A few workspace routes are narrower than that summary suggests, all enforced by 
 
 | Operation                  | Allowed                                |
 | -------------------------- | -------------------------------------- |
-| `GET /workspace/audit-log` | `owner` / `admin` only — not `analyst` |
+| `GET /workspace/audit-log` | `owner` / `admin` only - not `analyst` |
 | `PUT /workspace` (rename)  | `owner` only                           |
 | `GET /workspace/retention` | any member                             |
 | `PUT /workspace/retention` | `owner` / `admin` only                 |

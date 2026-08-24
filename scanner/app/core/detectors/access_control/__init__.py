@@ -8,16 +8,16 @@ attributes, and ``detect()`` signature are identical.
 
 The detector logic is composed from focused mixins, each owning one concern:
 
-* ``RuntimeMixin`` — the ``detect()`` orchestration entry point, per-scan auth
+* ``RuntimeMixin`` - the ``detect()`` orchestration entry point, per-scan auth
   material construction, and the small structural classification helpers.
-* ``ForcedBrowsingMixin`` — unauthenticated sensitive-path exposure.
-* ``IdorMixin`` — horizontal/vertical IDOR via id-mutation differential.
-* ``AuthorizationMatrixMixin`` — the unauth/low/second/privileged response
+* ``ForcedBrowsingMixin`` - unauthenticated sensitive-path exposure.
+* ``IdorMixin`` - horizontal/vertical IDOR via id-mutation differential.
+* ``AuthorizationMatrixMixin`` - the unauth/low/second/privileged response
   matrix and the response-profile comparison helpers it relies on.
-* ``MutatingAuthorizationMixin`` — non-destructive authz checks on
+* ``MutatingAuthorizationMixin`` - non-destructive authz checks on
   state-changing methods (synthetic non-existent id + status differential).
-* ``MassAssignmentMixin`` — privilege-field injection on create/update bodies.
-* ``TargetingMixin`` — attack-surface/target construction, request building,
+* ``MassAssignmentMixin`` - privilege-field injection on create/update bodies.
+* ``TargetingMixin`` - attack-surface/target construction, request building,
   header sanitization, and id/collection extraction shared by every check.
 
 ``common.py`` holds the module-level dataclasses, constants, regexes, and pure
@@ -79,7 +79,7 @@ class AccessControlDetector(
 ):
     name = "access_control"
 
-    # Tokens that name GATED FUNCTIONALITY — resources that are supposed to
+    # Tokens that name GATED FUNCTIONALITY - resources that are supposed to
     # require authorization, so reaching them unauthenticated (with a working
     # authenticated baseline) is a genuine A01 Broken Access Control finding and
     # the auth-vs-unauth differential IS the proof.
@@ -87,7 +87,7 @@ class AccessControlDetector(
     # Accidental FILE / VCS / dotfile exposure (``.git``, ``.env``,
     # ``.htaccess`` …) is deliberately NOT here: such a file should never be
     # web-served at all, there is no meaningful "authorized version" to diff
-    # against, and it is A02 Security Misconfiguration — owned by the
+    # against, and it is A02 Security Misconfiguration - owned by the
     # ``sensitive_paths`` detector, which probes those exact paths and confirms
     # by content. Keeping them here made forced browsing do sensitive_paths'
     # job and emit the same exposure twice under two different OWASP categories.

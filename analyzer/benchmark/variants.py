@@ -1,8 +1,8 @@
 """Prompt variants under test.
 
-baseline — the production prompt, imported directly from app.prompts so the
+baseline - the production prompt, imported directly from app.prompts so the
            measurement tracks real code.
-brief    — baseline plus the EvidenceGrader brief (proof summary, weaknesses,
+brief    - baseline plus the EvidenceGrader brief (proof summary, weaknesses,
            judge question) that the scanner already computes but discards.
 """
 from __future__ import annotations
@@ -15,20 +15,20 @@ VARIANTS = ("baseline", "brief", "brief_locus")
 
 
 _LOCUS_RULE = (
-    "LOCUS RULE — judge the MATCH, not the PAGE:\n"
+    "LOCUS RULE - judge the MATCH, not the PAGE:\n"
     "A page can host tutorial, documentation, or example content AND still be vulnerable. "
     "What matters is where the matched evidence sits, not what the surrounding page is about.\n"
     "- If detection_evidence reports match_location as 'outside_code_block', "
     "'command_output_block', or 'attribute_value_broken_out', the match is LIVE application "
     "output. A tutorial-looking page title does NOT make it a false positive.\n"
     "- If match_location is 'code_block' AND the surrounding page is documentation, the match "
-    "is illustrative text — that IS a false positive.\n"
+    "is illustrative text - that IS a false positive.\n"
     "- If detection_evidence shows the evidence is absent from the control request "
     "(control_response_lacks_marker=true, error_absent_in_control_request=true), the payload "
     "caused it. That is a true positive regardless of page topic.\n"
     "- If the evidence is present WITHOUT the payload (identical_without_payload=true, "
     "error_present_in_control_request=true, control_request_also_slow_ms), the scanner's claim "
-    "is contradicted — that IS a false positive.\n\n"
+    "is contradicted - that IS a false positive.\n\n"
 )
 
 

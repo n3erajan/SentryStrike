@@ -58,7 +58,7 @@ def _vuln(
 # ---------------------------------------------------------------------------
 
 class TestActiveOutputMethods:
-    """Methods where the proof is IN the response — ceiling 0.05."""
+    """Methods where the proof is IN the response - ceiling 0.05."""
 
     @pytest.mark.parametrize("method", [
         "union_based",
@@ -98,7 +98,7 @@ class TestActiveOutputMethods:
 
 
 class TestErrorEchoMethods:
-    """Methods where a DB/framework error string is echoed — ceiling 0.05."""
+    """Methods where a DB/framework error string is echoed - ceiling 0.05."""
 
     @pytest.mark.parametrize("method", ["error_based", "wrapper_error_analysis"])
     def test_error_echo_method(self, method):
@@ -109,7 +109,7 @@ class TestErrorEchoMethods:
 
 
 class TestTimingMethods:
-    """Timing methods — sub-classified by delta ratio."""
+    """Timing methods - sub-classified by delta ratio."""
 
     def test_timing_strong_large_delta(self):
         vuln = _vuln("SQL Injection (Time-Based Blind)", detection_method="time_based",
@@ -193,7 +193,7 @@ class TestAuthDifferentialMethods:
 
 
 class TestPatternMatchMethods:
-    """Pattern-match methods — regex hit could be reflected payload — ceiling 1.00."""
+    """Pattern-match methods - regex hit could be reflected payload - ceiling 1.00."""
 
     @pytest.mark.parametrize("method", [
         "observed_exception_evidence",
@@ -211,7 +211,7 @@ class TestPatternMatchMethods:
         assert grade.fp_ceiling == get_fp_ceiling("pattern_match")
 
     def test_reflection_prefix_is_pattern_match(self):
-        """XSS reflection_* methods: reflection without execution — AI judges."""
+        """XSS reflection_* methods: reflection without execution - AI judges."""
         grade = grader.grade(_vuln("Reflected XSS", detection_method="reflection_attribute"))
         assert grade.proof_type == "pattern_match"
         assert grade.fp_ceiling == get_fp_ceiling("pattern_match")
@@ -255,7 +255,7 @@ def test_ssrf_inband_is_indirect_differential_not_pattern_match() -> None:
     assert "internal_samples" in brief
 
 class TestStructuralVulnTypes:
-    """Structural vuln types — observation IS the proof — ceiling 0.10."""
+    """Structural vuln types - observation IS the proof - ceiling 0.10."""
 
     @pytest.mark.parametrize("vuln_type", [
         "Missing Security Header",
@@ -293,7 +293,7 @@ class TestStructuralVulnTypes:
 
 
 class TestHeuristicFallback:
-    """Unknown methods with no keyword match → heuristic — ceiling 0.40."""
+    """Unknown methods with no keyword match → heuristic - ceiling 0.40."""
 
     def test_unknown_method_no_keyword_match(self):
         grade = grader.grade(_vuln("Some Unknown Vulnerability",
@@ -524,17 +524,17 @@ class TestEvidenceBrief:
 
     def test_brief_falls_back_to_response_snippet_when_no_structured_evidence(self):
         """When a detector sets no detection_evidence, the brief still gives
-        the AI the response snippet to evaluate — never an empty PROOF MARKERS."""
+        the AI the response snippet to evaluate - never an empty PROOF MARKERS."""
         vuln = _vuln("Some Vulnerability", detection_method="unknown_method",
                      payload="test-payload",
-                     response_snippet="HTTP 200 — some response body here",
+                     response_snippet="HTTP 200 - some response body here",
                      detection_evidence={})
         grade = grader.grade(vuln)
         brief = grader.build_evidence_brief(vuln, grade)
         assert "response_excerpt" in brief or "payload" in brief
 
     def test_brief_does_not_contain_detector_verified(self):
-        """The brief must NOT expose detector_verified/confidence — those cause
+        """The brief must NOT expose detector_verified/confidence - those cause
         circular reasoning where the AI defers to the detector's verdict."""
         vuln = _vuln("Test", detection_method="error_based", verified=True, confidence=95.0)
         grade = grader.grade(vuln)

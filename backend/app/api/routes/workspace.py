@@ -252,7 +252,7 @@ async def invite_member(
             body_text=body_text,
             body_html=body_html,
         )
-    except Exception as exc:  # noqa: BLE001 — compensate the persisted invite and seat
+    except Exception as exc:  # noqa: BLE001 - compensate the persisted invite and seat
         await invites.record_email_delivery(
             invite,
             status=InviteEmailStatus.failed,
@@ -414,7 +414,7 @@ async def list_audit_log(
 
 
 # --------------------------------------------------------------------------- #
-# Settings — retention
+# Settings - retention
 # --------------------------------------------------------------------------- #
 
 

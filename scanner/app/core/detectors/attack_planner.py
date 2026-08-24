@@ -90,7 +90,7 @@ class AttackPlanner:
         (governor-admitted); ``denied_count`` is the number the governor refused at
         the budget ceiling. A body target counts as skipped only when it was not
         reached, and ``budget_exhausted`` is attributed strictly up to the real
-        ``denied_count`` — never inferred from a shortfall in findings. A detector
+        ``denied_count`` - never inferred from a shortfall in findings. A detector
         that ran fully and found nothing therefore reports ``budget_exhausted == 0``.
         """
         attempted = max(0, int(attempted_count))

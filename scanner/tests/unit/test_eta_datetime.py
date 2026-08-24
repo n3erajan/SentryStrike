@@ -174,7 +174,7 @@ def test_last_heavy_detector_does_not_claim_tiny_eta() -> None:
     orch._eta_state.detector_total_work = 530.0
     orch._eta_state.detector_completed_work = 30.0
     orch._eta_state.detector_total_s = 400.0
-    # Lights finished in 60s — pace would understate XSS if we trusted it alone;
+    # Lights finished in 60s - pace would understate XSS if we trusted it alone;
     # prior floor keeps remaining honest.
     orch._eta_state.detector_phase_started = perf_counter() - 60.0
 

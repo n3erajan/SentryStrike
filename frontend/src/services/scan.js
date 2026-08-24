@@ -1,4 +1,4 @@
-// Scan service — wraps the backend `/scans/*` routes (mounted under /api/v1).
+// Scan service - wraps the backend `/scans/*` routes (mounted under /api/v1).
 //
 //   POST   /scans                 { target_url, crawl_mode,
 //                                   authorization_confirmed,

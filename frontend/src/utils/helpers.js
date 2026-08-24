@@ -71,7 +71,7 @@ function parseUTCDate(iso) {
 // the user actually came from. Pages that can be reached from more than one list
 // (a scan is reachable from /scans and from an application's own history) pass
 // `state.from = { to, label }` when navigating; anything that arrives without it
-// — a deep link, a notification, a refresh, which all drop router state — falls
+// - a deep link, a notification, a refresh, which all drop router state - falls
 // back to the page's default list.
 function resolveBackTarget(state, fallbackTo, fallbackLabel) {
   const to = state?.from?.to;

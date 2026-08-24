@@ -15,8 +15,8 @@ class ObservedAuthEvidenceMixin:
 
     # SQL-statement keywords used to recognise a reflected query echo (see
     # ``_is_reflected_sql_echo``). Injection detectors surface DB error bodies
-    # that echo the application's own query — ``... WHERE email = '<payload>' AND
-    # password = '<hash>' ...`` — where ``password =`` is a SQL comparison, not a
+    # that echo the application's own query - ``... WHERE email = '<payload>' AND
+    # password = '<hash>' ...`` - where ``password =`` is a SQL comparison, not a
     # disclosed credential. Framework-agnostic: SQL keyword syntax is universal.
     _SQL_STATEMENT_RE = re.compile(r"\b(?:select|insert|update|delete)\b", re.IGNORECASE)
     _SQL_PASSWORD_COMPARISON_RE = re.compile(
@@ -28,7 +28,7 @@ class ObservedAuthEvidenceMixin:
         """True when a ``password =`` match is part of an echoed SQL statement.
 
         A DB error that reflects the query (``SELECT ... WHERE ... password =
-        '...'``) is not a credential/config disclosure — it is the injected query
+        '...'``) is not a credential/config disclosure - it is the injected query
         surfaced by the source injection finding, already reported there. Only a
         genuine config-style assignment (``db_password=...`` outside any SQL
         statement) should survive as credential disclosure.

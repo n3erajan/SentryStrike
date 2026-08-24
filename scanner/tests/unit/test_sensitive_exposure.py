@@ -81,7 +81,7 @@ def test_application_data_field_named_scoreboard_is_not_debug_metrics():
 
 def test_htaccess_with_directives_is_sensitive_file_exposure():
     # .htaccess exposure moved from the forced-browsing (A01) detector to
-    # sensitive_paths (A02) — it is accidental config-file exposure, not a
+    # sensitive_paths (A02) - it is accidental config-file exposure, not a
     # bypassed access control. A body carrying real Apache directives confirms it.
     detector = SensitivePathsDetector()
     body = "RewriteEngine On\nRewriteRule ^(.*)$ index.php [L]\n<Files ~ \"\\.inc$\">\nDeny from all\n</Files>"
@@ -97,7 +97,7 @@ def test_htaccess_with_directives_is_sensitive_file_exposure():
 
 def test_htaccess_path_without_directives_is_not_flagged():
     # A path that merely contains ".htaccess" but returns ordinary page content
-    # (no Apache directives) must not be classified — avoids false positives on
+    # (no Apache directives) must not be classified - avoids false positives on
     # soft-404 / app pages.
     detector = SensitivePathsDetector()
 
@@ -856,7 +856,7 @@ async def test_authenticated_scan_does_not_deadlock_on_many_matches(monkeypatch)
 
     ``probe_url`` runs inside ``async with semaphore``; ``asyncio.Semaphore`` is
     not reentrant, so a re-probe that acquired it again deadlocked the detector
-    the moment enough concurrent probes matched at once — every permit held by a
+    the moment enough concurrent probes matched at once - every permit held by a
     task waiting for one more. Observed live: the scanner went silent mid-scan
     right after a run of 200s on an exposed .git tree.
 

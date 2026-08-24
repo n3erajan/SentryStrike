@@ -23,13 +23,13 @@ async def settle_page(
     ``networkidle`` never fires on apps with persistent sockets/polling/analytics,
     so instead of waiting for a load state that never arrives we watch an in-flight
     request counter and return once it stays at zero for ``quiet_ms`` or ``cap_ms``
-    elapses — whichever comes first.
+    elapses - whichever comes first.
 
     Two modes:
 
     - ``inflight`` provided (the crawl engine): use the caller's persistent
-      counter — already wired to the page's request/requestfinished/requestfailed
-      events for the whole route sequence — and attach no listeners here.
+      counter - already wired to the page's request/requestfinished/requestfailed
+      events for the whole route sequence - and attach no listeners here.
     - ``inflight`` omitted (the auth manager): attach a temporary counter for the
       duration of this call and detach it before returning, so repeated calls on
       the same page never accumulate handlers.
@@ -130,7 +130,7 @@ async def install_resource_blocking(context: Any) -> None:
     """Abort non-essential resource loads on ``context`` for a faster settle.
 
     Blocks by resource type (image/media/font/stylesheet) and known-tracker host
-    only. Never aborts ``script``/``xhr``/``fetch``/``document`` — those can drive
+    only. Never aborts ``script``/``xhr``/``fetch``/``document`` - those can drive
     SPA data loads, so blocking them would break discovery. Best-effort: any error
     installing the route is swallowed so resource blocking never fails a crawl.
     """

@@ -67,7 +67,7 @@ def test_deduplicate_keeps_distinct_path_variable_routes_separate() -> None:
 
 def test_deduplicate_collapses_object_id_path_instances() -> None:
     """A BOLA/IDOR on /rest/basket/:id is ONE vulnerability even when demonstrated
-    against several object ids in the URL path (parameter is None — the id is not a
+    against several object ids in the URL path (parameter is None - the id is not a
     captured parameter). The numeric id segments must normalize so the instances
     collapse; the concrete urls survive in merged evidence."""
     findings = [

@@ -20,9 +20,9 @@ def test_is_valid_interaction_id_rejects_non_genuine():
         "",
         "notauuid",
         "ssrf-tooShort",
-        "ssrf-" + "a" * 31,          # 31 hex — too short
-        "ssrf-" + "a" * 33,          # 33 hex — too long
-        "ssrf-" + "A" * 32,          # uppercase — uuid4().hex is lowercase
+        "ssrf-" + "a" * 31,          # 31 hex - too short
+        "ssrf-" + "a" * 33,          # 33 hex - too long
+        "ssrf-" + "A" * 32,          # uppercase - uuid4().hex is lowercase
         "ssrf-../../etc/passwd",
         "ssrf-" + "g" * 32,          # non-hex
         "-" + "a" * 32,              # missing purpose

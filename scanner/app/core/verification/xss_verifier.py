@@ -27,6 +27,7 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
 from app.core.crawler.models import ParameterLocation
+from app.core.crawler.spa import install_resource_blocking, settle_page
 from app.core.crawler.url_parser import is_static_asset
 from app.core.detectors.attack_surface import AttackTarget, _set_json_path
 from app.core.detectors.base_detector import Finding
@@ -76,6 +77,16 @@ def _embed_canary(payload: str, canary: str) -> str:
     if "alert(1);//" in payload:
         return payload.replace("alert(1);//", f"{hook_call};//", 1)
     return f"{payload}<script>{hook_call}</script>"
+
+
+StoredKey = tuple[str, str, str]
+
+
+def stored_override_key(url: str, method: str, parameter: str) -> StoredKey:
+    """Canonical ``(url, method, parameter)`` key shared between batch stored-XSS
+    discovery (which plants canaries) and the per-candidate verify loop (which
+    consumes the confirmed display URLs)."""
+    return (url, method.upper(), parameter)
 
 
 class XSSVerifier(BaseVerifier):
@@ -143,8 +154,15 @@ class XSSVerifier(BaseVerifier):
         r"\bv-html\b", r"\bng-bind-html\b",
     )
     
+    # URL shapes where stored content is most likely to be rendered back, probed
+    # ahead of ordinary pages. Segment-anchored on purpose: an unanchored ``view``
+    # matched every ``/contents/html-view/...`` page on an ordinary CMS, so every
+    # content page was classed as a high-value sink. ``access`` and a bare ``ids``
+    # were dropped for the same reason — they matched substrings of common words
+    # rather than the admin/audit surfaces this is meant to find.
     _HEADER_SINK_PATTERNS: re.Pattern = re.compile(
-        r"(log|admin|report|view|activity|audit|history|dashboard|ids|monitor|feed|track|access)",
+        r"(?:^|[/_.-])(log|logs|admin|report|reports|activity|audit|history"
+        r"|dashboard|monitor|feed|track|tracking)(?:[/_.-]|$)",
         re.IGNORECASE,
     )
 
@@ -161,6 +179,11 @@ class XSSVerifier(BaseVerifier):
         Static assets (js/css/txt/images/…) are excluded: a stored XSS payload is
         reflected into an HTML page's DOM, never into a plain-text/binary asset, so
         re-fetching ``robots.txt``/``main.js`` as a stored sink only wastes budget.
+
+        Sink-shaped URLs are probed first, but they are capped too. Splicing them
+        in uncapped meant a site whose every route looked sink-shaped bypassed the
+        cap entirely and returned hundreds of URLs instead of tens — each of which
+        is a full page fetch during the read pass.
         """
         bare_urls: list[str] = []
         seen: set[str] = set()
@@ -173,8 +196,9 @@ class XSSVerifier(BaseVerifier):
                 bare_urls.append(bare)
 
         sinks = [u for u in bare_urls if cls._HEADER_SINK_PATTERNS.search(u)]
-        others = [u for u in bare_urls if u not in sinks]
-        capped = sinks + others[: cls._STORED_PROBE_URL_CAP]
+        sink_set = set(sinks)
+        others = [u for u in bare_urls if u not in sink_set]
+        capped = sinks[: cls._STORED_PROBE_URL_CAP] + others[: cls._STORED_PROBE_URL_CAP]
         return list(dict.fromkeys(capped))
 
     async def _batch_stored_discovery(
@@ -182,31 +206,47 @@ class XSSVerifier(BaseVerifier):
         candidates: list[AttackTarget],
         stored_display_urls: list[str],
         stored_baselines: dict[str, ResponseData] | None = None,
-    ) -> dict[str, set[str]]:
-        """Inject unique canaries into all params of a route in one request,
-        then probe each display URL once to discover which (param, display_url)
-        pairs reflect.
+    ) -> dict[StoredKey, set[str]]:
+        """Plant canaries for one route group, then read the display URLs.
 
-        Returns a mapping of ``parameter → {display_url, ...}`` for parameters
-        whose canary was found in at least one display URL's response. The
-        per-parameter canary mapping is stored in ``self._batch_canaries`` for
-        downstream use by ``_test_payload`` (so it can restrict stored probing
-        to only confirmed display URLs instead of fanning out to all of them).
-
-        This collapses the stored-XSS discovery phase from ``params × payloads ×
-        probe_urls`` to ``1 injection + probe_urls``, an O(n²) → O(n) reduction.
+        Kept for single-group callers. When several groups are in play, prefer
+        ``plant_batch_canaries`` across all of them followed by one shared
+        ``collect_stored_canaries`` pass: this method reads every display URL
+        itself, so calling it once per group refetches the same pages once per
+        group - on a slow target that dominated the whole phase.
         """
-        if not candidates or not stored_display_urls:
+        canary_map = await self.plant_batch_canaries(candidates)
+        if not canary_map or not stored_display_urls:
+            return {}
+        return await self.collect_stored_canaries(
+            canary_map, stored_display_urls, stored_baselines=stored_baselines,
+        )
+
+    async def plant_batch_canaries(
+        self,
+        candidates: list[AttackTarget],
+    ) -> dict[StoredKey, str]:
+        """Inject a unique canary into every parameter of a route in one request.
+
+        Returns ``{(url, method, parameter): canary}`` for the parameters whose
+        canary was submitted, or ``{}`` when the request could not be built or the
+        application rejected it - an empty result tells the caller to fall back to
+        per-parameter probing for this group, leaving other groups unaffected.
+
+        Reading is deliberately *not* done here. Canaries are globally unique
+        (``sentryprobe_<uuid4>``), so once every group has planted, one fetch of a
+        display page can be attributed to whichever canaries it contains.
+        """
+        if not candidates:
             return {}
 
-        self._stored_baselines = dict(stored_baselines or {})
-        self._batch_canaries: dict[str, str] = {}
+        self._batch_canaries: dict[StoredKey, str] = {}
 
         # Build one request that injects a unique canary into every parameter
         # of the batch. For JSON-body targets, each canary goes into its own
         # path within the same template. For form targets, each canary replaces
         # its parameter's value. For query targets, each canary is appended.
-        canary_map: dict[str, str] = {}
+        canary_map: dict[StoredKey, str] = {}
         primary_target = candidates[0]
 
         # All candidates in a batch share the same url+method, so we use the
@@ -218,8 +258,9 @@ class XSSVerifier(BaseVerifier):
 
         for cand in candidates:
             canary = ResponseAnalyzer.generate_probe_canary()
-            canary_map[cand.parameter] = canary
-            self._batch_canaries[cand.parameter] = canary
+            key = stored_override_key(cand.url, cand.method, cand.parameter)
+            canary_map[key] = canary
+            self._batch_canaries[key] = canary
 
             if cand.location in {ParameterLocation.json_body, ParameterLocation.graphql_variable}:
                 if merged_json_body is None:
@@ -230,7 +271,7 @@ class XSSVerifier(BaseVerifier):
             elif cand.location == ParameterLocation.query:
                 merged_params[cand.parameter] = canary
             else:
-                # path/header/cookie locations don't batch — skip them here;
+                # path/header/cookie locations don't batch - skip them here;
                 # they're handled by the normal per-candidate verify loop.
                 pass
 
@@ -268,7 +309,7 @@ class XSSVerifier(BaseVerifier):
             return {}
 
         # If the injection itself was rejected (e.g. 400 validation error),
-        # we can't determine stored reflection — fall back to per-param testing.
+        # we can't determine stored reflection - fall back to per-param testing.
         if getattr(batch_resp, "status_code", 200) in {400, 422}:
             logger.debug(
                 "Batch stored injection rejected (status=%s) for %s; "
@@ -277,24 +318,43 @@ class XSSVerifier(BaseVerifier):
             )
             return {}
 
-        # Probe each display URL once and check for ANY canary
-        confirmed: dict[str, set[str]] = {}
+        return canary_map
+
+    async def collect_stored_canaries(
+        self,
+        canary_map: dict[StoredKey, str],
+        stored_display_urls: list[str],
+        stored_baselines: dict[str, ResponseData] | None = None,
+    ) -> dict[StoredKey, set[str]]:
+        """Fetch each display URL **once** and attribute every canary it contains.
+
+        Returns ``{(url, method, parameter): {display_url, ...}}`` for candidates
+        whose canary was found in at least one display page.
+
+        A single fetch per display URL serves every planted canary, because
+        canaries are globally unique: a marker in the body identifies exactly one
+        candidate no matter which group planted it. Reading per group instead
+        multiplied the identical GETs by the number of groups.
+        """
+        if not canary_map or not stored_display_urls:
+            return {}
+
+        self._stored_baselines = dict(stored_baselines or {})
+
+        confirmed: dict[StoredKey, set[str]] = {}
         for probe_url in stored_display_urls:
             try:
-                if hasattr(self, "_stored_baselines") and probe_url in self._stored_baselines:
-                    baseline_resp = self._stored_baselines[probe_url]
-                else:
-                    baseline_resp = await self._send(
+                if probe_url not in self._stored_baselines:
+                    self._stored_baselines[probe_url] = await self._send(
                         probe_url, "GET", test_phase="stored_pre_test_baseline",
                     )
-                    self._stored_baselines[probe_url] = baseline_resp
 
                 resp = await self._send(probe_url, "GET", test_phase="batch_stored_check")
                 body = resp.body or ""
 
-                for param, canary in canary_map.items():
+                for key, canary in canary_map.items():
                     if canary in body:
-                        confirmed.setdefault(param, set()).add(probe_url)
+                        confirmed.setdefault(key, set()).add(probe_url)
             except Exception as e:
                 logger.debug("Batch stored probe failed for %s: %s", probe_url, e)
 
@@ -344,14 +404,14 @@ class XSSVerifier(BaseVerifier):
             stored_display_urls: Optional[list[str]] = None,
             stored_baselines: Optional[dict[str, ResponseData]] = None,
             target: Optional[object] = None,
-            stored_display_overrides: Optional[dict[str, set[str]]] = None,
+            stored_display_overrides: Optional[dict[StoredKey, set[str]]] = None,
         ) -> VerificationResult:
             """Verify XSS vulnerability safely utilizing integrated hybrid checks.
 
             ``stored_display_overrides`` carries the result of batch stored-XSS
-            discovery: a mapping of ``parameter → {display_url, ...}`` for
-            parameters whose canary was confirmed stored. When present, the
-            stored-reflection probe narrows to only those display URLs instead
+            discovery: a mapping of ``(url, method, parameter) → {display_url,
+            ...}`` for candidates whose canary was confirmed stored. When present,
+            the stored-reflection probe narrows to only those display URLs instead
             of fanning out to every discovered URL.
             """
             
@@ -440,8 +500,10 @@ class XSSVerifier(BaseVerifier):
                             # fan-out with a targeted O(1) probe of the single
                             # display URL where the canary was confirmed stored.
                             batch_stored_urls: list[str] | None = None
-                            if stored_display_overrides and parameter in stored_display_overrides:
-                                batch_stored_urls = list(stored_display_overrides[parameter])
+                            if stored_display_overrides:
+                                override_key = stored_override_key(url, method, parameter)
+                                if override_key in stored_display_overrides:
+                                    batch_stored_urls = list(stored_display_overrides[override_key])
 
                             if batch_stored_urls is not None:
                                 # Narrowed: probe only confirmed display URLs.
@@ -619,7 +681,7 @@ class XSSVerifier(BaseVerifier):
         method: str,
         stored_display_urls: Optional[list[str]] = None,
         stored_baselines: Optional[dict[str, ResponseData]] = None,
-        stored_display_overrides: Optional[dict[str, set[str]]] = None,
+        stored_display_overrides: Optional[dict[StoredKey, set[str]]] = None,
     ) -> VerificationResult:
         """Test several request headers for reflected XSS in one request per payload.
 
@@ -737,7 +799,7 @@ class XSSVerifier(BaseVerifier):
         self, url: str, parameter: str, method: str, value: str, payload: str, payload_type: str,
         form_inputs: Optional[list], stored_display_urls: Optional[list[str]], pre_test_baseline: ResponseData,
         target: Optional[object] = None,
-        stored_display_overrides: Optional[dict[str, set[str]]] = None,
+        stored_display_overrides: Optional[dict[StoredKey, set[str]]] = None,
         prefetched_response: Optional[ResponseData] = None,
         prefetched_canary: Optional[str] = None,
         prefetched_injected_payload: Optional[str] = None,
@@ -803,7 +865,7 @@ class XSSVerifier(BaseVerifier):
             # of confirming reflection on an SPA (the injected header value is
             # rendered client-side from an API response and never appears in the
             # raw HTML shell that this raw-string oracle matches against). On SPA
-            # targets skip it entirely for header injections — this is the single
+            # targets skip it entirely for header injections - this is the single
             # largest source of wasted XSS traffic (~93% of all requests). The
             # stored-header hypothesis is handled by the browser-DOM sweep. The
             # single reflected-header check above (one request per header per
@@ -813,16 +875,20 @@ class XSSVerifier(BaseVerifier):
             # Batch stored-discovery override: when available, use the confirmed
             # display URLs instead of fanning out to every discovered URL. If
             # batch discovery ran and this parameter is absent from the map,
-            # the canary was not stored — skip the probe entirely (this is the
+            # the canary was not stored - skip the probe entirely (this is the
             # primary request-savings path for non-stored POST params).
             batch_overrides_present = stored_display_overrides is not None
             batch_confirmed_urls: list[str] | None = None
             if batch_overrides_present:
-                batch_confirmed_urls = list(stored_display_overrides.get(parameter, set()))
+                batch_confirmed_urls = list(
+                    stored_display_overrides.get(
+                        stored_override_key(url, method, parameter), set()
+                    )
+                )
 
             if (not is_reflected or method.upper() == "POST") and not skip_stored:
                 if batch_overrides_present and not batch_confirmed_urls:
-                    # Batch discovery confirmed this param is not stored — skip
+                    # Batch discovery confirmed this param is not stored - skip
                     # the per-payload stored probe fan-out entirely.
                     pass
                 elif batch_confirmed_urls:
@@ -959,6 +1025,131 @@ class XSSVerifier(BaseVerifier):
             logger.error("XSS verification failed for %s:%s: %s", url, parameter, e)
             return VerificationResult(is_vulnerable=False, confidence_score=0.0, detection_method=payload_type, findings=[], evidence={"error": str(e)})
 
+    @staticmethod
+    async def _submit_form(page) -> None:
+        """Submit the page's form the way a user would - by clicking its button.
+
+        ``form.submit()`` does NOT include the submit button's name/value in the
+        request body, and most server-side handlers gate the write on exactly that
+        key (``isset($_POST['btnSign'])``, ``request.form.get('action')``, …).
+        Verified against a live guestbook: a POST carrying the button name stored
+        the entry, the identical POST without it was ignored outright. So the
+        browser verification was sending a request the application discarded -
+        nothing was stored, nothing executed, and a real Stored XSS was written off
+        as "browser did not confirm execution".
+
+        Clicking also runs the ``onclick``/``onsubmit`` handlers a genuine
+        submission would. ``form.submit()`` remains the fallback for forms with no
+        submit control.
+        """
+        submit_selector = (
+            "form input[type='submit'], form button[type='submit'], form button:not([type])"
+        )
+        try:
+            button = await page.query_selector(submit_selector)
+        except Exception:
+            button = None
+
+        if button is not None:
+            try:
+                await button.click()
+                return
+            except Exception as exc:
+                logger.debug("submit button click failed, falling back: %s", exc)
+
+        await page.evaluate("document.querySelector('form').submit()")
+
+    # Input types that ``page.fill`` cannot write to. Playwright raises
+    # ``Input of type "submit" cannot be filled`` and, because the fill loop had
+    # no per-field guard, that exception aborted the entire browser verification
+    # and returned "not confirmed". Practically every real form carries a named
+    # submit button, so browser-confirmed XSS on POST forms was failing wholesale
+    # - a genuine Stored XSS was reported as unconfirmed for exactly this reason.
+    _UNFILLABLE_INPUT_TYPES = frozenset({
+        "submit", "reset", "button", "image", "file",
+        "checkbox", "radio", "hidden", "color", "range",
+    })
+
+    @classmethod
+    def _is_fillable_input(cls, form_inputs: Optional[list], field_name: str) -> bool:
+        """True when ``field_name`` is a text-like input ``page.fill`` accepts.
+
+        Unknown fields default to fillable: the crawler does not always record a
+        type, and a missing type usually means a plain text input.
+        """
+        if not isinstance(form_inputs, list):
+            return True
+        for item in form_inputs:
+            if not hasattr(item, "get"):
+                continue
+            if (item.get("name") or item.get("id")) != field_name:
+                continue
+            input_type = str(item.get("input_type") or item.get("type") or "").lower()
+            return input_type not in cls._UNFILLABLE_INPUT_TYPES
+        return True
+
+    async def _fill_form_fields(
+        self,
+        page,
+        resolved_inputs: dict,
+        form_inputs: Optional[list],
+        parameter: str,
+        payload: str,
+    ) -> None:
+        """Fill a form's text-like fields, injecting ``payload`` into ``parameter``.
+
+        Each field is filled independently: one awkward field must not cost the
+        whole verification, which is what happened when a named submit button
+        raised mid-loop.
+        """
+        for field_name, baseline_val in resolved_inputs.items():
+            if not field_name:
+                continue
+            if field_name != parameter and not self._is_fillable_input(form_inputs, field_name):
+                continue
+            fill_value = payload if field_name == parameter else baseline_val
+            sel = (
+                f"input[name='{field_name}'], textarea[name='{field_name}'], "
+                f"[id='{field_name}']"
+            )
+            try:
+                if await page.query_selector(sel):
+                    await page.fill(sel, str(fill_value))
+            except Exception as exc:
+                logger.debug("could not fill form field %s: %s", field_name, exc)
+
+    @staticmethod
+    async def _drop_client_side_input_limits(page) -> None:
+        """Remove client-side input restrictions before filling a form.
+
+        ``page.fill`` writes through the DOM, so the browser enforces
+        ``maxlength``: a 59-character payload into ``maxlength="10"`` stores
+        ``'<script>wi'`` and can never execute. The finding is then discarded as
+        "browser did not confirm execution" even though the server accepts the
+        full value - ``maxlength`` is a client-side hint, and an attacker submits
+        with curl or devtools, not the rendered form.
+
+        ``pattern``/``readonly``/``disabled`` are dropped for the same reason: all
+        are advisory to anyone crafting the request directly.
+
+        Best-effort - a page that refuses evaluation must not fail verification.
+        """
+        try:
+            await page.evaluate(
+                """() => {
+                    document.querySelectorAll(
+                        '[maxlength], [pattern], [readonly], [disabled]'
+                    ).forEach(el => {
+                        el.removeAttribute('maxlength');
+                        el.removeAttribute('pattern');
+                        el.removeAttribute('readonly');
+                        el.removeAttribute('disabled');
+                    });
+                }"""
+            )
+        except Exception as exc:
+            logger.debug("could not drop client-side input limits: %s", exc)
+
     async def _install_xss_browser_hooks(self, page, canary: str) -> None:
         script = f"""
 (() => {{
@@ -974,13 +1165,13 @@ class XSSVerifier(BaseVerifier):
   // actually RAN. Mere reflection of the canary as text or markup in the DOM is
   // NOT execution: a payload that the app HTML-escapes or strips to inert text
   // still leaves the canary substring in the page, but nothing executes. We
-  // therefore deliberately do NOT observe DOM mutations for canary presence —
+  // therefore deliberately do NOT observe DOM mutations for canary presence -
   // doing so conflates reflection with execution and produces false positives on
   // any route that sanitises input (e.g. a track/search route that renders the
   // parameter as escaped text). Every sweep vector invokes
   // ``window.sentry_hook(canary)`` (or alert/confirm/prompt) from its executing
   // context (onerror/onload/javascript:/inline script), so a genuine execution
-  // always routes through one of these callbacks — and only those set the flag.
+  // always routes through one of these callbacks - and only those set the flag.
   window.sentry_hook = (value) => {{
     if (!sentryCanary || String(value).includes(sentryCanary)) mark('hook', value);
   }};
@@ -1019,6 +1210,9 @@ class XSSVerifier(BaseVerifier):
             try:
                 browser = await p.chromium.launch(headless=True)
                 context = await browser.new_context(ignore_https_errors=True, user_agent="SentryStrikeScanner/1.0")
+                # Assets cannot execute a payload; on a slow target they only
+                # eat the 5s navigation budget. Scripts/XHR stay unblocked.
+                await install_resource_blocking(context)
 
                 browser_cookies = dict(getattr(getattr(self, "http_verifier", None), "cookies", {}) or {})
                 if prepared and prepared.cookies:
@@ -1065,13 +1259,12 @@ class XSSVerifier(BaseVerifier):
                         await page.goto(navigation_url, wait_until="domcontentloaded", timeout=5000)
                     elif prepared.method.upper() == "POST" and form_inputs:
                         await page.goto(url, wait_until="domcontentloaded", timeout=5000)
+                        await self._drop_client_side_input_limits(page)
                         resolved_inputs = {item.get('name') or item.get('id'): item.get('value', '') for item in form_inputs if hasattr(item, 'get')} if isinstance(form_inputs, list) else form_inputs
-                        for field_name, baseline_val in resolved_inputs.items():
-                            fill_value = payload if field_name == parameter else baseline_val
-                            sel = f"input[name='{field_name}'], textarea[name='{field_name}'], [id='{field_name}']"
-                            if await page.query_selector(sel):
-                                await page.fill(sel, str(fill_value))
-                        await page.evaluate("document.querySelector('form').submit()")
+                        await self._fill_form_fields(
+                            page, resolved_inputs, form_inputs, parameter, payload,
+                        )
+                        await self._submit_form(page)
                         await page.wait_for_load_state("domcontentloaded", timeout=5000)
                     else:
                         return False
@@ -1087,12 +1280,12 @@ class XSSVerifier(BaseVerifier):
                     await page.goto(urlunparse(parts), wait_until="domcontentloaded", timeout=5000)
                 elif method.upper() == "POST" and form_inputs:
                     await page.goto(url, wait_until="domcontentloaded", timeout=5000)
+                    await self._drop_client_side_input_limits(page)
                     resolved_inputs = {item.get('name') or item.get('id'): item.get('value', '') for item in form_inputs if hasattr(item, 'get')} if isinstance(form_inputs, list) else form_inputs
-                    for field_name, baseline_val in resolved_inputs.items():
-                        fill_value = payload if field_name == parameter else baseline_val
-                        sel = f"input[name='{field_name}'], textarea[name='{field_name}'], [id='{field_name}']"
-                        if await page.query_selector(sel): await page.fill(sel, str(fill_value))
-                    await page.evaluate("document.querySelector('form').submit()")
+                    await self._fill_form_fields(
+                        page, resolved_inputs, form_inputs, parameter, payload,
+                    )
+                    await self._submit_form(page)
                     await page.wait_for_load_state("domcontentloaded", timeout=5000)
 
                 # Evaluate the execution oracle BEFORE the stored-display sweep.
@@ -1169,7 +1362,8 @@ class XSSVerifier(BaseVerifier):
                     page = await context.new_page()
                     await self._install_xss_browser_hooks(page, canary)
                     try:
-                        await page.goto(probe_url, wait_until="networkidle", timeout=5000)
+                        await page.goto(probe_url, wait_until="domcontentloaded", timeout=8000)
+                        await settle_page(page, quiet_ms=300.0, cap_ms=2500.0)
                         await page.evaluate(
                             "(payload) => window.postMessage(payload, window.location.origin)",
                             payload,
@@ -1202,7 +1396,7 @@ class XSSVerifier(BaseVerifier):
     )
     # Hard cap on navigations per candidate so the vector × surface loop stays
     # inside a single job's timeout rather than multiplying the job count.
-    # Raised from 12 — the browser-DOM sweep is the genuinely effective SPA
+    # Raised from 12 - the browser-DOM sweep is the genuinely effective SPA
     # confirmer, so budget follows yield now that the header-stored HTTP fan-out
     # is disabled on SPAs.
     _DOM_MAX_ATTEMPTS_PER_CANDIDATE = 18
@@ -1224,8 +1418,8 @@ class XSSVerifier(BaseVerifier):
         """Navigate an SPA route with executing canaries and assert on DOM execution.
 
         Tries a small ordered set of generic execution vectors across
-        the query, hash-route query, and fragment surfaces — SPAs read user input
-        from both ``location.search`` and ``location.hash`` — stopping at the
+        the query, hash-route query, and fragment surfaces - SPAs read user input
+        from both ``location.search`` and ``location.hash`` - stopping at the
         first vector/surface that fires the hooked canary. Independent of any
         HTTP-body reflection.
 
@@ -1305,7 +1499,7 @@ class XSSVerifier(BaseVerifier):
         # 2. Hash-route query: a query scoped to the hash path (``/#/route?p=``).
         # Parse the hash's own query and REPLACE the parameter's value in place.
         # A route discovered WITH a seed value (``/#/search?q=seed``) must not
-        # yield a duplicate ``q`` — the SPA resolves a repeated param to the
+        # yield a duplicate ``q`` - the SPA resolves a repeated param to the
         # first (seed) value, so the payload would never render. Preserve the
         # route path and any sibling hash params.
         parts = list(parsed)
@@ -1345,7 +1539,7 @@ class XSSVerifier(BaseVerifier):
     async def _new_reflection_context(self, browser, route_url: str, storage_state: dict | None = None):
         # Seed from the full authenticated storage_state when available
         # so authenticated-only SPA routes render during DOM confirmation. Falls
-        # back to cookie injection when absent. Opaque per-origin blob — generic.
+        # back to cookie injection when absent. Opaque per-origin blob - generic.
         context = None
         extra_http_headers = {
             str(key): str(value)
@@ -1379,6 +1573,12 @@ class XSSVerifier(BaseVerifier):
                     await context.add_cookies(playwright_cookies)
                 except Exception:
                     pass
+        # Images/media/fonts/stylesheets and tracker beacons cannot execute a
+        # reflected payload, but on a slow target they dominate the navigation
+        # budget and time the probe out before the DOM is even parsed. The crawl
+        # engine already blocks them; verification browsers were still paying for
+        # them. Scripts/XHR/fetch are never blocked - those are the sinks.
+        await install_resource_blocking(context)
         return context
 
     async def _probe_reflection_url(self, context, probe_url: str, canary: str) -> dict:
@@ -1522,12 +1722,12 @@ class XSSVerifier(BaseVerifier):
                 return result
 
         # Browser-aware stored oracle: for SPA targets the HTTP-body oracle
-        # above cannot observe client-rendered stored XSS — the canary is stored
+        # above cannot observe client-rendered stored XSS - the canary is stored
         # in the database and rendered into the DOM by the SPA, but the display
         # URL's HTTP body is raw JSON or the SPA shell, never executable HTML.
         # Navigate the display URL in a real browser with canary hooks installed
         # and confirm EXECUTION. Falls back to the HTTP check above when no
-        # browser is available (already handled — we only reach here on a clean
+        # browser is available (already handled - we only reach here on a clean
         # HTTP negative). Reuses the existing Playwright plumbing from the DOM
         # sweep: _new_reflection_context, _install_xss_browser_hooks,
         # _browser_xss_fired.
@@ -1591,10 +1791,12 @@ class XSSVerifier(BaseVerifier):
                         # from its API and renders it into the DOM. If the
                         # stored canary is in the rendered output and the
                         # browser executes it, the hooked hooks fire.
-                        await page.goto(probe_url, wait_until="domcontentloaded", timeout=5000)
+                        await page.goto(probe_url, wait_until="domcontentloaded", timeout=8000)
                         # Give the SPA a beat to fetch its data and render.
+                        # ``networkidle`` never fires on apps with persistent
+                        # sockets or polling, so drain in-flight requests instead.
                         try:
-                            await page.wait_for_load_state("networkidle", timeout=3000)
+                            await settle_page(page, quiet_ms=300.0, cap_ms=3000.0)
                         except Exception:
                             pass
                         await asyncio.sleep(0.35)

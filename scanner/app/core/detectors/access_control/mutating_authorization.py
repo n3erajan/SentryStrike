@@ -154,7 +154,7 @@ class MutatingAuthorizationMixin:
             authed_verifier, synth_req, test_phase="mutating_authz_owner"
         )
         # Skip when even the authenticated owner is denied (creds insufficient for
-        # this endpoint) or the method is simply unsupported (405/501) — no
+        # this endpoint) or the method is simply unsupported (405/501) - no
         # reliable signal. A 404 for the OWNER is expected and fine: the object id
         # is synthetic, so the endpoint (which we observed/extracted as live) ran
         # the auth check, passed it, then failed the object lookup. That "auth
@@ -197,7 +197,7 @@ class MutatingAuthorizationMixin:
         # when the mutating operation was actually PROCESSED. A matching non-success
         # status (404 not-found, 400 bad-request, 409 conflict, 5xx, ...) proves the
         # opposite: the mutation never ran, so no record changed and no auth signal
-        # exists — a 404 for a synthetic id short-circuits at routing/object-lookup
+        # exists - a 404 for a synthetic id short-circuits at routing/object-lookup
         # and can occur whether or not the endpoint enforces auth. Identical 404s
         # therefore say nothing about authorization. Require either a processed
         # (2xx/3xx) shared status, or a destructive confirmation on a real id (which
@@ -208,7 +208,7 @@ class MutatingAuthorizationMixin:
         evidence = (
             f"Missing authentication on state-changing endpoint: an unauthenticated "
             f"{synth_req.method} to {synth_req.url} returned HTTP {unauth.status_code}, identical to "
-            f"the authenticated owner's HTTP {owner.status_code} — the endpoint does not enforce "
+            f"the authenticated owner's HTTP {owner.status_code} - the endpoint does not enforce "
             f"authentication for a mutating operation. Probed with a synthetic non-existent object id, "
             f"so no real record was modified." + confirm_note
         )

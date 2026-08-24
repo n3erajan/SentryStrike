@@ -94,12 +94,12 @@ def _looks_like_path_id_segment(segment: str) -> bool:
 # too broad and was the primary root cause of semantic-slug false positives.
 # ---------------------------------------------------------------------------
 
-# Pattern 3: opaque token — must have digits mixed in (e.g. "abc123", "user_42")
+# Pattern 3: opaque token - must have digits mixed in (e.g. "abc123", "user_42")
 # Pure alpha strings like "changelog" do NOT match.
 _OPAQUE_TOKEN_RE = re.compile(r"^(?=.*\d)[a-zA-Z0-9_\-]{2,32}$")
 
 # Well-known semantic slug words that should never be treated as IDs even if
-# they happen to pass a regex.  This list is intentionally generic — it covers
+# they happen to pass a regex.  This list is intentionally generic - it covers
 # routing / navigation tokens that appear across many frameworks and apps.
 _SEMANTIC_SLUGS: frozenset[str] = frozenset({
     # Navigation / document-type words
@@ -124,7 +124,7 @@ _SEMANTIC_SLUGS: frozenset[str] = frozenset({
 def _is_valid_id_value(val: str) -> bool:
     """
     Return True only when *val* looks like a genuine object-reference
-    identifier — not a semantic slug or human-readable keyword.
+    identifier - not a semantic slug or human-readable keyword.
 
     Accepts:
       - Pure integers: "1", "42", "10000"
@@ -142,7 +142,7 @@ def _is_valid_id_value(val: str) -> bool:
     if not val:
         return False
     lower = val.lower()
-    # Hard blocklist first — quick exit
+    # Hard blocklist first - quick exit
     if lower in _NON_ID_VALUES or lower in _SEMANTIC_SLUGS:
         return False
     # Pure integers are always valid IDs
@@ -179,7 +179,7 @@ def _looks_like_login_page(body: str) -> bool:
     """Return True when the response body appears to be a login/auth wall.
 
     A login wall is an HTML document. A structured JSON/data payload is an API
-    response and is NEVER a login page — even when it contains field names such
+    response and is NEVER a login page - even when it contains field names such
     as ``email``, ``username`` or ``lastLoginIp`` (whose substring "login"
     otherwise trips the word heuristic). Guarding on JSON first prevents a data
     collection (e.g. a user listing) from being misread as a login wall, which
@@ -265,9 +265,9 @@ def _strip_query(url: str) -> str:
 #      200, the resource is public and IDOR is not applicable.
 #   3. Mutating the ID and requesting with credentials.
 #   4. Comparing the mutated response against:
-#      a. The unauthenticated mutated response  — if unauth also gets 200,
+#      a. The unauthenticated mutated response  - if unauth also gets 200,
 #         the mutated resource is public, not an access-control bypass.
-#      b. The authenticated own-resource response — the content should be
+#      b. The authenticated own-resource response - the content should be
 #         *meaningfully different* (a different object was returned) but not
 #         so different that it looks like a generic error page.
 #   5. Only flagging when the authenticated mutated response is clearly a
@@ -437,7 +437,7 @@ def _differential_idor_verdict(
     if own_sim > 0.95:
         return False, own_sim, "mutated response is virtually identical to own resource (generic template)"
     if own_sim < 0.10:
-        return False, own_sim, "mutated response is too dissimilar from own resource — likely an error page"
+        return False, own_sim, "mutated response is too dissimilar from own resource - likely an error page"
 
     return True, own_sim, "differential analysis passed"
 

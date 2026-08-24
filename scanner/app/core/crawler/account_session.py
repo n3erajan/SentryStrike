@@ -72,7 +72,7 @@ async def resolve_account_session(
     """Log ``account`` in against ``root_url`` (or apply its raw cookies/headers).
 
     When ``preferred_replay`` (the login recipe that authenticated the main
-    account) is supplied, it is replayed first with this account's credentials —
+    account) is supplied, it is replayed first with this account's credentials -
     so second/admin logins reuse the *same winning path* instead of restarting
     the whole strategy cascade from Strategy 1. Falls back to the full cascade if
     the replay does not authenticate.

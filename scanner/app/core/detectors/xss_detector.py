@@ -11,6 +11,7 @@ from app.utils.scan_http import build_observed_request_snippet
 from app.core.verification.xss_verifier import (
     PLAYWRIGHT_AVAILABLE,
     PendingBrowserVerification,
+    StoredKey,
     XSSVerifier,
     async_playwright,
 )
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 def _fragment_path(url: str) -> str:
     """Return the fragment's path portion (``/#/search?q=x`` → ``/search``).
 
-    Empty for non-hash-router URLs — those are server paths the target sweep
+    Empty for non-hash-router URLs - those are server paths the target sweep
     already covers, so they need no SPA projection.
     """
     if not url:
@@ -237,7 +238,7 @@ class XSSDetector(BaseDetector):
         # probe from O(params × payloads × urls) to O(1 injection + urls).
         # Only body/form/json candidates batch; query/path/header candidates are
         # tested individually by the per-candidate verify loop below.
-        stored_display_overrides: dict[str, set[str]] = {}
+        stored_display_overrides: dict[StoredKey, set[str]] = {}
         batch_groups: dict[tuple[str, str], list[AttackTarget]] = {}
         for cand in candidates:
             if not isinstance(cand, AttackTarget):
@@ -246,12 +247,20 @@ class XSSDetector(BaseDetector):
                 key = (cand.url, cand.method.upper())
                 batch_groups.setdefault(key, []).append(cand)
 
-        # Run batch discovery for groups with 2+ body parameters — single-param
+        # Run batch discovery for groups with 2+ body parameters - single-param
         # groups get no batching benefit and are handled by the normal per-candidate
-        # verify loop. Run all batches concurrently.
-        async def run_batch_discovery(
+        # verify loop.
+        #
+        # Two phases, deliberately. Every group plants its canaries first
+        # (concurrently), then ONE reader fetches each display URL a single time
+        # and attributes whatever canaries it finds. Canaries are globally unique,
+        # so a marker in a page body identifies exactly one candidate regardless of
+        # which group planted it - there is no need for each group to re-read the
+        # same pages. Reading per group made the cost groups × display_urls, which
+        # on a slow target meant thousands of duplicate GETs of the same page.
+        async def plant_group(
             group_key: tuple[str, str], group_cands: list[AttackTarget],
-        ) -> dict[str, set[str]]:
+        ) -> dict[StoredKey, str]:
             batch_verifier = XSSVerifier()
             batch_verifier.http_verifier.cookies = session_cookies
             if auth_headers:
@@ -259,13 +268,9 @@ class XSSDetector(BaseDetector):
                     **batch_verifier.http_verifier.headers, **auth_headers,
                 }
             try:
-                return await batch_verifier._batch_stored_discovery(
-                    group_cands,
-                    stored_probe_urls,
-                    stored_baselines=shared_baselines,
-                )
+                return await batch_verifier.plant_batch_canaries(group_cands)
             except Exception as e:
-                logger.debug("Batch stored discovery failed for %s: %s", group_key[0], e)
+                logger.debug("Batch canary planting failed for %s: %s", group_key[0], e)
                 return {}
             finally:
                 await batch_verifier.close()
@@ -275,20 +280,46 @@ class XSSDetector(BaseDetector):
         }
         if batchable_groups:
             logger.debug(
-                "XSSDetector: running batch stored discovery for %d groups (%d total params)",
+                "XSSDetector: planting batch stored canaries for %d groups (%d total params)",
                 len(batchable_groups),
                 sum(len(c) for c in batchable_groups.values()),
             )
-            batch_results = await asyncio.gather(
-                *(run_batch_discovery(k, c) for k, c in batchable_groups.items()),
+            plant_results = await asyncio.gather(
+                *(plant_group(k, c) for k, c in batchable_groups.items()),
                 return_exceptions=True,
             )
-            for result in batch_results:
+            # A group whose injection was rejected contributes nothing and simply
+            # falls back to per-parameter probing; it must not stop the others
+            # from being read.
+            planted_canaries: dict[StoredKey, str] = {}
+            for result in plant_results:
                 if isinstance(result, Exception):
-                    logger.debug("Batch stored discovery group failed: %s", result)
+                    logger.debug("Batch canary planting group failed: %s", result)
                     continue
-                for param, display_urls in result.items():
-                    stored_display_overrides.setdefault(param, set()).update(display_urls)
+                planted_canaries.update(result)
+
+            if planted_canaries:
+                logger.debug(
+                    "XSSDetector: reading %d display URL(s) once for %d planted canaries",
+                    len(stored_probe_urls),
+                    len(planted_canaries),
+                )
+                reader = XSSVerifier()
+                reader.http_verifier.cookies = session_cookies
+                if auth_headers:
+                    reader.http_verifier.headers = {
+                        **reader.http_verifier.headers, **auth_headers,
+                    }
+                try:
+                    stored_display_overrides = await reader.collect_stored_canaries(
+                        planted_canaries,
+                        stored_probe_urls,
+                        stored_baselines=shared_baselines,
+                    )
+                except Exception as e:
+                    logger.debug("Batch stored read pass failed: %s", e)
+                finally:
+                    await reader.close()
 
             if stored_display_overrides:
                 logger.debug(
@@ -591,12 +622,12 @@ class XSSDetector(BaseDetector):
 
         Priority: params the HTTP phase already echoed (partial reflection), then
         classic reflective names, then everything else. Only query/fragment-
-        reachable GET targets are eligible — SPAs read these from
+        reachable GET targets are eligible - SPAs read these from
         location.search/hash.
 
         Jobs come from three sources:
 
-        1. Replayable GET attack targets — params observed on server-reachable
+        1. Replayable GET attack targets - params observed on server-reachable
            URLs. On an SPA these are typically API endpoints
            (``/rest/<seg>/search?q=``) whose raw JSON response never executes an
            injected canary, so navigating the API URL directly yields a clean
@@ -606,7 +637,7 @@ class XSSDetector(BaseDetector):
            ``/#/<seg>`` or ``/#/<seg>/…``) so the canary is delivered to the
            route the SPA actually renders.
         2. The query parameters carried on discovered SPA routes themselves
-           (``/#/search?q=x``) — these are never in the HTTP attack surface.
+           (``/#/search?q=x``) - these are never in the HTTP attack surface.
         3. API↔SPA segment projection of route-derived params, so a ``q``
            observed only on an API route still reaches its SPA counterpart.
         """
@@ -663,7 +694,7 @@ class XSSDetector(BaseDetector):
             the API URL is matched against the segments of every discovered SPA
             hash route. ``/rest/products/search`` ↔ ``/#/search`` shares
             ``search``; ``/api/v2/users`` ↔ ``/#/users`` shares ``users``. This
-            is string logic over observed structure — never a hardcoded
+            is string logic over observed structure - never a hardcoded
             API↔SPA mapping.
             """
             for seg in _path_segments(api_url):
@@ -828,10 +859,10 @@ class XSSDetector(BaseDetector):
 
         The ``method`` slot encodes how the verifier tests the candidate:
 
-        - ``"HEADER_BATCH:<h1>,<h2>,..."`` — inject every listed header in one
+        - ``"HEADER_BATCH:<h1>,<h2>,..."`` - inject every listed header in one
           request (each with its own canary) and attribute reflection per
           header. Used for headers with no routing semantics.
-        - ``"HEADER:<header-name>"`` — inject a single header per request. Used
+        - ``"HEADER:<header-name>"`` - inject a single header per request. Used
           for routing-sensitive headers (e.g. ``X-Original-URL``).
 
         Both route through XSSVerifier without changing the 4-tuple contract

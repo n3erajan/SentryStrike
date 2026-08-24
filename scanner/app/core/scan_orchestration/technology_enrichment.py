@@ -84,9 +84,9 @@ class TechnologyEnrichmentMixin:
 
         The supply-chain gate needs a version before it can emit an A03 finding.
         Header/HTML/runtime fingerprinting names technologies but rarely versions
-        them; this harvests the version-bearing surfaces most apps expose —
+        them; this harvests the version-bearing surfaces most apps expose -
         ecosystem-standard package manifests/lockfiles and ``Server`` /
-        ``X-Powered-By`` / ``X-AspNet-Version`` headers — via the generic
+        ``X-Powered-By`` / ``X-AspNet-Version`` headers - via the generic
         :mod:`app.integrations.version_probe`.
 
         Merge semantics mirror :meth:`_enrich_tech_from_errors`: back-fill a

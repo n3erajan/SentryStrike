@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from app.utils.scan_metrics import record_detector_request
+from app.utils.scan_metrics import record_detector_request, record_tested_surface
 
 http_logger = logging.getLogger("sentry.http")
 
@@ -129,6 +129,17 @@ def log_http_response(
     response_time_ms: float = 0,
 ) -> None:
     record_detector_request(module)
+    # Ledger the request as tested surface. This function is reached only after a
+    # real response came back or a real transport failure occurred, and never for
+    # a probe the budget governor denied (those return earlier, in
+    # HttpVerifier.send_request), so the ledger records what was genuinely sent.
+    record_tested_surface(
+        module=module,
+        method=method,
+        url=url,
+        parameter=parameter,
+        status_code=status_code,
+    )
     parts = [f"HTTP {method} {url}", f"status={status_code}"]
 
     if response_time_ms > 0:

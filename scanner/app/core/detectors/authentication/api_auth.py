@@ -371,7 +371,7 @@ class AuthApiProbeMixin:
         for domain in ranked_domains(account_emails):
             if domain not in domains:
                 domains.append(domain)
-        # Observed (response) e-mails are real accounts — prioritise them as
+        # Observed (response) e-mails are real accounts - prioritise them as
         # verbatim candidates over the scanner's own account identity.
         emails = response_emails + [e for e in account_emails if e not in response_emails]
         return emails, usernames, domains
@@ -386,7 +386,7 @@ class AuthApiProbeMixin:
         """Cross observed/derived identities with weak passwords into login pairs.
 
         For an e-mail login, identities are observed e-mails plus common
-        privileged local-parts synthesised against the OBSERVED domains — nothing
+        privileged local-parts synthesised against the OBSERVED domains - nothing
         target-specific is hardcoded. Ordered most-likely-first; the caller caps
         the total number of live attempts.
         """
@@ -425,7 +425,7 @@ class AuthApiProbeMixin:
 
         # Emit breadth-first (password-rank outer, user inner) so the top password
         # is tried against EVERY priority account before moving to the next
-        # password — the accepted default pair surfaces well within the attempt cap
+        # password - the accepted default pair surfaces well within the attempt cap
         # even when many candidate accounts exist.
         pairs: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
@@ -522,7 +522,7 @@ class AuthApiProbeMixin:
             )
             baseline_status = getattr(baseline, "status_code", 0)
             # If the invalid credential already "succeeds", the endpoint accepts
-            # anything (or is not really a login) — do not manufacture a finding.
+            # anything (or is not really a login) - do not manufacture a finding.
             if self._looks_like_auth_success(baseline_status, getattr(baseline, "body", "") or "", -1):
                 return []
 

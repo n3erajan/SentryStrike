@@ -96,7 +96,7 @@ class RedisScanQueue:
     Jobs are pushed onto a Redis list (``RPUSH``) and claimed with a blocking
     pop (``BLPOP``) so workers idle efficiently instead of polling. Cancellation
     and worker liveness are tracked with short-lived keys rather than queue
-    messages, because they are signals — not work items.
+    messages, because they are signals - not work items.
     """
     def __init__(
         self,
@@ -108,7 +108,7 @@ class RedisScanQueue:
         heartbeat_key_prefix: str = "sentrystrike:worker:heartbeat",
         heartbeat_ttl_seconds: int = 20,
         lease_key_prefix: str = "sentrystrike:scan:lease",
-        lease_ttl_seconds: int = 30,
+        lease_ttl_seconds: int = 120,
     ) -> None:
         self.client = client
         self.queue_name = queue_name

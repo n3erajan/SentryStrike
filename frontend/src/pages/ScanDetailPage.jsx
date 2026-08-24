@@ -76,7 +76,11 @@ function ScanDetailPage() {
   const displayName =
     applicationName || siteTitle || hostnameOf(targetUrl || target)
 
-  const surfaces = statistics?.total_urls_crawled ?? Math.max(1, stageIdx * 20)
+  // Distinct URLs, SPA routes, and API endpoints the crawler has found. This is
+  // discovery, not testing - nothing here says a surface was probed. Reported as
+  // a dash until the crawl phase publishes a real count, rather than guessed
+  // from the current stage.
+  const discovered = statistics?.total_urls_crawled
   const rawFindings = statistics?.raw_findings ?? 0
   const analysisStatus = analysis?.status
   const showAnalysis = Boolean(analysisStatus) && status === 'completed'
@@ -131,8 +135,8 @@ function ScanDetailPage() {
           <span>Complete</span>
         </div>
         <div className='stat'>
-          <strong>{surfaces}</strong>
-          <span>Surfaces</span>
+          <strong>{Number.isFinite(discovered) ? discovered : '-'}</strong>
+          <span>URLs found</span>
         </div>
         <div className='stat'>
           <strong>{rawFindings}</strong>

@@ -30,7 +30,7 @@ class Invite(Document):
     """An email-bound, role-pinned invitation to join a workspace.
 
     Registration is only reachable by consuming a pending invite. The invited
-    email and role are fixed at issue time — the registrant cannot change either.
+    email and role are fixed at issue time - the registrant cannot change either.
     Only the SHA-256 hash of the invite token is stored, mirroring
     ``UserSession``, so a database leak does not expose usable invite links.
 

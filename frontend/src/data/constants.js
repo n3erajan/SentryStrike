@@ -61,7 +61,7 @@ function severityClass(severity) {
 }
 
 // The scanner pipeline's phases, in order. AI enrichment is no longer part of
-// this list — it runs in the standalone analyzer worker after the scan
+// this list - it runs in the standalone analyzer worker after the scan
 // completes, and is reported separately through the scan's `analysis` state.
 const SCAN_PHASES = [
   { key: "queued", label: "Queued" },

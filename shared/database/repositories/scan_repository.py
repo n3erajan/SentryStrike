@@ -470,7 +470,7 @@ class ScanRepository:
 
         A running scan is backed by a short-TTL Redis lease that its worker
         renews on a timer. If the worker crashes, the lease expires and the DB
-        is left showing ``running`` forever — the UI then polls indefinitely and
+        is left showing ``running`` forever - the UI then polls indefinitely and
         cancelling only sets a key no worker will read. This reconciles that
         lazily at read time: a ``running`` scan with a provably-absent lease is
         transitioned to ``failed`` with a clear message.
@@ -478,7 +478,7 @@ class ScanRepository:
         Fail-safe against Redis outages: the scan is only failed when the lease
         is *positively confirmed absent* (Redis reachable, key missing). If the
         lease check raises (Redis unavailable), we cannot distinguish a dead
-        worker from an unreachable Redis, so the scan is left untouched — a
+        worker from an unreachable Redis, so the scan is left untouched - a
         transient Redis blip must never mass-fail live scans.
 
         Only ``running`` scans are candidates. ``queued`` scans have no worker

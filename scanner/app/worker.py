@@ -60,7 +60,7 @@ def _make_cancellation_checker(queue: ScanQueue):
     """Build a fail-safe cancellation checker for the orchestrator.
 
     The cancel key is a *signal*, not scan data. If Redis is unreachable when
-    the orchestrator polls it at a phase boundary, we must NOT abort the scan —
+    the orchestrator polls it at a phase boundary, we must NOT abort the scan -
     "can't tell" is treated as "not cancelled" so the scan proceeds. A genuine
     cancellation still lands via the pub/sub watcher (task cancel) and, once
     Redis recovers, the next phase-boundary poll.
@@ -95,11 +95,16 @@ async def _best_effort_clear_cancel(queue: ScanQueue, scan_id: str) -> None:
 async def _lease_loop(queue: ScanQueue, scan_id: str, ttl_seconds: int) -> None:
     """Renew the per-scan lease while the scan runs.
 
-    Refreshes at half the TTL so a single missed renewal does not expire the
-    lease. Best-effort: a failed renewal is logged and retried, never fatal to
-    the scan — the lease only drives dead-worker detection, not scan logic.
+    Refreshes at a quarter of the TTL so several consecutive missed renewals do
+    not expire the lease. The margin matters because this task can only run when
+    the event loop is free: any CPU-bound stretch in the pipeline (response
+    diffing was the worst offender) delays renewal by exactly its duration, and
+    an expired lease makes the backend reap a healthy scan as orphaned.
+
+    Best-effort: a failed renewal is logged and retried, never fatal to the scan
+    - the lease only drives dead-worker detection, not scan logic.
     """
-    interval = max(1, ttl_seconds // 2)
+    interval = max(1, ttl_seconds // 4)
     while True:
         try:
             await queue.renew_lease(scan_id)

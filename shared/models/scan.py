@@ -161,6 +161,83 @@ class DetectorCoverageMetric(BaseModel):
     skipped_reasons: dict[str, int] = Field(default_factory=dict)
 
 
+class ProbedParameter(BaseModel):
+    """One parameter name actually exercised against a path."""
+
+    name: str
+    detectors: list[str] = Field(default_factory=list)
+    requests: int = 0
+
+
+class ProbedPath(BaseModel):
+    """One path the scanner actually sent requests to.
+
+    Query strings are stripped from ``path``; the parameters exercised are listed
+    by name in ``parameters``. Path segments are never templated, so this records
+    the concrete resources probed rather than a pattern they belong to.
+    """
+
+    path: str
+    methods: list[str] = Field(default_factory=list)
+    parameters: list[ProbedParameter] = Field(default_factory=list)
+    detectors: list[str] = Field(default_factory=list)
+    requests: int = 0
+    status_codes: list[int] = Field(default_factory=list)
+    # Requests sent to this path that never got a response (timeout/transport
+    # error). Probed, but not answered - so absence of a finding here is weaker.
+    no_response: int = 0
+    parameters_omitted: int = 0
+
+
+class ScanCoverage(BaseModel):
+    """Inventory of what the scan actually tested, measured not estimated.
+
+    Built from the tested-surface ledger, which records one entry per distinct
+    ``(detector, method, path, parameter)`` that produced a real HTTP exchange.
+    Budget-denied probes are excluded by construction, and paths the target
+    answered only with 404/410 are separated out as negative existence probes
+    rather than counted as surface that was tested. The counts are the honest
+    answer to "what was covered"; ``tested_paths`` is the itemised inventory of
+    paths that exist, capped for storage with the omitted totals stated alongside.
+    """
+
+    paths_tested: int = 0
+    # Of ``paths_tested``, how many were probed by at least one detector rather
+    # than merely fetched by the crawler. The gap between the two is the set of
+    # paths that were reached but never actively tested.
+    paths_probed_by_detector: int = 0
+    # Candidate paths the target answered only with 404/410. Path-guessing
+    # detectors probe thousands of these; they establish that a resource is
+    # absent, so counting them as tested surface would inflate coverage into
+    # fiction. Reported here, and deliberately not itemised in ``tested_paths``.
+    paths_absent: int = 0
+    # Paths every probe of which went unanswered, so existence was never
+    # established either way.
+    paths_existence_unconfirmed: int = 0
+    # Share of ``requests_sent`` spent proving those absent paths absent.
+    requests_to_absent_paths: int = 0
+    parameters_tested: int = 0
+    requests_sent: int = 0
+    # Requests dispatched that got no response at all across the whole scan.
+    requests_without_response: int = 0
+    # Probes the budget governor refused at a ceiling - attempted, never sent,
+    # and therefore deliberately absent from the tested inventory.
+    requests_denied_by_budget: int = 0
+    detectors_exercised: list[str] = Field(default_factory=list)
+    tested_paths: list[ProbedPath] = Field(default_factory=list)
+    tested_paths_truncated: bool = False
+    # Distinct paths present in the ledger but not itemised in ``tested_paths``.
+    tested_paths_omitted: int = 0
+    # Distinct (detector, method, path, parameter) tuples the ledger could not
+    # record because it hit its own entry ceiling.
+    ledger_entries_omitted: int = 0
+    # Playwright-driven probes (DOM XSS verification, browser crawling) do not
+    # pass through the HTTP ledger, so they are not itemised below. False here
+    # means this inventory covers the HTTP layer only and browser-only coverage
+    # is understated - never that no browser testing happened.
+    browser_probes_itemised: bool = False
+
+
 class AttackChain(BaseModel):
     """A multi-step exploitation path that chains individual findings."""
 
@@ -184,6 +261,7 @@ class ReportMetadata(BaseModel):
     evidence_strength_breakdown: EvidenceStrengthBreakdown = Field(default_factory=EvidenceStrengthBreakdown)
     coverage_warnings: list[str] = Field(default_factory=list)
     detector_coverage: list[DetectorCoverageMetric] = Field(default_factory=list)
+    tested_surface: ScanCoverage = Field(default_factory=ScanCoverage)
 
 
 class ScanAnalysisState(BaseModel):
@@ -211,7 +289,7 @@ class Scan(Document):
     submitted_by_user_id: Indexed(str)
     submitted_by_full_name: str
     submitted_by_email: str
-    # Who cancelled it, if anyone (may differ from the submitter — any non-viewer
+    # Who cancelled it, if anyone (may differ from the submitter - any non-viewer
     # org member can cancel a scan).
     cancelled_by_user_id: str | None = None
     cancelled_by_email: str | None = None

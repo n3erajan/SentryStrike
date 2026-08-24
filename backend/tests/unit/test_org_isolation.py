@@ -577,7 +577,7 @@ def test_scan_status_returns_phase_and_message_for_polling() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cross-tenant isolation — every read handler against another org's scan
+# Cross-tenant isolation - every read handler against another org's scan
 # ---------------------------------------------------------------------------
 
 

@@ -137,8 +137,8 @@ class ApiWorkflowMixin:
 
         Structural weakness (OWASP A07): security questions are low-entropy,
         often answerable from public/social data, and non-revocable. When a reset
-        flow sets a new password gated only on a security-answer field — with no
-        unguessable, single-use token/OTP/signed challenge — the recovery channel
+        flow sets a new password gated only on a security-answer field - with no
+        unguessable, single-use token/OTP/signed challenge - the recovery channel
         is the weakest link. This is a design finding (the fields are observed),
         not an exploit attempt; confidence is moderate and no answer is guessed.
         """

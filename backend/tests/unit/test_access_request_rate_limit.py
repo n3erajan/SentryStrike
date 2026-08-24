@@ -15,7 +15,7 @@ def fifteen_minute_limit(monkeypatch) -> int:
 
     ``get_settings`` reads ``backend/.env``, where a deployment may raise
     ACCESS_REQUEST_IP_LIMIT_PER_FIFTEEN_MINUTES above the count these tests
-    use — the limiter would then fall through to the daily window and the
+    use - the limiter would then fall through to the daily window and the
     fake's scripted results would run out.
     """
     limit = 3

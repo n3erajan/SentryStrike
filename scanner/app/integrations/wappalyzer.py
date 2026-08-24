@@ -3,15 +3,15 @@
 Replaces the previous header-only stub with a robust, Wappalyzer-schema engine
 (:mod:`app.integrations.wappalyzer_engine`) fed from two evidence sources:
 
-1. **Passive** — response headers, cookies, HTML, ``<script src>`` and ``<meta>``
+1. **Passive** - response headers, cookies, HTML, ``<script src>`` and ``<meta>``
    tags the crawler already captured (``crawl_result.requests`` /
    ``spa_root_html``). Zero extra requests in the common path.
-2. **Runtime** — an optional Playwright ``page.evaluate`` pass that reads the
+2. **Runtime** - an optional Playwright ``page.evaluate`` pass that reads the
    ``js`` window properties and ``dom`` selectors the fingerprints reference.
    This is what identifies modern SPAs (e.g. Angular via ``[ng-version]``) that
    emit no ``Server`` / ``X-Powered-By`` header.
 
-Output is ``list[TechnologyComponent]`` — unchanged, so CVE enrichment
+Output is ``list[TechnologyComponent]`` - unchanged, so CVE enrichment
 (:meth:`app.integrations.cve_database.CveDatabaseService.enrich_components`) is
 untouched.
 """
@@ -110,7 +110,7 @@ class TechnologyDetector:
                     html_parts.append(snippet)
 
         # Fallback / supplement: one fetch of the root document. Fires when
-        # EITHER headers or HTML are missing — the spider captures spa_root_html
+        # EITHER headers or HTML are missing - the spider captures spa_root_html
         # on every HTML crawl, and crawl_result.requests only exists when the
         # browser engine ran, so non-SPA targets otherwise get HTML evidence but
         # no header evidence (Server / X-Powered-By), yielding zero detections.
@@ -162,7 +162,7 @@ class TechnologyDetector:
         return script_src, meta
 
     # ------------------------------------------------------------------ #
-    # Runtime (Playwright) evidence — js / dom fingerprints
+    # Runtime (Playwright) evidence - js / dom fingerprints
     # ------------------------------------------------------------------ #
 
     async def _augment_with_runtime(

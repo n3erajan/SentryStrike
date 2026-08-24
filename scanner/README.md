@@ -62,11 +62,11 @@ Three OWASP 2025 categories have no detector, and reports say so rather than let
 
 | Category                                   | Why no detector                                                                                          |
 | ------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| A06 Insecure Design                        | Requires business rules, trust boundaries, and abuse cases — a threat model, not a request/response pair |
+| A06 Insecure Design                        | Requires business rules, trust boundaries, and abuse cases - a threat model, not a request/response pair |
 | A08 Software or Data Integrity Failures    | Requires build pipelines, artifact signing, and update trust, all outside the running application        |
 | A09 Security Logging and Alerting Failures | Requires server-side logs, monitoring, and whether an alert reached a responder                          |
 
-`OwaspCategory` in `shared/models/vulnerability.py` defines all ten so the taxonomy stays complete; detectors never emit the three above. Coverage still depends on what the target exposes, the configured budgets, and the credentials supplied — a clean scan is not proof an application is secure.
+`OwaspCategory` in `shared/models/vulnerability.py` defines all ten so the taxonomy stays complete; detectors never emit the three above. Coverage still depends on what the target exposes, the configured budgets, and the credentials supplied - a clean scan is not proof an application is secure.
 
 ## Re-verification
 

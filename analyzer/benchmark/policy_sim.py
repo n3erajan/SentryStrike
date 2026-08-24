@@ -83,7 +83,7 @@ def main() -> None:
     results = []
     for f in files:
         results.extend(json.load(open(f, encoding="utf-8"))["results"])
-    # dedupe repeated runs — keep first run per case
+    # dedupe repeated runs - keep first run per case
     seen, uniq = set(), []
     for r in results:
         if r["id"] in seen:

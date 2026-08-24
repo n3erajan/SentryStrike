@@ -119,7 +119,7 @@ class SSRFDetector(BaseDetector):
         control host, repeated to smooth timing noise, then reports a finding
         when a robust, consistent differential appears. A strong, consistent
         differential (status divergence or large timing delta) is accepted as
-        VERIFIED — the server demonstrably reached different target classes
+        VERIFIED - the server demonstrably reached different target classes
         differently. This is useful indirect evidence, but it is not proof that
         the target server issued an outbound request: validation, denylisting,
         application timeouts, and upstream behavior can produce the same signal.
@@ -307,7 +307,7 @@ class SSRFDetector(BaseDetector):
 
                     # Dead-baseline abort: 401/403/404/405 to the plain baseline
                     # means the sink is unreachable/unauthorized as sent, so the
-                    # reflection/OAST/in-band probes cannot yield a differential —
+                    # reflection/OAST/in-band probes cannot yield a differential -
                     # skip rather than spend the SSRF payload budget on 4xx noise.
                     if is_dead_baseline(baseline):
                         return cand_findings

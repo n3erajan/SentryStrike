@@ -22,7 +22,7 @@ class CommandInjectionDetector(BaseDetector):
         # with a generic name still qualify via a shell/host-shaped value or a
         # diagnostic endpoint context. Command injection is often blind (no value
         # shape at all), so any *replayable* param carrying a substantive opaque
-        # value is also allowed through to the timing probe — a positive signal
+        # value is also allowed through to the timing probe - a positive signal
         # is preferred, but its absence must not zero out coverage.
         planner = kwargs.get("attack_planner")
         surface = (
@@ -91,7 +91,7 @@ class CommandInjectionDetector(BaseDetector):
     def _is_command_candidate(self, target: AttackTarget) -> bool:
         """Select a target for command-injection probing.
 
-        Positive signal — a command-token name, a shell/host-shaped value, or a
+        Positive signal - a command-token name, a shell/host-shaped value, or a
         diagnostic endpoint context (via the shared value-aware selection). Or,
         for blind command injection (no value shape), any *replayable* target
         whose baseline value is a substantive opaque string, so replayable

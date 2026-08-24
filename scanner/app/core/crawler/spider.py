@@ -371,7 +371,7 @@ class WebSpider:
                         # Detect the SPA shell fallback for EVERY discovery source
                         # and even file-like paths (``allow_file_like_path=True``).
                         # In a SPA the server returns the same ``index.html`` shell
-                        # for any path with no distinct resource — client routes
+                        # for any path with no distinct resource - client routes
                         # (``/login``, ``/accounting``, ``/order-completion/:id``),
                         # dead brute-force guesses (``/.env``, ``/.git``), and
                         # mistyped file paths all render byte-identical HTML. Such a
@@ -398,7 +398,7 @@ class WebSpider:
                             # set regardless of source. Brute-force guesses were
                             # probes for a resource that does not exist, so they are
                             # additionally recorded as dead (reported/suppressed).
-                            # Real client routes (js/html/sitemap) are NOT dead —
+                            # Real client routes (js/html/sitemap) are NOT dead -
                             # they remain in ``crawl_state.routes`` so the browser
                             # engine still visits them via SPA navigation; they are
                             # only excluded from the raw-HTTP detector surface.
@@ -428,7 +428,7 @@ class WebSpider:
                         continue
 
                     # Note: SPA shell fallbacks (any source) already `continue`d
-                    # above, so they never reach HTML parsing here — no duplicate
+                    # above, so they never reach HTML parsing here - no duplicate
                     # link/form extraction from identical shells.
 
                     async with lock:
@@ -501,7 +501,7 @@ class WebSpider:
                 # in ``dead_routes`` but the ORIGINAL enqueued RouteCandidate in
                 # ``crawl_state.routes`` keeps ``is_dead=False``, so without this set
                 # they would still be canonicalised to ``#/wp-admin`` and navigated
-                # as live SPA routes — wasting budget on the app's not-found
+                # as live SPA routes - wasting budget on the app's not-found
                 # component. A correctly-guessed real route (``/administration`` →
                 # ``#/administration``) never HTTP-resolves to the shell, so it is
                 # NOT in ``dead_urls`` and is still browser-seeded.
@@ -515,7 +515,7 @@ class WebSpider:
                 await self._run_browser_discovery(crawl_state, root_url, browser_routes, progress_callback)
 
         # Browser routes reconstructed from a dead hash route hold a real
-        # server URL the HTTP worker never saw — a query-bearing endpoint
+        # server URL the HTTP worker never saw - a query-bearing endpoint
         # (/redirect?to=https://...) or a served file (/ftp/legal.md). Extend
         # discovered_urls so ParamDiscovery + all detectors (open_redirect,
         # file_inclusion, ssrf, …) receive them.
@@ -820,8 +820,8 @@ class WebSpider:
         # No separate readiness probe: ``crawl_into`` detects Playwright/browser
         # availability inline on its own launch (setting ``browser_available``
         # True the moment Chromium starts, or ``browser_error`` + False on import/
-        # launch failure), so the old ``check_readiness()`` throwaway launch — a
-        # second cold Chromium start every run — is gone. A launch failure merges
+        # launch failure), so the old ``check_readiness()`` throwaway launch - a
+        # second cold Chromium start every run - is gone. A launch failure merges
         # cleanly as static-only via the ``finally`` merge below.
         loop = asyncio.get_running_loop()
         budget = self._scan_config.get_val("crawl_browser_budget_seconds", self.settings.crawl_browser_budget_seconds) if self._scan_config else self.settings.crawl_browser_budget_seconds

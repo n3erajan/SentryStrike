@@ -1,4 +1,4 @@
-# Fingerprint Database — Attribution
+# Fingerprint Database - Attribution
 
 The files `technologies.json` and `categories.json` in this directory are a
 **merged, vendored copy** of the community-maintained web technology fingerprint
@@ -10,7 +10,7 @@ database, used under the MIT License.
 - **License:** MIT (see the upstream repository for the full license text).
 - **Fallback mirror:** https://github.com/tunetheweb/wappalyzer (also MIT).
 
-SentryStrike vendors the **data only** — it does not depend on or bundle the
+SentryStrike vendors the **data only** - it does not depend on or bundle the
 upstream matching engine (our engine is a clean-room reimplementation of the
 documented pattern format in `../wappalyzer_engine.py`).
 

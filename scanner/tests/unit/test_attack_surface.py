@@ -73,7 +73,7 @@ def test_hash_route_form_submission_is_not_resurrected_as_shell_target():
 
     Regression: SPA form clusters on ``/#/address/create`` (fields such as the
     framework-generated ``mat-input-18``) were being translated to bare
-    ``/address/create`` and hammered by every injection detector — hundreds of
+    ``/address/create`` and hammered by every injection detector - hundreds of
     shell-only POSTs per scan.
     """
     form = HtmlForm(

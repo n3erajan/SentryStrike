@@ -49,7 +49,7 @@ export function findFinishedScans(previousItems, nextItems) {
 // Overlays freshly-polled records onto a list that isn't polled itself.
 //
 // The scans table reads `scans:list:all`, which is only refetched when a scan
-// reaches a terminal status — so an in-flight scan's progress and phase columns
+// reaches a terminal status - so an in-flight scan's progress and phase columns
 // would sit frozen at their mount-time values. `scans:list:25` is already being
 // polled every few seconds for the active count, so reuse those records rather
 // than issuing a second request.

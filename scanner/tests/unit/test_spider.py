@@ -78,7 +78,7 @@ async def test_run_browser_discovery_merges_partial_results_on_error(monkeypatch
             client_routes=None,
             progress_callback=None,
         ):
-            # Stream a partial observation, mark availability, then blow up —
+            # Stream a partial observation, mark availability, then blow up -
             # simulating a timeout/exception mid-run.
             state.browser_available = True
             state.requests.append(
@@ -541,7 +541,7 @@ async def test_crawl_marks_spa_fallback_common_paths_dead(monkeypatch):
 
 def test_browser_route_seed_excludes_http_dead_brute_paths():
     """A brute-force guess that HTTP-resolved to the SPA shell (recorded in
-    ``dead_routes``) must NOT be seeded to the browser as a live SPA route —
+    ``dead_routes``) must NOT be seeded to the browser as a live SPA route -
     otherwise it is canonicalised to ``#/wp-admin`` and navigated into the app's
     not-found component. A correctly-guessed real route (never in ``dead_routes``)
     is still seeded."""

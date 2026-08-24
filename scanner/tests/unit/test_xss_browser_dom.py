@@ -720,13 +720,13 @@ def test_select_dom_reflection_jobs_no_projection_without_shared_segment():
     targets = [_qtarget("http://x/rest/products/search", "q")]
     routes = [SimpleNamespace(url="http://x/#/profile")]
     jobs = detector._select_dom_reflection_jobs(targets, [], max_jobs=10, routes=routes)
-    # No SPA route shares "search" — the only ``q`` job is against the API URL.
+    # No SPA route shares "search" - the only ``q`` job is against the API URL.
     spa_urls = {url for url, param, _ in jobs if param == "q"}
     assert "http://x/#/profile" not in spa_urls
 
 
 def test_select_dom_reflection_jobs_segment_match_is_not_substring():
-    """Segment matching is on full path segments, not substrings — ``/search``
+    """Segment matching is on full path segments, not substrings - ``/search``
     must not match ``/#/research`` (different segment) to avoid false
     projections."""
     detector = XSSDetector()
@@ -745,7 +745,7 @@ def test_select_dom_reflection_jobs_path_router_api_needs_no_projection():
     detector = XSSDetector()
     from types import SimpleNamespace
 
-    # Path-router route (no fragment) — not an SPA hash route, must not seed
+    # Path-router route (no fragment) - not an SPA hash route, must not seed
     # the segment index, so no projection occurs.
     targets = [_qtarget("http://x/search", "q")]
     routes = [SimpleNamespace(url="http://x/search")]
@@ -829,7 +829,7 @@ def test_probe_stored_falls_back_to_browser_on_spa_when_http_negative(monkeypatc
     verifier.spa_mode = True
     canary = "sentry_abc123"
 
-    # HTTP _send returns a body with no canary — clean HTTP negative.
+    # HTTP _send returns a body with no canary - clean HTTP negative.
     async def fake_send(self, url, method, params=None, data=None, **kwargs):
         from app.core.verification.response_analyzer import ResponseData
         return ResponseData(
@@ -862,7 +862,7 @@ def test_probe_stored_falls_back_to_browser_on_spa_when_http_negative(monkeypatc
 
 def test_probe_stored_browser_oracle_negative_when_not_fired(monkeypatch):
     """When neither HTTP-body nor browser execution confirms the canary, the
-    stored oracle returns a clean negative — no fabricated finding."""
+    stored oracle returns a clean negative - no fabricated finding."""
     verifier = XSSVerifier()
     verifier.spa_mode = True
     canary = "sentry_abc123"
@@ -896,7 +896,7 @@ def test_probe_stored_browser_oracle_negative_when_not_fired(monkeypatch):
 
 
 def test_probe_stored_browser_oracle_skipped_when_not_spa(monkeypatch):
-    """The browser-aware oracle must NOT run on non-SPA targets — the HTTP-body
+    """The browser-aware oracle must NOT run on non-SPA targets - the HTTP-body
     oracle is authoritative there. Confirms the SPA gate prevents scope creep."""
     verifier = XSSVerifier()
     verifier.spa_mode = False

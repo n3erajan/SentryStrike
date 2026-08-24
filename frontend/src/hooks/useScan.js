@@ -5,13 +5,13 @@ import { getApplication } from "../services/applications.js";
 import useQuery from "./useQuery.js";
 
 // Form state + submission for a new scan. Polling and progress no longer live
-// here — once a scan is created the caller navigates to its own active-scan
+// here - once a scan is created the caller navigates to its own active-scan
 // page (see ActiveScanPage / useScanStatus). `startScan` resolves to the new
 // scan_id (or null on failure), leaving the form intact so the user can queue
 // another scan immediately while the first one runs.
 //
 // `applicationId` is optional. When set, the target URL and config are seeded
-// from that application's stored defaults — the workspace-level default config
+// from that application's stored defaults - the workspace-level default config
 // no longer exists; defaults live on the Application entity now.
 function useScanForm({ applicationId, retry } = {}) {
   const applicationQuery = useQuery({
@@ -71,7 +71,7 @@ function useScanForm({ applicationId, retry } = {}) {
   const [conflict, setConflict] = useState(false);
 
   // Seed the form from the chosen application. Clearing the selection leaves
-  // whatever the user has already typed alone — only an explicit pick rewrites
+  // whatever the user has already typed alone - only an explicit pick rewrites
   // the URL and config. `loadedApp` tracks which id the form currently
   // reflects, so the loading flag is derived rather than set synchronously.
   const [loadedApp, setLoadedApp] = useState(() => {
@@ -96,7 +96,7 @@ function useScanForm({ applicationId, retry } = {}) {
   const canStart = valid && consent && !submitting && !defaultsLoading;
 
   // Creates the scan and returns its id. Returns null (and sets `error`) on
-  // failure. Does NOT poll — the caller routes to the active-scan view.
+  // failure. Does NOT poll - the caller routes to the active-scan view.
   const startScan = useCallback(async () => {
     setTouched(true);
     if (!valid || !consent || submitting) return null;

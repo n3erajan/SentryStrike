@@ -46,7 +46,7 @@ async def test_boolean_operator_differential_is_flagged():
             # Broad match: the whole product list comes back.
             return _resp(200, "PRODUCT " * 300)
         if phase == "nosql_bool_false":
-            # No match: empty result set — diverges from the true response.
+            # No match: empty result set - diverges from the true response.
             return _resp(200, "[]")
         # baseline / stability / error-injection: a stable benign body.
         return _resp(200, "N" * 500)
@@ -77,7 +77,7 @@ async def test_benign_endpoint_is_not_flagged():
     verifier = NoSqliVerifier()
 
     async def mock_send(url, method="POST", params=None, data=None, **kwargs):
-        # Every request — true, false, baseline — returns the identical body.
+        # Every request - true, false, baseline - returns the identical body.
         return _resp(200, "N" * 500)
 
     verifier._send = mock_send
@@ -103,7 +103,7 @@ async def test_error_based_requires_two_confirmations():
     async def mock_send(url, method="POST", params=None, data=None, **kwargs):
         phase = kwargs.get("test_phase")
         if phase == "nosql_bool_true" or phase == "nosql_bool_false":
-            # No boolean divergence — force the error technique to be the signal.
+            # No boolean divergence - force the error technique to be the signal.
             return _resp(200, "N" * 500)
         if phase == "nosql_error_injection":
             return _resp(500, "MongoServerError: unknown operator: $nope")
@@ -126,7 +126,7 @@ async def test_error_based_requires_two_confirmations():
 
 @pytest.mark.asyncio
 async def test_single_error_hit_is_not_reported():
-    """One malformed operator surfacing an error is recorded but not reported —
+    """One malformed operator surfacing an error is recorded but not reported -
     a second independent confirmation is required."""
     verifier = NoSqliVerifier()
     calls = {"error": 0}
@@ -159,7 +159,7 @@ async def test_single_error_hit_is_not_reported():
 @pytest.mark.asyncio
 async def test_operator_pair_reflection_is_rejected():
     """A literal canary echo means the object was stored/echoed as text, not
-    evaluated as an operator — the pair is rejected."""
+    evaluated as an operator - the pair is rejected."""
     verifier = NoSqliVerifier()
     target = _json_body_target()
     baseline = _resp(200, "N" * 500)
@@ -195,7 +195,7 @@ def _query_target() -> AttackTarget:
 @pytest.mark.asyncio
 async def test_bracket_notation_query_operator_is_flagged():
     """A query param via bracket notation (`category[$ne]=`) that diverges across
-    two operator families is flagged — the classic query/form NoSQL vector."""
+    two operator families is flagged - the classic query/form NoSQL vector."""
     verifier = NoSqliVerifier()
     seen: dict[str, str] = {}
 
@@ -229,7 +229,7 @@ async def test_bracket_notation_query_operator_is_flagged():
 
 @pytest.mark.asyncio
 async def test_non_injectable_target_is_skipped():
-    """Path/header/cookie locations cannot express a nested operator — skipped."""
+    """Path/header/cookie locations cannot express a nested operator - skipped."""
     verifier = NoSqliVerifier()
     path_target = AttackTarget(
         url="http://example.com/rest/track-order/{id}",

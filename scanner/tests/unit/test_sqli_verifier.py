@@ -302,7 +302,7 @@ def test_sqli_verifier_resolves_value_from_url():
 
 @pytest.mark.asyncio
 async def test_sqli_verifier_aborts_on_dead_baseline():
-    """A 401/404 baseline means the endpoint is unreachable as sent — the full
+    """A 401/404 baseline means the endpoint is unreachable as sent - the full
     payload matrix must NOT fire (that was ~55% of wasted SQLi traffic)."""
     verifier = SQLiVerifier()
     phases: list[str] = []
@@ -338,7 +338,7 @@ async def test_sqli_verifier_aborts_on_dead_baseline():
 
 @pytest.mark.asyncio
 async def test_sqli_verifier_proceeds_on_healthy_baseline_status():
-    """A healthy 200 baseline (login-style flow) must NOT be gated — injection
+    """A healthy 200 baseline (login-style flow) must NOT be gated - injection
     phases still run so real login SQLi is preserved."""
     verifier = SQLiVerifier()
     phases: list[str] = []

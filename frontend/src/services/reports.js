@@ -1,4 +1,4 @@
-// Report service — wraps the backend `/reports/*` routes (mounted under /api/v1).
+// Report service - wraps the backend `/reports/*` routes (mounted under /api/v1).
 //
 //   GET  /reports/{id}           -> full report payload (see reports.py)
 //   GET  /reports/{id}/pdf       -> application/pdf attachment

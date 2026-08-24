@@ -36,7 +36,7 @@ SPECIALIZED_INPUT_DETECTORS = frozenset(
 # Detectors that reach a verdict without dispatching a single HTTP request.
 # They correlate evidence another phase already collected (supply_chain reads
 # the fingerprinted technology stack and maps versions to CVEs), so a
-# ``requests_sent == 0`` metric is their normal, complete state — not a gap.
+# ``requests_sent == 0`` metric is their normal, complete state - not a gap.
 # The 0-request coverage warning must never fire for these, or it reports a
 # guaranteed false gap on every scan. A detector belongs here only if it holds
 # no HttpVerifier and opens no scan client; anything that tags requests with a
@@ -48,6 +48,18 @@ NON_HTTP_DETECTORS = frozenset({"supply_chain"})
 COVERAGE_WARNING_EXEMPT_SKIP_REASONS = frozenset(
     {"https_only_checks_not_applicable"}
 )
+
+
+# Detectors whose HTTP traffic is tagged with a ``module=`` label that differs
+# from the detector name. Single source of truth: request counts are looked up
+# through it here, and the tested-surface ledger normalises its recorded module
+# labels back to detector names through its reverse (see ``coverage.py``).
+DETECTOR_REQUEST_ALIASES: dict[str, tuple[str, ...]] = {
+    "authentication_failures": ("authentication_failures", "auth"),
+    "file_inclusion": ("file_inclusion", "lfi", "rfi"),
+    "injection_sql_command": ("injection_sql_command", "sqli"),
+    "nosql_injection": ("nosql_injection", "nosqli"),
+}
 
 
 class DetectorExecutionMixin:
@@ -244,8 +256,8 @@ class DetectorExecutionMixin:
             ]
         )
         # Static body synthesis makes bodies testable even without an
-        # observed request body, so only report the coverage gap when nothing —
-        # observed or synthesizable — could feed a body-injection detector.
+        # observed request body, so only report the coverage gap when nothing -
+        # observed or synthesizable - could feed a body-injection detector.
         synthesizable_body_endpoints = 0
         if not replayable_body_count and api_endpoints:
             from app.core.crawler.api_extractor import ApiExtractor
@@ -344,13 +356,7 @@ class DetectorExecutionMixin:
         return len(snippets)
 
     def _detector_request_aliases(self, detector_name: str) -> tuple[str, ...]:
-        aliases = {
-            "authentication_failures": ("authentication_failures", "auth"),
-            "file_inclusion": ("file_inclusion", "lfi", "rfi"),
-            "injection_sql_command": ("injection_sql_command", "sqli"),
-            "nosql_injection": ("nosql_injection", "nosqli"),
-        }
-        return aliases.get(detector_name, (detector_name,))
+        return DETECTOR_REQUEST_ALIASES.get(detector_name, (detector_name,))
 
     def _apply_detector_request_counts(
         self,
@@ -370,7 +376,7 @@ class DetectorExecutionMixin:
             # Recompute the planner-derived coverage fields from the REAL
             # governor attempted/denied counts, replacing the zero-attempt
             # baseline set during the detector loop. budget_exhausted is now
-            # attributed strictly from denied_total — never a finding shortfall.
+            # attributed strictly from denied_total - never a finding shortfall.
             if isinstance(planner, AttackPlanner):
                 summary = planner.coverage_summary(
                     metric.detector,
@@ -433,12 +439,12 @@ class DetectorExecutionMixin:
         """Surface 0-request detectors as explicit coverage warnings.
 
         A detector that built candidates but sent 0 requests represents a silent
-        coverage gap — either every candidate was filtered, the budget governor
+        coverage gap - either every candidate was filtered, the budget governor
         denied everything, or a structural prerequisite was missing. Each of
         these is already recorded in ``skipped_reasons``; this method lifts the
         gap to a top-level ``coverage_warning`` so an operator reading the report
         sees it without drilling into per-detector metrics. Detectors that built
-        0 candidates are not warned here (no gap — there was nothing to test).
+        0 candidates are not warned here (no gap - there was nothing to test).
 
         Two classes are exempt, because for them a 0-request metric is the normal
         complete state rather than a gap: detectors in ``NON_HTTP_DETECTORS``,
@@ -467,7 +473,7 @@ class DetectorExecutionMixin:
                 warnings.append(
                     f"detector '{metric.detector}' built {metric.candidates_built} "
                     f"candidate(s) but sent 0 requests ({reason}); "
-                    "coverage gap — findings for this class are absent by design, "
+                    "coverage gap - findings for this class are absent by design, "
                     "not by confirmation."
                 )
         return warnings

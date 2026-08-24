@@ -42,7 +42,7 @@ def test_server_endpoint_from_dead_route_reconstructs_query_endpoint():
 
 def test_server_endpoint_from_dead_route_ignores_paramless_and_api_routes():
     """A dead route with no query (an ordinary brute-force/client dead route such
-    as ``#/wp-admin``) or a root API path stays dead — never resurrected as an
+    as ``#/wp-admin``) or a root API path stays dead - never resurrected as an
     HTTP endpoint."""
     recon = BrowserDiscoveryEngine._server_endpoint_from_dead_route
     assert recon("http://x/#/wp-admin") == ""          # no query, no extension
@@ -55,7 +55,7 @@ def test_server_endpoint_from_dead_route_reconstructs_served_file():
     """A hash-routed SPA canonicalises a real served-file anchor
     (``./ftp/legal.md``) into a dead hash route (``#/ftp/legal.md``). A query-less
     path whose last segment has a file extension is a real static resource the
-    router swallowed — reconstruct its plain server URL (the ``/ftp/:file`` path
+    router swallowed - reconstruct its plain server URL (the ``/ftp/:file`` path
     traversal / arbitrary-file-read discovery miss). A bare route word stays dead."""
     recon = BrowserDiscoveryEngine._server_endpoint_from_dead_route
     assert recon("http://x/#/ftp/legal.md") == "http://x/ftp/legal.md"
@@ -277,7 +277,7 @@ async def test_crawl_into_terminates_when_a_worker_hangs_on_unbounded_await(monk
     engine._pool_stuck_grace_s = 0.3
 
     # Every worker wedges on its first route the instant it reaches this inline
-    # step — a stand-in for a body read / stream that never resolves. It is a
+    # step - a stand-in for a body read / stream that never resolves. It is a
     # cancellable await, matching a real Playwright await (the Python task
     # unwinds on cancel even though the browser-side op may linger).
     async def _hang(_page):
@@ -310,7 +310,7 @@ async def test_crawl_into_terminates_when_a_worker_hangs_on_unbounded_await(monk
 @pytest.mark.asyncio
 async def test_crawl_into_abandons_a_route_that_hangs_and_continues(monkeypatch, caplog):
     """A single route whose processing wedges on an unbounded await must be
-    abandoned at the per-route cap so the worker moves on — one bad route may
+    abandoned at the per-route cap so the worker moves on - one bad route may
     never stall a worker until the (much later) pool watchdog. The deadline is
     set far in the future so ONLY the per-route cap can rescue the run: if it is
     absent the workers hang and the guard below times out."""
@@ -328,7 +328,7 @@ async def test_crawl_into_abandons_a_route_that_hangs_and_continues(monkeypatch,
     state = CrawlState()
     loop = asyncio.get_running_loop()
     # Far-off budget: the global pool watchdog (budget + 20s grace) cannot be
-    # what saves this within the guard window — only per-route abandonment can.
+    # what saves this within the guard window - only per-route abandonment can.
     deadline = loop.time() + 120.0
 
     with caplog.at_level("WARNING", logger="app.core.crawler.browser_engine"):
@@ -471,14 +471,14 @@ def test_browser_navigable_gate_excludes_api_and_asset_leaves():
     forms or client-side routes) are excluded, while app pages and hash-router
     routes are always navigable."""
     nav = BrowserDiscoveryEngine._is_browser_navigable
-    # Raw API/data/asset leaves — excluded (already covered by the HTTP crawler).
+    # Raw API/data/asset leaves - excluded (already covered by the HTTP crawler).
     assert nav("http://x.test/api/Feedbacks") is False
     assert nav("http://x.test/rest/products/search") is False
     assert nav("http://x.test/graphql") is False
     assert nav("http://x.test/assets/i18n/en.json") is False
     assert nav("http://x.test/main.js") is False
     assert nav("http://x.test/logo.png") is False
-    # App pages and hash-router routes — always navigable.
+    # App pages and hash-router routes - always navigable.
     assert nav("http://x.test/") is True
     assert nav("http://x.test/login") is True
     assert nav("http://x.test/#/register") is True
@@ -551,9 +551,9 @@ def test_browser_json_observation_metadata_preserves_body_and_replay_headers():
 @pytest.mark.parametrize(
     "raw_body",
     [
-        "[{\"id\":1},{\"id\":2}]",  # top-level array — schema inference yields entries
-        "[1,2,3]",                    # top-level array of primitives — empty schema
-        "{}",                          # empty object — empty schema
+        "[{\"id\":1},{\"id\":2}]",  # top-level array - schema inference yields entries
+        "[1,2,3]",                    # top-level array of primitives - empty schema
+        "{}",                          # empty object - empty schema
         "\"just-a-string\"",         # top-level JSON primitive
     ],
 )
@@ -1031,7 +1031,7 @@ async def test_capture_forms_returns_structured_forms():
 
         async def evaluate(self, script, *args):
             # One literal <form> cluster and one <form>-less orphan cluster with
-            # a file input — the pattern RC-1 previously missed entirely.
+            # a file input - the pattern RC-1 previously missed entirely.
             return [
                 {
                     "cluster_id": 0,
@@ -1506,7 +1506,7 @@ async def test_submit_discovered_forms_fills_submits_and_captures_body():
     page.on("request", lambda r: captured.append(r))
 
     # A <form>-less orphan cluster (has_form=False): fields are targeted by their
-    # data-sentry-field ids and submission clicks the cluster-scoped control —
+    # data-sentry-field ids and submission clicks the cluster-scoped control -
     # the exact path that was previously impossible without a literal <form>.
     form = {
         "action": "http://spa.test/rest/user/login",
@@ -1540,7 +1540,7 @@ async def test_submit_discovered_forms_threads_live_inflight_counter():
     post-submit settle, so it waits for the submit-triggered XHR to finish
     before navigating back. Passing a throwaway ``{"count": 0}`` (the old bug)
     let the settle return early and the goto tore the frame down mid-capture,
-    losing the POST body — hence ``replayable_json_bodies == 0``."""
+    losing the POST body - hence ``replayable_json_bodies == 0``."""
     engine = BrowserDiscoveryEngine()
     page = _SubmitFakePage()
 
@@ -1564,7 +1564,7 @@ async def test_submit_discovered_forms_threads_live_inflight_counter():
         inflight=live_inflight,
     )
 
-    # The *same* counter object is forwarded — not a fresh throwaway.
+    # The *same* counter object is forwarded - not a fresh throwaway.
     assert seen_inflight and seen_inflight[0] is live_inflight
 
 
@@ -1673,7 +1673,7 @@ async def test_submit_discovered_forms_skips_logout_cluster():
 @pytest.mark.asyncio
 async def test_reacquire_cluster_fast_path_skips_navigation_when_page_stayed():
     """Perf: when the page never left the route, ``_reacquire_cluster`` must not
-    navigate/settle/retry — the cluster's capture-time anchors are still bound to
+    navigate/settle/retry - the cluster's capture-time anchors are still bound to
     the live DOM. Paying navigate+settle per form is what exhausted the crawl
     budget once discovery breadth grew. The passed form is returned as-is when a
     cheap re-capture finds no in-place re-tag."""
@@ -1851,7 +1851,7 @@ def test_normalize_for_seen_keeps_spa_hash_routes_distinct():
 
 
 def test_browser_targets_seeds_hash_routes():
-    """A hash-routed SPA's seeded routes must all survive into the work queue —
+    """A hash-routed SPA's seeded routes must all survive into the work queue -
     the bug collapsed them onto the origin so only the root was ever crawled."""
     engine = BrowserDiscoveryEngine()
     targets = engine._browser_targets(
@@ -1880,7 +1880,7 @@ def test_hash_routed_targets_canonicalize_path_routes_and_dedupe():
 
 def test_runtime_hash_hint_converts_flat_seed_routes_to_hash():
     """Flat routes mined from a JS bundle (``/login``) must be seeded as hash
-    routes (``/#/login``) once a runtime probe reports the app is hash-routed —
+    routes (``/#/login``) once a runtime probe reports the app is hash-routed -
     otherwise the bare path only ever loads the SPA shell and the real page's
     forms/XHR never fire. The static heuristic cannot see this because every
     seed string is a bare path with no fragment."""
@@ -2069,7 +2069,7 @@ def test_candidate_field_selectors_skips_unsafe_name_but_keeps_positional():
 
 class _FallbackFillPage:
     """Fake page whose ``data-sentry-field`` selectors are 'gone' (raise, like a
-    re-rendered node) but whose cluster-scoped positional selectors fill — models
+    re-rendered node) but whose cluster-scoped positional selectors fill - models
     the framework-re-render case that left password fields empty."""
 
     def __init__(self):
@@ -2115,7 +2115,7 @@ async def test_fill_form_fields_falls_back_when_field_tag_is_stripped():
 async def test_ui_state_signature_bounded_when_evaluate_hangs():
     """A route whose JS keeps the main thread busy makes ``page.evaluate()``
     never resolve. Playwright's ``evaluate`` ignores ``set_default_timeout``, so
-    without an explicit bound the call hangs forever — blocking the worker inside
+    without an explicit bound the call hangs forever - blocking the worker inside
     ``_exercise_page``, which never returns to the deadline check, so the pool
     ``gather`` join never completes and the whole crawl hangs past its budget
     until killed. ``_ui_state_signature`` must therefore return promptly even

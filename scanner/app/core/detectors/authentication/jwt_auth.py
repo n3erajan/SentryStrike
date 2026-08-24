@@ -261,7 +261,7 @@ class JwtAuthProbeMixin:
 
     # Standard JWT identity claim names (RFC 7519 + common vendor claims). Used to
     # substitute a canary so a reflected forged identity is undeniable proof. Generic
-    # — no target-specific claim names.
+    # - no target-specific claim names.
     _IDENTITY_CLAIM_KEYS = frozenset({
         "email", "mail", "e-mail", "sub", "username", "user", "user_name",
         "preferred_username", "name", "login", "uid", "upn", "unique_name",
@@ -398,7 +398,7 @@ class JwtAuthProbeMixin:
 
     # Generic REST/English conventions for identity-reflecting endpoints. Used only
     # to RANK candidates so the limited oracle budget is spent on the endpoints most
-    # likely to be a forgery oracle — NOT to gate detection (any endpoint that shows
+    # likely to be a forgery oracle - NOT to gate detection (any endpoint that shows
     # an auth differential still qualifies). Contains no target-specific paths.
     _IDENTITY_PATH_TOKENS = (
         "whoami", "userinfo", "me", "self", "current", "profile", "account",
@@ -452,7 +452,7 @@ class JwtAuthProbeMixin:
         Static assets are dropped (never an auth oracle) and identity-reflecting
         endpoints are ranked first so the budgeted oracle probes land on the URLs
         most likely to expose a signature-verification bypass. The auth differential
-        measured later — not this ranking — is what actually qualifies an oracle.
+        measured later - not this ranking - is what actually qualifies an oracle.
         """
         ranked: list[tuple[int, str, list[dict]]] = []
         seen: set[str] = set()

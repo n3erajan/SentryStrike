@@ -4,7 +4,7 @@ import { useLocation, useNavigationType } from "react-router-dom";
 /* Reset the window scroll on navigation.
  *
  * The document never unloads in an SPA, so `window.scrollY` carries over from
- * the previous route — clicking a footer link from the bottom of the landing
+ * the previous route - clicking a footer link from the bottom of the landing
  * page drops you into the middle of the next one. BrowserRouter has no
  * built-in restoration (ScrollRestoration is data-router only), so this does
  * it here.

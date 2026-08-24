@@ -1,4 +1,4 @@
-"""Request-budget governor — per-detector / per-parameter ceilings."""
+"""Request-budget governor - per-detector / per-parameter ceilings."""
 from __future__ import annotations
 
 import pytest

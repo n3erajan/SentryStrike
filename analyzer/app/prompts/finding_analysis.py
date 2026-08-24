@@ -47,11 +47,11 @@ _ADJUDICATION_ROLE_AND_TASK = (
     "You are an expert security triager performing false-positive adjudication for a DAST scanner.\n\n"
     "TASK: The scanner has reported a specific finding with a title and evidence.\n"
     "Your job is to decide: does the evidence actually support the scanner's claim?\n\n"
-    "IMPORTANT DISTINCTION — 'Normal behavior' vs 'Security concern':\n"
+    "IMPORTANT DISTINCTION - 'Normal behavior' vs 'Security concern':\n"
     "Some vulnerability classes (e.g. Exposed API Documentation, Debug Endpoints, Missing Headers, "
     "Metrics Exposure) describe conditions where the application is working exactly as coded, "
     "but that configuration itself IS the security problem. For these findings, the fact that "
-    "the endpoint serves its content 'normally' does NOT contradict the scanner's claim — "
+    "the endpoint serves its content 'normally' does NOT contradict the scanner's claim - "
     "it SUPPORTS it. The scanner is claiming the exposure exists, and the response proves it does.\n\n"
     "A finding is a false positive ONLY when the evidence does not actually demonstrate what "
     "the scanner claims. For example:\n"
@@ -76,7 +76,7 @@ def _get_axes_definition() -> str:
         "or the 'leaked' data is intentionally public with no private fields. "
         "Answer 'yes' ONLY if you can point to specific evidence that contradicts the claim. "
         "The fact that an application serves content 'normally' does NOT contradict claims about "
-        "exposed documentation, missing headers, debug endpoints, or misconfigurations — "
+        "exposed documentation, missing headers, debug endpoints, or misconfigurations - "
         "those findings assert that the normal behavior itself is the problem.\n"
         "- CAUSALLY_CONNECTED: Did the scanner's payload or test request directly cause the "
         "security-relevant evidence to appear, or was the content pre-existing? For findings "
@@ -127,13 +127,13 @@ def build_adjudication_prompt(
         enrichment_note = f"Vulnerability Class Context:\n{enrichment_description}\n\n"
 
     # The brief is scanner-authored, so it sits outside the untrusted fence and
-    # is stated to be trusted — the model must weigh it above target-controlled
+    # is stated to be trusted - the model must weigh it above target-controlled
     # response content. Keep it immediately before the evidence: moving it earlier
     # in the prompt measured 0.733 recall versus 0.867 here on the 30-case corpus.
     brief_note = ""
     if evidence_brief:
         brief_note = (
-            "SCANNER EVIDENCE BRIEF (trusted — produced by the scanner, not the target):\n"
+            "SCANNER EVIDENCE BRIEF (trusted - produced by the scanner, not the target):\n"
             f"{evidence_brief}\n\n"
         )
 

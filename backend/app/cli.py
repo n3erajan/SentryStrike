@@ -179,7 +179,7 @@ async def _approve_access_request(request_id: str, member_limit: int) -> int:
                 body_text=body_text,
                 body_html=body_html,
             )
-        except Exception as exc:  # noqa: BLE001 — surface any delivery failure to the operator
+        except Exception as exc:  # noqa: BLE001 - surface any delivery failure to the operator
             await service.record_email_delivery(
                 invite,
                 status=InviteEmailStatus.failed,
@@ -228,7 +228,7 @@ def _email_check(to: str) -> int:
     try:
         settings = get_settings()
         backend = get_email_backend()
-    except Exception as exc:  # noqa: BLE001 — settings validation is operator-facing here
+    except Exception as exc:  # noqa: BLE001 - settings validation is operator-facing here
         print(f"Email configuration is invalid: {exc}", file=sys.stderr)
         return 1
 
@@ -248,7 +248,7 @@ def _email_check(to: str) -> int:
                 "diagnostic email from SentryStrike."
             ),
         )
-    except Exception as exc:  # noqa: BLE001 — exact SMTP failure is useful to the operator
+    except Exception as exc:  # noqa: BLE001 - exact SMTP failure is useful to the operator
         print(f"SMTP check failed ({type(exc).__name__}: {exc}).", file=sys.stderr)
         return 1
     print(

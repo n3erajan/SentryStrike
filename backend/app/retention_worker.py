@@ -35,7 +35,7 @@ async def run_retention_worker() -> None:
         while True:
             try:
                 await service.purge_once()
-            except Exception:  # noqa: BLE001 — a failed pass must not kill the schedule
+            except Exception:  # noqa: BLE001 - a failed pass must not kill the schedule
                 logger.exception("retention purge pass failed; will retry next interval")
             await asyncio.sleep(interval)
     finally:

@@ -153,7 +153,7 @@ class SessionAuthProbeMixin:
     # ---------------------------------------------------------------------------
 
     # Path fragments (separator-stripped) that mark a change-password endpoint, and
-    # separator-stripped parameter names for each password field. Generic — no
+    # separator-stripped parameter names for each password field. Generic - no
     # target-specific paths or fields.
     _CHANGE_PW_PATH_TOKENS = (
         "changepassword", "updatepassword", "setpassword",
@@ -240,8 +240,8 @@ class SessionAuthProbeMixin:
     def _build_change_pw_request(self, endpoint: dict, new_pw: str, current_value: str | None):
         """Return (url, method, params, data, json_body) for a change-password attempt.
 
-        Honours the endpoint's observed transport — query string, JSON body, or
-        form-urlencoded body — so the probe matches how the server accepts input.
+        Honours the endpoint's observed transport - query string, JSON body, or
+        form-urlencoded body - so the probe matches how the server accepts input.
         """
         fields: dict[str, str] = {endpoint["new"]: new_pw}
         if endpoint.get("repeat"):
@@ -259,8 +259,8 @@ class SessionAuthProbeMixin:
     async def _test_change_password_current_bypass(self, kwargs: dict[str, object]) -> list[Finding]:
         """Safely test whether change-password enforces the current password.
 
-        Runs entirely against a freshly provisioned, DISPOSABLE throwaway account —
-        never the user's scan session — so a successful password change cannot lock
+        Runs entirely against a freshly provisioned, DISPOSABLE throwaway account -
+        never the user's scan session - so a successful password change cannot lock
         anyone out or invalidate the scan. Each variant forward-changes the throwaway
         password (no revert needed, so password-reuse policies are irrelevant), and a
         finding is raised only when a login with the NEW password succeeds, proving
@@ -311,7 +311,7 @@ class SessionAuthProbeMixin:
                             evidence=(
                                 "On a throwaway account, the change-password endpoint accepted a new password "
                                 f"with the current-password {how}, and the account password was actually changed "
-                                "— confirmed by logging in with the new password. The endpoint does not verify the "
+                                "- confirmed by logging in with the new password. The endpoint does not verify the "
                                 "current credential, enabling account takeover from any active or CSRF'd session "
                                 "(CWE-620). Tested on a disposable identity; no real account was affected."
                             ),

@@ -3,7 +3,7 @@ import posixpath
 import re
 from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlunparse
 
-# Canonical set of file extensions that are inert static assets — never an
+# Canonical set of file extensions that are inert static assets - never an
 # HTML page or an injectable HTTP endpoint. This is the SINGLE source of truth
 # shared by the crawler (skip enqueueing/testing them) and the detectors (never
 # fuzz them or use them as reflection sinks). ``.txt`` is included: robots.txt /
@@ -30,7 +30,7 @@ def is_static_asset(url: str) -> bool:
     """True when ``url``'s path ends in a known inert static-asset extension.
 
     Framework-agnostic gate used everywhere a URL must be classified as
-    "not a testable HTTP page" — the crawler uses it to avoid enqueueing assets,
+    "not a testable HTTP page" - the crawler uses it to avoid enqueueing assets,
     and detectors use it to avoid fuzzing them or probing them as XSS sinks.
     """
     try:
@@ -92,7 +92,7 @@ def is_session_termination_url(url: str) -> bool:
         # ``logoff.jsp`` …) BEFORE removing separators. The separator-strip below
         # deletes the dot too, so without this a server-rendered auth page like
         # ``logout.php`` canonicalized to ``logoutphp`` and slipped past the token
-        # set — only extensionless SPA routes (``/auth/sign-out``) were caught.
+        # set - only extensionless SPA routes (``/auth/sign-out``) were caught.
         # That let the crawler enqueue ``logout.php`` and detectors GET it,
         # destroying the shared session so later probes were redirected to login.
         # Extension-agnostic: matches any short alphanumeric suffix, no framework

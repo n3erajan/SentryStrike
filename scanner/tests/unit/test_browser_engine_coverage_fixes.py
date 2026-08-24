@@ -35,7 +35,7 @@ from app.core.crawler.browser_engine import (
 def test_init_scripts_are_self_invoking_iife():
     """add_init_script injects source verbatim; a bare ``() => {}`` is defined but
     never called. The route hook (and any future init script) must self-invoke,
-    else it silently does nothing — the exact regression this guards."""
+    else it silently does nothing - the exact regression this guards."""
     # The route hook must call itself: ends with an invoked-IIFE close ``})();``.
     normalized = SPA_ROUTE_HOOK_SCRIPT.strip()
     assert normalized.startswith("(()") or normalized.startswith("(function"), (
@@ -121,7 +121,7 @@ def test_session_storage_script_skips_malformed_entries():
 
 def test_overlay_detect_requires_high_zindex_for_cover_rule():
     """A low-z structural shell (mat-sidenav-container: absolute, z-index 1,
-    full-viewport) must NOT be treated as a blocking overlay — that false
+    full-viewport) must NOT be treated as a blocking overlay - that false
     positive forced an ~1.8s dismiss pass on every interaction. The cover rule
     now requires a high stacking order; role/class rules still catch real modals."""
     # The absolute/fixed + big cover rule must gate on a high z-index threshold.
@@ -136,7 +136,7 @@ def test_overlay_detect_requires_high_zindex_for_cover_rule():
 
 def test_action_click_script_targets_verbs_not_nav_nouns():
     """Requires an action VERB (add/save/create/…) so a nav control whose label
-    merely contains a noun ("Your Basket", "Show cart") is not clicked — clicking
+    merely contains a noun ("Your Basket", "Show cart") is not clicked - clicking
     it would navigate away and abort the whole in-page action pass."""
     # Action verbs present; bare nav nouns absent from the action matcher.
     assert re.search(r"\\b\(add\|", SAFE_ACTION_CLICK_SCRIPT)
@@ -217,8 +217,8 @@ async def test_action_click_fires_action_button_not_nav_button():
 # --- Button-driven mutation capture (body-coverage #1) ------------------------
 #
 # These exercise the crawl-side wiring (dict return, mutation counting, cross-
-# route dedup, per-route pass loop, deadline) with a fake page — no real browser
-# — so they run in the fast unit suite.
+# route dedup, per-route pass loop, deadline) with a fake page - no real browser
+# - so they run in the fast unit suite.
 
 
 class _FakeReq:

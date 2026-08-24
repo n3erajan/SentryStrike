@@ -46,5 +46,5 @@ async def catch(interaction_id: str, request: Request) -> Response:
         path=request.url.path,
         method=request.method,
     ).insert()
-    # Static body — never reflect the id or any input.
+    # Static body - never reflect the id or any input.
     return Response(content="ok", media_type="text/plain")

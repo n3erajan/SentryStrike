@@ -2,7 +2,7 @@
 
 When a detector builds N candidates but sends 0 requests, the scan report
 must surface an explicit ``coverage_warning`` so the silent gap is visible to
-an operator reading the report — not buried in per-detector metrics.
+an operator reading the report - not buried in per-detector metrics.
 """
 from app.core.scanner import ScanOrchestrator
 from shared.models.scan import DetectorCoverageMetric
@@ -38,7 +38,7 @@ def test_zero_request_detector_produces_coverage_warning():
 
 
 def test_zero_candidate_detector_produces_no_warning():
-    """A detector that built 0 candidates has no gap — there was nothing to
+    """A detector that built 0 candidates has no gap - there was nothing to
     test. It must not produce a coverage warning (no false alarm)."""
     metrics = [
         DetectorCoverageMetric(
@@ -53,7 +53,7 @@ def test_zero_candidate_detector_produces_no_warning():
 
 
 def test_detector_with_requests_produces_no_warning():
-    """A detector that sent requests has no coverage gap — no warning."""
+    """A detector that sent requests has no coverage gap - no warning."""
     metrics = [
         DetectorCoverageMetric(
             detector="xss",
@@ -95,7 +95,7 @@ def test_multiple_zero_request_detectors_each_warned():
 
 def test_non_http_detector_never_warned():
     """supply_chain reaches its verdict by correlating the fingerprinted
-    technology stack against CVEs — it dispatches no HTTP request at all. A
+    technology stack against CVEs - it dispatches no HTTP request at all. A
     0-request metric is its normal complete state, so warning about it would
     report a guaranteed false gap on every scan."""
     metrics = [
@@ -125,8 +125,8 @@ def test_inapplicable_skip_reason_suppresses_warning():
 
 
 def test_crypto_failures_still_warned_on_https_target():
-    """Without the inapplicability reason — i.e. an https target where the
-    transport checks should have run — crypto_failures is a real gap and must
+    """Without the inapplicability reason - i.e. an https target where the
+    transport checks should have run - crypto_failures is a real gap and must
     still be warned about."""
     metrics = [
         DetectorCoverageMetric(
@@ -167,7 +167,7 @@ def test_https_target_does_not_record_crypto_inapplicability_reason():
 
 def test_zero_request_detector_without_skip_reason_still_warned():
     """Even when skipped_reasons is empty, a 0-request detector that built
-    candidates still gets a warning with a generic reason — the gap exists
+    candidates still gets a warning with a generic reason - the gap exists
     regardless of whether a skip reason was recorded."""
     metrics = [
         DetectorCoverageMetric(

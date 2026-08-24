@@ -160,7 +160,7 @@ class HttpVerifier:
         # build_observed_request_snippet renderer so every HTTP-backed finding
         # (HttpVerifier, observed-request detectors, exception_handler) emits
         # the same ``{METHOD} {path} HTTP/1.1\nHost: …\n{headers}\n\n{body}``
-        # shape — no per-call inline f-string divergence.
+        # shape - no per-call inline f-string divergence.
         all_headers = {**self.headers, **(headers or {})}
         has_explicit_cookie_header = any(
             str(name).lower() == "cookie" for name in all_headers
@@ -229,8 +229,8 @@ class HttpVerifier:
         # has exhausted its ceiling, skip the network call and return an explicit
         # "not tested" sentinel (status_code == -1) rather than a benign 0. A real
         # 0 means connection error/timeout ("nothing there"); -1 means the probe
-        # was never sent, so detectors must treat it as UNTESTED — never a negative
-        # — so a budget-denied tail probe cannot score a real vuln as absent.
+        # was never sent, so detectors must treat it as UNTESTED - never a negative
+        # - so a budget-denied tail probe cannot score a real vuln as absent.
         # No-op outside a governed scan or for uninstrumented callers.
         if request_governor.admit(ctx.module, ctx.parameter) is request_governor.GovernorDecision.DENY:
             return ResponseData(

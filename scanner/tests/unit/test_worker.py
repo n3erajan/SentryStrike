@@ -273,3 +273,40 @@ async def test_scan_proceeds_when_cancel_signal_check_fails() -> None:
     )
 
     orchestrator.run_scan.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lease_renews_several_times_per_ttl() -> None:
+    """Stall headroom: renewing at half the TTL left no margin.
+
+    The lease loop can only run when the event loop is free, so any CPU-bound
+    stretch in the pipeline delays renewal by its own duration. At TTL/2 a single
+    delayed renewal expired the lease and the backend reaped a healthy scan as
+    "Scan worker stopped unexpectedly". Renewing at TTL/4 tolerates three
+    consecutive misses.
+    """
+    queue = FakeQueue(lease_ttl_seconds=120)
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(delay: float, *args, **kwargs):
+        sleeps.append(delay)
+        # Collapse the wait so the test does not actually sleep for minutes.
+        return await real_sleep(0, *args, **kwargs)
+
+    task = asyncio.create_task(worker._lease_loop(queue, "scan-lease", 120))
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(asyncio, "sleep", recording_sleep)
+            while len(sleeps) < 4:
+                await real_sleep(0)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert sleeps[0] == 30, f"renew interval {sleeps[0]}s is not a quarter of the 120s TTL"
+    assert len(queue.renew_calls) >= 4, "lease loop stopped renewing"
+    assert set(queue.renew_calls) == {"scan-lease"}

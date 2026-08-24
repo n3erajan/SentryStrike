@@ -6,7 +6,7 @@
 # The worker drives Playwright/Chromium for browser-based crawling, so it is
 # built on the official Playwright Python image whose Chromium build and OS
 # libraries are matched to the pinned playwright==1.60.0 wheel. Do NOT bump the
-# base tag independently of scanner/requirements.txt — the browser and the
+# base tag independently of scanner/requirements.txt - the browser and the
 # client library must agree.
 # ---------------------------------------------------------------------------
 FROM mcr.microsoft.com/playwright/python:v1.60.0-noble

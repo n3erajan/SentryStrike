@@ -1,4 +1,4 @@
-"""Issue 4 — a target-controlled robots.txt must not turn into SSRF.
+"""Issue 4 - a target-controlled robots.txt must not turn into SSRF.
 
 robots.txt can declare ``Sitemap:`` directives, and those URLs are fully
 attacker-controlled. The crawler used to fetch every declared sitemap URL before

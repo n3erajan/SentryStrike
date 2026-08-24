@@ -4,7 +4,7 @@ The browser crawl has a finite time budget. Visiting routes in raw discovery
 order spends that budget on low-value pages while high-value ones (auth, forms,
 search, API-bearing routes) are never reached before truncation. This module
 provides a pure, unit-testable :func:`score_route_surface` that ranks a route by
-**generic** structural signals only — token *families* and shape, never a full
+**generic** structural signals only - token *families* and shape, never a full
 path, app name, parameter, or credential. The crawl uses the score to drive a
 priority queue so the highest-surface routes are visited first.
 """
@@ -80,7 +80,7 @@ def _path_tokens(path: str) -> list[str]:
 def score_route_surface(url: str, evidence: str = "") -> int:
     """Rank a route by generic vulnerability-surface signals (higher = sooner).
 
-    Signals (all generic — token families and structure, no full-path matching):
+    Signals (all generic - token families and structure, no full-path matching):
 
     * a query string present (carries injectable parameters),
     * path tokens from a high/medium value family (auth, forms, api, …),

@@ -145,7 +145,7 @@ def test_exception_detector_only_analyzes_response_snippet() -> None:
 
 def test_bare_500_without_disclosure_is_not_verbose_error() -> None:
     # A 500 whose body carries a generic message (no stack trace, file path,
-    # SQL echo or framework exception) is not "verbose error handling" — even
+    # SQL echo or framework exception) is not "verbose error handling" - even
     # when the response ships tech-fingerprint headers. Reporting one such 500
     # per fuzzed parameter was the dominant error-handling noise source.
     detector = ExceptionHandlingDetector()
@@ -164,7 +164,7 @@ def test_bare_500_without_disclosure_is_not_verbose_error() -> None:
 
 def test_500_with_stack_trace_is_still_reported() -> None:
     # A genuine internal disclosure (a language stack trace / SQL echo) is still
-    # reported — the tightening only drops content-free error statuses.
+    # reported - the tightening only drops content-free error statuses.
     detector = ExceptionHandlingDetector()
     finding = detector._analyse_response(
         url="https://example.test/api/search",
@@ -186,8 +186,8 @@ def test_500_with_stack_trace_is_still_reported() -> None:
 
 def test_node_stack_trace_500_is_reported() -> None:
     # A Node/Express stack trace is a server-generated error message containing
-    # sensitive information (CWE-550) — it leaks file paths and framework
-    # internals — and belongs to A10 regardless of language. The bare-500 noise
+    # sensitive information (CWE-550) - it leaks file paths and framework
+    # internals - and belongs to A10 regardless of language. The bare-500 noise
     # drop must not swallow a genuine stack trace of any stack.
     detector = ExceptionHandlingDetector()
     finding = detector._analyse_response(
@@ -267,7 +267,7 @@ def test_direct_fuzz_ignores_bare_query_echo_in_page_content() -> None:
 
 def test_direct_fuzz_still_reports_real_sql_engine_error() -> None:
     # The query-echo exclusion must not suppress a genuine DB engine error that
-    # happens to also contain a query echo — the specific engine-error pattern
+    # happens to also contain a query echo - the specific engine-error pattern
     # keeps the finding.
     detector = ExceptionHandlingDetector()
 

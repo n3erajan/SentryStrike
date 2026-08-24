@@ -30,7 +30,7 @@ class ContentMatch:
     substring used to be discarded the moment the branch returned. Every
     consumer downstream then re-derived "what was the proof?" independently:
     the snippet builder guessed with its own marker lists, and the AI
-    adjudicator was handed a window that need not contain the match at all —
+    adjudicator was handed a window that need not contain the match at all -
     so it judged pattern-match findings without ever seeing the pattern's
     output. Capturing the span once, here, is what makes those findings
     adjudicable.
@@ -191,7 +191,7 @@ class SensitivePathsDetector(BaseDetector):
 
     @staticmethod
     def _shannon_entropy(text: str) -> float:
-        """Bits per character — separates real secrets from prose and markup.
+        """Bits per character - separates real secrets from prose and markup.
 
         A high-entropy token looks like a key; ``Password:<br><input`` and
         ``YOUR_API_KEY_HERE`` do not. The adjudicator weighs this alongside the
@@ -572,7 +572,7 @@ class SensitivePathsDetector(BaseDetector):
 
         Every probe in this detector carries the scan session, so a ``Cookie:``
         header in the evidence records what the scanner sent, not what the
-        server demanded — and downstream that header is read as proof the
+        server demanded - and downstream that header is read as proof the
         target is privilege-gated, costing a full CVSS band. One credential-free
         GET settles the question with evidence: if the same classification still
         holds, the exposure is open to anyone and the finding earns ``PR:N``.
@@ -834,8 +834,8 @@ class SensitivePathsDetector(BaseDetector):
         (both sides normalized to a trailing slash), so ``/config/`` can never
         absorb ``/config2/``. Only listings actually produced are considered, so
         when a parent directory is forbidden its deepest reachable descendant
-        becomes the root. The survivor keeps the ancestor's URL — the right
-        place to point a reader — and carries the folded paths as evidence.
+        becomes the root. The survivor keeps the ancestor's URL - the right
+        place to point a reader - and carries the folded paths as evidence.
 
         Repository proof is promoted rather than discarded: a tree containing a
         confirmed version-control listing IS an exposed repository, even when

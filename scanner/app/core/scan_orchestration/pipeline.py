@@ -17,7 +17,12 @@ from app.core.scan_orchestration.progress import _EtaState
 from app.core.verification.verification_framework import FindingDeduplicator, TestPollutionFilter
 from app.utils.cvss_calculator import CvssCalculator
 from app.utils.scan_metrics import begin_request_counting, end_request_counting, snapshot_request_counts
-from app.core.request_governor import begin_governor, end_governor, denied_snapshot
+from app.core.request_governor import (
+    begin_governor,
+    denied_snapshot,
+    end_governor,
+    snapshot as governor_admitted_snapshot,
+)
 from shared.analysis_handoff import ensure_initial_analysis_job
 from shared.finding_rollups import apply_finding_rollups
 from shared.models.scan import CrawlMode, DetectorCoverageMetric, ScanPhase, ScanStatus
@@ -49,7 +54,7 @@ def _detector_progress_message(done: int, total: int, findings_count: int) -> st
     """Phase message for the detector stage.
 
     ``done`` counts detectors that have *finished*. Every detector is launched
-    concurrently, so this is never a "currently running" count — phrasing it as
+    concurrently, so this is never a "currently running" count - phrasing it as
     one (the old "Running detectors 3/13") read as though only 3 of 13 were
     working. The heartbeat ticker and the per-completion update share this one
     string: both counts only change when a detector completes, so emitting the
@@ -139,7 +144,7 @@ class PipelineMixin:
             crawl_result.parameters = [p for p in crawl_result.parameters if is_same_origin(target_url, getattr(p, "url", ""))]
             # A form is in scope only when its resolved submission target is same-origin.
             # page_url resolves relative/empty actions but is not scope proof on its
-            # own — otherwise a same-origin page with an off-origin action could
+            # own - otherwise a same-origin page with an off-origin action could
             # send active payloads and credentials to a third party.
             crawl_result.forms = self._scope_forms_to_origin(target_url, crawl_result.forms, is_same_origin)
 
@@ -356,8 +361,8 @@ class PipelineMixin:
                         await asyncio.sleep(3.0)
                         governor_counts = denied_snapshot()
                         if governor_counts:
-                            total_allowed = sum(sum(stats.values()) for source, stats in governor_counts.items() if source == "allowed")
-                            total_denied = sum(sum(stats.values()) for source, stats in governor_counts.items() if source != "allowed")
+                            total_denied = sum(governor_counts.values())
+                            total_allowed = sum(governor_admitted_snapshot().values())
                             if total_allowed > 0:
                                 self._eta_state.governor_denial_rate = total_denied / max(1, total_allowed)
                                 
@@ -535,6 +540,13 @@ class PipelineMixin:
                 if ticker_task is not None:
                     ticker_task.cancel()
                     await asyncio.gather(ticker_task, return_exceptions=True)
+                # Snapshot the tested-surface ledger while its ContextVar is
+                # still live. Done in ``finally`` so a cancelled or failed
+                # detector phase still reports the surface it did test, instead
+                # of reporting none.
+                self._capture_tested_surface(
+                    scan, requests_denied_by_budget=sum(denied_snapshot().values())
+                )
                 end_request_counting()
                 end_governor()
             self._apply_detector_request_counts(

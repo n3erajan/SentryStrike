@@ -48,7 +48,7 @@ class ScanQueueSettings(_RootSettings):
         alias="SCAN_LEASE_KEY_PREFIX",
     )
     scan_lease_ttl_seconds: int = Field(
-        default=30,
+        default=120,
         ge=10,
         alias="SCAN_LEASE_TTL_SECONDS",
     )

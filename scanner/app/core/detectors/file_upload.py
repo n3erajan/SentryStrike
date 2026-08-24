@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from html import unescape
 from urllib.parse import urljoin, urlparse
@@ -33,7 +35,7 @@ class FileUploadDetector(BaseDetector):
 
     # A file upload is a state-changing operation: it is carried only by a
     # request method with a meaningful body (POST/PUT/PATCH). GET/HEAD/DELETE/
-    # OPTIONS candidates are never upload sinks — they arise when the crawler
+    # OPTIONS candidates are never upload sinks - they arise when the crawler
     # observed a plain data request to a URL that superficially matched an upload
     # field/path heuristic. Testing them produces false positives: a GET data
     # endpoint ignores the multipart body, so every file type yields an identical
@@ -144,7 +146,15 @@ class FileUploadDetector(BaseDetector):
                 try:
                     await self._test_uploads(client, findings, candidate)
                 except Exception as exc:
-                    logger.error("File upload test failed for %s: %s", candidate.url, exc)
+                    # ``%s`` alone renders httpx transport errors (ReadTimeout,
+                    # ConnectError, RemoteProtocolError) as an empty string, which
+                    # turns a lost Critical finding into an unexplainable blank
+                    # log line. Always record the type, and the traceback at debug.
+                    logger.error(
+                        "File upload test failed for %s: %s: %s",
+                        candidate.url, type(exc).__name__, exc or "<no message>",
+                    )
+                    logger.debug("File upload test traceback for %s", candidate.url, exc_info=True)
 
         return findings
 
@@ -389,20 +399,20 @@ class FileUploadDetector(BaseDetector):
         # --- Test 6: XML entity-parser differential (bounded, safe) ---
         await self._test_xml_parser(client, findings, candidate)
 
-        # --- Test 7: real XXE — external entity file disclosure (reflected) ---
+        # --- Test 7: real XXE - external entity file disclosure (reflected) ---
         await self._test_xxe_external_entity(client, findings, candidate)
 
         # --- Test 8: type-allowlist bypass (accept-differential, no retrieval) ---
         # A secure upload endpoint enforces a type allowlist and REJECTS dangerous
         # active-content / executable types. When a benign allowed type AND a
         # dangerous active-content type are accepted IDENTICALLY, the endpoint
-        # applies no server-side file-type validation (CWE-434) — a real weakness
+        # applies no server-side file-type validation (CWE-434) - a real weakness
         # even when the stored file is never served back (so Tests 1-5, which all
         # require retrieval/execution to confirm, stay silent).
         #
         # Zero-FP anchor: we ALSO require the endpoint to REJECT an oversized upload.
         # That proves it runs real server-side upload validation (a size guard), so
-        # accepting the dangerous type is a genuine gap — not a permissive stub that
+        # accepting the dangerous type is a genuine gap - not a permissive stub that
         # merely echoes 2xx to everything (which we cannot distinguish from a real
         # handler and must not flag). Framework-agnostic: keyed on the accept/reject
         # differential, never on a target path.
@@ -474,7 +484,7 @@ class FileUploadDetector(BaseDetector):
 
     # A bounded, entirely internal XML entity. There is NO external reference
     # (no SYSTEM/http/file) and NO recursive expansion, so it can never cause an
-    # SSRF, file read, or billion-laughs blow-up — it only reveals whether the
+    # SSRF, file read, or billion-laughs blow-up - it only reveals whether the
     # parser expands entities at all, a precondition for XXE.
     _XML_ENTITY_CANARY = "SENTRY_XXE_ENTITY_CANARY"
     _XML_ENTITY_DOC = (
@@ -488,8 +498,8 @@ class FileUploadDetector(BaseDetector):
 
     # External-entity (real XXE) probes. Each references a benign, universally
     # present read-only OS file; the signature is content that appears ONLY when
-    # the parser resolves the external entity and reflects it — never in our own
-    # payload — so a match is undeniable proof of arbitrary file disclosure (zero
+    # the parser resolves the external entity and reflects it - never in our own
+    # payload - so a match is undeniable proof of arbitrary file disclosure (zero
     # false positive). Read-only and bounded (one small doc per probe). No SSRF,
     # no write, no recursion. Covers the two dominant server OS families so the
     # check is target-agnostic (a Linux or Windows backend each has one hit).
@@ -622,7 +632,7 @@ class FileUploadDetector(BaseDetector):
                 payload="sentry_entity.xml",
                 evidence=(
                     "Uploaded XML had its internal entity expanded and reflected in "
-                    "the response — the parser resolves entities, a precondition for "
+                    "the response - the parser resolves entities, a precondition for "
                     "XXE. Bounded internal-only entity was used (no external fetch)."
                 ),
                 confidence_score=70.0,
@@ -696,7 +706,7 @@ class FileUploadDetector(BaseDetector):
             body = response.text or ""
             match = signature.search(body)
             # The signature is reflected file content, never present in our
-            # payload — any match proves external-entity resolution + disclosure.
+            # payload - any match proves external-entity resolution + disclosure.
             if not match:
                 continue
             disclosed = body[match.start(): match.start() + 80]
@@ -716,7 +726,7 @@ class FileUploadDetector(BaseDetector):
                 evidence=(
                     "Uploaded XML with an external SYSTEM entity "
                     f"({uri}) was resolved server-side and the referenced file's "
-                    "content was reflected in the response — arbitrary file "
+                    "content was reflected in the response - arbitrary file "
                     f"disclosure via XXE. Disclosed content: {disclosed!r}."
                 ),
                 confidence_score=95.0,
@@ -733,6 +743,47 @@ class FileUploadDetector(BaseDetector):
             ))
             return
 
+    # A single slow response must not discard an upload test. Uploads are the
+    # heaviest request a detector sends (multipart body, server-side file write,
+    # often an antivirus or image-resize hook), so they are the first thing to
+    # exceed the shared request timeout while the rest of the scan hammers the
+    # same host. Losing that race used to abort the whole candidate and report
+    # "no findings" - silently downgrading a Critical to nothing.
+    _TRANSPORT_RETRIES = 2
+    _TRANSPORT_RETRY_DELAY_S = 0.5
+
+    async def _with_transport_retry(
+        self,
+        send: "Callable[[], Awaitable[httpx.Response]]",
+        *,
+        label: object = "",
+    ) -> httpx.Response:
+        """Await ``send()``, retrying transport-level failures.
+
+        Only ``httpx.TransportError`` (timeouts, connection resets, protocol
+        errors) is retried - those say nothing about the target's behaviour. HTTP
+        error *statuses* are returned untouched, because a 403/413 is a real
+        answer about whether the upload was accepted.
+
+        Takes a callable rather than request kwargs so it wraps whichever client
+        method a call site already uses.
+        """
+        last_exc: httpx.TransportError | None = None
+        for attempt in range(self._TRANSPORT_RETRIES + 1):
+            try:
+                return await send()
+            except httpx.TransportError as exc:
+                last_exc = exc
+                if attempt < self._TRANSPORT_RETRIES:
+                    logger.debug(
+                        "upload request to %s failed (%s); retry %d/%d",
+                        label, type(exc).__name__,
+                        attempt + 1, self._TRANSPORT_RETRIES,
+                    )
+                    await asyncio.sleep(self._TRANSPORT_RETRY_DELAY_S)
+        assert last_exc is not None
+        raise last_exc
+
     async def _send_upload(
         self,
         client: httpx.AsyncClient,
@@ -747,14 +798,17 @@ class FileUploadDetector(BaseDetector):
         files = {candidate.file_field: (filename, content, content_type)}
 
         # The original ternary ``method="POST" if method != "POST" else method``
-        # was inverted — it always resolved to "POST". The corrected form below
+        # was inverted - it always resolved to "POST". The corrected form below
         # normalise the value - just pass method directly.
-        response = await client.request(
-            method=candidate.method,
-            url=candidate.url,
-            data=data,
-            files=files,
-            headers=candidate.headers or None,
+        response = await self._with_transport_retry(
+            lambda: client.request(
+                method=candidate.method,
+                url=candidate.url,
+                data=data,
+                files=files,
+                headers=candidate.headers or None,
+            ),
+            label=candidate.url,
         )
         body = response.text or ""
         accepted = (
@@ -1029,7 +1083,12 @@ class FileUploadDetector(BaseDetector):
     ) -> str | None:
         for url in candidate_urls:
             try:
-                resp = await client.get(url)
+                # Retried: a timeout here is not evidence the file is
+                # inaccessible, but the bare ``continue`` below would treat it as
+                # exactly that and downgrade a real finding to a miss.
+                resp = await self._with_transport_retry(
+                    lambda: client.get(url), label=url,
+                )
                 if resp.status_code == 200 and canary in (resp.text or ""):
                     return url
             except Exception:

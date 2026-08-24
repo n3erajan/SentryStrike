@@ -150,7 +150,7 @@ class FormAuthProbeMixin:
             # length / status for success detection.
             #
             # When the login identifier is an e-mail (the common case for both SPAs
-            # and traditional apps), a bare "admin" never authenticates — the
+            # and traditional apps), a bare "admin" never authenticates - the
             # candidates must be e-mails on the app's OWN domain. Harvest that
             # domain (and any observed accounts) from what the target itself
             # exposed and synthesise privileged e-mail candidates; this is the same
@@ -266,7 +266,7 @@ class FormAuthProbeMixin:
 
                     # --- Protection signal: stop the sequence early -------------
                     # 401/403 is the EXPECTED per-attempt rejection of a wrong
-                    # credential, NOT a lockout — treating it as one aborts the
+                    # credential, NOT a lockout - treating it as one aborts the
                     # sequence after the first failed pair (so default creds are
                     # never reached on any API that rejects with 401). Only a
                     # genuine throttle/lockout (429/423) or a rate-limit message

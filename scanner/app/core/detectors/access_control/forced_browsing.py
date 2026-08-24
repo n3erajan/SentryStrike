@@ -39,7 +39,7 @@ class ForcedBrowsingMixin:
             segments = {seg for seg in path_lower.split("/") if seg}
             # A dotfile / VCS-metadata segment (``.git``, ``.env``, ``.htaccess``,
             # ``.svn``, ``.hg``, ``.ssh``, ``.DS_Store`` …) is never gated
-            # functionality — it is accidental file exposure (A02 Security
+            # functionality - it is accidental file exposure (A02 Security
             # Misconfiguration), owned by the sensitive_paths detector, which
             # confirms it by content. Skip such paths here so forced browsing
             # (A01) does not re-report the same exposure under a second OWASP

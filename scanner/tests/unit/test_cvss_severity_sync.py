@@ -37,7 +37,7 @@ def test_path_traversal_cvss_reflects_high_severity():
     ],
 )
 def test_access_control_family_not_underscored(vuln_type):
-    """Broken-authorization findings read others' PII/secrets — Confidentiality
+    """Broken-authorization findings read others' PII/secrets - Confidentiality
     High. Regression: these titles matched NO CVSS profile (substring match),
     so they fell to the generic default (C:L) and were reported Low. They must
     now match an access-control profile with C:H."""
@@ -47,7 +47,7 @@ def test_access_control_family_not_underscored(vuln_type):
 
 
 def test_mass_assignment_scores_integrity_high():
-    """Mass assignment mutates a privilege field — Integrity High, not the
+    """Mass assignment mutates a privilege field - Integrity High, not the
     generic read default."""
     result = CvssCalculator.from_vulnerability_context(
         "Mass Assignment / Privilege Field Injection", requires_auth=True

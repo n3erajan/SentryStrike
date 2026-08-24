@@ -119,7 +119,7 @@ def test_error_fingerprint_per_stack(label):
 
 
 def test_generality_breadth():
-    # Every distinct stack in the corpus is detected — proves this is not
+    # Every distinct stack in the corpus is detected - proves this is not
     # hardcoded to one target.
     all_detected: set[str] = set()
     for body, _, _ in _CORPUS.values():

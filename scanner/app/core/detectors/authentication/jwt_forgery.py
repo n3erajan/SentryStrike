@@ -17,7 +17,7 @@ class ActiveJwtForgeryMixin:
         access proves signature verification is broken. The oracle differential is
         measured by status code OR response body (identity claim reflection), and the
         forged token is replayed in the SAME carrier (Authorization header or cookie)
-        the application actually reads — so the check works for header- and cookie-
+        the application actually reads - so the check works for header- and cookie-
         based JWT auth alike. Idempotent GET only; runs solely when an observed
         JWT-carrying GET oracle exists, so it adds near-zero cost otherwise. Session
         cookies are excluded so acceptance is attributable to the forged token alone.
@@ -39,7 +39,7 @@ class ActiveJwtForgeryMixin:
                 carrier = oracle["carrier"]
                 header, payload = self._decode_jwt(oracle["base_token"])
 
-                # (label, token, canary) — canary None means unchanged payload.
+                # (label, token, canary) - canary None means unchanged payload.
                 forged: list[tuple[str, str, str | None]] = [
                     (label, token, None) for label, token in self._forge_alg_none(header, payload)
                 ]
@@ -91,7 +91,7 @@ class ActiveJwtForgeryMixin:
                             evidence=(
                                 f"A forged JWT ({label}) built from the scanner's own token, presented via the "
                                 f"{carrier_desc}, was accepted by an authentication-gated endpoint: {proof_text}. "
-                                "Signature verification is not enforced — any user or role can be impersonated."
+                                "Signature verification is not enforced - any user or role can be impersonated."
                             ),
                             verified=True,
                             detection_method="jwt_active_forgery",

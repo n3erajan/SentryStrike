@@ -10,6 +10,7 @@ import pytest
 from app.core.scanner import ScanOrchestrator
 from app.core.crawler.spider import TargetUnreachableError
 from app.core.detectors.base_detector import Finding
+from app.utils.http_logging import log_http_response
 from shared.models.scan import CrawlMode, ScanPhase, ScanStatus
 from shared.models.vulnerability import OwaspCategory, SeverityLevel, TechnologyComponent
 
@@ -275,7 +276,10 @@ async def test_cancelling_detection_does_not_leave_progress_ticker_running() -> 
     orchestrator.supply_chain_detector = FakeDetector()
 
     scan_task = asyncio.create_task(orchestrator.run_scan("mock-id"))
-    await asyncio.wait_for(detector_started.wait(), timeout=1)
+    # The phases before detection do real network work (technology enrichment,
+    # version probing), so how long they take is machine- and order-dependent. A
+    # 1s budget made this test fail whenever it ran after another full-scan test.
+    await asyncio.wait_for(detector_started.wait(), timeout=15)
     scan_task.cancel()
     await asyncio.wait_for(scan_task, timeout=1)
 
@@ -394,3 +398,118 @@ async def test_full_scan_against_mock_server():
         httpd.shutdown()
         httpd.server_close()
         server_thread.join()
+
+
+@pytest.mark.asyncio
+async def test_scanner_workflow_records_the_surface_it_actually_tested(caplog) -> None:
+    """The persisted tested-surface inventory must match the requests the run
+    really dispatched, and must exclude a path nothing ever requested.
+
+    Cross-derivation: the inventory is compared against the ``sentry.http`` log
+    lines emitted during the same run, which are produced independently of the
+    ledger. Both are reconstructions of the same traffic, so they must agree.
+    """
+    import logging
+    import re
+
+    scan = FakeScan()
+    repository = FakeRepo(scan)
+
+    class ProbingDetector:
+        """A detector that sends (logs) real request traffic like the live ones."""
+
+        name = "injection_sql_command"
+
+        async def detect(self, urls, forms, **kwargs):
+            log_http_response("GET", "https://example.com/search?q=payload", 200, module="sqli", parameter="q")
+            log_http_response("GET", "https://example.com/search?q=other", 500, module="sqli", parameter="q")
+            log_http_response("POST", "https://example.com/login", 302, module="sqli", parameter="username")
+            # Sent but unanswered - probed, not cleared.
+            log_http_response("GET", "https://example.com/slow", 0, module="sqli", parameter="id")
+            # A path-guessing miss: the resource is absent, not tested.
+            log_http_response("GET", "https://example.com/ghost", 404, module="sqli", parameter="id")
+            return []
+
+    class SilentSupplyChain:
+        """Correlates the fingerprinted stack; dispatches no requests of its own."""
+
+        name = "supply_chain"
+
+        async def detect(self, urls, forms, **kwargs):
+            return []
+
+    orchestrator = ScanOrchestrator(repository)
+    orchestrator.spider = FakeSpider()
+    orchestrator.technology_detector = FakeTechDetector()
+    orchestrator.cve_service = FakeCveService()
+    orchestrator.ssl_analyzer = FakeSsl()
+    orchestrator.detectors = [ProbingDetector()]
+    orchestrator.supply_chain_detector = SilentSupplyChain()
+    orchestrator.prioritizer = FakePrioritizer()
+    orchestrator.false_positive = FakeFP()
+    orchestrator.remediation_gen = FakeRemediation()
+
+    with caplog.at_level(logging.INFO, logger="sentry.http"):
+        await orchestrator.run_scan("mock-id")
+
+    coverage = scan.report_metadata.tested_surface
+    by_path = {path.path: path for path in coverage.tested_paths}
+
+    # /search and /login answered; /slow never responded and /ghost 404'd, so
+    # neither counts as surface that was tested.
+    assert coverage.paths_tested == 2
+    assert coverage.paths_probed_by_detector == 2
+    assert coverage.paths_absent == 1
+    assert coverage.paths_existence_unconfirmed == 1
+    assert coverage.parameters_tested == 2
+    assert coverage.detectors_exercised == ["injection_sql_command"]
+    assert coverage.browser_probes_itemised is False
+
+    # Query strings collapse; the parameter is named; both statuses are kept.
+    search = by_path["https://example.com/search"]
+    assert search.methods == ["GET"]
+    assert [p.name for p in search.parameters] == ["q"]
+    assert search.status_codes == [200, 500]
+    assert search.requests == 2
+
+    # A path that only 404'd is counted as absent, never listed as tested.
+    assert "https://example.com/ghost" not in by_path
+    assert coverage.requests_to_absent_paths == 1
+
+    # An unanswered probe establishes nothing, so its path is not tested surface.
+    assert "https://example.com/slow" not in by_path
+    assert coverage.requests_without_response >= 1
+
+    # A path the scan never requested must not appear as tested.
+    assert "https://example.com/admin" not in by_path
+
+    # Independent reconstruction from the log stream, limited to the paths that
+    # answered - the ledger and the log must agree on those.
+    logged = set()
+    for record in caplog.records:
+        if record.name != "sentry.http":
+            continue
+        message = record.getMessage()
+        request = re.match(r"HTTP (\w+) (\S+)", message)
+        module = re.search(r"module=([^ |]+)", message)
+        status = re.search(r"status=(-?\d+)", message)
+        if not request or not module or not status:
+            continue
+        if int(status.group(1)) in (0, 404, 410):
+            continue
+        parameter = re.search(r"parameter=([^ |]+)", message)
+        logged.add(
+            (
+                module.group(1),
+                request.group(1),
+                request.group(2).split("?")[0],
+                parameter.group(1) if parameter else "",
+            )
+        )
+    ledgered = {
+        ("sqli", method, path.path, parameter.name)
+        for path in coverage.tested_paths
+        for method in path.methods
+        for parameter in path.parameters
+    }
+    assert ledgered == {entry for entry in logged if entry[0] == "sqli"}

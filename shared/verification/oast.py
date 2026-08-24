@@ -10,7 +10,7 @@ import httpx
 
 # Genuine scanner-minted interaction ids only: new_callback_url() mints
 # f"{purpose}-{uuid4().hex}", where uuid4().hex is exactly 32 lowercase hex
-# chars. This anchored pattern is the "genuine uuid" gate — random strings,
+# chars. This anchored pattern is the "genuine uuid" gate - random strings,
 # traversal probes, wrong length/case all fail it, so they are never stored.
 INTERACTION_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}-[0-9a-f]{32}$")
 

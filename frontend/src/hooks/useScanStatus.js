@@ -19,7 +19,7 @@ function stageForProgress(progress, status, currentPhase) {
   return Math.max(1, Math.min(SCAN_PHASES.length - 1, idx));
 }
 
-// The worker reports several distinct messages under one phase key — detector
+// The worker reports several distinct messages under one phase key - detector
 // progress alone walks from "Running 12 active detectors" to "Detectors 7/12
 // complete". Deduping on the phase key would freeze the log at each phase's
 // first message, so key on the phase and message together. Returns the key to
@@ -34,7 +34,7 @@ function nextPhaseLogKey(status, phase, message, lastKey) {
 // cancellation remains pending until the scanner worker acknowledges it.
 //
 // AI enrichment runs in a separate analyzer worker after the scan itself
-// completes, so `analysis` keeps updating past the scan's terminal status —
+// completes, so `analysis` keeps updating past the scan's terminal status -
 // polling continues until that reaches a terminal state too.
 function useScanStatus(scanId) {
   const [status, setStatus] = useState(null);
@@ -159,7 +159,7 @@ function useScanStatus(scanId) {
         }
         // Enrichment is still in flight; keep polling even once the scan is
         // done. `not_requested` also counts as pending, because the analyzer
-        // handoff lands a moment after the scan flips to completed — but the
+        // handoff lands a moment after the scan flips to completed - but the
         // post-completion polling is capped so a job that never gets enqueued
         // (AI analysis disabled, analyzer down) doesn't poll forever.
         const analysisTerminal = ["completed", "failed", "cancelled"].includes(

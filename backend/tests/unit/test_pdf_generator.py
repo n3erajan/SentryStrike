@@ -8,6 +8,7 @@ from app.utils.pdf_generator import (
     build_remediation_roadmap,
     build_scan_pdf,
     build_statistics,
+    build_tested_surface,
     build_styles,
     build_vulnerability_summary,
     full_code_block,
@@ -568,3 +569,118 @@ def test_pdf_escapes_dynamic_markup_in_ai_text() -> None:
 
     assert pdf.startswith(b"%PDF")
     assert len(pdf) > 1000
+
+
+def test_pdf_tested_surface_reports_measured_coverage_and_gaps() -> None:
+    """The coverage section states what was tested from the request ledger, names
+    the reached-but-unprobed gap, and reproduces the scanner's own warnings."""
+    scan_data = {
+        "data": {
+            "tested_surface": {
+                "paths_tested": 12,
+                "paths_probed_by_detector": 9,
+                "parameters_tested": 27,
+                "requests_sent": 1840,
+                "requests_without_response": 4,
+                "requests_denied_by_budget": 61,
+                "detectors_exercised": ["injection_sql_command", "xss"],
+                "tested_paths": [{"path": "http://t/a", "methods": ["GET"]}],
+                "tested_paths_truncated": False,
+                "tested_paths_omitted": 0,
+                "ledger_entries_omitted": 0,
+                "browser_probes_itemised": False,
+            },
+            "coverage_warnings": [
+                "No second-user account configured; horizontal IDOR comparison was not tested.",
+            ],
+        }
+    }
+
+    text = _flowable_text(build_tested_surface(scan_data, build_styles()))
+
+    assert "Tested Surface" in text
+    assert "Existing Paths Reached" in text and "12" in text
+    assert "Paths Probed by a Detector" in text and "9" in text
+    assert "Parameters Tested" in text and "27" in text
+    assert "1840" in text
+    assert "Requests Denied by Request Budget" in text and "61" in text
+    # The reached-but-never-probed gap is spelled out, not left for the reader.
+    assert "3 of the 12 existing paths reached" in text
+    assert "treat" in text and "untested" in text
+    # Browser probes are disclosed as unlisted rather than silently missing.
+    assert "Browser-driven probes" in text
+    # The scanner's own coverage warning is reproduced verbatim.
+    assert "horizontal IDOR comparison was not tested" in text
+    assert "Coverage Gaps" in text
+
+
+def test_pdf_tested_surface_distinguishes_unrecorded_from_nothing_tested() -> None:
+    """A scan with no ledger (predating the feature) must not print zeros that
+    would read as 'nothing was tested'."""
+    text = _flowable_text(build_tested_surface({"data": {}}, build_styles()))
+
+    assert "No tested-surface inventory was recorded" in text
+    assert "does not mean nothing was tested" in text
+    # With no recorded gaps, the section still refuses to imply full coverage.
+    assert "not that the whole" in text
+
+
+def test_pdf_tested_surface_reports_truncated_inventory() -> None:
+    scan_data = {
+        "data": {
+            "tested_surface": {
+                "paths_tested": 640,
+                "paths_probed_by_detector": 640,
+                "parameters_tested": 900,
+                "requests_sent": 9000,
+                "tested_paths": [{"path": f"http://t/p{i}"} for i in range(500)],
+                "tested_paths_truncated": True,
+                "tested_paths_omitted": 140,
+                "ledger_entries_omitted": 12,
+                "browser_probes_itemised": False,
+            }
+        }
+    }
+
+    text = _flowable_text(build_tested_surface(scan_data, build_styles()))
+
+    assert "140 further tested paths exceeded the storage" in text
+    assert "12 distinct parameter probes exceeded the" in text
+
+
+def test_pdf_tested_surface_separates_404_probes_from_tested_surface() -> None:
+    """Path-guessing checks probe thousands of URLs that do not exist. The report
+    must count those apart from tested surface, or a DVWA scan claims 2,873
+    tested paths against an app with a few dozen."""
+    scan_data = {
+        "data": {
+            "tested_surface": {
+                "paths_tested": 34,
+                "paths_probed_by_detector": 34,
+                "paths_absent": 2839,
+                "paths_existence_unconfirmed": 2,
+                "requests_to_absent_paths": 4102,
+                "parameters_tested": 166,
+                "requests_sent": 6974,
+                "requests_without_response": 2,
+                "requests_denied_by_budget": 590,
+                "detectors_exercised": ["sensitive_paths", "xss"],
+                "tested_paths": [{"path": "http://t/dvwa/"}],
+                "browser_probes_itemised": False,
+            }
+        }
+    }
+
+    text = _flowable_text(build_tested_surface(scan_data, build_styles()))
+
+    assert "Existing Paths Reached" in text and "34" in text
+    assert "Candidate Paths Found Absent" in text and "2839" in text
+    assert "Requests Proving a Path Absent (404)" in text and "4102" in text
+    # The reader is told plainly why those are not coverage.
+    assert "excluded from the tested surface" in text
+    assert "inflate coverage with paths that do not exist" in text
+    # Unanswered probes are their own bucket, not silently folded into either.
+    assert "Paths With Existence Unconfirmed" in text
+    assert "not established in either direction" in text
+    # The honest request total is still shown.
+    assert "6974" in text

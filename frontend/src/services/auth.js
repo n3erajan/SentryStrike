@@ -1,8 +1,8 @@
-// Auth service — talks to the backend `/auth/*` routes via apiClient.
+// Auth service - talks to the backend `/auth/*` routes via apiClient.
 //
 // Authentication is handled by an HttpOnly session cookie set by the backend
 // on login/register and cleared on logout. The frontend never touches the token
-// — no localStorage, no bearer header management.
+// - no localStorage, no bearer header management.
 //
 // Contract (mounted under /api/v1):
 //   POST /auth/register  { email, password, full_name, invite_token, turnstile_token } -> 201 { user } + set-cookie
@@ -65,6 +65,6 @@ export async function logout() {
   try {
     await apiRequest("/auth/logout", { method: "POST" });
   } catch {
-    // Ignore network/session errors — we clear local state regardless.
+    // Ignore network/session errors - we clear local state regardless.
   }
 }

@@ -1,6 +1,6 @@
 """Aggregate risk-score model: evidence-adjusted, band-preserving breadth.
 
-Standards-aligned properties under test (CVSS base scores must not be averaged —
+Standards-aligned properties under test (CVSS base scores must not be averaged -
 averaging dilutes the worst finding, and an attacker only needs one):
   * the worst finding anchors the score and is never diluted by lower-severity noise
   * additional findings add saturating breadth without crossing the anchor's band
@@ -75,14 +75,14 @@ def test_worst_finding_is_not_diluted_by_low_severity_noise() -> None:
 
     assert band_solo == "Critical"
     assert band_noisy == "Critical"
-    # Noise only adds breadth on top of the anchor — it can never lower the score.
+    # Noise only adds breadth on top of the anchor - it can never lower the score.
     assert score_noisy >= score_solo
     assert score_noisy >= 90.0
 
 
 def test_discriminates_presence_of_a_critical() -> None:
     """Same breadth of findings scores lower without a Critical (High) than with one
-    (Critical) — the old averaging-times-volume formula saturated both near 100."""
+    (Critical) - the old averaging-times-volume formula saturated both near 100."""
     no_crit = [mk(8.0, H)] * 8 + [mk(5.5, M)] * 13 + [mk(2.5, L)] * 4
     with_crit = [mk(9.1, C), mk(9.1, C)] + no_crit
 

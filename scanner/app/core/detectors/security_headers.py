@@ -45,9 +45,9 @@ class SecurityHeadersDetector(BaseDetector):
         if acao == probe:
             if credentials:
                 return ("high", f"reflects an arbitrary request Origin ({probe_origin}) together with "
-                                "Access-Control-Allow-Credentials: true — any website can read this "
+                                "Access-Control-Allow-Credentials: true - any website can read this "
                                 "origin's authenticated responses")
-            return ("medium", f"reflects an arbitrary request Origin ({probe_origin}) — any website can "
+            return ("medium", f"reflects an arbitrary request Origin ({probe_origin}) - any website can "
                               "read cross-origin responses from this origin")
         if acao == "*":
             if credentials:

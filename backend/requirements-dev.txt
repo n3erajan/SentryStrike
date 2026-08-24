@@ -2,7 +2,7 @@
 # Installs the runtime requirements plus the test toolchain.
 #   pip install -r backend/requirements-dev.txt
 #
-# Production images install requirements.txt only — pytest never ships.
+# Production images install requirements.txt only - pytest never ships.
 -r requirements.txt
 
 pytest==8.3.5

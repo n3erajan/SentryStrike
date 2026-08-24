@@ -79,6 +79,32 @@ function titleCase(value) {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : "N/A";
 }
 
+// Detector ids are snake_case module names; title-casing alone yields "Xss" and
+// "Injection sql command". Spell the known ones properly, fall back otherwise.
+const DETECTOR_LABELS = {
+  access_control: "Access control",
+  authentication_failures: "Authentication",
+  crypto_failures: "Cryptographic failures",
+  csrf: "CSRF",
+  exception_handling: "Error handling",
+  file_inclusion: "File inclusion (LFI/RFI)",
+  file_upload: "File upload",
+  injection_sql_command: "SQL / command injection",
+  nosql_injection: "NoSQL injection",
+  open_redirect: "Open redirect",
+  security_headers: "Security headers",
+  sensitive_paths: "Sensitive paths",
+  ssrf: "SSRF",
+  supply_chain: "Supply chain",
+  xss: "XSS",
+  crawler: "Crawler (discovery only)",
+};
+
+function detectorLabel(name) {
+  const key = (name || "").toString().trim();
+  return DETECTOR_LABELS[key] || titleCase(key);
+}
+
 // The AI verdict (confirmed | uncertain | likely_false_positive) is the model's
 // calibrated judgement, reconciled against evidence grade so weak proof can't be
 // over-confirmed. Map it to a label + color class for the finding badge.
@@ -116,6 +142,197 @@ function MetricTable({ title, rows }) {
           <b>{value}</b>
         </div>
       ))}
+    </div>
+  );
+}
+
+// The tested-surface inventory: which paths and parameters the scan actually
+// sent requests to, plus the gaps the scanner recorded. Paginated because a
+// broad scan reaches hundreds of paths and dumping them all buries the report.
+const TESTED_PATH_PAGE = 20;
+
+function CoveragePanel({ surface, warnings }) {
+  const [visible, setVisible] = useState(TESTED_PATH_PAGE);
+  const paths = surface?.tested_paths || [];
+  const recorded = Boolean(surface && Object.keys(surface).length > 0);
+  if (!recorded && warnings.length === 0) return null;
+
+  const pathsTested = surface?.paths_tested ?? 0;
+  const probed = surface?.paths_probed_by_detector ?? 0;
+  const absent = surface?.paths_absent ?? 0;
+  const unconfirmed = surface?.paths_existence_unconfirmed ?? 0;
+  const reachedNotProbed = Math.max(0, pathsTested - probed);
+  const shown = paths.slice(0, visible);
+
+  return (
+    <div className='panel'>
+      <div className='panel-h'>What was tested</div>
+      <div className='panel-b'>
+        {recorded ? (
+          <>
+            <p className='small'>
+              Measured from the requests this scan actually sent - not from the
+              surface found while crawling. Probes the request budget refused are
+              excluded, and a path the target answered only with 404 is recorded
+              as absent rather than as tested surface.
+            </p>
+            <MetricTable
+              title='Tested surface'
+              rows={[
+                ["Existing paths reached", pathsTested],
+                ["Paths probed by a detector", probed],
+                ["Parameters tested", surface.parameters_tested ?? 0],
+                ["Requests sent", surface.requests_sent ?? 0],
+                [
+                  "Requests proving a path absent (404)",
+                  surface.requests_to_absent_paths ?? 0,
+                ],
+                ["Candidate paths found absent", absent],
+                ["Requests with no response", surface.requests_without_response ?? 0],
+                ["Requests denied by budget", surface.requests_denied_by_budget ?? 0],
+              ]}
+            />
+            {absent > 0 && (
+              <p className='small'>
+                Path-guessing checks probed <b>{absent}</b> candidate path
+                {absent === 1 ? "" : "s"} the target answered only with 404/410.
+                Those probes prove a resource is absent, so they are counted above
+                but excluded from the tested surface and from the list below -
+                counting them would inflate coverage with paths that do not exist.
+              </p>
+            )}
+            {unconfirmed > 0 && (
+              <p className='small'>
+                <b>{unconfirmed}</b> path{unconfirmed === 1 ? "" : "s"} never
+                returned a response at all, so whether they exist was not
+                established either way. They are excluded from the tested surface.
+              </p>
+            )}
+            {reachedNotProbed > 0 && (
+              <p className='small'>
+                <b>{reachedNotProbed}</b> of the {pathsTested} existing paths
+                reached were fetched while crawling but never probed by a
+                detector. Treat them as untested.
+              </p>
+            )}
+            {(surface.detectors_exercised || []).length > 0 && (
+              <p className='small'>
+                Detectors that sent traffic:{" "}
+                {surface.detectors_exercised
+                  .map((name) => detectorLabel(name))
+                  .join(", ")}
+                .
+              </p>
+            )}
+            {surface.browser_probes_itemised === false && (
+              <p className='small'>
+                Browser-driven probes (DOM XSS verification, browser crawling) are
+                not itemised below - this inventory covers HTTP-layer traffic only,
+                so browser coverage is understated here rather than absent.
+              </p>
+            )}
+            {shown.length > 0 && (
+              <>
+                <table className='coverage-table'>
+                  <thead>
+                    <tr>
+                      <th>Path</th>
+                      <th>Methods</th>
+                      <th>Parameters tested</th>
+                      <th>Detectors</th>
+                      <th>Requests</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {shown.map((p) => (
+                      <tr key={`${p.path}-${(p.methods || []).join(",")}`}>
+                        <td className='mono' style={{ wordBreak: "break-all" }}>
+                          {p.path}
+                        </td>
+                        <td>{(p.methods || []).join(", ")}</td>
+                        <td>
+                          {(p.parameters || []).length === 0 ? (
+                            <span className='muted-text'>
+                              none - path-level only
+                            </span>
+                          ) : (
+                            <>
+                              {(p.parameters || [])
+                                .map((param) => param.name)
+                                .join(", ")}
+                              {p.parameters_omitted > 0 &&
+                                ` +${p.parameters_omitted} more`}
+                            </>
+                          )}
+                        </td>
+                        <td>
+                          {(p.detectors || [])
+                            .map((name) => detectorLabel(name))
+                            .join(", ")}
+                        </td>
+                        <td>
+                          {p.requests ?? 0}
+                          {p.no_response > 0 && ` (${p.no_response} unanswered)`}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div className='coverage-more'>
+                  <span className='small'>
+                    Showing {shown.length} of {paths.length} existing path
+                    {paths.length === 1 ? "" : "s"}
+                    {surface.tested_paths_omitted > 0 &&
+                      ` - ${surface.tested_paths_omitted} further tested path${
+                        surface.tested_paths_omitted === 1 ? "" : "s"
+                      } exceeded the storage limit and are counted above but not listed`}
+                    .
+                  </span>
+                  {visible < paths.length && (
+                    <button
+                      className='btn'
+                      onClick={() =>
+                        setVisible((count) => count + TESTED_PATH_PAGE)
+                      }
+                    >
+                      Show more
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
+          </>
+        ) : (
+          <p className='small'>
+            No tested-surface inventory was recorded for this scan, so the paths
+            and parameters exercised cannot be listed. This does not mean nothing
+            was tested.
+          </p>
+        )}
+
+        <div className='coverage-gaps'>
+          <b>Coverage gaps - what was not tested</b>
+          {warnings.length > 0 ? (
+            <>
+              <p className='small'>
+                Where a class was not exercised, the absence of findings in that
+                class is not evidence the target is unaffected.
+              </p>
+              <ul className='limitations'>
+                {warnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <p className='small'>
+              The scanner recorded no coverage gaps for this run - every detector
+              it ran sent traffic and its prerequisites were met. That is not the
+              same as having tested the whole application.
+            </p>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -788,7 +1005,7 @@ function ReportPage() {
     );
 
   // Everything below dereferences `report`, so it lives in a closure that only
-  // runs on the loaded branch — the skeleton branch never evaluates it.
+  // runs on the loaded branch - the skeleton branch never evaluates it.
   function renderReport() {
   const stats = report.statistics || {};
   const breakdown = stats.severity_breakdown || {};
@@ -822,12 +1039,9 @@ function ReportPage() {
   const chains = report.attack_chains || [];
   const limitations = report.scanner_limitations || [];
   const authorization = report.authorization || {};
-  const coverage =
-    report.coverage_summary?.overall_coverage_pct ??
-    report.report_metadata?.coverage_percent;
-  const coverageStr = Number.isFinite(coverage)
-    ? `${Math.round(coverage)}%`
-    : "N/A";
+  const testedSurface = report.tested_surface || report.report_metadata?.tested_surface || {};
+  const coverageWarnings =
+    report.coverage_warnings || report.report_metadata?.coverage_warnings || [];
   const analysis = report.analysis || {};
   const analysisStatus = analysis.status || "not_requested";
   const analysisComplete = analysisStatus === "completed";
@@ -916,7 +1130,7 @@ function ReportPage() {
           </div>
           <div className='kv'>
             <span>Verified findings</span>
-            <b>{stats.total_vulnerabilities ?? vulns.length}</b>
+            <b>{stats.active_vulnerabilities ?? stats.total_vulnerabilities ?? vulns.length}</b>
           </div>
           <div className='kv'>
             <span>URLs crawled</span>
@@ -927,8 +1141,12 @@ function ReportPage() {
             <b>{crawlLabel(report.crawl_mode)}</b>
           </div>
           <div className='kv'>
-            <span>Coverage</span>
-            <b>{coverageStr}</b>
+            <span>Paths tested</span>
+            <b>
+              {Number.isFinite(testedSurface.paths_probed_by_detector)
+                ? testedSurface.paths_probed_by_detector
+                : "Not recorded"}
+            </b>
           </div>
           {authCov.state && (
             <div className='kv'>
@@ -982,10 +1200,10 @@ function ReportPage() {
 
       <div className='metric-cols'>
         <MetricTable
-          title='Scan coverage'
+          title='Crawl &amp; auth coverage'
           rows={[
             ["Crawl scope", crawlLabel(report.crawl_mode)],
-            ["URLs crawled", stats.total_urls_crawled ?? "N/A"],
+            ["URLs discovered", stats.total_urls_crawled ?? "N/A"],
             ["Auth state", titleCase(authCov.state) || "Unauthenticated"],
             ["Authed URLs", authCov.authenticated_url_count ?? 0],
             [
@@ -1097,6 +1315,8 @@ function ReportPage() {
           )}
         </div>
       </div>
+
+      <CoveragePanel surface={testedSurface} warnings={coverageWarnings} />
 
       {limitations.length > 0 && (
         <div className='panel'>

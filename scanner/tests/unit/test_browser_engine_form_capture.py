@@ -1,7 +1,7 @@
 """Form-capture robustness against a live headless page (real Chromium).
 
 These tests drive the actual FORM_CAPTURE_SCRIPT so the DOM heuristics are
-exercised for real, not stubbed — covering submit-less framework clusters and
+exercised for real, not stubbed - covering submit-less framework clusters and
 standalone file inputs. Skipped cleanly when a browser cannot be launched (CI
 without the chromium binary).
 """

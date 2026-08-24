@@ -135,7 +135,7 @@ def create_app() -> FastAPI:
     app.include_router(workspace.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
     app.include_router(notifications.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
 
-    # OAST callback collaborator — unauthenticated by design (the tested target
+    # OAST callback collaborator - unauthenticated by design (the tested target
     # is unauthenticated when its server-side fetch calls back). No /api/v1 prefix.
     app.include_router(oast.router)
 

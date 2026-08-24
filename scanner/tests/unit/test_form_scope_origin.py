@@ -1,4 +1,4 @@
-"""Issue 2 — form scope filter must key on the RESOLVED action, not page_url.
+"""Issue 2 - form scope filter must key on the RESOLVED action, not page_url.
 
 A form is an attack target because of where it SUBMITS (its action), not the
 page it appears on. The old filter accepted a form when either its action OR its
@@ -57,7 +57,7 @@ def test_same_origin_absolute_action_is_kept():
 
 
 def test_relative_action_is_resolved_against_page_url_and_kept():
-    """A relative/empty action is legitimate — resolve it against page_url, and
+    """A relative/empty action is legitimate - resolve it against page_url, and
     the resolved absolute action is written back for downstream targeting."""
     form = _form("http://localhost:3000/contact", "/api/Feedbacks")
 

@@ -63,9 +63,9 @@ faster than a character count suggests. Re-measure before increasing them.
 
 ## Accuracy
 
-The labelled corpus in [`../benchmark/`](../benchmark/) holds 31 cases — 21 in
+The labelled corpus in [`../benchmark/`](../benchmark/) holds 31 cases - 21 in
 `corpus.py` plus 10 in `corpus_adversarial.py`, run together with
-`--corpus all` — split 15 genuine and 16 spurious across all ten proof types.
+`--corpus all` - split 15 genuine and 16 spurious across all ten proof types.
 Metrics use FP-flagging as the positive class, matching `run_benchmark.py`:
 
 | Metric | Value |

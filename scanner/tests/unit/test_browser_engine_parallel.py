@@ -206,7 +206,7 @@ async def test_parallel_crawl_visits_all_routes_as_a_set(monkeypatch):
     # is mid-route) fails here instead of hanging the suite.
     await asyncio.wait_for(engine.crawl_into(state, ROOT, routes=[]), timeout=15.0)
 
-    # (a) All routes visited — assert on the SET (order is nondeterministic).
+    # (a) All routes visited - assert on the SET (order is nondeterministic).
     visited_set = {u.rstrip("/") for u in site.visited}
     assert visited_set == EXPECTED
     # (b) No route visited twice: seen_routes claims at enqueue time.
@@ -275,7 +275,7 @@ async def test_parallel_crawl_terminates_with_more_workers_than_routes(monkeypat
 @pytest.mark.asyncio
 async def test_partial_results_survive_hard_cancellation(monkeypatch):
     """RC-1 durability under the pool: a hard cancellation (the spider's safety
-    timeout) still yields whatever each worker streamed — the merge runs in
+    timeout) still yields whatever each worker streamed - the merge runs in
     ``finally`` so per-worker partial observations are never discarded."""
 
     class _SlowFirePage(_Page):
@@ -324,7 +324,7 @@ async def test_partial_results_survive_hard_cancellation(monkeypatch):
     state = CrawlState()
 
     # Hard cancellation after the first observations streamed but before the
-    # (never-arriving) settle completes — mirrors the spider's safety timeout.
+    # (never-arriving) settle completes - mirrors the spider's safety timeout.
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(engine.crawl_into(state, ROOT, routes=[]), timeout=0.3)
 

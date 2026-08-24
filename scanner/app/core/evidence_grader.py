@@ -1,31 +1,31 @@
 """Proof-type-based evidence characterization for false-positive adjudication.
 
-The grader classifies each finding's *proof* — what kind of evidence
-demonstrates the vulnerability — and sets a false-positive ceiling that
+The grader classifies each finding's *proof* - what kind of evidence
+demonstrates the vulnerability - and sets a false-positive ceiling that
 reflects how undeniable that proof is.
 
 The key insight: ``verified=True`` means different things for different finding
 types. For SQLi error-based, ``verified`` means "we saw a DB error string
-echoed" — genuine proof. For access-control data-exposure, ``verified`` means
-"the request returned HTTP 200" — not proof of anything. The grader now
+echoed" - genuine proof. For access-control data-exposure, ``verified`` means
+"the request returned HTTP 200" - not proof of anything. The grader now
 distinguishes these cases via proof types instead of trusting detector
 self-verification uniformly.
 
 Proof types and ceilings
 ------------------------
-active_output     — command output / file contents / canary execution  → 0.05
-error_echo         — DB/framework error string causally connected       → 0.05
-structural         — missing header / TLS / admin path (absence IS vuln) → 0.10
-timing_strong      — delta >=5x baseline, large absolute delta          → 0.15
-timing_weak        — delta <5x baseline or not reproduced                → 0.40
-ssrf_differential  — repeated internal/control behavior difference       → 0.49
-auth_confirmed     — cross-identity/object differential with proof      → 0.15
-auth_differential  — ambiguous access-control / public-data question   → 1.00
-pattern_match      — verbose error / path disclosure (regex hit)        → 1.00
-heuristic          — observable but no active proof                     → 0.40
+active_output     - command output / file contents / canary execution  → 0.05
+error_echo         - DB/framework error string causally connected       → 0.05
+structural         - missing header / TLS / admin path (absence IS vuln) → 0.10
+timing_strong      - delta >=5x baseline, large absolute delta          → 0.15
+timing_weak        - delta <5x baseline or not reproduced                → 0.40
+ssrf_differential  - repeated internal/control behavior difference       → 0.49
+auth_confirmed     - cross-identity/object differential with proof      → 0.15
+auth_differential  - ambiguous access-control / public-data question   → 1.00
+pattern_match      - verbose error / path disclosure (regex hit)        → 1.00
+heuristic          - observable but no active proof                     → 0.40
 
 For ``auth_differential`` and ``pattern_match`` the ceiling is 1.00 (no cap)
-so the AI can flag false positives freely — but it receives a discriminative
+so the AI can flag false positives freely - but it receives a discriminative
 evidence brief (proof markers + weaknesses + judge question) that tells it
 exactly what to evaluate, so its judgment is grounded rather than open-ended.
 """
@@ -66,63 +66,63 @@ class EvidenceGrade:
 # Proof-type classification tables
 # ---------------------------------------------------------------------------
 
-# Detection methods whose output constitutes undeniable proof — the proof
+# Detection methods whose output constitutes undeniable proof - the proof
 # is IN the response (command output, file contents, canary execution, data
 # extraction, boolean differential, CSRF token bypass).
 _ACTIVE_OUTPUT_METHODS: frozenset[str] = frozenset({
-    # SQLi — boolean/union extract data from the DB
+    # SQLi - boolean/union extract data from the DB
     "union_based",
     "boolean_differential",
-    # Command injection — command output in response
+    # Command injection - command output in response
     "command_output",
-    # File inclusion — file contents retrieved
+    # File inclusion - file contents retrieved
     "file_retrieval",
     "path_traversal_file_read",
     "stream_decoding_oracle",
     "remote_include_content_fingerprint",
     "remote_include_error_oracle_content_confirmed",
-    # XSS — browser-confirmed execution
+    # XSS - browser-confirmed execution
     "canary_verified",
     "context_breakout",
     "dom_xss_browser_execution",
-    # CSRF — token tampering proved the request succeeded without valid token
+    # CSRF - token tampering proved the request succeeded without valid token
     "token_bypass",
     "csrf_tamper_test",
-    # SSRF — server fetched internal content (reflected) or OAST callback received
+    # SSRF - server fetched internal content (reflected) or OAST callback received
     "ssrf_reflection",
     "ssrf_oast_callback",
-    # Open redirect — redirect observed (Location header or external redirect)
+    # Open redirect - redirect observed (Location header or external redirect)
     "location_header_redirect",
     "observed_external_location_redirect",
-    # File upload — uploaded file executed / bypassed content-type check
+    # File upload - uploaded file executed / bypassed content-type check
     "file_upload_execution",
     "content_type_bypass_execution",
     "double_extension_execution",
-    # Auth — default creds / credential stuffing succeeded (login confirmed)
+    # Auth - default creds / credential stuffing succeeded (login confirmed)
     "default_credentials_probe",
     "credential_stuffing_probe",
-    # Auth — token still valid after logout (proof: reused token worked)
+    # Auth - token still valid after logout (proof: reused token worked)
     "logout_token_reuse_probe",
     "stream_decoding_oracle",
     "remote_include_error_oracle",
-    # NoSQL — two independent true/false operator families changed output
+    # NoSQL - two independent true/false operator families changed output
     "nosql_boolean_operator",
-    # Access/auth — the response proves the dangerous state was accepted
+    # Access/auth - the response proves the dangerous state was accepted
     "mass_assignment_privilege_field",
     "jwt_active_forgery",
-    # File handling — protected content or an external entity was returned
+    # File handling - protected content or an external entity was returned
     "poison_null_byte_extension_bypass",
     "xxe_external_entity_file_read",
 })
 
-# Detection methods where a DB/framework error string is echoed — the error
+# Detection methods where a DB/framework error string is echoed - the error
 # text IS the proof.
 _ERROR_ECHO_METHODS: frozenset[str] = frozenset({
     "error_based",
     "wrapper_error_analysis",
 })
 
-# Timing-based detection methods — sub-classified strong/weak by delta ratio.
+# Timing-based detection methods - sub-classified strong/weak by delta ratio.
 _TIMING_METHODS: frozenset[str] = frozenset({
     "time_based",
     "time_based_blind",
@@ -140,7 +140,7 @@ _AUTH_CONFIRMED_METHODS: frozenset[str] = frozenset({
     "vertical_idor",
 })
 
-# Access-control detection methods — "200 OK" is not proof; AI must judge
+# Access-control detection methods - "200 OK" is not proof; AI must judge
 # whether the data is genuinely restricted.
 _AUTH_DIFF_METHODS: frozenset[str] = frozenset({
     "authorization_matrix",
@@ -168,7 +168,7 @@ _AUTH_DIFF_KEYWORDS: tuple[str, ...] = (
 )
 
 
-# Pattern-match methods — a regex hit on the response body could be a genuine
+# Pattern-match methods - a regex hit on the response body could be a genuine
 # error, reflected payload, or normal page content. The AI must judge.
 _PATTERN_MATCH_METHODS: frozenset[str] = frozenset({
     "observed_exception_evidence",
@@ -192,7 +192,7 @@ _PATTERN_MATCH_KEYWORDS: tuple[str, ...] = (
     "metrics endpoint",
 )
 
-# Structural vuln types — the observation itself IS the proof (missing header,
+# Structural vuln types - the observation itself IS the proof (missing header,
 # TLS absence, admin path reachability, GET credentials, CSRF token absence,
 # brute-force absence, captcha absence, cookie attribute issues).
 _STRUCTURAL_VULN_KEYWORDS: tuple[str, ...] = (
@@ -289,7 +289,7 @@ class EvidenceGrader:
         """Characterize the finding's proof and set a false-positive ceiling.
 
         Interpretive proof types (auth_differential, pattern_match) get no
-        ceiling so the AI can flag false positives — but it receives a
+        ceiling so the AI can flag false positives - but it receives a
         discriminative evidence brief so its judgment is grounded.
         """
         proof_type = self._classify_proof_type(vuln)
@@ -315,7 +315,7 @@ class EvidenceGrader:
         """Build a discriminative evidence brief for the AI prompt.
 
         Replaces the old descriptive evidence_block (which exposed
-        ``detector_verified`` and ``detector_confidence_score`` — signals the
+        ``detector_verified`` and ``detector_confidence_score`` - signals the
         AI deferred to circularly). The brief gives the AI the PROOF MARKERS
         and WEAKNESSES it needs to judge whether the finding is real, not the
         detector's self-assessment of confidence.
@@ -360,14 +360,14 @@ class EvidenceGrader:
             return "auth_differential"
 
         # XSS reflection_* methods: payload reflected in response but execution
-        # not browser-confirmed. Reflection is not proof of execution — AI judges.
+        # not browser-confirmed. Reflection is not proof of execution - AI judges.
         if method.startswith("reflection_") or method in _PATTERN_MATCH_METHODS:
             return "pattern_match"
 
         # Structural checked BEFORE pattern_match keywords: some vuln types
         # (e.g. "Credentials Transmitted via HTTP GET") contain substrings that
         # would also match pattern_match keywords ("credential"), but the
-        # structural classification is the correct one — the observation IS
+        # structural classification is the correct one - the observation IS
         # the proof. Pattern-match keywords only catch non-structural types.
         if method in _STRUCTURAL_METHODS or self._is_structural(vuln_lower):
             return "structural"
@@ -382,7 +382,7 @@ class EvidenceGrader:
         """Sub-classify timing as strong/weak based on the delta ratio.
 
         Strong: delta >= 5x baseline (or >= 2000ms absolute with no baseline).
-        Weak: delta < 5x baseline — could be network jitter.
+        Weak: delta < 5x baseline - could be network jitter.
         """
         delta_value = EvidenceGrader._first_value(de.get("delta_ms"))
         if delta_value is None:
@@ -393,7 +393,7 @@ class EvidenceGrader:
 
         if baseline > 0:
             return "timing_strong" if delta >= baseline * 5 else "timing_weak"
-        # No baseline recorded — use absolute threshold (2s is well above
+        # No baseline recorded - use absolute threshold (2s is well above
         # normal HTTP latency and clearly distinguishes SLEEP from jitter).
         return "timing_strong" if delta >= 2000 else "timing_weak"
 
@@ -423,12 +423,12 @@ class EvidenceGrader:
         elif proof_type == "active_output":
             lines = self._active_output_markers(de, vuln)
         else:
-            # Structural / heuristic — generic markers
+            # Structural / heuristic - generic markers
             if de:
                 lines = [f"  - {k}: {self._truncate_value(v)}" for k, v in list(de.items())[:6]]
             # If no structured evidence, fall back to the response snippet so
             # the AI has SOMETHING to evaluate (detectors that only set prose
-            # evidence — e.g. file_upload before this pass — still surface it
+            # evidence - e.g. file_upload before this pass - still surface it
             # via _finding_response_snippet into response_snippet).
             if not lines and vuln.evidence.response_snippet:
                 lines.append(f"  - response_excerpt: {self._truncate_value(vuln.evidence.response_snippet, 300)}")
@@ -519,7 +519,7 @@ class EvidenceGrader:
             unauth_fields = set(self._profile_values(role_profiles["unauthenticated"], "json_shape"))
             authed_fields = set(self._profile_values(role_profiles["low"], "json_shape"))
             if unauth_fields and authed_fields and unauth_fields == authed_fields:
-                lines.append("  - responses_identical: true (inferred — identical field sets)")
+                lines.append("  - responses_identical: true (inferred - identical field sets)")
 
         # Horizontal IDOR/BOLA normally exposes restricted data in two authenticated
         # contexts while anonymous access is denied, so preserve both sides.
@@ -677,24 +677,24 @@ class EvidenceGrader:
 
     def _proof_summary(self, proof_type: str, vuln: Vulnerability) -> str:
         summaries = {
-            "active_output": "Active exploitation confirmed — the proof is in the response (command output, file contents, or code execution).",
+            "active_output": "Active exploitation confirmed - the proof is in the response (command output, file contents, or code execution).",
             "error_echo": "A database/framework error string was echoed in the response, causally connected to the injected payload.",
-            "structural": "The vulnerability is structural — the observation itself IS the proof (missing header, TLS absence, admin path reachability, etc.).",
-            "timing_strong": "Strong timing differential — the response delay is large enough to clearly indicate sleep-based SQL injection.",
-            "timing_weak": "Weak timing differential — the response delay is small and could be network jitter rather than SQL injection.",
+            "structural": "The vulnerability is structural - the observation itself IS the proof (missing header, TLS absence, admin path reachability, etc.).",
+            "timing_strong": "Strong timing differential - the response delay is large enough to clearly indicate sleep-based SQL injection.",
+            "timing_weak": "Weak timing differential - the response delay is small and could be network jitter rather than SQL injection.",
             "ssrf_differential": "Repeated internal-target versus external-control behavior differed, but no outbound callback or internal response content was observed.",
-            "auth_confirmed": "Confirmed authorization differential — distinct users or privilege levels received the same restricted object, fields, or privileged capability.",
-            "auth_differential": "Access-control finding — responses from different authentication or user contexts indicate a possible boundary bypass. This is real only when a less-privileged context receives restricted data or the same object as another user.",
-            "pattern_match": "A pattern was matched in the response body — this could be a genuine error disclosure, reflected payload text, or normal page content.",
-            "heuristic": "Heuristic observation without active exploitation proof — the finding is based on observation alone.",
+            "auth_confirmed": "Confirmed authorization differential - distinct users or privilege levels received the same restricted object, fields, or privileged capability.",
+            "auth_differential": "Access-control finding - responses from different authentication or user contexts indicate a possible boundary bypass. This is real only when a less-privileged context receives restricted data or the same object as another user.",
+            "pattern_match": "A pattern was matched in the response body - this could be a genuine error disclosure, reflected payload text, or normal page content.",
+            "heuristic": "Heuristic observation without active exploitation proof - the finding is based on observation alone.",
         }
         return summaries.get(proof_type, "Uncharacterized evidence.")
 
     def _proof_weaknesses(self, proof_type: str) -> str:
         weaknesses = {
-            "active_output": "None — the proof is in the response output. This is undeniable.",
-            "error_echo": "None — the database error text is causally connected to the payload. This is strong proof.",
-            "structural": "Minimal — the observation is the proof. A false positive would require the scanner to have misconfigured its request.",
+            "active_output": "None - the proof is in the response output. This is undeniable.",
+            "error_echo": "None - the database error text is causally connected to the payload. This is strong proof.",
+            "structural": "Minimal - the observation is the proof. A false positive would require the scanner to have misconfigured its request.",
             "timing_strong": "Time deltas can have non-SQL causes (network jitter, lock contention, background load). But a large delta matching the SLEEP argument is strong. This would be a false positive only if the delta does not scale with the sleep duration.",
             "timing_weak": "The timing delta is small and could be caused by network jitter, database load, or connection overhead rather than SQL SLEEP. If the delta does not clearly exceed normal latency variation, this is likely a false positive.",
             "ssrf_differential": "A timeout, status, or body-length difference can also be caused by URL validation, denylisting, application timeouts, DNS behavior, or upstream filtering. It does not prove that the server issued an outbound request.",
@@ -707,9 +707,9 @@ class EvidenceGrader:
 
     def _judge_question(self, proof_type: str) -> str:
         questions = {
-            "active_output": "Is the proof in the response genuine? (It should be — do not flag as false positive.)",
+            "active_output": "Is the proof in the response genuine? (It should be - do not flag as false positive.)",
             "error_echo": "Is the error string a genuine database/framework error, or could it be a benign message?",
-            "structural": "Is this observation a genuine security gap? (It should be — do not flag as false positive.)",
+            "structural": "Is this observation a genuine security gap? (It should be - do not flag as false positive.)",
             "timing_strong": "Does the timing delta clearly indicate SQL SLEEP execution, or could it be network noise?",
             "timing_weak": "Is the timing delta clearly caused by SQL SLEEP, or could it be network jitter or normal latency variation?",
             "ssrf_differential": "Do the repeated control and internal samples support a probable server-side fetch, while remaining short of confirmation without an OAST callback or reflected internal content?",
@@ -721,7 +721,7 @@ class EvidenceGrader:
         return questions.get(proof_type, "")
 
     # ------------------------------------------------------------------
-    # Reason (for report display — backward compat with evidence_grade_reason)
+    # Reason (for report display - backward compat with evidence_grade_reason)
     # ------------------------------------------------------------------
 
     def _grade_reason(self, proof_type: str, vuln: Vulnerability) -> str:
@@ -770,7 +770,7 @@ class EvidenceGrader:
                 delta = self._first_value(de.get("timing_delta_ms"))
             return (
                 f"Weak timing differential: delta={delta if delta is not None else '?'}ms "
-                f"— could be network jitter "
+                f"- could be network jitter "
                 f"(method={method}, confidence={confidence:.0f}, verified={verified})"
             )
         if proof_type == "active_output":
@@ -785,7 +785,7 @@ class EvidenceGrader:
             )
         if proof_type == "structural":
             return (
-                f"Structural/observable finding: '{vuln.vuln_type}' — "
+                f"Structural/observable finding: '{vuln.vuln_type}' - "
                 f"the observation itself is the proof"
             )
         return (

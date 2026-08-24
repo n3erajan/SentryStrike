@@ -58,7 +58,7 @@ def test_extract_page_title_and_code_blocks():
 
 
 def test_compute_fp_probability():
-    # SQLi on tutorial page (evidence contradicts claim — matched text is educational, not real SQLi)
+    # SQLi on tutorial page (evidence contradicts claim - matched text is educational, not real SQLi)
     axes_sqli_doc = {"EVIDENTIAL_ALIGNMENT": "no", "SCANNER_CLAIM_CONTRADICTED": "yes", "CAUSALLY_CONNECTED": "no"}
     assert compute_fp_probability(axes_sqli_doc) == 0.85
 
@@ -66,7 +66,7 @@ def test_compute_fp_probability():
     axes_api_docs = {"EVIDENTIAL_ALIGNMENT": "yes", "SCANNER_CLAIM_CONTRADICTED": "no", "CAUSALLY_CONNECTED": "not_applicable"}
     assert compute_fp_probability(axes_api_docs) == 0.05
 
-    # Public API IDOR (evidence contradicts — data is public, no private fields)
+    # Public API IDOR (evidence contradicts - data is public, no private fields)
     axes_public_api = {"EVIDENTIAL_ALIGNMENT": "no", "SCANNER_CLAIM_CONTRADICTED": "yes"}
     assert compute_fp_probability(axes_public_api) == 0.85
 

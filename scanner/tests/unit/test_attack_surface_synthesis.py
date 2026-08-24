@@ -504,7 +504,7 @@ def test_no_update_synthesis_when_post_targets_item_path():
         '{"id": 99}',
     )
     targets = AttackSurface.build([], [], requests=[obs])
-    # /activate is a noun, but the id 42 earlier doesn't matter — the final segment
+    # /activate is a noun, but the id 42 earlier doesn't matter - the final segment
     # "activate" is not an id, so this WOULD synthesize; guard instead on failure
     # responses. Here status is 201 so it synthesizes an /activate/{id}: acceptable
     # only if an id was returned. This asserts the create-id gate, not path shape.
@@ -546,7 +546,7 @@ def test_observed_update_wins_over_synthesized():
 
 def test_request_with_unresolved_path_placeholder_yields_no_body_targets():
     """An observed request whose URL still carries a route template (:addressId)
-    is a crawler artifact, not a replayable XHR — it must not emit body targets
+    is a crawler artifact, not a replayable XHR - it must not emit body targets
     that would each 404 against a non-existent object."""
     req = RequestObservation(
         url="http://x/api/Addresss/:addressId",

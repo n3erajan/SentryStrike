@@ -1,4 +1,4 @@
-"""Issue 1 — per-scan isolation of the spider and detector graph.
+"""Issue 1 - per-scan isolation of the spider and detector graph.
 
 Concurrent scans must never share a WebSpider or detector instance: those own
 mutable cookies, auth headers, HTTP clients, and verifier state, so a shared
@@ -24,7 +24,7 @@ def test_build_detectors_returns_fresh_instances_each_call():
     second = orch._build_detectors()
 
     assert len(first) == len(second)
-    # Same types, distinct objects — no detector instance is shared between graphs.
+    # Same types, distinct objects - no detector instance is shared between graphs.
     assert [type(d) for d in first] == [type(d) for d in second]
     for a, b in zip(first, second):
         assert a is not b

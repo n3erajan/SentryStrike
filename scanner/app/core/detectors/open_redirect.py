@@ -27,8 +27,8 @@ class OpenRedirectDetector(BaseDetector):
     redirect_param_tokens = REDIRECT_NAME_TOKENS
 
     # Scanner-controlled external marker host. Every payload below is crafted so
-    # that a successful redirect resolves — the way a browser resolves an
-    # authority — to this host, so confirmation is a single host-equality check.
+    # that a successful redirect resolves - the way a browser resolves an
+    # authority - to this host, so confirmation is a single host-equality check.
     _MARKER_HOST = "sentrystrike.invalid"
 
     # Generic open-redirect payload families. All are framework-agnostic and all
@@ -37,10 +37,10 @@ class OpenRedirectDetector(BaseDetector):
     #   1. direct absolute external URL
     #   2. protocol-relative URL (//host)
     #   3. encoded absolute (percent-encoded scheme separators)
-    #   4. backslash scheme-confusion (https:\\host — browsers fold \ to /)
+    #   4. backslash scheme-confusion (https:\\host - browsers fold \ to /)
     #   5. encoded backslash scheme-confusion
     #   6. path-relative backslash (/\host → //host)
-    #   7. userinfo confusion (user@host — the real host follows the @)
+    #   7. userinfo confusion (user@host - the real host follows the @)
     payloads = (
         "https://sentrystrike.invalid/open-redirect",
         "//sentrystrike.invalid/open-redirect",
@@ -87,7 +87,7 @@ class OpenRedirectDetector(BaseDetector):
                     # the only accepted signal: it proves an ATTACKER-controlled
                     # target (a real open redirect / allowlist bypass). An app that
                     # merely redirects the observed value to its own allowlisted
-                    # host is NOT reported — that destination is not attacker
+                    # host is NOT reported - that destination is not attacker
                     # controllable, so flagging it would be a false positive.
                     for payload in self._candidate_payloads(candidate):
                         prepared = candidate.build_request(payload)
@@ -169,7 +169,7 @@ class OpenRedirectDetector(BaseDetector):
         # Allowlist-substring bypass seeded from the app's OWN observed value.
         # When the discovered parameter value is a URL the app already emitted
         # (e.g. ``/redirect?to=https://github.com/…`` mined from a real link),
-        # that value is — by construction — one the app's allowlist accepts.
+        # that value is - by construction - one the app's allowlist accepts.
         # Embed it, verbatim, as a substring of a marker-resolving URL: a naive
         # ``includes``/``endsWith`` allowlist check still sees the allowed string,
         # yet the authority a browser resolves is the scanner marker. The allowed
@@ -235,7 +235,7 @@ class OpenRedirectDetector(BaseDetector):
         """Pick (route_url, param) probes from routes carrying a redirect param.
 
         Mines both the ordinary query and the fragment query of hash routes
-        (``/#/redirect?to=``) — the latter are dropped from the HTTP surface, so
+        (``/#/redirect?to=``) - the latter are dropped from the HTTP surface, so
         this is the only path that reaches a client-side redirect sink. Selection
         reuses the shared name-OR-value predicate, so it stays generic.
         """
@@ -456,7 +456,7 @@ class OpenRedirectDetector(BaseDetector):
             try:
                 await page.goto(probe_url, wait_until="commit", timeout=8000)
             except Exception:
-                # A navigation to the unresolvable marker raises — that's expected
+                # A navigation to the unresolvable marker raises - that's expected
                 # and the request handler has already recorded the attempt.
                 pass
             # Give client-side JS a moment to perform the redirect.
@@ -488,7 +488,7 @@ class OpenRedirectDetector(BaseDetector):
         Mirrors user-agent authority resolution: folds backslashes to forward
         slashes (browsers treat ``\\`` as ``/`` in the authority) and strips any
         ``userinfo@`` prefix, so ``https://allowed.test@evil`` resolves to
-        ``evil`` — the userinfo-confusion bypass. Percent-encoding is *not*
+        ``evil`` - the userinfo-confusion bypass. Percent-encoding is *not*
         decoded: an encoded payload counts only when the server itself decoded
         it into a literal ``//``/``\\`` authority, which is the actual redirect
         condition. Returns "" for a relative or same-origin-only Location.

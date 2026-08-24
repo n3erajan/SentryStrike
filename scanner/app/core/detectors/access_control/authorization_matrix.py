@@ -96,7 +96,7 @@ class AuthorizationMatrixMixin:
         unauth_sensitive = self._profile_exposes_nonpublic_data(target, unauth_profile)
         # An endpoint that authenticates via credentials carried in the REQUEST
         # body (login / token / authenticate) is doing its designed job when it
-        # returns 200 with a session token — stripping ambient session state does
+        # returns 200 with a session token - stripping ambient session state does
         # not make the call "unauthenticated", because the body itself carries the
         # credential. Framework-agnostic: never treat such a response as an
         # unauthorized data leak.
@@ -107,7 +107,7 @@ class AuthorizationMatrixMixin:
         # authenticated identity receives is *public by design*: identity does
         # not change the result, so there is no authorization boundary being
         # bypassed (product catalogues, language lists, public config, captcha,
-        # feedback walls, …). This is the single largest source of noise — a bare
+        # feedback walls, …). This is the single largest source of noise - a bare
         # 200 JSON collection is not, on its own, a data leak. Only genuine secret
         # material in the anonymous body overrides this, because such values must
         # never be world-readable regardless of the endpoint's intended audience.
@@ -235,8 +235,8 @@ class AuthorizationMatrixMixin:
         # anonymous callers (401/403/login/redirect) but returns the SAME record
         # to two DISTINCT authenticated identities is not scoped to its owner:
         # any authenticated user can read another user's object. The id-mutation
-        # path deliberately drops this — identical values across identities look
-        # like a "generic template" under its val_sim==1.0 short-circuit — so the
+        # path deliberately drops this - identical values across identities look
+        # like a "generic template" under its val_sim==1.0 short-circuit - so the
         # matrix consumes {unauth, low, second} directly, regardless of val_sim.
         # The "same record to both" signal is value-level (shared stable object
         # identifiers), so genuine per-owner objects (different ids per identity)
@@ -356,7 +356,7 @@ class AuthorizationMatrixMixin:
             "admin_like": target.admin_like,
             # The key discriminative signal for the AI: whether anonymous and
             # authenticated responses are identical (public by design). When
-            # True, the endpoint has no authorization boundary — the AI should
+            # True, the endpoint has no authorization boundary - the AI should
             # flag it as a false positive.
             "serves_public_data": serves_public_data,
             "states": {
@@ -412,16 +412,16 @@ class AuthorizationMatrixMixin:
         # Non-public exposure must be evidenced by the anonymous response BODY
         # carrying data that is not meant to be world-readable. Two structural,
         # framework-agnostic signals qualify:
-        #   1. Secret material — passwords, tokens, API keys, crypto seeds, etc.
+        #   1. Secret material - passwords, tokens, API keys, crypto seeds, etc.
         #      A secret in an anonymous response is a leak regardless of design.
-        #   2. Object-scoped data — the request targets a specific object (id in
+        #   2. Object-scoped data - the request targets a specific object (id in
         #      path/query/body) and the response returns that record. Whether it
         #      is truly a leak is then decided by the public-endpoint suppression
         #      in ``_verify_matrix_target`` (a public detail page is identical
         #      across auth states and is dropped there).
         # A bare public collection (a product/feedback/language list with no
         # secret fields and no object scoping) is NOT, on its own, evidence of a
-        # leak — such listings are public on the overwhelming majority of sites.
+        # leak - such listings are public on the overwhelming majority of sites.
         # An admin-looking URL is likewise not evidence: a public
         # ``{"version": "x.y.z"}`` under ``/admin/*`` is not a data leak.
         if profile.secret_fields:

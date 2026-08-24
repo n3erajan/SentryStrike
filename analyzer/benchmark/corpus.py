@@ -517,7 +517,7 @@ CASES = [
         # value class was defined by exclusion and did not exclude angle
         # brackets. The scanner-side fix stops this reaching the adjudicator at
         # all; the case stays here because markup-as-value is a shape the judge
-        # should reject on its own — entropy is low and the match is form markup.
+        # should reject on its own - entropy is low and the match is form markup.
         "id": "fp-secret-is-form-markup",
         "label": "FP",
         "proof_type": "pattern_match",

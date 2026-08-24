@@ -30,7 +30,7 @@ class AuditLogEntry(Document):
     """An append-only record of a compliance-relevant action within a workspace.
 
     Entries are never mutated or deleted by application code (they outlive the
-    scans and members they reference — a removed member's id still appears here).
+    scans and members they reference - a removed member's id still appears here).
     Each is scoped to one ``org_id``; ``actor_*`` identifies who performed it
     (None for system actions like the retention purge), and ``metadata`` carries
     action-specific context (e.g. the old/new role, the purged scan's target).

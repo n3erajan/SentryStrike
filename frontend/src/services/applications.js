@@ -1,4 +1,4 @@
-// Application service — wraps the backend `/applications/*` routes (mounted
+// Application service - wraps the backend `/applications/*` routes (mounted
 // under /api/v1). An Application is an org-scoped web-app target that owns a
 // name, a target URL, and a default ScanConfig used to prefill new scans.
 //
@@ -33,7 +33,7 @@ export function createApplication({ name, targetUrl, config }) {
   });
 }
 
-// Only the supplied fields are sent — the backend leaves the rest untouched.
+// Only the supplied fields are sent - the backend leaves the rest untouched.
 export function updateApplication(appId, { name, targetUrl, config }) {
   const body = {};
   if (name !== undefined) body.name = name;

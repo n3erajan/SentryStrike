@@ -40,14 +40,14 @@ async def test_open_redirect_detector_ignores_constrained_allowlisted_redirect()
     """An app that always redirects to a fixed allowlisted host (and never to an
     attacker-controlled target) is NOT an open redirect. The destination is not
     attacker-controllable, so no payload reaches the marker host and nothing is
-    reported — this is the false positive we must not raise."""
+    reported - this is the false positive we must not raise."""
     detector = OpenRedirectDetector()
     observed_urls: list[str] = []
 
     async def send_request(self, url, method="GET", params=None, data=None, **kwargs):
         observed_urls.append(url)
         # Whatever the input, the app only ever redirects to its own allowlisted
-        # host — never to the scanner marker. Not attacker-controllable.
+        # host - never to the scanner marker. Not attacker-controllable.
         return ResponseData(
             302,
             {"Location": "https://github.com/juice-shop/juice-shop"},
@@ -809,7 +809,7 @@ async def test_upload_type_validation_not_flagged_when_endpoint_accepts_everythi
 async def test_file_upload_skips_get_candidate_no_type_validation_fp(monkeypatch):
     """A GET endpoint is never a file-upload sink. A GET data endpoint ignores the
     multipart body (identical 2xx for any file type) and its framework rejects an
-    oversized body with a generic 413 — which would otherwise trip the accept/reject
+    oversized body with a generic 413 - which would otherwise trip the accept/reject
     differential (Test 8) and manufacture a 'Missing File Type Validation' FP.
     The detector must drop the GET candidate before testing it."""
     detector = FileUploadDetector()
@@ -889,7 +889,7 @@ async def test_file_upload_flags_type_validation_on_post_sink(monkeypatch):
 @pytest.mark.asyncio
 async def test_open_redirect_browser_sweep_with_scan_config(monkeypatch):
     """The browser sweep reads its bounds from ScanConfig, which carries no
-    open-redirect fields at all — resolution must fall back to settings."""
+    open-redirect fields at all - resolution must fall back to settings."""
     import app.core.detectors.open_redirect as ormod
     from shared.schemas.scan_schema import ScanConfig
 

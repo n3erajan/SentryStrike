@@ -3,8 +3,8 @@
 // The backend rejects re-verification requests it cannot honour with a 409
 // (see `assert_reverify_allowed`). This module reproduces that classification
 // so the UI can disable the button and explain why, instead of letting the
-// user click into a dead end. The backend remains the authority — a 409 is
-// still handled — but the two must be kept in sync by hand when the policy
+// user click into a dead end. The backend remains the authority - a 409 is
+// still handled - but the two must be kept in sync by hand when the policy
 // changes.
 //
 // The three ENFORCE_* feature flags are all enabled on the backend, so the

@@ -107,7 +107,7 @@ def test_burst_stability_accepts_uniform_401_api_rejection():
     """A correct JSON API answering invalid logins with a steady 401 is UNprotected.
 
     Regression: the old gate required every burst response to be 2xx, so any API
-    that returns 401 on bad credentials (the standard, correct behaviour — and what
+    that returns 401 on bad credentials (the standard, correct behaviour - and what
     the live target does) was misread as "server reacted" and never flagged for
     missing brute-force protection.
     """
@@ -555,7 +555,7 @@ async def test_password_change_enforcement_probe_no_finding_when_rejected():
 @pytest.mark.asyncio
 async def test_password_change_never_touches_real_account_when_no_disposable():
     """When a disposable account cannot be provisioned, the probe is skipped entirely
-    — it must NEVER fire a password change against the real scan session."""
+    - it must NEVER fire a password change against the real scan session."""
     detector = AuthenticationFailuresDetector()
     request = RequestObservation(
         url="https://example.test/rest/user/change-password?current=x&new=y&repeat=y",
@@ -583,7 +583,7 @@ async def test_password_change_never_touches_real_account_when_no_disposable():
 @pytest.mark.asyncio
 async def test_security_question_weak_recovery_is_flagged():
     """A reset flow gated only on a security-answer field (no token/OTP) is flagged
-    as weak recovery — a structural finding, no answer is guessed."""
+    as weak recovery - a structural finding, no answer is guessed."""
     detector = AuthenticationFailuresDetector()
     endpoint = ApiEndpoint(
         url="https://example.test/api/password/reset",
@@ -824,7 +824,7 @@ def test_credential_disclosure_ignores_reflected_sql_query_echo() -> None:
     # A SQLi/LFI source finding surfaces a DB error that echoes the app's own
     # query (``... WHERE email = '<payload>' AND password = '<hash>' ...``). The
     # ``password =`` there is a SQL comparison in a reflected statement, not a
-    # disclosed credential — it must NOT be re-reported as credential disclosure.
+    # disclosed credential - it must NOT be re-reported as credential disclosure.
     detector = AuthenticationFailuresDetector()
     source = Finding(
         category=OwaspCategory.a05,
@@ -848,7 +848,7 @@ def test_credential_disclosure_ignores_reflected_sql_query_echo() -> None:
 
 def test_credential_disclosure_still_flags_config_key_leak() -> None:
     # A genuine config/credential key leaked outside any SQL statement is still
-    # reported — the guard only strips reflected SQL comparisons.
+    # reported - the guard only strips reflected SQL comparisons.
     detector = AuthenticationFailuresDetector()
     source = Finding(
         category=OwaspCategory.a05,

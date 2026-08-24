@@ -4,7 +4,7 @@ import Tooltip from "./Tooltip.jsx";
 import { CRED_FIELDS } from "../data/constants.js";
 
 // Access-control re-verification needs a second identity to prove the
-// difference — the backend rejects the job otherwise (see
+// difference - the backend rejects the job otherwise (see
 // utils/reverifyPolicy.js). This collects a second and/or admin test account,
 // posted with the job and never persisted beyond the Redis payload.
 const ROLES = [

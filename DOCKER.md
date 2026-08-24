@@ -24,7 +24,7 @@ Only the frontend is reachable from the host. Its nginx serves the SPA and proxi
 MongoDB is the durable source of truth on the `mongo_data` volume. Redis runs with `--save '' --appendonly no` and **has no volume on purpose**: it holds queue payloads, cancel keys, leases, and heartbeats, all TTL'd and all safe to lose. Losing Redis costs you in-flight dispatch, not state.
 
 > [!NOTE]
-> `BACKEND_PORT` in `.env.example` is vestigial — the compose file no longer publishes the backend. Set `FRONTEND_PORT` to move the only host-facing port.
+> `BACKEND_PORT` in `.env.example` is vestigial - the compose file no longer publishes the backend. Set `FRONTEND_PORT` to move the only host-facing port.
 
 ## OAST callbacks in compose
 
@@ -36,7 +36,7 @@ OAST_CALLBACK_BASE_URL=https://sentry.example.com/oast   # what the TARGET calls
 OAST_POLL_URL=http://backend:8000/oast/poll              # what the SCANNER polls
 ```
 
-Both derive from `PUBLIC_HOSTNAME` when unset. If that is empty too, they stay `None` and the out-of-band checks are **skipped rather than failed** — blind SSRF and blind SQLi go undetected and the scan still reports success.
+Both derive from `PUBLIC_HOSTNAME` when unset. If that is empty too, they stay `None` and the out-of-band checks are **skipped rather than failed** - blind SSRF and blind SQLi go undetected and the scan still reports success.
 
 Two things to get right:
 
@@ -55,13 +55,13 @@ curl http://localhost/api/v1/health
 | Service | Probe | Proves | Does **not** prove |
 |---|---|---|---|
 | `frontend` | HTTP `:8080/` in-container | nginx serves the bundle | backend reachable |
-| `backend` | `GET /api/v1/health` | API responds after Mongo + Redis | — |
+| `backend` | `GET /api/v1/health` | API responds after Mongo + Redis | - |
 | `scanner` | Redis `PING` | container can reach its queue | the worker loop is consuming |
 | `analyzer` | signal to PID 1 | process alive | provider is configured or reachable |
-| `mongo` | `db.runCommand({ping:1})` | accepts commands | — |
-| `redis` | `redis-cli ping` | accepts commands | — |
+| `mongo` | `db.runCommand({ping:1})` | accepts commands | - |
+| `redis` | `redis-cli ping` | accepts commands | - |
 
-The last two columns matter. A green `scanner` says nothing about whether scans are progressing — heartbeat keys and worker logs do. A green `analyzer` says nothing about the LLM; provider misconfiguration fails durable jobs visibly instead of restart-looping the worker, which is deliberate.
+The last two columns matter. A green `scanner` says nothing about whether scans are progressing - heartbeat keys and worker logs do. A green `analyzer` says nothing about the LLM; provider misconfiguration fails durable jobs visibly instead of restart-looping the worker, which is deliberate.
 
 `GET /api/v1/health` returns the live scanner-worker count from Redis heartbeats. That is the real capacity signal.
 
@@ -78,7 +78,7 @@ Treat logs as sensitive: they carry target URLs and security evidence. Secrets a
 
 ## Scaling workers
 
-Both workers are safe to scale — they claim from shared queues under leases with revision-guarded writes, so two workers cannot double-publish.
+Both workers are safe to scale - they claim from shared queues under leases with revision-guarded writes, so two workers cannot double-publish.
 
 ```bash
 docker compose up -d --scale scanner=4 --scale analyzer=2
@@ -115,13 +115,13 @@ docker compose exec mongo mongorestore --archive=/tmp/ss.archive --gzip --drop
 > [!WARNING]
 > `--drop` deletes matching collections before restoring. Check which deployment you are pointed at first.
 
-Encrypt backups, store them off the Docker host, and actually test a restore. Retention purging (`retention_worker.py`, 30-day floor) trims scan data on its own schedule — that is not a backup.
+Encrypt backups, store them off the Docker host, and actually test a restore. Retention purging (`retention_worker.py`, 30-day floor) trims scan data on its own schedule - that is not a backup.
 
 ## Production hardening
 
 1. Terminate HTTPS at a reverse proxy or ingress in front of the stack.
 2. Set `AUTH_COOKIE_SECURE=true`, `APP_DEBUG=false`, and restrict `CORS_ORIGINS` to real origins. Debug mode exposes `/docs`.
-3. Replace the Turnstile test keys with real ones — the shipped defaults always pass.
+3. Replace the Turnstile test keys with real ones - the shipped defaults always pass.
 4. Route `/oast/` at the external proxy and set `PUBLIC_HOSTNAME`, or blind detection stays off.
 5. Keep Mongo and Redis off public interfaces; add auth appropriate to the environment.
 6. Move SMTP and provider credentials to your platform's secret manager, not into images.
@@ -158,7 +158,7 @@ No keys means no worker is running the loop, whatever `docker compose ps` says.
 docker compose exec analyzer python -c "import os,urllib.request; print(urllib.request.urlopen(os.environ['AI_BASE_URL'].rstrip('/')+'/models', timeout=10).status)"
 ```
 
-For host-installed Ollama, `AI_BASE_URL` must use `host.docker.internal`, not `localhost`, and Ollama must accept connections from Docker. Build the pinned model first — see [`analyzer/ollama/README.md`](analyzer/ollama/README.md).
+For host-installed Ollama, `AI_BASE_URL` must use `host.docker.internal`, not `localhost`, and Ollama must accept connections from Docker. Build the pinned model first - see [`analyzer/ollama/README.md`](analyzer/ollama/README.md).
 
 **Analysis verdicts look confident but wrong.** Suspect a truncated prompt. Check `prompt_tokens` on the job; a stock model tag loads a 4096-token window and drops the overflow silently. That is what `gemma4:e4b-it-qat-16k` exists to prevent.
 

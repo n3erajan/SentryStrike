@@ -2,13 +2,13 @@ import asyncio
 import json
 import logging
 import re
-from difflib import SequenceMatcher
 from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
 
 from app.core.crawler.api_extractor import ApiExtractor
 from app.core.crawler.models import ParameterLocation
 from app.core.crawler.spa import SpaFallbackDetector
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.core.verification.response_analyzer import ResponseAnalyzer
 from app.core.verification.verification_framework import HttpVerifier, URLParameterBuilder
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 # Parameter-name tokens (separator-stripped) for change-password forms.
-# Shared idea with SessionAuthProbeMixin — keep the sets aligned in spirit, not
+# Shared idea with SessionAuthProbeMixin - keep the sets aligned in spirit, not
 # by importing that mixin (csrf must stay usable without the auth package).
 _NEW_PASSWORD_PARAMS = frozenset({
     "newpassword", "newpass", "passwordnew", "new",
@@ -31,7 +31,7 @@ _CURRENT_PASSWORD_PARAMS = frozenset({
     "current", "old", "existing", "passwordcurr",
 })
 # Affirmative that a password-change *handler* ran. Business validation may still
-# fail (mismatch / wrong current) — that is enough CSRF proof and must not require
+# fail (mismatch / wrong current) - that is enough CSRF proof and must not require
 # committing a new password on the scan account.
 _CREDENTIAL_ACTION_PROCESSED_RE = re.compile(
     r"\b(?:"
@@ -266,7 +266,7 @@ class CSRFDetector(BaseDetector):
             ):
                 continue
 
-            # Filter out setup/install/onboarding routes — one-shot operations
+            # Filter out setup/install/onboarding routes - one-shot operations
             # that do not carry real CSRF risk beyond the initial configuration.
             setup_tokens = {"setup", "install", "wizard", "onboarding"}
             is_setup_route = any(tok in url_path_lower for tok in setup_tokens)
@@ -465,7 +465,7 @@ class CSRFDetector(BaseDetector):
         )
 
     @classmethod
-    def _responses_equivalent(cls, control: object, probe: object) -> bool:
+    async def _responses_equivalent(cls, control: object, probe: object) -> bool:
         """True when the probe is accepted like a known-successful control."""
         if cls._response_rejected(probe):
             return False
@@ -483,7 +483,9 @@ class CSRFDetector(BaseDetector):
             return bool(control_location) and control_location == probe_location
         control_body = re.sub(r"\s+", " ", str(getattr(control, "body", "") or "")).strip()
         probe_body = re.sub(r"\s+", " ", str(getattr(probe, "body", "") or "")).strip()
-        return bool(control_body) and SequenceMatcher(None, control_body, probe_body).ratio() >= 0.90
+        if not control_body:
+            return False
+        return await ResponseAnalyzer.calculate_similarity_async(control_body, probe_body) >= 0.90
 
     # Content types a cross-origin HTML form can natively produce. Anything else
     # (application/json, application/graphql, …) forces a CORS preflight, so a
@@ -499,7 +501,7 @@ class CSRFDetector(BaseDetector):
         """True when a browser could emit this request from a cross-site page.
 
         Static/browser <form> candidates carry no explicit location and default
-        to form-encoding — natively forgeable. Observed-XHR and spec candidates
+        to form-encoding - natively forgeable. Observed-XHR and spec candidates
         carry (location, content_type); only a simple (form/text) body is
         forgeable. A JSON/GraphQL body is not, so it can never be classic
         ambient-cookie CSRF regardless of what our same-site client observes.
@@ -532,7 +534,7 @@ class CSRFDetector(BaseDetector):
 
         Ambient-cookie CSRF does not apply when the app authenticates with a
         bearer token (browsers never attach it cross-site), so we never fabricate
-        a vulnerability here — only surface an informational note if
+        a vulnerability here - only surface an informational note if
         state-changing endpoints exist.
         """
         findings: list[Finding] = []
@@ -577,7 +579,7 @@ class CSRFDetector(BaseDetector):
         # Only genuine mutating APIs (observed non-GET XHR or a spec/JS
         # endpoint with a mutating method) are CSRF-testable. A browser-discovered
         # SPA "form" is an input cluster keyed to a *client-side route* whose
-        # ``action`` is the route URL — submitting to it returns the 200 HTML
+        # ``action`` is the route URL - submitting to it returns the 200 HTML
         # shell for every route, which previously produced blanket false CSRF
         # findings on navigation routes (/register, /search, …).
         mutating_keys = self._mutating_endpoint_keys(requests, api_endpoints)
@@ -692,7 +694,7 @@ class CSRFDetector(BaseDetector):
                         if self._response_indicates_processing(response):
                             return True
                         # Password-change handlers often return a validation error
-                        # (mismatch / wrong current) instead of a success word —
+                        # (mismatch / wrong current) instead of a success word -
                         # that still proves the forged request reached app logic.
                         return credential_mutating and self._credential_change_action_processed(response)
 
@@ -737,7 +739,7 @@ class CSRFDetector(BaseDetector):
                     )
 
                     if control_response is not None:
-                        accepted = self._responses_equivalent(control_response, bypass_response)
+                        accepted = await self._responses_equivalent(control_response, bypass_response)
                     else:
                         accepted = _action_accepted(bypass_response)
                     if not accepted:
@@ -748,7 +750,7 @@ class CSRFDetector(BaseDetector):
                     # An SPA returns the 200 HTML shell for any client-side
                     # route, so "200 + no error string" is not evidence of a state
                     # change. If the response is the SPA shell, no mutation
-                    # occurred — never emit a finding.
+                    # occurred - never emit a finding.
                     if spa_detector is not None:
                         shell = spa_detector.detect(
                             injected_url,
@@ -822,7 +824,7 @@ class CSRFDetector(BaseDetector):
         #   1. A cross-site-forgeable body. Only "simple" request bodies
         #      (application/x-www-form-urlencoded, multipart/form-data,
         #      text/plain, or empty) can be produced by a cross-origin HTML form.
-        #      A JSON or GraphQL body cannot — an attacker page can't set that
+        #      A JSON or GraphQL body cannot - an attacker page can't set that
         #      Content-Type on a form, and a cross-site fetch() of it triggers a
         #      CORS preflight the target must approve. Such endpoints are NOT
         #      forgeable, so replaying them from our own same-site client and
@@ -832,7 +834,7 @@ class CSRFDetector(BaseDetector):
         #      "login CSRF" is a separate, far weaker class with no ambient
         #      session to abuse.
         # This is what turns "our client replayed it and got 200" into a real
-        # cross-site claim, and it generalises to any framework — no app-specific
+        # cross-site claim, and it generalises to any framework - no app-specific
         # paths or content types are hard-coded.
         verifiable_candidates = [
             c

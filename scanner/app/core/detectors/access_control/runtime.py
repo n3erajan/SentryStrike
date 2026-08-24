@@ -348,7 +348,7 @@ class RuntimeMixin:
     def _is_admin_like_url(self, url: str) -> bool:
         path = urlparse(url).path
         # Dotfile / VCS-metadata paths are file exposure (A02), not gated
-        # functionality — never "admin-like". Excluding them keeps this ranking
+        # functionality - never "admin-like". Excluding them keeps this ranking
         # signal aligned with the forced-browsing scope and avoids the
         # ``.git/config`` → ``config`` token collision.
         if any(seg.startswith(".") for seg in path.split("/") if seg):
@@ -361,7 +361,7 @@ class RuntimeMixin:
 
         Such an endpoint (login / authenticate / token / sign-in) is *meant* to
         accept anonymous callers and return a session token, so a 200 under the
-        unauthenticated verifier is expected behaviour — not an authorization
+        unauthenticated verifier is expected behaviour - not an authorization
         bypass. Detection is structural (a password-like body key), so it holds
         for any framework, not just a specific app's ``/login`` path.
         """

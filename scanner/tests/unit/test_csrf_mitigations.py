@@ -29,7 +29,7 @@ class _FakeResponse:
 
 
 class _FakeVerifier:
-    """Stand-in for HttpVerifier — records nothing, always accepts the request."""
+    """Stand-in for HttpVerifier - records nothing, always accepts the request."""
 
     def __init__(self, *args, **kwargs):
         self.cookies = kwargs.get("cookies")
@@ -121,7 +121,7 @@ async def test_csrf_cookie_auth_consumes_browser_discovered_forms(monkeypatch):
 
     findings = await detector.detect(
         ["http://target.test/profile"],
-        [],  # no static forms — SPA renders forms only in the DOM
+        [],  # no static forms - SPA renders forms only in the DOM
         session_cookies={"session": "abc123"},
         auth_headers={},
         browser_forms=browser_forms,
@@ -174,7 +174,7 @@ async def test_csrf_password_change_probe_uses_non_committing_mismatched_passwor
     """Password-change CSRF must not submit matching new/confirm values.
 
     Matching values permanently rewrite the scan account password while leaving
-    the session valid — poisoning the next scan's login. Proof still holds when
+    the session valid - poisoning the next scan's login. Proof still holds when
     the handler runs and rejects a mismatch (or accepts a disposable change).
     """
     captured: list[dict] = []
@@ -301,7 +301,7 @@ class _ShellVerifier(_FakeVerifier):
 async def test_csrf_no_finding_on_spa_client_routes(monkeypatch):
     """Browser-discovered SPA "forms" are client-side routes whose action
     returns the 200 HTML shell. With no observed mutating API backing them, they
-    must not be tested at all — no CSRF findings on navigation routes."""
+    must not be tested at all - no CSRF findings on navigation routes."""
     monkeypatch.setattr(csrf_module, "HttpVerifier", _ShellVerifier)
 
     detector = CSRFDetector()
@@ -367,7 +367,7 @@ async def test_csrf_finding_on_real_mutating_api(monkeypatch):
     foreign-Origin submission with a non-shell response is a genuine CSRF finding.
 
     The observed request is form-encoded, so it is genuinely cross-site
-    forgeable (a JSON body would not be — see test_csrf_suppressed_on_json_api).
+    forgeable (a JSON body would not be - see test_csrf_suppressed_on_json_api).
     """
     from app.core.crawler.models import RequestObservation
 
@@ -553,7 +553,7 @@ async def test_csrf_skips_mutating_api_schema_with_unresolved_path(monkeypatch):
 async def test_csrf_suppressed_on_json_api(monkeypatch):
     """JSON APIs requiring application/json are not cross-site forgeable (HTML
     forms cannot set that Content-Type; fetch() triggers a blocked CORS
-    preflight). The detector must skip them — no false CSRF on JSON endpoints."""
+    preflight). The detector must skip them - no false CSRF on JSON endpoints."""
     from app.core.crawler.models import RequestObservation
 
     monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)
@@ -586,7 +586,7 @@ async def test_csrf_suppressed_on_json_api(monkeypatch):
 async def test_csrf_suppressed_on_login_endpoint(monkeypatch):
     """Login/authenticate endpoints accept anonymous callers by design. A forged
     login is the separate, weaker 'login CSRF' class with no ambient session to
-    abuse — skip them uniformly. Structural path detection -> framework-agnostic."""
+    abuse - skip them uniformly. Structural path detection -> framework-agnostic."""
     from app.core.crawler.models import RequestObservation
 
     monkeypatch.setattr(csrf_module, "HttpVerifier", _FakeVerifier)

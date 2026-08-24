@@ -85,7 +85,7 @@ class RuntimeMixin:
         """Keep only forms whose RESOLVED submission target is same-origin.
 
         A form's ``page_url`` locates the page it was found on; its ``action`` is
-        where it submits. Scope is decided by the action ONLY — page_url just
+        where it submits. Scope is decided by the action ONLY - page_url just
         resolves a relative/empty action. Accepting a form because its page is
         same-origin would let a same-origin page carrying an off-origin action
         turn into an AttackTarget aimed at a third party (Issue 2). The resolved

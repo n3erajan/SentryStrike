@@ -75,7 +75,7 @@ def compute_fp_probability(axes: dict[str, str]) -> float:
         return 0.75
 
     # 3. Not causally connected AND alignment is weak → Likely FP
-    #    (but only when causal connection is relevant — skip for "not_applicable")
+    #    (but only when causal connection is relevant - skip for "not_applicable")
     if causal == "no" and alignment in ("no", "uncertain"):
         return 0.75
 
@@ -97,7 +97,7 @@ def build_evidence_json(vulnerability: Vulnerability, max_chars: int) -> str:
     The response snippet is the sole unbounded, target-controlled field. Building
     the envelope first and fitting the snippet into the remaining budget keeps the
     detection metadata the adjudicator relies on (detection_method, proof_type,
-    evidence_grade) present, and keeps the output valid JSON — slicing the
+    evidence_grade) present, and keeps the output valid JSON - slicing the
     serialized string did neither.
 
     ``matched_text``/``match_location``/``match_entropy`` are promoted out of

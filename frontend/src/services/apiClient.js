@@ -6,10 +6,10 @@
 // ApiErrors. Backend copy is accepted only when it passes defensive checks.
 //
 // The backend sets an HttpOnly session cookie on login; every request includes
-// it via `credentials: "include"` — no client-side token storage needed.
+// it via `credentials: "include"` - no client-side token storage needed.
 //
 // Requests go to VITE_API_URL. In dev, set it to the backend's absolute origin
-// (e.g. http://localhost:8000/api/v1) — cross-origin, so the backend's CORS must
+// (e.g. http://localhost:8000/api/v1) - cross-origin, so the backend's CORS must
 // allow this origin with credentials. Leave it relative ("/api/v1", the default)
 // when the frontend and API share an origin behind a reverse proxy.
 

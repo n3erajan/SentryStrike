@@ -9,7 +9,7 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react";
  * stops the swap from reading as an instant cut.
  *
  * `settled` (useQuery's `contentEntered`) is true when the query already
- * had cached data at mount — an SPA navigation. Animating that would fade
+ * had cached data at mount - an SPA navigation. Animating that would fade
  * content the user has effectively already seen, so it renders at rest.
  */
 
@@ -18,7 +18,7 @@ const CONTENT_ENTER_S = 0.3;
 
 /* AnimatePresence diffs its *direct* children by `child.key`, so a key set
  * on the inner motion element inside QuerySkeleton/QueryContent never reaches
- * it — both branches read as key "", the outgoing one is never seen as
+ * it - both branches read as key "", the outgoing one is never seen as
  * exiting, and the swap becomes the instant cut we're trying to avoid.
  * Rather than make all ~16 call sites remember a key, stamp one here from the
  * branch's component type. An explicit key at the call site still wins, which

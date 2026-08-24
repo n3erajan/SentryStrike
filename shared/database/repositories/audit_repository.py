@@ -37,7 +37,7 @@ class AuditRepository:
                 metadata=metadata or {},
             )
             await entry.insert()
-        except Exception:  # noqa: BLE001 — auditing must never break the audited action
+        except Exception:  # noqa: BLE001 - auditing must never break the audited action
             logger.exception("failed to record audit entry action=%s org=%s", action.value, org_id)
             return None
         return entry

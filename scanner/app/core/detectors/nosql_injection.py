@@ -1,4 +1,4 @@
-"""NoSQL Injection Detector — active-verification wrapper.
+"""NoSQL Injection Detector - active-verification wrapper.
 
 Selects JSON-body parameters (the only location a document-DB parses an operator
 object as query logic) and runs :class:`NoSqliVerifier` against each. Verified
@@ -96,9 +96,9 @@ class NoSqlInjectionDetector(BaseDetector):
         """Select a target that can carry an operator object.
 
         Two transports reach a document-DB filter with a nested operator:
-          * a JSON body (``{"field": {"$ne": …}}``) — always in scope, and
+          * a JSON body (``{"field": {"$ne": …}}``) - always in scope, and
           * a query/form param via bracket notation (``field[$ne]=…``, which the
-            qs parser re-nests) — in scope when the param is a real observed one
+            qs parser re-nests) - in scope when the param is a real observed one
             (``replayable``), which bounds the fan-out to genuine inputs rather
             than static-synthesis guesses.
         Path/header/cookie locations cannot express a nested operator."""

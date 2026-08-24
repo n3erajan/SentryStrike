@@ -181,10 +181,49 @@ async def test_blocks_known_tracker_hosts_even_for_scripts():
 
 def test_auth_manager_no_longer_waits_on_networkidle():
     """Change 1 guard: the auth browser methods must not block on a load state
-    (``networkidle``) that never fires on SPAs — they use ``settle_page`` now."""
+    (``networkidle``) that never fires on SPAs - they use ``settle_page`` now."""
     import inspect as _inspect
 
     from app.core.crawler import auth_manager
 
     source = _inspect.getsource(auth_manager)
     assert "networkidle" not in source
+
+
+def test_xss_verifier_no_longer_waits_on_networkidle():
+    """The DOM-XSS probe used ``wait_until="networkidle"`` with a 5s timeout.
+
+    On a slow target that never settles in time, every probe died with
+    ``Page.goto: Timeout 5000ms exceeded`` and the sweep reported nothing - a
+    silent loss of coverage rather than an honest negative. It uses the
+    inflight-drain settle now, like the crawler and auth manager.
+    """
+    import inspect as _inspect
+
+    from app.core.verification import xss_verifier
+
+    source = _inspect.getsource(xss_verifier)
+    # Match actual use, not the word: the module explains in a comment why it
+    # stopped waiting on that load state.
+    assert 'wait_until="networkidle"' not in source
+    assert 'wait_for_load_state("networkidle"' not in source
+
+
+def test_xss_verifier_browser_contexts_block_assets():
+    """Images/media/fonts/stylesheets cannot execute a reflected payload.
+
+    Loading them only spends the navigation budget, which is what made probes
+    time out on a slow target. Both context builders must install blocking.
+    """
+    import inspect as _inspect
+
+    from app.core.verification import xss_verifier
+
+    for func in (
+        xss_verifier.XSSVerifier._new_reflection_context,
+        xss_verifier.XSSVerifier._verify_browser_execution,
+    ):
+        source = _inspect.getsource(func)
+        assert "install_resource_blocking" in source, (
+            f"{func.__qualname__} builds a browser context without blocking assets"
+        )

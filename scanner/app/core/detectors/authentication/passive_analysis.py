@@ -36,7 +36,7 @@ class PassiveAuthAnalysisMixin:
             # 1. Login form discovered → run active auth tests.
             if has_username and has_password:
                 # A form whose action is a client-side (hash) route posts to the
-                # SPA shell, not a login handler — every attempt returns the app
+                # SPA shell, not a login handler - every attempt returns the app
                 # index, so active probing there is meaningless and yields a
                 # misleading "no brute-force protection" on the shell. For SPAs the
                 # REAL JSON login endpoint is exercised by the API auth-workflow

@@ -137,7 +137,7 @@ class MassAssignmentMixin:
             return []
 
         # A replayed CREATE (registration/signup) collides with the record it
-        # originally created — the server rejects the duplicate identity (e.g.
+        # originally created - the server rejects the duplicate identity (e.g.
         # "email must be unique") with a 4xx. That aborts the check before the
         # privilege-field probe ever runs, producing a false negative. For POST
         # (create) requests, give each replayed body a fresh unique identity so

@@ -111,7 +111,7 @@ async def test_access_control_detector_flags_admin_and_idor() -> None:
 @pytest.mark.asyncio
 async def test_forced_browsing_ignores_file_exposure_paths() -> None:
     # Accidental file / VCS / dotfile exposure (.git, .env, .htaccess) is A02
-    # Security Misconfiguration owned by the sensitive_paths detector — it should
+    # Security Misconfiguration owned by the sensitive_paths detector - it should
     # NOT be reported by forced browsing (A01), which is for gated functionality
     # reachable without authorization. Probing these here made two detectors emit
     # the same exposure under two different OWASP categories.
@@ -235,7 +235,7 @@ async def test_access_control_matrix_flags_sensitive_unauthenticated_api_exposur
     # A genuine unauthenticated exposure: the anonymous response carries secret
     # material (a token). Such data must never be world-readable regardless of
     # whether authenticated identities receive the same body, so the
-    # public-endpoint suppression does NOT apply — the secret path fires.
+    # public-endpoint suppression does NOT apply - the secret path fires.
     detector = AccessControlDetector()
     request = RequestObservation(
         url="https://example.com/api/profile",
@@ -306,7 +306,7 @@ async def test_access_control_matrix_does_not_flag_public_endpoint_identical_acr
     # endpoint (e.g. an app-configuration route) that returns a byte-identical
     # response to anonymous, low-privilege and second-user requests. Identity
     # does not change the result, so there is no authorization boundary being
-    # bypassed — even though the body contains a field name that trips the broad
+    # bypassed - even though the body contains a field name that trips the broad
     # "sensitive" heuristic (``privacyContactEmail``). It must NOT be flagged.
     detector = AccessControlDetector()
     request = RequestObservation(
@@ -436,7 +436,7 @@ async def test_mass_assignment_survives_unique_create_collision() -> None:
         )
 
     # Mass-assignment replays used freshened unique identities (not the taken
-    # email), so the create succeeded and the probe ran — proving the finding is
+    # email), so the create succeeded and the probe ran - proving the finding is
     # produced only because the duplicate-email collision was avoided. (Other
     # access-control checks share the patched sender and may replay the observed
     # body verbatim; the freshened create is what unlocks this finding.)

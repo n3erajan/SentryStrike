@@ -3,7 +3,7 @@
 Locks in the fix for the audit's "command_injection sent 0 of 378 built
 candidates": selection is now name-OR-value-OR-context, with a replayable
 blind-timing fallback so JSON-body params with generic names (``city``,
-``message``) are no longer silently dropped. Generic — no target-specific names.
+``message``) are no longer silently dropped. Generic - no target-specific names.
 """
 
 from __future__ import annotations

@@ -2,7 +2,7 @@
 
 Detectors historically gated injection candidates purely on the parameter
 *name* (an allowlist). That misses candidates whose name is generic (``to``,
-``q``, ``dest2``) but whose *value* is clearly the class's data — a URL, a
+``q``, ``dest2``) but whose *value* is clearly the class's data - a URL, a
 path, or a filename. These pure predicates let open-redirect, LFI, and SSRF
 select a parameter when either its **name** matches the class tokens **or**
 its **baseline value** looks like the class's data.

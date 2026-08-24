@@ -7,21 +7,21 @@ breaking out of a quoted SQL string, the attacker replaces a *field value* with 
 query-operator object (``{"$ne": …}``, ``{"$gt": …}``, ``{"$regex": …}``,
 ``{"$where": …}``). When the server passes that object straight into a document-DB
 query filter, the operator is *evaluated* as query logic rather than compared as a
-literal value — bypassing intended matching.
+literal value - bypassing intended matching.
 
 The operator object reaches the server two ways, both handled here:
-  * **JSON body** — ``{"field": {"$ne": …}}`` on a JSON endpoint.
-  * **Bracket notation** — ``field[$ne]=…`` in a query string or urlencoded form,
+  * **JSON body** - ``{"field": {"$ne": …}}`` on a JSON endpoint.
+  * **Bracket notation** - ``field[$ne]=…`` in a query string or urlencoded form,
     which Express's ``qs`` parser (and equivalents) expands into the same nested
     object ``{field: {$ne: …}}``. This is the classic query/form NoSQL vector.
 
 Three techniques, ordered by reliability (same shape as the SQLi verifier):
-  1. Boolean operator differential — an always-true operator produces a healthy
+  1. Boolean operator differential - an always-true operator produces a healthy
      response that DIVERGES from an always-false operator; confirmed across two
      independent operator families before reporting.
-  2. Error-based — a malformed operator forces a document-DB/ODM error whose
+  2. Error-based - a malformed operator forces a document-DB/ODM error whose
      marker is absent from the baseline; two independent payloads must confirm.
-  3. Timing-based blind — a ``$where`` sleep-equivalent, gated exactly like the
+  3. Timing-based blind - a ``$where`` sleep-equivalent, gated exactly like the
      SQLi time-based technique (baseline-slow skip, relative floor).
 
 False-positive philosophy (inherited): no single-payload, single-check result is
@@ -29,12 +29,11 @@ ever reported. Boolean requires two operator families to diverge; error requires
 two confirming payloads; timing requires the relative-delay floor.
 
 Framework/target-agnostic: payloads are the standard MongoDB/document-DB operator
-set — a universal property of the technology, never an app-specific value. The
+set - a universal property of the technology, never an app-specific value. The
 verifier only runs against JSON-body parameters (the sole place an operator
 object is parsed as query logic).
 """
 
-import difflib
 import json
 import logging
 from typing import Optional
@@ -56,7 +55,7 @@ logger = logging.getLogger(__name__)
 _HIGH_CONFIDENCE_THRESHOLD = 85.0
 
 # If two identical benign requests are less similar than this, the endpoint is
-# too volatile for a boolean differential — an operator "divergence" could be
+# too volatile for a boolean differential - an operator "divergence" could be
 # noise, so boolean is disabled for that parameter.
 _STABILITY_FLOOR = 0.70
 
@@ -93,13 +92,17 @@ _NOSQL_ERROR_MARKERS = frozenset({
 })
 
 
-def _body_similarity(a: Optional[str], b: Optional[str]) -> float:
-    """Sequence-matcher similarity between two bodies (1.0 for both-empty)."""
+async def _body_similarity(a: Optional[str], b: Optional[str]) -> float:
+    """Sequence-matcher similarity between two bodies (1.0 for both-empty).
+
+    Runs off the event loop via the bounded shared implementation: diffing full
+    bodies inline is quadratic and stalls lease renewal on large pages.
+    """
     a = a or ""
     b = b or ""
     if not a and not b:
         return 1.0
-    return difflib.SequenceMatcher(None, a, b).ratio()
+    return await ResponseAnalyzer.calculate_similarity_async(a, b)
 
 
 def _new_nosql_errors(baseline_body: str, injected_body: str, payload: str) -> list[str]:
@@ -158,7 +161,7 @@ class NoSqliVerifier(BaseVerifier):
         )
 
         # Dead baseline: a plain 401/403/404/405 means the endpoint is unreachable
-        # as sent, so no operator differential can exist — abort before spending
+        # as sent, so no operator differential can exist - abort before spending
         # the payload budget (mirrors the SQLi verifier).
         if is_dead_baseline(baseline):
             return VerificationResult(
@@ -224,7 +227,7 @@ class NoSqliVerifier(BaseVerifier):
         ``("id",   {"$gt": {"$gt": ""}})``    -> ``{"id[$gt][$gt]": ""}``
 
         This is the wire form Express's ``qs`` parser (and equivalents) re-nest
-        back into ``{email: {$ne: "x"}}`` — generic to any deep-object body parser.
+        back into ``{email: {$ne: "x"}}`` - generic to any deep-object body parser.
         """
         out: dict[str, str] = {}
         if isinstance(operator, dict):
@@ -325,7 +328,7 @@ class NoSqliVerifier(BaseVerifier):
             )
             if probe.not_tested:
                 return True
-            return _body_similarity(baseline.body, probe.body) >= _STABILITY_FLOOR
+            return await _body_similarity(baseline.body, probe.body) >= _STABILITY_FLOOR
         except Exception:
             return True
 
@@ -347,7 +350,7 @@ class NoSqliVerifier(BaseVerifier):
         (200) response that DIVERGES from the always-false operator's response.
         If the server treats the object as a literal (no operator support) both
         responses collapse to the same not-found/error shape and do not diverge.
-        Two independent families must diverge before reporting — two evaluations
+        Two independent families must diverge before reporting - two evaluations
         passing independently is strong evidence against coincidence.
         """
         try:
@@ -462,7 +465,7 @@ class NoSqliVerifier(BaseVerifier):
         if true_resp.status_code != 200:
             return None
 
-        similarity = _body_similarity(true_resp.body, false_resp.body)
+        similarity = await _body_similarity(true_resp.body, false_resp.body)
         diverged = (true_resp.status_code != false_resp.status_code) or (similarity <= _DIVERGE_MAX)
         if not diverged:
             return None
@@ -494,7 +497,7 @@ class NoSqliVerifier(BaseVerifier):
 
         Only document-DB-specific error markers count, and they must be ABSENT
         from the baseline. Two independent payloads must both trigger a new error
-        before reporting — a single hit is recorded but never reported.
+        before reporting - a single hit is recorded but never reported.
         """
         error_operators = [
             {"$regex": "("},          # invalid regex → "Regular expression is invalid"
@@ -588,7 +591,7 @@ class NoSqliVerifier(BaseVerifier):
         Gated exactly like the SQLi time-based technique: skip when the baseline
         is already slow, require the observed delay to clear a relative floor
         (fraction of the intended sleep), and require the injected mean itself to
-        be a substantial fraction of the sleep — so network jitter cannot pass.
+        be a substantial fraction of the sleep - so network jitter cannot pass.
         """
         sleep_ms = 3000
         sleep_operators = [

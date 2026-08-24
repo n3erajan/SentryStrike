@@ -156,7 +156,7 @@ _WEAK_STANDALONE = frozenset({
 
 # Query-shape echoes ("SELECT ... FROM ... WHERE", "INSERT INTO ... VALUES") prove
 # only that SQL statement text appears in the body. In a SQL-injection verifier's
-# OWN response that echo IS the injection proof — already owned by the A05 finding —
+# OWN response that echo IS the injection proof - already owned by the A05 finding -
 # not independent verbose-error disclosure. Excluded from the observed-evidence
 # derivation path so an A05 SQLi echo (often on a 2xx response) is not re-reported
 # as A10 verbose error handling. A raw DB *engine* error ("SQLITE_ERROR",
@@ -421,14 +421,14 @@ class ExceptionHandlingDetector(BaseDetector):
         }
 
         # Single source of truth for attack targets. Consume the shared
-        # AttackPlanner (built once per scan) — or rebuild the identical
-        # AttackSurface when no planner was threaded in — instead of fabricating
+        # AttackPlanner (built once per scan) - or rebuild the identical
+        # AttackSurface when no planner was threaded in - instead of fabricating
         # request shapes from raw urls/forms. This is what keeps the detector from
         # POSTing to SPA client routes (``/#/score-board``) or fuzzing synthetic
         # ``mat-input-N`` DOM fields: the central builder already drops
         # route-fragment URLs, skips transport noise, dedupes, and carries the
         # real observed endpoints/params/bodies. Every other injection detector
-        # already sources targets this way — exception handling now matches.
+        # already sources targets this way - exception handling now matches.
         planner = kwargs.get("attack_planner")
         if planner is not None and hasattr(planner, "targets_for"):
             targets = list(planner.targets_for(self.name))
@@ -468,7 +468,7 @@ class ExceptionHandlingDetector(BaseDetector):
             # One unified loop over the shared targets (replaces the old separate
             # GET-param / single-param / form passes that each rebuilt requests
             # from raw urls/forms). Each target's own parameter is fuzzed with the
-            # error-inducing payloads via the shared ``build_request`` — the exact
+            # error-inducing payloads via the shared ``build_request`` - the exact
             # request shape every other detector uses, against real endpoints.
             fuzz_tasks = [
                 self._probe_target(client, semaphore, target, payload, desc)
@@ -657,8 +657,8 @@ class ExceptionHandlingDetector(BaseDetector):
         """Fuzz one shared ``AttackTarget``'s parameter with an error-inducing
         payload and analyse the response for verbose-error disclosure.
 
-        The concrete request is built by ``AttackTarget.build_request`` — the same
-        shared builder every detector uses — so the injection point, location
+        The concrete request is built by ``AttackTarget.build_request`` - the same
+        shared builder every detector uses - so the injection point, location
         (query/form/json/path), method, headers and cookies are exactly what the
         crawler observed. No SPA client-route URL can appear here because the
         central AttackSurface already dropped route-fragment targets.
@@ -728,7 +728,7 @@ class ExceptionHandlingDetector(BaseDetector):
         # VALUES") are low-specificity: they match ordinary page prose and HTML
         # ("select a language from the menu where ...") as readily as a real DB
         # error. Standing ALONE on a non-error (2xx/3xx/4xx) response they are
-        # benign page content, not verbose-error proof — this is the false
+        # benign page content, not verbose-error proof - this is the false
         # positive that fired on a 200 guestbook page. Keep them only when the
         # response is a genuine server error (5xx) or a real engine-error/stack-
         # trace pattern corroborates; then a SELECT...WHERE echo inside an actual
@@ -745,7 +745,7 @@ class ExceptionHandlingDetector(BaseDetector):
         sensitive_hdrs = _sensitive_headers_present(headers, http_status=status)
 
         # A response is "verbose error handling" only when its BODY discloses
-        # internal detail — a stack trace, server file path, SQL echo, or a
+        # internal detail - a stack trace, server file path, SQL echo, or a
         # framework exception (all captured by the pattern sets). A bare error
         # status with a generic message (``{"message":"internal error"}``) leaks
         # nothing actionable and is NOT a finding, even when the response carries

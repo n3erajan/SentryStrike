@@ -38,11 +38,11 @@ async def _merge_session_storage(storage_state: Any, page: Any) -> Any:
     Playwright's ``context.storage_state()`` captures cookies + localStorage but
     NOT sessionStorage, so session-scoped values an SPA keeps there (cart/basket
     id, CSRF token, wizard progress) are lost when the blob is replayed into a
-    fresh crawl context — and the flows that need them (e.g. an add-to-basket
+    fresh crawl context - and the flows that need them (e.g. an add-to-basket
     POST attaching a sessionStorage id) can never fire. This reads the page's
     sessionStorage and attaches it, per origin, so the crawler's restore path
     (``browser_engine._session_storage_init_script``) has data to re-seed. Purely
-    generic: no key is inspected or special-cased. Best-effort — any failure
+    generic: no key is inspected or special-cased. Best-effort - any failure
     leaves ``storage_state`` unchanged."""
     if not isinstance(storage_state, dict):
         return storage_state
@@ -513,7 +513,7 @@ class SmartAuthenticator:
         self, client: httpx.AsyncClient, root_url: str, username: str, password: str
     ) -> AuthResult | None:
         logger.info("[auth] Trying Strategy 2: HTML Form Extraction")
-        # Relative paths only — a leading slash replaces the entire URL path and
+        # Relative paths only - a leading slash replaces the entire URL path and
         # escapes path-mounted apps (``http://host/app/`` + ``/login`` →
         # ``http://host/login``). Resolve against the application base instead.
         parsed_root = urlparse(root_url)
@@ -658,7 +658,7 @@ class SmartAuthenticator:
 
         Many PHP/legacy apps gate login on the clicked submit control's name/value
         (``name=form value=submit``, ``name=Login``, …). Omitting it leaves a
-        pre-auth session cookie while the POST is ignored — so prefer a
+        pre-auth session cookie while the POST is ignored - so prefer a
         submit/login-labelled control, else the first named submitter.
         """
         candidates = cls._named_submitter_candidates(form)
@@ -674,7 +674,7 @@ class SmartAuthenticator:
         """Build an application/x-www-form-urlencoded body for a credential form.
 
         Includes username/password mappings, hidden fields, default ``<select>``
-        values, and one named submitter — the same successful controls a browser
+        values, and one named submitter - the same successful controls a browser
         sends on Enter / primary submit click. Does not invent app-specific fields.
         """
         payload: dict[str, str] = {}
@@ -1092,7 +1092,7 @@ class SmartAuthenticator:
                                 # reactive-form submit button (Angular/React/Vue)
                                 # stays ``[disabled]`` until the framework marks the
                                 # form valid; clicking it would block on Playwright's
-                                # 30s actionability wait, then throw — two such
+                                # 30s actionability wait, then throw - two such
                                 # buttons burned ~60s per login. Skipping lets the
                                 # Enter fallback (which submits via keydown
                                 # regardless of button state) fire immediately.
@@ -1431,7 +1431,7 @@ class SmartAuthenticator:
         form, then common register API paths) and log it in via the existing
         authentication cascade. Returns an authenticated :class:`AuthResult`
         with the secondary session's cookies/bearer token, or ``None`` when a
-        second identity cannot be provisioned. Never raises — provisioning is
+        second identity cannot be provisioned. Never raises - provisioning is
         strictly best-effort and the caller degrades gracefully.
         """
         username, password = self._throwaway_credentials()

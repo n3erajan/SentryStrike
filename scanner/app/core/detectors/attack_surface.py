@@ -17,7 +17,7 @@ from app.core.crawler.models import (
 from app.core.crawler.param_discovery import ParamDiscovery
 
 
-# Locations that carry a request *body* — a submission whose real server endpoint
+# Locations that carry a request *body* - a submission whose real server endpoint
 # is the XHR the form fires, not the URL the field was scraped from. Used to reject
 # synthetic SPA form submissions when their action is a client-side route.
 _BODY_SUBMISSION_LOCATIONS = frozenset(
@@ -225,7 +225,7 @@ class AttackSurface:
                     # a form-field name (often a framework-generated id like
                     # ``mat-input-18``) was scraped against the route URL. The
                     # translated server path (``/#/address/create`` -> ``/address/
-                    # create``) only reaches the shell — a POST there tests
+                    # create``) only reaches the shell - a POST there tests
                     # nothing while multiplying budget across every field × every
                     # detector. The real endpoint is captured separately as the
                     # form's observed XHR (an ``/api/…`` request). This mirrors
@@ -317,7 +317,7 @@ class AttackSurface:
                 # A genuinely-observed XHR always carries a concrete id in its
                 # path; a URL still holding a route template (``:addressId``,
                 # ``{id}``) is a crawler artifact (Angular route table scraped as
-                # an observation). Replaying it only produces 404 noise — the leaf
+                # an observation). Replaying it only produces 404 noise - the leaf
                 # body params would each be fired against a non-existent object.
                 continue
             observed_headers, observed_cookies = cls._request_replay_metadata(request)
@@ -474,12 +474,12 @@ class AttackSurface:
     def _url_has_route_fragment(url: str) -> bool:
         """True when ``url`` carries a client-side route fragment (``…/#/path``).
 
-        A URL fragment (everything after ``#``) is NEVER transmitted over HTTP —
+        A URL fragment (everything after ``#``) is NEVER transmitted over HTTP -
         the server only ever sees the part before it. So a target whose URL is a
         hash route (``http://host/#/address/create``) resolves on the wire to a
         request against ``/`` (the SPA shell), which returns static index.html and
         exercises no application logic. Such a target is pure wasted budget: every
-        payload lands on the shell. Framework-agnostic — any hash-routed SPA
+        payload lands on the shell. Framework-agnostic - any hash-routed SPA
         (Angular ``useHash``, Vue hash history, React ``HashRouter``) expresses its
         routes this way, and a bare in-page anchor (``#section``) is not route-like
         so it is not matched. The real endpoint for these forms is captured
@@ -552,7 +552,7 @@ class AttackSurface:
             return False
 
     # Response keys (priority order) that carry a newly-created resource's id, and
-    # a shape check for the id value. Purely structural — no app-specific names.
+    # a shape check for the id value. Purely structural - no app-specific names.
     _CREATED_ID_KEYS: tuple[str, ...] = ("id", "_id", "uuid", "uid", "ID", "Id", "UUID")
     _OBJECT_ID_SEGMENT_RE = re.compile(
         r"^(?:\d+"                                   # integer id
@@ -605,8 +605,8 @@ class AttackSurface:
 
         An observed ``POST /collection`` that returns a created resource id implies
         an id-scoped ``PUT``/``PATCH /collection/{id}`` accepting the same body
-        shape. Detectors then exercise the *update* path — a distinct endpoint the
-        crawler never navigates to — against a REAL, self-created id with a real,
+        shape. Detectors then exercise the *update* path - a distinct endpoint the
+        crawler never navigates to - against a REAL, self-created id with a real,
         authenticated body, so these targets are replayable rather than synthetic.
 
         Purely structural: keys on the HTTP verb, a collection-shaped path (final
@@ -811,7 +811,7 @@ class AttackSurface:
         SPA input clusters (``source == "browser_cluster"``) submit their fields as
         a JSON POST to an API endpoint, but only *if* the live submit fired. When
         the submit path fails (disabled control, impossible validation, no observed
-        XHR), the captured field names/types are still known — so synthesize a
+        XHR), the captured field names/types are still known - so synthesize a
         skeleton JSON body and emit one low-confidence ``json_body`` target per
         field (``replayable=False``, ``source_confidence="form_synth"``). This
         decouples injection coverage from the fragile runtime submit.
@@ -829,7 +829,7 @@ class AttackSurface:
             if cls._url_has_route_fragment(url):
                 # SPA clusters have no real ``action`` so this falls back to the
                 # route URL (``/#/address/create``). That fragment is stripped on
-                # the wire, so a POST here only hits the shell — the synthesized
+                # the wire, so a POST here only hits the shell - the synthesized
                 # body tests nothing. Form-cluster robustness tracks separately;
                 # route URL translation targets discovered routes, not synthetic
                 # form submissions.
@@ -1056,7 +1056,7 @@ class AttackSurface:
         """True when injecting this path candidate leaves no unresolved placeholder.
 
         A ``path``-location candidate (e.g. ``/api/users/{userId}``) owns its
-        placeholder — that segment is the injection point, not a broken URL.
+        placeholder - that segment is the injection point, not a broken URL.
         Substituting a probe value should yield a concrete, requestable URL; if a
         second placeholder remains (multi-segment templates), the request would
         404, so the candidate is not kept. Generic ``param_N`` names come from

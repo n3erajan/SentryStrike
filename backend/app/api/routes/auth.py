@@ -108,7 +108,7 @@ async def preview_invite(
     """Validate an invite token and return the role and org info.
 
     Shows the role and org name before the invitee fills in their details.
-    Does not return the pinned email — the user must enter it.
+    Does not return the pinned email - the user must enter it.
     Does not consume the invite.
     """
     try:

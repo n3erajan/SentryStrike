@@ -76,7 +76,7 @@ async def test_purge_deletes_only_scans_older_than_org_retention() -> None:
     fresh = FakeScan("fresh", NOW - timedelta(days=10))
     svc = _service(orgs, {"org-1": [old, fresh]})
 
-    summary = await svc.purge_once()
+    summary = await svc.purge_once(now=NOW)
 
     assert summary == {"org-1": 1}
     assert old.deleted is True
@@ -95,7 +95,7 @@ async def test_purge_uses_each_orgs_own_retention_window() -> None:
         audit_repository=FakeAuditRepository(),
     )
 
-    summary = await svc.purge_once()
+    summary = await svc.purge_once(now=NOW)
 
     # 60 days old: past the 30-day window, within the 365-day window.
     assert summary == {"org-short": 1, "org-long": 0}
@@ -110,7 +110,7 @@ async def test_each_purged_scan_is_audited() -> None:
     audit = FakeAuditRepository()
     svc = _service(orgs, {"org-1": [old]}, audit=audit)
 
-    await svc.purge_once()
+    await svc.purge_once(now=NOW)
 
     assert len(audit.entries) == 1
     entry = audit.entries[0]
@@ -136,7 +136,7 @@ async def test_scan_is_audited_before_it_is_deleted() -> None:
 
     svc = _service(orgs, {"org-1": [old]}, audit=OrderCheckingAudit())
 
-    await svc.purge_once()
+    await svc.purge_once(now=NOW)
 
     assert seen_deleted_flag == [False]
     assert old.deleted is True
@@ -159,7 +159,7 @@ async def test_one_orgs_failure_does_not_stall_the_sweep() -> None:
         audit_repository=FakeAuditRepository(),
     )
 
-    summary = await svc.purge_once()
+    summary = await svc.purge_once(now=NOW)
 
     assert summary == {"org-bad": 0, "org-good": 1}
     assert good_scan.deleted is True
@@ -172,7 +172,7 @@ async def test_purge_with_no_expired_scans_is_a_noop() -> None:
     audit = FakeAuditRepository()
     svc = _service(orgs, {"org-1": [fresh]}, audit=audit)
 
-    summary = await svc.purge_once()
+    summary = await svc.purge_once(now=NOW)
 
     assert summary == {"org-1": 0}
     assert fresh.deleted is False

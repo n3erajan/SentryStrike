@@ -101,8 +101,8 @@ def test_relative_api_paths_resolve_from_origin_root_not_frontend_route():
 
 def test_base_variable_concat_calls_are_resolved_to_full_path():
     """body-coverage #3: a call whose URL is ``base + "/tail"`` or a template
-    ``\\`${base}/tail\\``` — where the literal tail alone carries no /api|/rest
-    token — is recovered by resolving the base var to its literal path prefix."""
+    ``\\`${base}/tail\\``` - where the literal tail alone carries no /api|/rest
+    token - is recovered by resolving the base var to its literal path prefix."""
     script = """
         class Feedback {
           constructor() { this.host = "/api"; }
@@ -159,7 +159,7 @@ def test_javascript_url_string_derives_rest_parent_endpoint():
 
 def test_ambiguous_base_variable_is_not_resolved():
     """A base name bound to different literals in different scopes (the minified
-    per-class field pattern) MUST NOT resolve — resolving it would fabricate
+    per-class field pattern) MUST NOT resolve - resolving it would fabricate
     wrong endpoints. Ambiguous names are dropped entirely."""
     script = """
         class A { h = "/api/BasketItems"; f(b){ return this.http.post(this.h + "/x", b); } }
@@ -174,8 +174,8 @@ def test_ambiguous_base_variable_is_not_resolved():
 
 def test_scope_local_base_variable_resolves_reused_service_field_per_class():
     """A genuine base-URL field name (``host``) reused across minified service
-    classes with DIFFERENT resource paths must still resolve — scope-locally to
-    each call's own nearest-preceding class field — even though the global
+    classes with DIFFERENT resource paths must still resolve - scope-locally to
+    each call's own nearest-preceding class field - even though the global
     resolver drops it as ambiguous. This is the exact SPA pattern (one ``host``
     per Angular service) that otherwise loses every ``this.host + "/x"`` endpoint.
     Each call resolves to ITS OWN class path, never a sibling's."""
@@ -187,7 +187,7 @@ def test_scope_local_base_variable_resolves_reused_service_field_per_class():
     assert ApiExtractor._resolve_base_vars(script) == {}
     _, endpoints = ApiExtractor.extract_from_javascript("https://example.test/", script)
     by = {(e.method, e.url) for e in endpoints}
-    # Each concat call resolves to its OWN class's base path — no cross-contamination.
+    # Each concat call resolves to its OWN class's base path - no cross-contamination.
     assert ("PATCH", "https://example.test/rest/products/reviews") in by
     assert ("POST", "https://example.test/api/Feedbacks/bulk") in by
     assert ("PATCH", "https://example.test/api/Feedbacks/reviews") not in by

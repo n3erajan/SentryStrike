@@ -2,14 +2,14 @@
 
 Complements the Wappalyzer-schema engine (:mod:`app.integrations.wappalyzer_engine`),
 which fingerprints *normal* page markup + runtime globals. That engine matches
-almost nothing against stack traces and framework error pages — yet those are the
+almost nothing against stack traces and framework error pages - yet those are the
 single richest technology surface an app exposes: they leak the framework, ORM,
 database engine, language/runtime, and frequently a version, none of which need a
 version header.
 
 This module is a curated, **stack-agnostic** signature table. Each signature
 encodes a universal property of a *technology* (e.g. "Sequelize, in any app,
-emits ``node_modules/sequelize`` and ``Sequelize<X>Error``") — never a property
+emits ``node_modules/sequelize`` and ``Sequelize<X>Error``") - never a property
 of any particular target. It is the same technique DB-error fingerprinters (e.g.
 sqlmap) use, broadened across ORMs, languages, frameworks, and servers.
 
@@ -31,11 +31,11 @@ logger = logging.getLogger(__name__)
 class _Sig:
     """A single error-surface signature.
 
-    ``pattern``  — regex (compiled case-insensitively) matched against error text.
-    ``name``     — technology name (aligned with Wappalyzer names where possible so
+    ``pattern``  - regex (compiled case-insensitively) matched against error text.
+    ``name``     - technology name (aligned with Wappalyzer names where possible so
                    downstream CVE lookups and de-dup are consistent).
-    ``category`` — normalized category string (matches engine categories).
-    ``version_group`` — regex group index holding the version, if the marker
+    ``category`` - normalized category string (matches engine categories).
+    ``version_group`` - regex group index holding the version, if the marker
                    carries one; else ``None``.
     """
 
@@ -49,7 +49,7 @@ class _Sig:
 
 
 # --------------------------------------------------------------------------- #
-# Signature table — grouped by layer for auditability. Anchored to unambiguous
+# Signature table - grouped by layer for auditability. Anchored to unambiguous
 # error-class names / module paths / framework markers to minimise false
 # positives (an app merely echoing the word "mysql" must NOT match).
 # --------------------------------------------------------------------------- #
@@ -83,7 +83,7 @@ _SIGNATURES: list[_Sig] = [
     # ---- Languages / runtimes (from stack-frame grammar) ----
     _Sig(r"node:internal[/\\]|\bat process\.processTicksAndRejections\b|node_modules[/\\]", "Node.js", "language"),
     # Node >=15 prints a ``Node.js v<version>`` banner at the tail of any
-    # unhandled-exception dump — a universal runtime marker. Kept as a separate
+    # unhandled-exception dump - a universal runtime marker. Kept as a separate
     # signature so it back-fills the version even when an earlier stack frame
     # already matched the existence-only Node.js signature above.
     _Sig(r"Node\.js v([0-9]+\.[0-9][0-9.]*)", "Node.js", "language", 1),
@@ -100,7 +100,7 @@ _SIGNATURES: list[_Sig] = [
     # many Express error-page banners print ``Express <ver>`` in their title
     # (e.g. "OWASP Juice Shop (Express ^4.22.1)"), tolerating the npm caret /
     # ``v`` prefix / ``version`` keyword. Two signatures, same name, each with
-    # its own single capture group at index 1 — ``match_error_evidence`` merges
+    # its own single capture group at index 1 - ``match_error_evidence`` merges
     # by name and back-fills whichever signature captures a version. The third
     # signature keeps the existence-only markers (plain-npm path, stack-frame
     # names) so detection still fires when no version is present.
@@ -179,5 +179,5 @@ def match_error_evidence(texts: list[str]) -> list[TechComponent]:
 
 
 def signature_count() -> int:
-    """Number of compiled signatures — for diagnostics/tests."""
+    """Number of compiled signatures - for diagnostics/tests."""
     return len(_COMPILED)

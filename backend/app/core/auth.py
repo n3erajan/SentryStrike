@@ -107,7 +107,7 @@ def as_utc_naive(value: datetime | None) -> datetime | None:
 class AuthService:
     """Application logic for user login, session management, and logout.
 
-    Account creation lives in ``app.core.invites`` — registration is invite-only,
+    Account creation lives in ``app.core.invites`` - registration is invite-only,
     so there is no open ``register`` here.
     """
 

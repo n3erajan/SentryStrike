@@ -24,7 +24,7 @@ class ApiExtractor:
     # Client-side navigation sinks: location.assign("/x") / location.replace("/x")
     # / (window.)location.href = "/x" / window.location = "/x". Captures the quoted
     # absolute-path literal, tolerating a leading base concat (hostServer+"/x").
-    # These are real server pages the app navigates to — safe to fetch (and parse
+    # These are real server pages the app navigates to - safe to fetch (and parse
     # their forms) even when single-segment, unlike arbitrary quoted strings.
     NAV_SINK_RE = re.compile(
         r"""(?:location\s*\.\s*(?:assign|replace)\s*\(|"""
@@ -62,7 +62,7 @@ class ApiExtractor:
     # uploader / socket / service object whose path segment carries no
     # ``/api``-style token (e.g. ``/file-upload``) and so is dropped by every
     # other pass. The var must resolve to a base prefix OR be a base/host-ish
-    # name (then the origin is the base) — this anchoring keeps arbitrary string
+    # name (then the origin is the base) - this anchoring keeps arbitrary string
     # concatenations out.
     BASE_CONCAT_ASSIGN_RE = re.compile(
         r"""(?<![=!<>+\-*/%&|^~])[:=]\s*"""
@@ -221,7 +221,7 @@ class ApiExtractor:
         # no /api|/rest token and so is dropped by the string-literal passes above.
         # Resolve the base var to its literal path prefix (only when unambiguous)
         # and reconstruct the full path so the endpoint is recovered. Bodies are
-        # NOT invented here — a bare-variable body stays None (see plan #3).
+        # NOT invented here - a bare-variable body stays None (see plan #3).
         # A base var (``host``/``baseUrl``/…) is frequently REUSED across many
         # minified service classes, each binding it to a different resource path
         # (``host=this.hostServer+"/rest/products"`` in one, ``+"/api/Feedbacks"``
@@ -246,7 +246,7 @@ class ApiExtractor:
             if prefix is None:
                 continue
             joined = prefix + (tail if tail.startswith("/") else f"/{tail}" if tail else "")
-            # A template tail may still carry ``${id}`` interpolations — normalise
+            # A template tail may still carry ``${id}`` interpolations - normalise
             # them to ``{name}`` path placeholders (a bare concat tail is unchanged).
             joined = cls.normalize_template_url(joined)
             if not cls._looks_api_path(joined):
@@ -267,8 +267,8 @@ class ApiExtractor:
         # token (``/file-upload``), so the string-literal and verb passes drop it.
         # Reuse the same base-var resolution as the verb-concat loop; when the var
         # is a base/host-ish name that resolved to no path prefix, the origin is
-        # the base (prefix ""). Not gated on ``_looks_api_path`` — the base anchor
-        # is what makes the tail a real endpoint — but static assets are skipped.
+        # the base (prefix ""). Not gated on ``_looks_api_path`` - the base anchor
+        # is what makes the tail a real endpoint - but static assets are skipped.
         for match in cls.BASE_CONCAT_ASSIGN_RE.finditer(script_text):
             var = match.group("var") or ""
             tail = match.group("tail") or ""
@@ -673,7 +673,7 @@ class ApiExtractor:
         Framework-agnostic and deliberately conservative: a name is kept ONLY when
         every assignment to it across the whole script agrees on the same literal.
         Minified per-class fields frequently reuse a name (e.g. ``host`` bound to a
-        different resource path in each service) — resolving an ambiguous name
+        different resource path in each service) - resolving an ambiguous name
         would fabricate wrong endpoints, so ambiguous names are dropped entirely.
         Only path-shaped literals (leading ``/`` or a bare ``api``/``rest``-style
         segment) are kept; absolute ``http(s)://`` origins collapse to their path.
@@ -687,7 +687,7 @@ class ApiExtractor:
     # Bounded backward window for scope-local base-var resolution. A minified
     # service class defines its own ``host=``/``baseUrl=`` field immediately
     # before its methods, so the nearest preceding assignment within this many
-    # chars is that class's own field — the correct binding even when the same
+    # chars is that class's own field - the correct binding even when the same
     # name is reused by other classes (which the global resolver drops as
     # ambiguous). Generous because a class's own field is always the closest
     # preceding one; the bound only guards against grabbing an unrelated prior
@@ -926,7 +926,7 @@ class ApiExtractor:
         Body-injection synthesis must target real API endpoints,
         never SPA HTML navigation routes (a ``POST /login`` Angular *route* that
         returns the 200 HTML shell exercises no vulnerable code). An endpoint is
-        API-like when **any** generic signal holds — all key on structure/token
+        API-like when **any** generic signal holds - all key on structure/token
         families, never a full path:
 
         * declared/observed content-type is JSON/form/multipart/graphql,
@@ -935,8 +935,8 @@ class ApiExtractor:
         * it was sourced from XHR/fetch/JS mining rather than an ``<a href>`` link.
 
         Endpoints whose only evidence is an HTML navigation route (static
-        html/sitemap/robots source with no body signal) — or whose observed
-        response content-type is ``text/html`` — are **not** API-like. Ambiguous
+        html/sitemap/robots source with no body signal) - or whose observed
+        response content-type is ``text/html`` - are **not** API-like. Ambiguous
         endpoints (no content-type, no schema, no api token) default to False so
         placeholder bodies are never sprayed at HTML routes.
         """

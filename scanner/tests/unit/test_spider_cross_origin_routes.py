@@ -113,7 +113,7 @@ def test_browser_forms_are_merged_into_detector_forms_same_origin_only():
 def test_synthetic_named_inputs_are_dropped_during_merge():
     # Pre-hydration Angular captures yield positional fallback names
     # (field_<cid>_<idx>) flagged named=False. These are internal handles for
-    # fill/submit addressing, never real backend parameter names — they must
+    # fill/submit addressing, never real backend parameter names - they must
     # not become injection targets. Real-named inputs in the same cluster
     # survive.
     browser_forms = [
@@ -177,7 +177,7 @@ def test_session_termination_url_matches_extensioned_logout_pages():
     # Regression: server-rendered logout endpoints carry a file extension
     # (logout.php / sign-out.aspx / logoff.jsp). The guard must strip the
     # extension before canonicalizing, or the crawler enqueues them and a
-    # detector's GET destroys the shared session — silently redirecting every
+    # detector's GET destroys the shared session - silently redirecting every
     # later probe to the login page (the DVWA SQLi/XSS-miss root cause).
     for url in (
         "http://target.test/dvwa/logout.php",

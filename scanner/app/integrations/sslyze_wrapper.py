@@ -8,7 +8,7 @@ class SslAnalyzer:
 
     Performs an async TLS handshake with the target on port 443 and reports
     whether the connection succeeded. Does not inspect certificate chains or
-    cipher suites — it is a basic gate that flags targets without HTTPS.
+    cipher suites - it is a basic gate that flags targets without HTTPS.
     Production-grade TLS evaluation is deferred to an external tool.
     """
 

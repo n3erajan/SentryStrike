@@ -1,14 +1,202 @@
 from app.config import get_settings
 from app.core.detectors.attack_surface import AttackSurface
-from shared.models.scan import AuthCoverage, SpaApiCoverage
+from app.core.scan_orchestration.detector_execution import DETECTOR_REQUEST_ALIASES
+from app.utils.scan_metrics import TestedSurfaceEntry
+from shared.models.scan import (
+    AuthCoverage,
+    ScanCoverage,
+    SpaApiCoverage,
+    ProbedParameter,
+    ProbedPath,
+)
+
+# Storage ceilings for the persisted inventory. The ledger itself is capped
+# separately (app.utils.scan_metrics.LEDGER_MAX_ENTRIES); these bound what is
+# written to the scan document and served in the JSON report. Whatever is left
+# out is counted, never silently dropped.
+MAX_TESTED_PATHS = 500
+MAX_PARAMETERS_PER_PATH = 40
+
+# Module labels that carry HTTP traffic but are not detectors. Paths they
+# reached are real coverage of the surface (the scanner did request them), so
+# they stay in the inventory; they just do not count as active testing.
+NON_DETECTOR_MODULES = frozenset({"crawler"})
+
+# Statuses that prove the target does not serve a path. A probe answered only by
+# these established absence - the scanner looked, the resource was not there - so
+# the path is not application surface that got tested. Everything else (2xx, 3xx,
+# 401/403 protected, 405 wrong method, 5xx) means the path exists in some form.
+ABSENT_STATUS_CODES = frozenset({404, 410})
+
+# Reverse of the detector alias table: the ledger records the ``module=`` label
+# a request was tagged with (e.g. "sqli"), and the report names detectors
+# ("injection_sql_command"). Same detector, one canonical name.
+_MODULE_TO_DETECTOR = {
+    alias: detector
+    for detector, aliases in DETECTOR_REQUEST_ALIASES.items()
+    for alias in aliases
+}
+
+
+def canonical_detector(module: str) -> str:
+    """Canonical detector name for a ledger ``module`` label."""
+    return _MODULE_TO_DETECTOR.get(module, module)
+
+
+def build_tested_surface(
+    entries: list[TestedSurfaceEntry],
+    *,
+    totals: dict[str, int] | None = None,
+    requests_denied_by_budget: int = 0,
+) -> ScanCoverage:
+    """Aggregate ledger entries into the report's tested-surface inventory.
+
+    Every figure is derived from requests that actually went out - nothing here
+    is estimated from discovered surface or from finding counts.
+
+    Crucially, a path is only counted as *tested surface* when the target showed
+    it exists. Path-guessing detectors (sensitive_paths in particular) probe
+    thousands of candidate URLs that the app never served; counting those 404s as
+    "paths reached" inflates coverage into fiction - a DVWA scan reporting 2,873
+    tested paths when the app has a few dozen. Paths whose every response was
+    404/410 are therefore reported separately as negative existence probes, and
+    are not itemised: they establish absence, not coverage.
+
+    Paths are ranked by how much of them was exercised (parameters, then
+    requests) so that if the inventory is truncated, the best-covered surface is
+    what survives, and the omitted remainder is reported as a count.
+    """
+    totals = totals or {}
+    by_path: dict[str, dict] = {}
+    for entry in entries:
+        detector = canonical_detector(entry.module)
+        bucket = by_path.setdefault(
+            entry.path,
+            {
+                "methods": set(),
+                "detectors": set(),
+                "parameters": {},
+                "requests": 0,
+                "status_codes": set(),
+                "no_response": 0,
+            },
+        )
+        bucket["methods"].add(entry.method)
+        bucket["detectors"].add(detector)
+        bucket["requests"] += entry.requests
+        bucket["status_codes"].update(entry.status_codes)
+        bucket["no_response"] += entry.no_response
+        if entry.parameter:
+            parameter = bucket["parameters"].setdefault(
+                entry.parameter, {"detectors": set(), "requests": 0}
+            )
+            parameter["detectors"].add(detector)
+            parameter["requests"] += entry.requests
+
+    real: dict[str, dict] = {}
+    missing: dict[str, dict] = {}
+    unconfirmed: dict[str, dict] = {}
+    for path, bucket in by_path.items():
+        statuses = bucket["status_codes"]
+        if not statuses:
+            # Every probe went unanswered, so existence was never established.
+            unconfirmed[path] = bucket
+        elif statuses <= ABSENT_STATUS_CODES:
+            missing[path] = bucket
+        else:
+            real[path] = bucket
+
+    detectors_exercised = sorted(
+        {
+            detector
+            for bucket in by_path.values()
+            for detector in bucket["detectors"]
+            if detector not in NON_DETECTOR_MODULES
+        }
+    )
+    paths_probed_by_detector = sum(
+        1 for bucket in real.values() if bucket["detectors"] - NON_DETECTOR_MODULES
+    )
+    parameters_tested = len(
+        {(path, name) for path, bucket in real.items() for name in bucket["parameters"]}
+    )
+
+    ranked = sorted(
+        real.items(),
+        key=lambda item: (-len(item[1]["parameters"]), -item[1]["requests"], item[0]),
+    )
+    tested_paths: list[ProbedPath] = []
+    for path, bucket in ranked[:MAX_TESTED_PATHS]:
+        parameters = sorted(
+            bucket["parameters"].items(),
+            key=lambda item: (-item[1]["requests"], item[0]),
+        )
+        tested_paths.append(
+            ProbedPath(
+                path=path,
+                methods=sorted(bucket["methods"]),
+                parameters=[
+                    ProbedParameter(
+                        name=name,
+                        detectors=sorted(stats["detectors"]),
+                        requests=stats["requests"],
+                    )
+                    for name, stats in parameters[:MAX_PARAMETERS_PER_PATH]
+                ],
+                detectors=sorted(bucket["detectors"]),
+                requests=bucket["requests"],
+                status_codes=sorted(bucket["status_codes"]),
+                no_response=bucket["no_response"],
+                parameters_omitted=max(0, len(parameters) - MAX_PARAMETERS_PER_PATH),
+            )
+        )
+
+    return ScanCoverage(
+        paths_tested=len(real),
+        paths_probed_by_detector=paths_probed_by_detector,
+        paths_absent=len(missing),
+        paths_existence_unconfirmed=len(unconfirmed),
+        requests_to_absent_paths=sum(bucket["requests"] for bucket in missing.values()),
+        parameters_tested=parameters_tested,
+        requests_sent=int(totals.get("total_requests", 0) or 0)
+        or sum(entry.requests for entry in entries),
+        requests_without_response=int(totals.get("total_no_response", 0) or 0),
+        requests_denied_by_budget=max(0, int(requests_denied_by_budget)),
+        detectors_exercised=detectors_exercised,
+        tested_paths=tested_paths,
+        tested_paths_truncated=len(real) > MAX_TESTED_PATHS,
+        tested_paths_omitted=max(0, len(real) - MAX_TESTED_PATHS),
+        ledger_entries_omitted=int(totals.get("omitted", 0) or 0),
+        # Playwright probes bypass the HTTP ledger; nothing here itemises them.
+        browser_probes_itemised=False,
+    )
 
 
 class CoverageMixin:
+    def _capture_tested_surface(
+        self, scan: 'Scan', requests_denied_by_budget: int = 0
+    ) -> ScanCoverage:
+        """Snapshot the tested-surface ledger onto the scan's report metadata.
+
+        Must be called while the scan's request-counting context is still live
+        (before ``end_request_counting()``), since the ledger is ContextVar-scoped
+        to the run.
+        """
+        from app.utils.scan_metrics import snapshot_tested_surface, tested_surface_totals
+
+        coverage = build_tested_surface(
+            snapshot_tested_surface(),
+            totals=tested_surface_totals(),
+            requests_denied_by_budget=requests_denied_by_budget,
+        )
+        scan.report_metadata.tested_surface = coverage
+        return coverage
+
     @staticmethod
     def _count_discovered_surface(crawl_result) -> int:
         """Distinct discovered URLs across the HTTP spider, SPA routes, and API endpoints.
 
-        ``crawl_result.urls`` alone only holds the HTTP-spider seed surface — for a
+        ``crawl_result.urls`` alone only holds the HTTP-spider seed surface - for a
         browser-crawled SPA that is often just the shell (1 URL), which badly understates
         coverage. The honest "URLs crawled" figure is the deduplicated union of the pages
         navigated (``routes``) and the API endpoints discovered (``api_endpoints``) plus
@@ -130,7 +318,7 @@ class CoverageMixin:
             dynamic_status=dynamic_status,
         )
         # Authenticated surface actually scanned. ``crawl_result.urls`` alone holds
-        # only the HTTP-spider seed surface — for a browser-crawled SPA that is
+        # only the HTTP-spider seed surface - for a browser-crawled SPA that is
         # often just the shell (1 URL), which badly understates coverage. Use the
         # deduplicated union of pages navigated + API endpoints reached, exactly as
         # ``total_urls_crawled`` does, so the auth-coverage figure is truthful.
@@ -158,7 +346,7 @@ class CoverageMixin:
     ) -> str:
         """Classify dynamic-discovery health for honest reporting.
 
-        Only SPA targets can be "degraded" — a static site never needed the
+        Only SPA targets can be "degraded" - a static site never needed the
         browser. ``dynamic_failed`` when the browser could not run at all;
         ``dynamic_partial`` when it launched but yielded nothing usable or was
         truncated; ``dynamic_ok`` otherwise.

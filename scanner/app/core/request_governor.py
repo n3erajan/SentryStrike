@@ -3,7 +3,7 @@
 A per-scan governor consulted at the single HTTP chokepoint
 (:meth:`HttpVerifier.send_request`). It enforces per-detector and
 per-(detector, parameter) request ceilings so no single detector or parameter
-can dominate scan traffic — the failure mode that let header-stored XSS spend
+can dominate scan traffic - the failure mode that let header-stored XSS spend
 ~93% of all requests for one finding.
 
 Design constraints (this is a security scanner):
@@ -13,7 +13,7 @@ Design constraints (this is a security scanner):
   abort a detector) or fabricating content (which could create a false
   positive/negative). An empty body reads as "nothing here" to every detector,
   so the only effect is that the low-value *tail* of an over-budget detector's
-  probes is skipped — exactly the intended budget behaviour.
+  probes is skipped - exactly the intended budget behaviour.
 * **No cross-detector response caching.** Serving one detector's cached read to
   another risks stale differentials → false positives, so the governor never
   caches response bodies.
@@ -42,7 +42,7 @@ class _GovernorState:
     parameter_counts: dict[tuple[str, str], int] = field(default_factory=dict)
     # Detectors/parameters already reported as capped (so we log once, not per probe).
     denied_detectors: set[str] = field(default_factory=set)
-    # Per-detector count of DENIED (ceiling-hit) requests — distinct from the
+    # Per-detector count of DENIED (ceiling-hit) requests - distinct from the
     # admitted counts above. Feeds truthful "budget_exhausted" telemetry so the
     # coverage summary never infers a budget deny from a mere finding gap.
     denied_counts: dict[str, int] = field(default_factory=dict)

@@ -43,7 +43,7 @@ SAFE_SUBMIT_LABEL_RE = re.compile(
 )
 # A control that navigates away / abandons a form rather than submitting it.
 # Clicking one during form submission fires no mutating request AND leaves the
-# route, wasting budget and losing the form — so it is never treated as a submit
+# route, wasting budget and losing the form - so it is never treated as a submit
 # control. Generic across stacks (Back/Cancel/Close/Previous/Skip/Dismiss).
 NON_SUBMIT_CONTROL_RE = re.compile(
     r"\b(back|cancel|close|dismiss|previous|prev|skip|abort|discard|return|go\s*back|nav\s*before|navigate_before|arrow_back)\b",
@@ -242,7 +242,7 @@ OVERLAY_DETECT_SCRIPT = """
       // A genuine click-blocking overlay layers ABOVE app content with a high
       // stacking order. SPA layout shells (mat-sidenav-container, app-root
       // wrappers) are also position:absolute + full-viewport but sit at a low
-      // z-index (0-2) purely to establish a stacking context — they do NOT block
+      // z-index (0-2) purely to establish a stacking context - they do NOT block
       // interaction. A low z-index threshold here mis-flags that structural shell
       // as an overlay on EVERY route, forcing an expensive (~1.8s) dismiss pass
       // each interaction and throttling the crawl to ~1 click per route. Real
@@ -302,7 +302,7 @@ MODAL_CONTENT_SCRIPT = """
 # Expand hidden/collapsed interactive containers so their forms and links become
 # visible and capturable. Framework-agnostic: clicks on ARIA tab headers,
 # accordion/collapsible panel headers (aria-expanded=false), and "show
-# more"/"load more"/"expand" style **buttons** (never ``a[href]`` — anchors can
+# more"/"load more"/"expand" style **buttons** (never ``a[href]`` - anchors can
 # navigate away from the current route, losing the form the expansion was
 # meant to reveal). Excludes dropdown/menu/combobox triggers (aria-haspopup,
 # mat-select, role=combobox) which open transient panels that intercept
@@ -350,7 +350,7 @@ EXPAND_HIDDEN_SCRIPT = """
         tryClick(el);
       }
     });
-    // Generic "show more"/"load more"/"expand" controls — buttons only, never
+    // Generic "show more"/"load more"/"expand" controls - buttons only, never
     // a[href] (anchors can navigate away from the current route).
     document.querySelectorAll('button, [role=button]').forEach((el) => {
       if (!isVisible(el)) return;
@@ -424,7 +424,7 @@ OPEN_NAV_MENUS_SCRIPT = """
 
 # Click safe, mutating "action" buttons (add-to-cart/basket, save, create,
 # apply, post/comment, rate, redeem, generate, …) in one pass. Many SPA
-# mutations are fired by a plain button click — NOT a <form> submit — so the
+# mutations are fired by a plain button click - NOT a <form> submit - so the
 # form-submission path never reaches them (e.g. an add-to-basket button that
 # POSTs a cart item). The generic interaction loop treats these as low-priority
 # fallbacks and, with a short per-route budget, usually never clicks them. This
@@ -442,7 +442,7 @@ SAFE_ACTION_CLICK_SCRIPT = r"""
     const DESTRUCTIVE = /\b(delete|remove|destroy|reset|initialize|install|setup|migrate|drop|truncate|purchase|checkout|pay|buy|order|transfer|withdraw|subscribe|unsubscribe)\b/i;
     // Action VERBS only. A bare noun ("basket", "cart", "bag") also appears on
     // navigation controls ("Your Basket", "Show the shopping cart") which merely
-    // route away — clicking one aborts the whole in-page pass and fires no XHR.
+    // route away - clicking one aborts the whole in-page pass and fires no XHR.
     // Requiring a verb keeps "Add to Basket" (has "add") while rejecting the cart
     // nav button, and excludes purchase-completing verbs (buy/order/checkout/pay,
     // in DESTRUCTIVE) so the pass never completes an irreversible transaction.
@@ -492,7 +492,7 @@ SPA_SHELL_PROBE_SCRIPT = """
     const body = document.body;
     if (!body) return false;
     const kids = [...body.children];
-    // Chromium wraps a raw JSON/text/file response in a single <pre> — never a shell.
+    // Chromium wraps a raw JSON/text/file response in a single <pre> - never a shell.
     if (kids.length === 1 && kids[0].tagName === 'PRE') return false;
     // Otherwise a shell is a script-driven HTML document with a real element tree.
     return document.querySelectorAll('script[src]').length > 0 && kids.length > 0;
@@ -502,7 +502,7 @@ SPA_SHELL_PROBE_SCRIPT = """
 
 # Rendered-route content signature (framework-agnostic). A hash-routed SPA serves
 # ONE index.html for every ``#/…`` route, so HTTP status can never tell a live
-# route from a client-side 404/redirect-to-home — only the RENDERED DOM can. This
+# route from a client-side 404/redirect-to-home - only the RENDERED DOM can. This
 # probe returns a stable signature of the router-outlet's visible content: the
 # page title, the visible text length bucket, and the sorted set of structural
 # component tags (custom elements + landmark roles). Two routes that render the
@@ -660,7 +660,7 @@ FORM_CAPTURE_SCRIPT = """
       // with NO button, so a submit-less cluster is still worth recording when it
       // is clearly a form by content: a file input (uploads on change), a password
       // field (auth), or two-plus named fields. A lone unnamed search box stays
-      // dropped, keeping noise out. Generic — keyed on field content, not on any
+      // dropped, keeping noise out. Generic - keyed on field content, not on any
       // framework's markup.
       if (!hasForm && actionable < 1) {
         const hasFile = fileInputs > 0;
@@ -800,7 +800,7 @@ _CLUSTER_VALIDITY_SCRIPT = r"""
       }
     });
     // Also check custom dropdown widgets (mat-select, role=combobox) that are
-    // not native <select> — reactive forms gate submit on their value too.
+    // not native <select> - reactive forms gate submit on their value too.
     root.querySelectorAll('mat-select, [role=combobox], [role=listbox]').forEach((el) => {
       const required = el.getAttribute('aria-required') === 'true';
       const value = (el.innerText || '').trim();
@@ -917,7 +917,7 @@ class BrowserDiscoveryEngine:
         # fill on a field that never resolves, …) otherwise inherits Playwright's
         # 30s default. Our ``_bounded`` wrapper cancels the awaiting task after a
         # few hundred ms, but cancellation does not stop Playwright's underlying
-        # protocol call — it keeps running to ITS timeout and then rejects into a
+        # protocol call - it keeps running to ITS timeout and then rejects into a
         # future nobody awaits ("Future exception was never retrieved"). With a
         # 30s default that orphan lingers for 30s and any genuinely-unwrapped op
         # blocks a worker for 30s, which on a form-heavy SPA drags the whole crawl
@@ -943,7 +943,7 @@ class BrowserDiscoveryEngine:
             pass
 
         # Restore per-origin sessionStorage. Playwright's ``storage_state`` only
-        # seeds cookies + localStorage — sessionStorage is silently dropped, yet
+        # seeds cookies + localStorage - sessionStorage is silently dropped, yet
         # SPAs routinely keep session-scoped state there (cart/basket ids, CSRF
         # tokens, wizard progress). Without it a token-seeded context boots
         # authenticated but cannot fire flows that need that state (e.g. an
@@ -971,7 +971,7 @@ class BrowserDiscoveryEngine:
         Reads the ``origins[].sessionStorage`` entries from a Playwright-style
         ``storage_state`` blob (a list of ``{"name", "value"}`` pairs per origin)
         and emits JS that, on each navigation, writes those key/values into
-        ``sessionStorage`` **only when the page's own origin matches** — so one
+        ``sessionStorage`` **only when the page's own origin matches** - so one
         worker context can hold several origins' state without cross-seeding.
         Existing keys are not overwritten (the live app may have set a fresher
         value). Returns ``None`` when no origin carries sessionStorage, so the
@@ -1027,7 +1027,7 @@ class BrowserDiscoveryEngine:
 
         Each worker owns its ``wstate``/``by_key``/``inflight`` so observations
         stream into per-worker state (merged under lock at the end) and the
-        inflight counter reaches quiescence independently — a single shared
+        inflight counter reaches quiescence independently - a single shared
         counter never drains while any worker is still loading.
         """
 
@@ -1092,8 +1092,8 @@ class BrowserDiscoveryEngine:
             observed.response_headers = headers
             observed.response_content_type = headers.get("content-type")
             observed.redirect_chain = self._redirect_chain(request)
-            # Bounded: ``response.text()`` has no timeout and — unlike locator
-            # ops — is NOT covered by ``context.set_default_timeout``. On a
+            # Bounded: ``response.text()`` has no timeout and - unlike locator
+            # ops - is NOT covered by ``context.set_default_timeout``. On a
             # streaming / never-closing body (SSE, socket.io long-poll, a chat
             # stream) it never resolves, wedging this observer task; the worker
             # then blocks draining it. ``_bounded`` caps it so it always settles.
@@ -1156,7 +1156,7 @@ class BrowserDiscoveryEngine:
         # gather from re-raising the CancelledError/close error we expect.
         # Bounded: an observer that resists prompt cancellation must not wedge
         # the worker here (this runs inline in the route loop). If the cancelled
-        # tasks do not settle in time, abandon them rather than block — the
+        # tasks do not settle in time, abandon them rather than block - the
         # pool watchdog is the last resort, but this keeps a single stuck
         # observer from ever reaching it.
         if pending:
@@ -1289,7 +1289,7 @@ class BrowserDiscoveryEngine:
         # already timed out and moved on, but the underlying CDP call is orphaned).
         # That future is never awaited by anyone, so at GC asyncio logs a noisy
         # "Future exception was never retrieved" at crawl end. Results are already
-        # fully captured — this only silences the benign teardown artefact. A
+        # fully captured - this only silences the benign teardown artefact. A
         # scoped handler swallows ONLY that specific closed-target case and
         # delegates everything else to the previous handler, and is restored in
         # ``finally`` so no global state leaks out of the crawl.
@@ -1335,7 +1335,7 @@ class BrowserDiscoveryEngine:
             # A hard-deadline truncation cancels workers mid-``fill``, orphaning
             # Playwright protocol futures that reject with ``TargetClosedError``
             # once the browser closes. Their "never retrieved" warning fires at
-            # GC time — which otherwise lands AFTER the handler below is restored,
+            # GC time - which otherwise lands AFTER the handler below is restored,
             # leaking the flood. Force collection now, while the suppressor is
             # still installed, so those benign futures are swallowed at their
             # ``__del__`` rather than by the caller's default handler.
@@ -1389,7 +1389,7 @@ class BrowserDiscoveryEngine:
             # Route-path keys of the app's OWN client routes (mined from JS bundles,
             # HTML links, or the sitemap). A router-defined route that renders the
             # not-found component is almost always just missing a required query
-            # parameter (e.g. ``/#/search`` without ``q``), NOT genuinely dead — so
+            # parameter (e.g. ``/#/search`` without ``q``), NOT genuinely dead - so
             # it must survive suppression as a live route (a brute-force guess that
             # renders the same IS dead). Keyed by route path so a bare mined path
             # (``/search``) matches its rendered hash form (``/#/search``).
@@ -1397,8 +1397,8 @@ class BrowserDiscoveryEngine:
                 self._client_route_key(u) for u in (client_routes or [])
             }
             # Path keys of routes OBSERVED in the rendered DOM (anchors/router
-            # directives harvested during the crawl). Only these — never a
-            # brute-force wordlist seed — are eligible to be resurrected as a
+            # directives harvested during the crawl). Only these - never a
+            # brute-force wordlist seed - are eligible to be resurrected as a
             # real HTTP server endpoint when their hash form renders dead (see
             # the not-found-suppression site). Populated as discovery proceeds.
             browser_observed_keys: set[str] = set()
@@ -1424,7 +1424,7 @@ class BrowserDiscoveryEngine:
                 # Skip raw API/data/asset endpoints as NAVIGATION targets: the
                 # browser's value is rendering the SPA and exercising forms, which
                 # such URLs never do (a JSON/text body renders as a dead <pre>, an
-                # asset as bytes) — yet full-loading each one burns the finite
+                # asset as bytes) - yet full-loading each one burns the finite
                 # budget that high-value app routes need to be reached and their
                 # forms submitted. These endpoints are already covered by the HTTP
                 # crawler + JS api_extractor, and passive XHR capture during SPA
@@ -1441,8 +1441,8 @@ class BrowserDiscoveryEngine:
             # Probe the live app once to learn its routing mode before seeding.
             # Static route strings mined from JS bundles are bare paths
             # (``/login``); a hash-routed SPA only renders them at ``/#/login``,
-            # so seeding the bare path navigates the shell and the real page —
-            # with its forms and XHR calls — never loads. The probe reuses a
+            # so seeding the bare path navigates the shell and the real page -
+            # with its forms and XHR calls - never loads. The probe reuses a
             # seeded context (so an auth-gated root still renders) and is bounded;
             # on failure it returns None and the static heuristic stands in.
             #
@@ -1587,7 +1587,7 @@ class BrowserDiscoveryEngine:
                     # serves one index.html for every ``#/…`` route, so a
                     # brute-force wordlist path (``#/wp-admin``, ``#/.env``)
                     # renders the app's not-found/catch-all component with an
-                    # HTTP 200 — indistinguishable from a live route except by
+                    # HTTP 200 - indistinguishable from a live route except by
                     # the RENDERED DOM. When the route's rendered signature
                     # matches the not-found fallback captured at preflight,
                     # record it as dead and skip all form/interaction work
@@ -1606,7 +1606,7 @@ class BrowserDiscoveryEngine:
                             # project injectable params onto. Only a route with
                             # no client-route provenance (brute-force guess,
                             # blind discovery) is recorded as genuinely dead.
-                            # Either way we skip the interaction work below — an
+                            # Either way we skip the interaction work below - an
                             # empty not-found render has no forms to exercise.
                             is_client_route = (
                                 self._client_route_key(landed_url) in client_route_keys
@@ -1617,7 +1617,7 @@ class BrowserDiscoveryEngine:
                             # ``./redirect?to=…`` anchor) or a served file
                             # (``#/ftp/legal.md``, from a ``./ftp/legal.md``
                             # anchor). The hash form renders the not-found shell
-                            # only because the server never sees a fragment —
+                            # only because the server never sees a fragment -
                             # yet it is a real HTTP endpoint the detectors must
                             # test (open redirect, SSRF, LFI, path traversal /
                             # arbitrary file read). This is the "second chance
@@ -1677,7 +1677,7 @@ class BrowserDiscoveryEngine:
                     )
                     # Form capture + active submission is the highest-yield
                     # body-producing work, so it runs BEFORE blind
-                    # interaction — otherwise ``_exercise_page`` consumes the
+                    # interaction - otherwise ``_exercise_page`` consumes the
                     # per-route budget first and the submit path (which fires
                     # the app's real POST/PUT/PATCH XHR that on_request
                     # captures as a replayable body) is starved on truncation.
@@ -1749,7 +1749,7 @@ class BrowserDiscoveryEngine:
                                 # box) is captured on EVERY route with a
                                 # per-route action, so its ``_form_key`` differs
                                 # each time and it would be re-submitted on
-                                # every page — each attempt firing a useless GET
+                                # every page - each attempt firing a useless GET
                                 # and burning ~1-2s of the budget owed to
                                 # unreached form routes. Dedup a second time on
                                 # a route-independent structural signature
@@ -1777,9 +1777,9 @@ class BrowserDiscoveryEngine:
                         # fire safe action buttons (add/save/create/rate/…)
                         # that POST/PUT via a plain click with no <form>, so
                         # on_request captures their bodies too. Runs here as a
-                        # first-class high-yield step — right after form submit,
+                        # first-class high-yield step - right after form submit,
                         # before the blind interaction loop can spend the
-                        # budget — and is deadline/dedup-bounded so it never
+                        # budget - and is deadline/dedup-bounded so it never
                         # starves route coverage. Only clicks that fire a
                         # mutating XHR are counted as valuable.
                         if allow_interaction:
@@ -1830,7 +1830,7 @@ class BrowserDiscoveryEngine:
                     # then wake any idle workers to pick them up.
                     # Open hamburger/sidebar/dropdown menus so their route
                     # links become visible in the DOM. Collect links
-                    # IMMEDIATELY after opening menus — a scroll or any
+                    # IMMEDIATELY after opening menus - a scroll or any
                     # interaction can close a dropdown (mat-menu,
                     # cdk-overlay) and its dynamically-rendered route links
                     # vanish from the DOM. Then scroll for lazy-loaded
@@ -1939,7 +1939,7 @@ class BrowserDiscoveryEngine:
                     # Pool watchdog. A worker stuck on an unbounded await (a
                     # never-closing response body / socket.io stream that escapes
                     # the per-op bounds) never returns to the dequeue loop, so it
-                    # never becomes idle — the "all idle => finished" terminator
+                    # never becomes idle - the "all idle => finished" terminator
                     # can never fire, every other worker parks in ``cond.wait()``,
                     # and the crawl hangs forever (only a SIGINT breaks it). Cap
                     # the join at the budget plus a grace: on timeout ``wait_for``
@@ -1967,7 +1967,7 @@ class BrowserDiscoveryEngine:
                 ticker_task.cancel()
                 await asyncio.gather(ticker_task, return_exceptions=True)
                 # Merge each worker's local state into the shared state. This runs
-                # in ``finally`` — even under a hard-timeout cancellation — so the
+                # in ``finally`` - even under a hard-timeout cancellation - so the
                 # per-worker partial observations (streamed into each ``wstate`` in
                 # place during the run) are never discarded (the RC-1 durability
                 # guarantee, preserved despite per-worker accumulation). add_*
@@ -1975,7 +1975,7 @@ class BrowserDiscoveryEngine:
                 seen_observations: set[tuple[str, str, str]] = set()
                 for wstate in worker_states:
                     self._merge_worker_state(state, wstate, seen_observations)
-                # Derive endpoints/params from whatever streamed in — runs even on
+                # Derive endpoints/params from whatever streamed in - runs even on
                 # truncation so partial coverage yields testable surface.
                 self._derive_endpoints(state)
                 # Visibility summary: read as forms_submitted>0 but post_bodies==0
@@ -2052,14 +2052,14 @@ class BrowserDiscoveryEngine:
         """Normalise a request body for DEDUP KEYING only (never for storage).
 
         Some frameworks echo a server-generated, per-request volatile token back
-        into the very body they POST — most commonly an ISO-8601 timestamp
+        into the very body they POST - most commonly an ISO-8601 timestamp
         (``createdAt``/``updatedAt``/``iat``) baked into a nested object the form
         pulled from a prior GET. Two submits of the SAME form to the SAME endpoint
         then differ only by that timestamp, so the raw-body dedup key treats them
         as distinct and the identical replayable body is counted twice (observed
         as a phantom "double submit" of e.g. ``POST /api/Users/``). Collapsing
         only high-confidence volatile tokens keeps genuinely-distinct payloads
-        (different credentials, different search terms) fully separate — url +
+        (different credentials, different search terms) fully separate - url +
         method still isolate endpoints, and every non-volatile value is preserved
         verbatim in the key. The stored observation always keeps its original,
         replayable body; only this key is normalised. Framework-agnostic: matches
@@ -2160,7 +2160,7 @@ class BrowserDiscoveryEngine:
 
         A hash-routed SPA serves the same ``index.html`` for every ``#/…`` route,
         so a dead route (``#/wp-admin``) renders the app's client-side not-found /
-        catch-all component — indistinguishable from a live route by HTTP status.
+        catch-all component - indistinguishable from a live route by HTTP status.
         Capturing that fallback's rendered signature lets the crawl suppress any
         later route whose rendered component tree is identical to it. Best-effort:
         returns ``None`` on any failure so the crawl proceeds without suppression.
@@ -2176,7 +2176,7 @@ class BrowserDiscoveryEngine:
             if landed is _BOUNDED_FAILED:
                 return None
             # For a path-routed app a nonexistent path yields a real HTTP 404 whose
-            # body is NOT the SPA shell — never fingerprint that as a route fallback.
+            # body is NOT the SPA shell - never fingerprint that as a route fallback.
             if not hash_routed:
                 status = None
                 try:
@@ -2205,7 +2205,7 @@ class BrowserDiscoveryEngine:
         signature captured at preflight. The root itself is never dead (it
         bootstraps the shell). Conservative: requires an EXACT signature match, so
         only routes rendering an identical component tree to the confirmed 404 are
-        suppressed — a genuinely distinct route always survives.
+        suppressed - a genuinely distinct route always survives.
         """
         if not not_found_signature or not signature:
             return False
@@ -2223,7 +2223,7 @@ class BrowserDiscoveryEngine:
 
         Client-side routing is attempted only when the page currently holds a
         live, same-origin SPA shell (see :meth:`_navigate_spa_route`). Otherwise
-        — and whenever the SPA hop fails to land — a real ``page.goto`` full load
+        - and whenever the SPA hop fails to land - a real ``page.goto`` full load
         boots the shell so its router processes the route from a clean document.
         This is the fix for the poisoning bug: a worker whose page held a non-SPA
         document (a JSON API body, a static file, an error page) would otherwise
@@ -2246,7 +2246,7 @@ class BrowserDiscoveryEngine:
 
         - the current document is NOT a routable SPA shell (a raw JSON/text/file
           body or a scriptless page): routing it would only rewrite a dead
-          document's URL and the framework router would never react — the exact
+          document's URL and the framework router would never react - the exact
           cause of ``replayable_json_bodies == 0`` in production, where workers
           picked up HTTP-discovered API/file routes and were poisoned for their
           whole lifetime; or
@@ -2308,7 +2308,7 @@ class BrowserDiscoveryEngine:
         have_path = (after.path or "/").rstrip("/") or "/"
         if target_path == have_path:
             return True
-        # Path route that didn't move the URL at all: no-op — force a full load.
+        # Path route that didn't move the URL at all: no-op - force a full load.
         return after_url != before_url
 
     async def _settle_inflight(
@@ -2325,7 +2325,7 @@ class BrowserDiscoveryEngine:
         events) so there is exactly one settle implementation. ``networkidle``
         never fires on apps with persistent sockets/polling, so we watch the
         counter and return once it stays at zero for ``quiet_ms`` or ``cap_ms``
-        elapses — whichever comes first.
+        elapses - whichever comes first.
         """
         await settle_page(page, inflight=inflight, quiet_ms=quiet_ms, cap_ms=cap_ms)
 
@@ -2364,12 +2364,12 @@ class BrowserDiscoveryEngine:
         loses that surface entirely. This method runs the modal-content probe;
         when the modal is interactive (has inputs/forms/links), it re-runs form
         capture (which tags clusters inside the modal), submits any new forms,
-        and collects links — all before dismissing the modal. Non-interactive
+        and collects links - all before dismissing the modal. Non-interactive
         overlays (cookie banners, spinners) are dismissed immediately.
         """
         modal_info = await self._bounded(page.evaluate(MODAL_CONTENT_SCRIPT), 800)
         if not isinstance(modal_info, dict) or not modal_info.get("isInteractive"):
-            # Non-interactive overlay — dismiss immediately.
+            # Non-interactive overlay - dismiss immediately.
             keyboard = getattr(page, "keyboard", None)
             if keyboard is not None:
                 await self._bounded(keyboard.press("Escape"), 500)
@@ -2524,7 +2524,7 @@ class BrowserDiscoveryEngine:
                 continue
             if not has_form and action_controls < 1:
                 # Mirror the capture script's submit-less gate: keep a button-less
-                # cluster only when it is clearly a form by content — a file upload
+                # cluster only when it is clearly a form by content - a file upload
                 # (submits on change), a password field (auth), or two-plus named
                 # fields. A lone search box stays dropped so noise is not captured.
                 has_file = any(item["type"].lower() == "file" for item in normalized_inputs)
@@ -2626,7 +2626,7 @@ class BrowserDiscoveryEngine:
         the app fires its real ``POST/PUT/PATCH`` XHR with a real body shape that
         ``on_request`` captures as a replayable observation. Destructive forms
         (delete/pay/logout/…) are never submitted. Auth forms are submitted with
-        synthetic creds — capturing the request body is the goal even when the
+        synthetic creds - capturing the request body is the goal even when the
         credentials are invalid. Each form key is submitted at most once across
         the whole crawl (dedup via :meth:`CrawlState._form_key`).
 
@@ -2634,7 +2634,7 @@ class BrowserDiscoveryEngine:
         threaded in so the post-submit settle waits for the submit-triggered XHR
         to *finish* before we navigate back: otherwise the navigation tears the
         frame down while ``on_request`` is still asynchronously reading the
-        request body, and the observation (with its POST body) is lost — the
+        request body, and the observation (with its POST body) is lost - the
         real cause of ``replayable_json_bodies == 0`` despite forms being
         submitted. Falls back to a throwaway counter only for direct-call tests.
 
@@ -2649,7 +2649,7 @@ class BrowserDiscoveryEngine:
             # Stop cleanly at the overall crawl deadline. Each form runs an
             # expensive chain (re-capture + fill + fill-to-valid + settle), and a
             # form-heavy route entered near the budget would otherwise run minutes
-            # PAST the deadline — the cause of the crawl overrunning its clean
+            # PAST the deadline - the cause of the crawl overrunning its clean
             # internal deadline into the much larger hard-safety timeout, leaving a
             # long silent tail. Unsubmitted forms are simply left for a future run;
             # coverage already streamed is never lost.
@@ -2688,7 +2688,7 @@ class BrowserDiscoveryEngine:
                 # ``data-sentry-cluster``/``data-sentry-field`` anchors of every
                 # not-yet-submitted cluster (they were tagged against a DOM that no
                 # longer exists). Returning to the route and re-capturing re-tags
-                # the live DOM so this cluster's selectors resolve — otherwise the
+                # the live DOM so this cluster's selectors resolve - otherwise the
                 # fill silently no-ops and the app POST never fires, which (with a
                 # navigating first cluster such as a header search box) collapsed
                 # per-route submission to a single low-value form.
@@ -2788,7 +2788,7 @@ class BrowserDiscoveryEngine:
         """Briefly poll for the cluster's submit control to become enabled.
 
         Returns as soon as an enabled submit-like control is found (usually the
-        first probe) or after ``attempts`` short waits — bounded to well under
+        first probe) or after ``attempts`` short waits - bounded to well under
         half a second so it never dominates the per-form budget."""
         cluster_id = form.get("cluster_id")
         scope = f"[data-sentry-cluster='{cluster_id}'] " if cluster_id is not None else ""
@@ -2852,7 +2852,7 @@ class BrowserDiscoveryEngine:
             # cluster's ``data-sentry-cluster``/``data-sentry-field`` anchors are
             # still bound to the live DOM. A single cheap re-capture picks up any
             # in-place framework re-tag; on no match the passed ``form`` is as
-            # valid as at capture time. No navigation, no settle, no retry sleep —
+            # valid as at capture time. No navigation, no settle, no retry sleep -
             # in an XHR-driven SPA most submits fire without leaving the route, so
             # paying that cost per form is what exhausted the crawl budget.
             fresh = await self._capture_forms(page, route_url)
@@ -2860,7 +2860,7 @@ class BrowserDiscoveryEngine:
             return matched if matched is not None else form
         # A prior submit left the route: navigate back and re-capture against the
         # freshly-mounted DOM, which needs a beat to settle before the cluster
-        # exists — otherwise the stale anchors resolve to nothing. Only this
+        # exists - otherwise the stale anchors resolve to nothing. Only this
         # genuinely-changed case pays the navigate + settle + retry cost.
         await self._navigate(page, route_url, root_url, allow_spa=True)
         await self._settle_inflight(page, inflight)
@@ -2873,7 +2873,7 @@ class BrowserDiscoveryEngine:
             # The cluster may mount slightly late; brief settle then retry once.
             if attempt == 0:
                 await asyncio.sleep(0.3)
-        # Navigated but the cluster never reappeared — it is genuinely gone.
+        # Navigated but the cluster never reappeared - it is genuinely gone.
         return None
 
     async def _fill_form_fields(self, page: Any, form: Any) -> bool:
@@ -2884,8 +2884,8 @@ class BrowserDiscoveryEngine:
         Fields are resolved by a cascade of selectors, not by a single synthetic
         attribute. The ``data-sentry-field`` tag set by the capture script is the
         fast path, but frameworks (Angular Material, React, Vue) frequently
-        re-create an input node right after first render — discarding any foreign
-        attribute — so that tag is *gone* on exactly the fields that most need
+        re-create an input node right after first render - discarding any foreign
+        attribute - so that tag is *gone* on exactly the fields that most need
         filling (password/matInput wrappers). When it is missing, filling falls
         back to cluster-scoped selectors anchored on the ``data-sentry-cluster``
         attribute (which sits on a stable container and survives re-render):
@@ -2894,7 +2894,7 @@ class BrowserDiscoveryEngine:
 
         A field that never fills leaves a framework reactive-form invalid, which
         keeps its submit control ``disabled`` and means the app never fires its
-        real POST/PUT/PATCH XHR — the true cause of ``replayable_json_bodies == 0``
+        real POST/PUT/PATCH XHR - the true cause of ``replayable_json_bodies == 0``
         on <form>-less SPAs. Playwright's ``fill``/``check`` drive controlled
         inputs correctly (native setters + input/change events).
 
@@ -2924,7 +2924,7 @@ class BrowserDiscoveryEngine:
             nth = type_seen.get(itype, 0)
             type_seen[itype] = nth + 1
             if itype == "file":
-                # File inputs can't be filled with ``fill`` — they need
+                # File inputs can't be filled with ``fill`` - they need
                 # ``set_input_files``. A form with a required file input stays
                 # invalid and never fires its POST without this, so the complaint/
                 # upload forms (common in SPAs) are silently never submitted.
@@ -2942,7 +2942,7 @@ class BrowserDiscoveryEngine:
                 filled = True
         # Custom dropdowns (Angular Material ``mat-select``, and other ARIA
         # ``role=combobox``/``listbox`` widgets in React/Vue kits) are NOT native
-        # ``<select>`` elements — ``fill``/``select_option`` cannot satisfy them,
+        # ``<select>`` elements - ``fill``/``select_option`` cannot satisfy them,
         # so a reactive form gated on one stays invalid and never fires its POST.
         # Engaging them generically (open, pick the first real option) is the only
         # way to make such forms submittable, framework-agnostically.
@@ -2951,7 +2951,7 @@ class BrowserDiscoveryEngine:
         # Arithmetic-CAPTCHA satisfaction: a form gated on a "what is X+Y?" style
         # challenge stays invalid until the correct answer is entered, so its POST
         # never fires. Solve it generically (parse the expression from the DOM,
-        # compute, fill the answer field) — a very common SPA pattern.
+        # compute, fill the answer field) - a very common SPA pattern.
         if await self._solve_arithmetic_captcha(page, scope, inputs):
             filled = True
         # Dispatch blur on the active element after filling so reactive
@@ -3026,7 +3026,7 @@ class BrowserDiscoveryEngine:
 
         Supports ``+ - * x ×`` between two integers (the dominant math-CAPTCHA
         form). Returns the integer result, or ``None`` when no expression is
-        present. Pure Python arithmetic — the page string is parsed, never eval'd.
+        present. Pure Python arithmetic - the page string is parsed, never eval'd.
         """
         if not text:
             return None
@@ -3114,7 +3114,7 @@ class BrowserDiscoveryEngine:
                     picked = True
                     break
             if not picked and best_index is not None:
-                # Every option looked like a placeholder — select the first visible
+                # Every option looked like a placeholder - select the first visible
                 # one so a single-option dropdown is still satisfied.
                 chosen = await self._bounded(
                     options.nth(best_index).click(timeout=600), 800
@@ -3139,7 +3139,7 @@ class BrowserDiscoveryEngine:
         typed/format value). This queries the live cluster for still-invalid
         required controls and re-fills them, up to ``max_rounds`` times. Returns
         True once a submit control reports ``:enabled`` (or native form validity),
-        else False — best-effort; the submit path still attempts either way.
+        else False - best-effort; the submit path still attempts either way.
         """
         cluster_id = form.get("cluster_id")
         if cluster_id is None:
@@ -3401,14 +3401,14 @@ class BrowserDiscoveryEngine:
 
         Modern SPA reactive forms reject trivial values (a single ``1`` in a
         phone field, a random string where a ZIP/number is expected), which
-        leaves the form invalid and its submit disabled — so the app never fires
+        leaves the form invalid and its submit disabled - so the app never fires
         its POST XHR and no body is captured. The semantic ``hint`` (an input's
         label/placeholder/aria-label captured by :data:`FORM_CAPTURE_SCRIPT`)
         drives a value that satisfies common domain validators generically
         (phone, ZIP, quantity, card, name, address, …), then falls back to a
         type-appropriate value and finally the name-keyed baseline. The result
         is clamped to any captured ``minlength``/``maxlength``. All checks are on
-        generic English field semantics — no target- or framework-specific keys.
+        generic English field semantics - no target- or framework-specific keys.
         """
         joined = f"{name} {hint} {itype}".lower()
         value = self._value_from_semantics(joined, name, itype)
@@ -3479,7 +3479,7 @@ class BrowserDiscoveryEngine:
         The first round uses the normal semantic value; later rounds escalate to
         cover common hidden validators the base value can trip: a numeric field
         with an unexposed ``min`` (a quantity that must exceed a threshold), or a
-        text field needing more length. Purely generic — driven by input type and
+        text field needing more length. Purely generic - driven by input type and
         round index, never by app- or field-specific knowledge.
         """
         if round_index <= 0:
@@ -3546,7 +3546,7 @@ class BrowserDiscoveryEngine:
 
         Reactive forms disable their submit control until the form is valid, and
         clicking a disabled control merely burns the click-actionability timeout
-        (~800ms) and fires nothing — the dominant reason ``replayable_json_bodies``
+        (~800ms) and fires nothing - the dominant reason ``replayable_json_bodies``
         stayed at ~0 despite many "submitted" forms. So we skip disabled controls
         with a fast :meth:`~Locator.is_enabled` check instead of paying that
         timeout, preferring a real ``submit``-type control scoped to the cluster.
@@ -3575,7 +3575,7 @@ class BrowserDiscoveryEngine:
         # submit-labelled button), never a back/cancel/nav control. A real click
         # is tried BEFORE ``requestSubmit`` because reactive frameworks bind their
         # handler to the button's ``click`` (or the form's ``ngSubmit``, which a
-        # click triggers) — ``requestSubmit`` frequently reports success yet fires
+        # click triggers) - ``requestSubmit`` frequently reports success yet fires
         # no app request, which then counts a no-op as a submission and starves
         # this reliable path.
         if cluster_id is not None:
@@ -3618,7 +3618,7 @@ class BrowserDiscoveryEngine:
         A control labelled back/cancel/close/previous (:data:`NON_SUBMIT_CONTROL_RE`)
         is never clicked: a form's action row routinely pairs an enabled Back/Cancel
         button with a (disabled-until-valid) Submit, and clicking the enabled Back
-        both fires no app request and navigates off the route — the reason many
+        both fires no app request and navigates off the route - the reason many
         "submitted" forms produced no body. Such controls are skipped so the click
         only ever lands on a real submit."""
         for selector in selectors:
@@ -3726,7 +3726,7 @@ class BrowserDiscoveryEngine:
             # already ran the first-class button pass (body-coverage #1) with the
             # same ``clicked_action_keys`` set, so when it is provided this call
             # dedups against it and only fires controls revealed since (e.g. by
-            # expand_hidden_content) — no double-click, no double-count.
+            # expand_hidden_content) - no double-click, no double-count.
             action_result = await self._click_safe_action_buttons(
                 page, inflight, clicked_action_keys
             )
@@ -3753,7 +3753,7 @@ class BrowserDiscoveryEngine:
             attempted_controls.add(control_key)
 
             # Hard-bounded click; on interception, clear overlays and try one
-            # forced click (still never a destructive control — filtered above).
+            # forced click (still never a destructive control - filtered above).
             result = await self._bounded(element.click(timeout=800), 900)
             if result is _BOUNDED_FAILED:
                 await self._clear_blocking_overlays(page)
@@ -3762,7 +3762,7 @@ class BrowserDiscoveryEngine:
             if modal_aware:
                 # After each click, check if a modal/dialog opened and explore
                 # its content (forms, links) before dismissing it. This captures
-                # forms and routes that only exist inside modals — a major source
+                # forms and routes that only exist inside modals - a major source
                 # of missed surface on modal-heavy SPAs.
                 modal_links = await self._explore_modal_if_open(
                     page, page_url, inflight, pending_observers or set(),
@@ -3865,7 +3865,7 @@ class BrowserDiscoveryEngine:
     # Minimal valid files keyed by extension, used when a file input constrains
     # its ``accept`` type: uploading a mismatched type fails the field's format
     # validator and, for a form gating submit on validity, blocks the app POST.
-    # Generic across apps — a small library of the common document/media types.
+    # Generic across apps - a small library of the common document/media types.
     _TYPED_UPLOAD_FILES: dict[str, dict[str, Any]] = {
         ".pdf": {"name": "sentry.pdf", "mimeType": "application/pdf",
                  "buffer": b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF"},
@@ -3920,7 +3920,7 @@ class BrowserDiscoveryEngine:
         """Click safe, mutating action buttons in one in-page pass, then settle.
 
         Runs :data:`SAFE_ACTION_CLICK_SCRIPT` (add-to-cart/basket, save, create,
-        post, rate, redeem, … — destructive and navigation controls excluded,
+        post, rate, redeem, … - destructive and navigation controls excluded,
         de-duplicated by label) so button-triggered POST/PUT XHRs fire even
         though no ``<form>`` wraps them. All matching is done inside the page in a
         single evaluate (one round-trip, not N×attribute reads), so it stays cheap
@@ -3931,7 +3931,7 @@ class BrowserDiscoveryEngine:
         is seeded into the in-page de-dup set (so a site-wide widget fires once
         globally) and updated with this pass's clicks. A transient request watcher
         counts how many clicks fired a real *mutating* request (non
-        GET/HEAD/OPTIONS) — the value-producing signal, mirroring
+        GET/HEAD/OPTIONS) - the value-producing signal, mirroring
         :meth:`_submit_and_detect_fire`.
 
         Returns ``{"clicked": [labels], "mutations": int}`` (empty/zero on any
@@ -3992,7 +3992,7 @@ class BrowserDiscoveryEngine:
         Most SPA mutations fire on a plain button click with no ``<form>``
         (add-to-cart, save, create, rate, redeem, top-up). The form path never
         reaches them and the blind interaction loop rarely clicks them before the
-        per-route budget expires — so their POST/PUT body is never observed. This
+        per-route budget expires - so their POST/PUT body is never observed. This
         runs the safe action-click pass up-front, like form submission, and
         repeats it while genuinely-new labelled controls keep appearing (SPA
         re-render / lazy content), bounded by ``crawl_browser_action_click_passes``
@@ -4007,7 +4007,7 @@ class BrowserDiscoveryEngine:
             result = await self._click_safe_action_buttons(page, inflight, clicked_action_keys)
             clicked = result.get("clicked") or []
             if not clicked:
-                # No new safe action control fired this pass — nothing left to do
+                # No new safe action control fired this pass - nothing left to do
                 # on this route; stop instead of spinning to the pass cap.
                 break
             wstate.buttons_clicked += len(clicked)
@@ -4143,7 +4143,7 @@ class BrowserDiscoveryEngine:
         # Bound the evaluate like every other page.evaluate in this file:
         # Playwright's evaluate ignores context.set_default_timeout (it takes no
         # timeout option), so on a route whose JS keeps the main thread busy this
-        # would never resolve — hanging the worker inside _exercise_page and, via
+        # would never resolve - hanging the worker inside _exercise_page and, via
         # the pool join, the whole crawl past its deadline. _bounded caps it and
         # returns _BOUNDED_FAILED (non-str) on timeout, handled below.
         dom_signature = await self._bounded(
@@ -4287,7 +4287,7 @@ class BrowserDiscoveryEngine:
         Generic, framework-agnostic gate that excludes raw API/data/asset leaves
         which render as a dead ``<pre>``/bytes and bear no forms or client-side
         routes: a browser full-load of one yields nothing but spends budget owed
-        to real app routes. A hash-router route (``/#/…``) is ALWAYS navigable —
+        to real app routes. A hash-router route (``/#/…``) is ALWAYS navigable -
         its path is ``/`` and the real route lives in the fragment, so it is the
         SPA shell every time. Otherwise a path under a root API prefix
         (``/api``/``/rest``/``/graphql``/…) or ending in a data/asset suffix is
@@ -4367,7 +4367,7 @@ class BrowserDiscoveryEngine:
         React (``HashRouter``), or hand-rolled:
 
         1. Loading the app root leaves the URL carrying a route-bearing fragment
-           (``…/#/`` or ``…/#/home``) — the router rewrote ``/`` into the hash.
+           (``…/#/`` or ``…/#/home``) - the router rewrote ``/`` into the hash.
         2. The app's own same-origin navigation links are expressed as route
            fragments (``#/login``) rather than real paths (``/login``).
 
@@ -4433,7 +4433,7 @@ class BrowserDiscoveryEngine:
 
         Playwright's ``request.post_data`` base64-decodes the body and then
         ``.decode()``s it as UTF-8, raising ``UnicodeDecodeError`` for binary
-        bodies (gzip, protobuf, images) — which, unhandled, propagates out of the
+        bodies (gzip, protobuf, images) - which, unhandled, propagates out of the
         ``on_request``/``on_response`` event callbacks. Fall back to the raw
         ``post_data_buffer`` decoded leniently so such requests are still observed
         (as a best-effort text body) instead of blowing up the handler.
@@ -4673,7 +4673,7 @@ class BrowserDiscoveryEngine:
         if not body:
             return False
         lowered = (content_type or "").lower()
-        # JSON is replayable whenever the observed body actually parses as JSON —
+        # JSON is replayable whenever the observed body actually parses as JSON -
         # inferring the schema from the captured body rather than requiring a
         # pre-existing non-empty ``body_schema``. This keeps top-level arrays,
         # empty objects, and primitive JSON bodies (schema inference yields
@@ -4831,7 +4831,7 @@ class BrowserDiscoveryEngine:
 
         A hash-routed SPA serves one shell for every ``#/…``, so a genuine
         server resource linked as an anchor gets canonicalised to a hash route
-        and then renders the app's not-found shell — yet it is a real HTTP
+        and then renders the app's not-found shell - yet it is a real HTTP
         endpoint the detectors must test. Two shapes are recovered:
 
         * **Query-bearing endpoint** (``#/redirect?to=X``, canonicalised from a
@@ -4846,7 +4846,7 @@ class BrowserDiscoveryEngine:
 
         This is the "second chance without ``#``" for a browser/JS-mined route
         that turned out dead: retry it as its plain server path. Returns ``""``
-        for a bare dead client route (``#/wp-admin`` — no query, no extension) or
+        for a bare dead client route (``#/wp-admin`` - no query, no extension) or
         a root API prefix already covered by the HTTP crawler + JS api_extractor.
         Framework-agnostic: no app-specific paths.
         """

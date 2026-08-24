@@ -1,5 +1,5 @@
 /* Shared motion tokens for the public pages.
-   Feel: subtle & confident — opacity + small translate + blur,
+   Feel: subtle & confident - opacity + small translate + blur,
    springs with no bounce. */
 
 export const SPRING = { type: "spring", duration: 0.7, bounce: 0 };

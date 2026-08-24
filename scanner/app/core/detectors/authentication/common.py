@@ -133,7 +133,7 @@ class AuthCommonMixin:
         # page). Soft signals (rate-limit/challenge terms) are already screened by
         # _rate_limit_signals_present before this method runs.
         #
-        # A UNIFORM non-2xx code is NOT a control — it is the normal rejection
+        # A UNIFORM non-2xx code is NOT a control - it is the normal rejection
         # baseline. Most correct JSON APIs answer an invalid login with a steady
         # 401/403; the previous "must be 2xx" gate misread that as the server
         # reacting, so those APIs could never be flagged for missing brute-force

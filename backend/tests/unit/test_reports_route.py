@@ -16,8 +16,11 @@ from shared.models.scan import (
     EvidenceStrengthBreakdown,
     ReportMetadata,
     ScanAnalysisState,
+    ScanCoverage,
     ScanStatistics,
     SpaApiCoverage,
+    ProbedParameter,
+    ProbedPath,
 )
 from shared.models.vulnerability import (
     LocationInfo,
@@ -258,3 +261,89 @@ async def test_pdf_is_generated_for_completed_current_analysis(monkeypatch) -> N
     assert response.status_code == 200
     assert response.body == b"pdf-bytes"
     assert response.media_type == "application/pdf"
+
+
+def test_report_payload_promotes_tested_surface_and_coverage_warnings() -> None:
+    """The itemised "what was tested" inventory and the scanner's own coverage
+    caveats must be reachable at the top level of the JSON report, not only
+    nested inside report_metadata."""
+    scan = SimpleNamespace(
+        report_metadata=ReportMetadata(
+            coverage_warnings=[
+                "No second-user account configured; horizontal IDOR comparison was not tested.",
+            ],
+            tested_surface=ScanCoverage(
+                paths_tested=4,
+                paths_probed_by_detector=3,
+                parameters_tested=6,
+                requests_sent=210,
+                requests_denied_by_budget=8,
+                detectors_exercised=["injection_sql_command", "xss"],
+                tested_paths=[
+                    ProbedPath(
+                        path="http://target.test/api/items",
+                        methods=["GET", "POST"],
+                        parameters=[
+                            ProbedParameter(
+                                name="id",
+                                detectors=["injection_sql_command"],
+                                requests=40,
+                            )
+                        ],
+                        detectors=["injection_sql_command", "xss"],
+                        requests=64,
+                        status_codes=[200, 500],
+                    )
+                ],
+            ),
+        ),
+        statistics=ScanStatistics(),
+        overall_risk_score=0.0,
+        submitted_by_user_id="user-1",
+        submitted_by_full_name="Niuradaj Adhadh",
+        submitted_by_email="user@example.test",
+        authorization_confirmed=True,
+        authorization_confirmed_at=None,
+        technology_stack=[],
+        vulnerabilities=[],
+        analysis=None,
+    )
+
+    payload = _build_report_payload(scan, "scan-1")
+
+    surface = payload["tested_surface"]
+    assert surface["paths_tested"] == 4
+    assert surface["paths_probed_by_detector"] == 3
+    assert surface["parameters_tested"] == 6
+    assert surface["requests_denied_by_budget"] == 8
+    assert surface["browser_probes_itemised"] is False
+    assert surface["tested_paths"][0]["path"] == "http://target.test/api/items"
+    assert surface["tested_paths"][0]["parameters"][0]["name"] == "id"
+    assert payload["coverage_warnings"] == [
+        "No second-user account configured; horizontal IDOR comparison was not tested.",
+    ]
+    # The reached-but-unprobed gap must be derivable by any consumer.
+    assert surface["paths_tested"] - surface["paths_probed_by_detector"] == 1
+
+
+def test_report_payload_omits_no_coverage_keys_for_a_scan_without_a_ledger() -> None:
+    """A scan with no recorded surface still exposes the keys, defaulted, so the
+    UI can tell "not recorded" apart from "nothing tested"."""
+    scan = SimpleNamespace(
+        report_metadata=ReportMetadata(),
+        statistics=ScanStatistics(),
+        overall_risk_score=0.0,
+        submitted_by_user_id="user-1",
+        submitted_by_full_name="Niuradaj Adhadh",
+        submitted_by_email="user@example.test",
+        authorization_confirmed=False,
+        authorization_confirmed_at=None,
+        technology_stack=[],
+        vulnerabilities=[],
+        analysis=None,
+    )
+
+    payload = _build_report_payload(scan, "scan-1")
+
+    assert payload["tested_surface"]["paths_tested"] == 0
+    assert payload["coverage_warnings"] == []

@@ -1,7 +1,7 @@
 """coverage_summary must derive skips from real attempted/denied counts.
 
 Regression guard: a detector that ran fully but found nothing must report
-``budget_exhausted == 0`` — the old code inferred budget exhaustion from a
+``budget_exhausted == 0`` - the old code inferred budget exhaustion from a
 findings shortfall, which manufactured phantom ``budget_exhausted`` buckets.
 """
 from __future__ import annotations

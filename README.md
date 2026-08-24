@@ -106,13 +106,13 @@ The compose stack is single-origin: the frontend container's nginx serves the SP
 
 ### Set PUBLIC_HOSTNAME before you trust a blind finding
 
-`PUBLIC_HOSTNAME` is the one value with no usable default. The scanner derives both OAST URLs from it, and if it is empty they stay unset — the out-of-band checks are skipped rather than failed, so blind SSRF and blind SQL injection quietly go undetected and the scan still reports success. Set it to a base URL the _target_ can reach:
+`PUBLIC_HOSTNAME` is the one value with no usable default. The scanner derives both OAST URLs from it, and if it is empty they stay unset - the out-of-band checks are skipped rather than failed, so blind SSRF and blind SQL injection quietly go undetected and the scan still reports success. Set it to a base URL the _target_ can reach:
 
 ```dotenv
 PUBLIC_HOSTNAME=https://sentry.example.com
 ```
 
-For a public deployment, route `/oast/` at your external reverse proxy to the backend the same way you route `/api/`. Override `OAST_CALLBACK_BASE_URL` (what the target calls) and `OAST_POLL_URL` (what the scanner polls) in the root `.env` when they differ — compose interpolates the root `.env` before service `env_file` values load, so Compose-specific OAST overrides belong there, not in `scanner/.env`. See [DOCKER.md](DOCKER.md#oast-callbacks-in-compose) for the two mistakes that break it.
+For a public deployment, route `/oast/` at your external reverse proxy to the backend the same way you route `/api/`. Override `OAST_CALLBACK_BASE_URL` (what the target calls) and `OAST_POLL_URL` (what the scanner polls) in the root `.env` when they differ - compose interpolates the root `.env` before service `env_file` values load, so Compose-specific OAST overrides belong there, not in `scanner/.env`. See [DOCKER.md](DOCKER.md#oast-callbacks-in-compose) for the two mistakes that break it.
 
 ## Local development
 

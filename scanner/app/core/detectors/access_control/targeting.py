@@ -362,7 +362,7 @@ class TargetingMixin:
                 continue
             # SAFETY: an id-bearing state-changer (DELETE/PUT/PATCH /x/:id) would,
             # in the matrix, fire against the REAL object id under every auth
-            # context — destroying/altering a real record. Those are covered
+            # context - destroying/altering a real record. Those are covered
             # non-destructively (synthetic non-existent id) by
             # ``_check_mutating_authorization``, so exclude them here. POST creates
             # (no owner id in the path) stay in the matrix.
@@ -488,8 +488,8 @@ class TargetingMixin:
         segment rather than a concrete value.
 
         Crawlers frequently capture route templates before the SPA binds real
-        data — ``/rest/track-order/:id``, ``/rest/track-order/undefined``,
-        ``/api/orders/{orderId}`` — and these are not real, replayable endpoints.
+        data - ``/rest/track-order/:id``, ``/rest/track-order/undefined``,
+        ``/api/orders/{orderId}`` - and these are not real, replayable endpoints.
         Detection is structural (segment shape), so it holds for any framework or
         client router, and covers URL-encoded ``:`` (``%3A``) which the simple
         ``/:`` literal check misses.

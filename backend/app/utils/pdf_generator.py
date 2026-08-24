@@ -216,7 +216,7 @@ def _resolve_char(ch: str) -> tuple[str, str]:
     if ch in ("\n", "\t"):
         return ("keep", ch)
     if cp < 0x20 or cp == 0x7F:
-        # Non-printable control byte (NUL, DEL, etc.) — surface it visibly
+        # Non-printable control byte (NUL, DEL, etc.) - surface it visibly
         # rather than dropping it, so the report reflects the raw response.
         return ("latin", f"\\u{cp:04x}")
     if cp <= 0xFF:
@@ -800,7 +800,7 @@ class CoverPage:
 
         # ── Risk score pill ──
         risk = data.get("risk_score", 0)
-        pill_x, pill_y, pill_w, pill_h = 22*mm, h - 130*mm, 55*mm, 28*mm
+        pill_x, pill_y, pill_w, pill_h = 22*mm, h - 130*mm, 48*mm, 28*mm
         canvas.setFillColor(ACCENT_RED)
         canvas.roundRect(pill_x, pill_y, pill_w, pill_h, 5, fill=1, stroke=0)
         canvas.setFillColor(WHITE)
@@ -810,29 +810,36 @@ class CoverPage:
         canvas.drawCentredString(pill_x + pill_w/2, pill_y + 5, "RISK SCORE / 100")
 
         # ── Stats boxes ──
+        # Active findings only, so the total matches the severity distribution
+        # below it (suppressed false positives are excluded there as well).
+        total_active = int(
+            stats.get("active_vulnerabilities", stats.get("total_vulnerabilities", 0)) or 0
+        )
+        sev_stats = stats.get("severity_breakdown", {})
         sev_order = [
-            ("Critical", ACCENT_RED,    stats.get("severity_breakdown", {}).get("critical", 0)),
-            ("High",     ACCENT_ORANGE, stats.get("severity_breakdown", {}).get("high", 0)),
-            ("Medium",   ACCENT_YELLOW, stats.get("severity_breakdown", {}).get("medium", 0)),
-            ("Low",      ACCENT_BLUE,   stats.get("severity_breakdown", {}).get("low", 0)),
+            ("Critical", ACCENT_RED,    sev_stats.get("critical", 0)),
+            ("High",     ACCENT_ORANGE, sev_stats.get("high", 0)),
+            ("Medium",   ACCENT_YELLOW, sev_stats.get("medium", 0)),
+            ("Low",      ACCENT_BLUE,   sev_stats.get("low", 0)),
+            ("Info",     MID_GRAY,      sev_stats.get("info", 0)),
         ]
-        bx = 85*mm
+        bx = 74*mm
         for label, clr, count in sev_order:
             canvas.setFillColor(clr)
-            canvas.roundRect(bx, pill_y, 22*mm, pill_h, 4, fill=1, stroke=0)
+            canvas.roundRect(bx, pill_y, 20*mm, pill_h, 4, fill=1, stroke=0)
             canvas.setFillColor(WHITE)
             canvas.setFont("Helvetica-Bold", 16)
-            canvas.drawCentredString(bx + 11*mm, pill_y + 14, str(count))
+            canvas.drawCentredString(bx + 10*mm, pill_y + 14, str(count))
             canvas.setFont("Helvetica-Bold", 6.5)
-            canvas.drawCentredString(bx + 11*mm, pill_y + 5, label.upper())
-            bx += 26*mm
+            canvas.drawCentredString(bx + 10*mm, pill_y + 5, label.upper())
+            bx += 24*mm
 
         # ── Total vulns ──
         canvas.setFillColor(PANEL_BG)
         canvas.roundRect(22*mm, h - 160*mm, 55*mm, 20*mm, 4, fill=1, stroke=0)
         canvas.setFillColor(WHITE)
         canvas.setFont("Helvetica-Bold", 15)
-        canvas.drawCentredString(49.5*mm, h - 151*mm, str(stats.get("total_vulnerabilities", 0)))
+        canvas.drawCentredString(49.5*mm, h - 151*mm, str(total_active))
         canvas.setFont("Helvetica-Bold", 7)
         canvas.drawCentredString(49.5*mm, h - 158*mm, "TOTAL VULNERABILITIES")
 
@@ -1079,10 +1086,11 @@ def build_toc(data: dict, styles: dict) -> list:
     rows = [
         ("1.", "Executive Summary"),
         ("2.", "Scan Statistics"),
-        ("3.", "Technology Detected"),
-        ("4.", "Vulnerability Summary"),
-        ("5.", "Detailed Findings"),
-        ("6.", "Remediation Roadmap"),
+        ("3.", "Tested Surface & Coverage"),
+        ("4.", "Technology Detected"),
+        ("5.", "Vulnerability Summary"),
+        ("6.", "Detailed Findings"),
+        ("7.", "Remediation Roadmap"),
     ]
     tbl_data = [[Paragraph(n, styles["toc_title"]), Paragraph(t, styles["toc_entry"])] for n, t in rows]
     tbl = Table(tbl_data, colWidths=[15*mm, None])
@@ -1300,10 +1308,186 @@ def build_statistics(data: dict, styles: dict) -> list:
     return elems
 
 
+def _coverage_warnings(d: dict) -> list[str]:
+    warnings = d.get("coverage_warnings")
+    if not warnings:
+        warnings = (d.get("report_metadata") or {}).get("coverage_warnings") or []
+    return [str(warning) for warning in warnings if str(warning).strip()]
+
+
+# Detector identifiers are snake_case module names; title-casing them alone turns
+# acronyms into "Xss" / "Injection Sql Command". Spell the known ones properly and
+# fall back to title case for anything new.
+DETECTOR_LABELS = {
+    "access_control": "Access Control",
+    "authentication_failures": "Authentication",
+    "crypto_failures": "Cryptographic Failures",
+    "csrf": "CSRF",
+    "exception_handling": "Error Handling",
+    "file_inclusion": "File Inclusion (LFI/RFI)",
+    "file_upload": "File Upload",
+    "injection_sql_command": "SQL / Command Injection",
+    "nosql_injection": "NoSQL Injection",
+    "open_redirect": "Open Redirect",
+    "security_headers": "Security Headers",
+    "sensitive_paths": "Sensitive Paths",
+    "ssrf": "SSRF",
+    "supply_chain": "Supply Chain",
+    "xss": "XSS",
+    "crawler": "Crawler (discovery only)",
+}
+
+
+def _detector_label(name: Any) -> str:
+    key = str(name or "").strip()
+    return DETECTOR_LABELS.get(key, _clean_enum(key))
+
+
+def build_tested_surface(data: dict, styles: dict) -> list:
+    """Counts of what the scan actually tested, plus the gaps it knows about.
+
+    Deliberately counts only - a scan can probe hundreds of paths and thousands
+    of parameters, and itemising them here would bury the report. The full
+    inventory (every path, method, and parameter tested) is served in the JSON
+    report and rendered, paginated, in the web UI.
+    """
+    d = data.get("data", {})
+    surface = _report_metadata_value(d, "tested_surface")
+    warnings = _coverage_warnings(d)
+
+    elems = section_header("Tested Surface & Coverage", styles, "3")
+    elems.append(Paragraph(
+        "Measured from the requests this scan actually dispatched - not from the surface "
+        "discovered during crawling, and not inferred from the findings. Probes the request "
+        "budget refused are excluded, and a path the target answered only with 404 is recorded "
+        "as absent rather than as tested surface.",
+        styles["body_sm"],
+    ))
+    elems.append(Spacer(1, 3*mm))
+
+    if not surface:
+        # Absent field, not an empty result: this scan ran before the tested-surface
+        # ledger existed. Say so rather than printing zeros that would read as
+        # "nothing was tested".
+        elems.append(Paragraph(
+            "No tested-surface inventory was recorded for this scan, so the paths and parameters "
+            "exercised cannot be listed. This does not mean nothing was tested - see the findings "
+            "and the coverage gaps below.",
+            styles["body_sm"],
+        ))
+    else:
+        paths_tested = surface.get("paths_tested", 0)
+        probed = surface.get("paths_probed_by_detector", 0)
+        absent = surface.get("paths_absent", 0)
+        unconfirmed = surface.get("paths_existence_unconfirmed", 0)
+        rows = [
+            ("Existing Paths Reached", paths_tested),
+            ("Paths Probed by a Detector", probed),
+            ("Parameters Tested", surface.get("parameters_tested", 0)),
+            ("Requests Sent", surface.get("requests_sent", 0)),
+            ("Requests Proving a Path Absent (404)", surface.get("requests_to_absent_paths", 0)),
+            ("Candidate Paths Found Absent", absent),
+            ("Requests With No Response", surface.get("requests_without_response", 0)),
+            ("Requests Denied by Request Budget", surface.get("requests_denied_by_budget", 0)),
+        ]
+        if unconfirmed:
+            rows.append(("Paths With Existence Unconfirmed", unconfirmed))
+        detectors = surface.get("detectors_exercised") or []
+        rows.append(("Detectors That Sent Traffic", len(detectors)))
+        elems.append(_metric_table(rows, styles))
+
+        if absent:
+            elems.append(Spacer(1, 2*mm))
+            elems.append(Paragraph(
+                f"Path-guessing checks probed <b>{absent}</b> candidate path(s) the target answered "
+                "only with 404/410. Those probes prove a resource is absent, so they are counted "
+                "here but excluded from the tested surface above and from the itemised inventory - "
+                "counting them would inflate coverage with paths that do not exist.",
+                styles["body_sm"],
+            ))
+
+        if unconfirmed:
+            elems.append(Spacer(1, 2*mm))
+            elems.append(Paragraph(
+                f"<b>{unconfirmed}</b> path(s) never returned a response at all, so whether they "
+                "exist was not established in either direction. They are excluded from the tested "
+                "surface.",
+                styles["body_sm"],
+            ))
+
+        reached_not_probed = max(0, paths_tested - probed)
+        if reached_not_probed:
+            elems.append(Spacer(1, 2*mm))
+            elems.append(Paragraph(
+                f"<b>{reached_not_probed}</b> of the {paths_tested} existing paths reached were "
+                "fetched during crawling but never probed by a detector. They are listed in the "
+                "JSON report; treat them as untested.",
+                styles["body_sm"],
+            ))
+
+        if detectors:
+            elems.append(Spacer(1, 2*mm))
+            elems.append(Paragraph(
+                "Detectors that sent traffic: " + _para_escape(", ".join(_detector_label(name) for name in detectors)) + ".",
+                styles["body_sm"],
+            ))
+
+        notes: list[str] = []
+        if surface.get("tested_paths_truncated"):
+            notes.append(
+                f"The stored inventory lists {len(surface.get('tested_paths') or [])} paths; "
+                f"{surface.get('tested_paths_omitted', 0)} further tested paths exceeded the storage "
+                "ceiling and are counted above but not itemised."
+            )
+        if surface.get("ledger_entries_omitted"):
+            notes.append(
+                f"{surface.get('ledger_entries_omitted', 0)} distinct parameter probes exceeded the "
+                "recording ceiling; the request total above still includes them."
+            )
+        if not surface.get("browser_probes_itemised", False):
+            notes.append(
+                "Browser-driven probes (DOM XSS verification and browser crawling) do not pass "
+                "through the request ledger, so this inventory covers HTTP-layer traffic only. "
+                "Browser-only coverage is understated here, not absent from the scan."
+            )
+        if notes:
+            elems.append(Spacer(1, 2*mm))
+            for note in notes:
+                elems.append(Paragraph(f"- {_para_escape(note)}", styles["body_sm"]))
+
+        elems.append(Spacer(1, 2*mm))
+        elems.append(Paragraph(
+            "The itemised inventory - every path, method, and parameter tested, with the detectors "
+            "that probed it - is included in the JSON report for this scan.",
+            styles["body_sm"],
+        ))
+
+    elems.append(Spacer(1, 5*mm))
+    elems += sub_header("Coverage Gaps - What Was Not Tested", styles)
+    if warnings:
+        elems.append(Paragraph(
+            "Each item below is a gap the scanner recorded during this run. Where a class was not "
+            "exercised, the absence of findings in that class is not evidence that the target is "
+            "unaffected.",
+            styles["body_sm"],
+        ))
+        elems.append(Spacer(1, 2*mm))
+        for warning in warnings:
+            elems.append(Paragraph(f"- {_para_escape(warning)}", styles["body_sm"]))
+    else:
+        elems.append(Paragraph(
+            "The scanner recorded no coverage gaps for this run. That means every detector it ran "
+            "dispatched traffic and its structural prerequisites were met - not that the whole "
+            "application was tested.",
+            styles["body_sm"],
+        ))
+    return elems
+
+
 def build_technology_detected(data: dict, styles: dict) -> list:
     d = data.get("data", {})
     technologies = d.get("technology_stack", [])
-    elems = section_header("Technology Detected", styles, "3")
+    elems = section_header("Technology Detected", styles, "4")
     elems.append(Paragraph(
         "The scanner identified the following technologies and checked each detected component for known CVEs.",
         styles["body"],
@@ -1347,7 +1531,7 @@ def build_technology_detected(data: dict, styles: dict) -> list:
 def build_vulnerability_summary(data: dict, styles: dict) -> list:
     d = data.get("data", {})
     vulns = d.get("vulnerabilities", [])
-    elems = section_header("Vulnerability Summary", styles, "4")
+    elems = section_header("Vulnerability Summary", styles, "5")
     elems.append(Paragraph(
         "The table below lists findings ordered by CVSS score, with deterministic evidence "
         "strength and review status shown separately.",
@@ -1406,7 +1590,7 @@ def build_vulnerability_summary(data: dict, styles: dict) -> list:
 def build_detailed_findings(data: dict, styles: dict) -> list:
     d = data.get("data", {})
     vulns = d.get("vulnerabilities", [])
-    elems = section_header("Detailed Findings", styles, "5")
+    elems = section_header("Detailed Findings", styles, "6")
     elems.append(Paragraph(
         "Each finding is documented with technical evidence, AI-assisted analysis, "
         "business impact, and exploitability context.",
@@ -1574,7 +1758,7 @@ def build_remediation_roadmap(data: dict, styles: dict) -> list:
         for vulnerability in d.get("vulnerabilities", [])
         if not vulnerability.get("is_false_positive", False)
     ]
-    elems = section_header("Remediation Roadmap", styles, "6")
+    elems = section_header("Remediation Roadmap", styles, "7")
     elems.append(Paragraph(
         "The following roadmap prioritises remediation actions by severity and exploitability. "
         "Immediate attention should be given to Critical findings before addressing lower-severity items.",
@@ -1603,7 +1787,7 @@ def build_remediation_roadmap(data: dict, styles: dict) -> list:
             phases["Backlog (Low / Informational)"].append(v)
 
     # Sort each severity bucket by exploitability so the easiest-to-exploit
-    # items appear first — the fastest remediation wins at every level.
+    # items appear first - the fastest remediation wins at every level.
     for items in phases.values():
         items.sort(key=lambda v: _exploit_order.get(
             _clean_enum(v.get("ai_analysis", {}).get("exploitability", "Medium")), 1
@@ -1683,6 +1867,10 @@ def build_scan_pdf(scan_data: dict | None = None,
     story.append(PageBreak())
 
     story += build_statistics(scan_data, styles)
+    story.append(PageBreak())
+
+    coverage_section = build_tested_surface(scan_data, styles)
+    story += coverage_section
     story.append(PageBreak())
 
     story += build_technology_detected(scan_data, styles)

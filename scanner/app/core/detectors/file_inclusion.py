@@ -267,7 +267,7 @@ class FileInclusionDetector(BaseDetector):
                                 f"appending a poison null byte and an allowed extension "
                                 f"({self._NULL_BYTE}.{ext}) returns HTTP 200 with the file's "
                                 f"contents. The null byte truncates the path server-side while "
-                                f"the appended extension satisfies the whitelist — arbitrary "
+                                f"the appended extension satisfies the whitelist - arbitrary "
                                 f"read of an otherwise-blocked file."
                             ),
                             confidence_score=95.0,
@@ -307,7 +307,7 @@ class FileInclusionDetector(BaseDetector):
 
     @staticmethod
     def _is_valid_src_code_delivery(text_content: str) -> bool:
-        # Use substring checks rather than regex — faster and avoids regex
+        # Use substring checks rather than regex - faster and avoids regex
         # edge cases that produced false negatives on previously tested targets.
         text_lower = text_content.lower()
         indicators = ["<?php", "html", "doctype", "require_once", "include(", "$_get", "$_post"]
@@ -389,7 +389,7 @@ class FileInclusionDetector(BaseDetector):
 
         # Poison-null-byte extension-filter bypass on directory-served files.
         # The injection point is a static file's own path segment (not a query or
-        # body parameter), so this runs independently of ``candidates`` — there is
+        # body parameter), so this runs independently of ``candidates`` - there is
         # no ``AttackSurface`` candidate for a plain ``/dir/file.ext`` URL.
         try:
             findings.extend(
@@ -449,7 +449,7 @@ class FileInclusionDetector(BaseDetector):
 
                     # Dead-baseline abort: a 401/403/404/405 baseline means the
                     # endpoint is unreachable/unauthorized as sent, so no path or
-                    # wrapper differential can exist — skip rather than fire the
+                    # wrapper differential can exist - skip rather than fire the
                     # traversal/wrapper payload set into 4xx noise.
                     if is_dead_baseline(baseline):
                         return cand_findings
@@ -471,7 +471,7 @@ class FileInclusionDetector(BaseDetector):
 
                     # Terms that prove the server *attempted* a remote HTTP fetch and
                     # hit a network-level failure.  allow_url_include must therefore be
-                    # ON — this is a genuine RFI indicator (still needs canary
+                    # ON - this is a genuine RFI indicator (still needs canary
                     # confirmation before we report it, see below).
                     rfi_network_error_terms = re.compile(
                         r"(failed to open stream: HTTP request failed|"
@@ -486,7 +486,7 @@ class FileInclusionDetector(BaseDetector):
 
                     # Terms that prove the server *refused* to make a remote request
                     # because allow_url_include is DISABLED.  Their presence means the
-                    # server is NOT vulnerable — treat as a suppressor, never a trigger.
+                    # server is NOT vulnerable - treat as a suppressor, never a trigger.
                     rfi_blocked_terms = re.compile(
                         r"(allow_url_include|"
                         r"wrapper is disabled in the server configuration|"
@@ -528,7 +528,7 @@ class FileInclusionDetector(BaseDetector):
                                     if not re.search(verify_rule, stripped_body, re.I):
                                         continue
 
-                                # Lower threshold to 10 bytes — slim system/docker
+                                # Lower threshold to 10 bytes - slim system/docker
                                 # responses would previously fall below the
                                 # 50-byte minimum and be incorrectly marked as
                                 # non-differential.
@@ -625,7 +625,7 @@ class FileInclusionDetector(BaseDetector):
                     # httpx then percent-encodes, turning "http://example.com/" into
                     # "http%3A%2F%2Fexample.com%2F".  PHP's include() receives that
                     # literal string and tries to open a *local* file by that name
-                    # instead of making an HTTP request — so RFI silently fails.
+                    # instead of making an HTTP request - so RFI silently fails.
                     #
                     # Fix: build the injection URL manually, substituting the param
                     # value with the raw RFI URL using safe=':/?#[]@!$&\'()*+,;=%'
@@ -734,7 +734,7 @@ class FileInclusionDetector(BaseDetector):
                         # The un-routable payloads (0.0.0.0) are designed to reveal
                         # whether allow_url_include is ON: if the server *attempts* the
                         # fetch it will emit a network-level error.  That is only an
-                        # *indicator* — not proof — because display_errors=Off silently
+                        # *indicator* - not proof - because display_errors=Off silently
                         # swallows those errors, and display_errors=On on a non-vulnerable
                         # app can surface them for unrelated reasons.
                         #
@@ -757,7 +757,7 @@ class FileInclusionDetector(BaseDetector):
                         ):
                             # Send example.com and require its known content to
                             # appear in the response.  A network error alone is never
-                            # enough to report — we need the actual remote body reflected.
+                            # enough to report - we need the actual remote body reflected.
                             confirm_url, confirm_params, confirm_data, confirm_json, confirm_headers, confirm_cookies = (
                                 _build_rfi_request_args(self._RFI_CONFIRM_PAYLOAD)
                             )

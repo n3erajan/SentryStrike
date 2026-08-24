@@ -6,7 +6,7 @@ is deliberately I/O-free so it is fast and unit-testable: evidence is gathered
 by the caller (:class:`app.integrations.wappalyzer.TechnologyDetector`) and
 passed in via :class:`Evidence`.
 
-Pattern format (Wappalyzer): ``"<regex>\\;confidence:50\\;version:\\1"`` — a
+Pattern format (Wappalyzer): ``"<regex>\\;confidence:50\\;version:\\1"`` - a
 regex followed by optional ``\\;``-delimited tags. ``version:\\1`` back-references
 a regex capture group to extract the version (supports the ternary
 ``\\1?a:b`` form). Patterns are JS regexes; the minority that don't compile
@@ -451,6 +451,6 @@ def runtime_probes() -> tuple[list[str], list[str]]:
 
 
 def db_stats() -> tuple[int, int]:
-    """(technology_count, skipped_pattern_count) — for diagnostics/tests."""
+    """(technology_count, skipped_pattern_count) - for diagnostics/tests."""
     techs, skipped = _load_db()
     return len(techs), skipped

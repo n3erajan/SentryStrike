@@ -10,12 +10,100 @@ Provides functions for:
 - Differential analysis
 """
 
+import asyncio
 import html
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
 from uuid import uuid4
+from zlib import crc32
+
+# ``SequenceMatcher.ratio()`` over raw characters is O(n*m). On 350 KB of real
+# page content a single call measured 505s - and a boolean differential makes
+# three. That much uninterruptible CPU on the event loop starves the scan
+# worker's lease-renewal task past its TTL, so the backend reconciles a healthy
+# scan as orphaned and reports "Scan worker stopped unexpectedly".
+#
+# Fix: compare a bounded sequence of *content-defined chunks* instead of
+# characters. Two properties matter, and cheaper schemes break one or the other:
+#
+#   * Whole-document coverage. A head/tail window is fast but blind to the
+#     mid-page block that boolean-blind SQLi actually toggles - it reports two
+#     differing bodies as identical, which is the one error this metric must
+#     never make.
+#   * Shift tolerance. Fixed-offset chunks realign nothing after an insertion:
+#     a 200-character nonce near the top of the page moves every later boundary
+#     and scores 0.0, so an ordinary CSRF token would read as "totally
+#     different" and destroy the noise calibration.
+#
+# Content-defined boundaries give both. Chunks break where the content says
+# (a token checksum hits the boundary modulus), so an insertion disturbs only the
+# chunk containing it, and every part of the document is still represented. The
+# modulus is derived from the longer body so both sides break identically -
+# otherwise the sequences would misalign and everything would look different.
+_SIMILARITY_TARGET_CHUNKS = 1024
+
+# Below this, comparing raw characters is cheap and maximally precise, so short
+# bodies (the common case) keep exact character-level similarity.
+_SIMILARITY_EXACT_CHARS = 8_192
+
+# Token boundaries for chunking. Every character falls into exactly one
+# alternative, so tokenising and rejoining is lossless - a chunked comparison
+# must never silently drop content it was asked to compare. Breaking at ``<`` and
+# at whitespace runs keeps tokens content-anchored in markup and in JSON/text.
+_TOKEN_RE = re.compile(r"<|[^\s<]+|\s+")
+
+
+def _content_defined_chunks(text: str, modulus: int) -> list[str]:
+    """Split ``text`` into chunks whose boundaries are decided by content.
+
+    Tokens accumulate into a chunk until a token's checksum hits the boundary
+    modulus. Because the boundary depends only on the token itself, inserting or
+    removing content perturbs the chunk it lands in and leaves the rest aligned.
+
+    ``crc32`` rather than ``hash``: it is not randomised per process, so the same
+    two bodies always yield the same similarity score and recorded evidence stays
+    reproducible across worker restarts.
+    """
+    tokens = _TOKEN_RE.findall(text)
+    if modulus <= 1:
+        return tokens
+    chunks: list[str] = []
+    current: list[str] = []
+    for token in tokens:
+        current.append(token)
+        if crc32(token.encode("utf-8", "replace")) % modulus == 0:
+            chunks.append("".join(current))
+            current = []
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
+def _chunk_modulus(len_a: int, len_b: int) -> int:
+    """Boundary modulus that keeps the chunk count near the target.
+
+    Derived from the longer body so ``a`` and ``b`` are chunked identically.
+    Tokens average ~8 characters, so token count is estimated from length rather
+    than paying a second tokenisation pass.
+    """
+    estimated_tokens = max(len_a, len_b) // 8
+    return max(1, estimated_tokens // _SIMILARITY_TARGET_CHUNKS)
+
+
+# ``extract_differences`` produces human-readable evidence and needs
+# character-level opcodes, so it cannot use the chunked path. It gets a plain
+# head+tail cap instead - small enough that the quadratic walk stays negligible.
+_EVIDENCE_WINDOW_CHARS = 8_192
+
+
+def _evidence_window(text: str) -> str:
+    """Cap ``text`` to a head+tail window for evidence extraction."""
+    if len(text) <= _EVIDENCE_WINDOW_CHARS:
+        return text
+    half = _EVIDENCE_WINDOW_CHARS // 2
+    return text[:half] + text[-half:]
 
 
 @dataclass
@@ -46,7 +134,7 @@ class ResponseData:
 # 404 = dead endpoint or non-existent object, 405 = wrong method for this URL.
 # Deliberately excludes 400 (a validation error an injection may still flip) and
 # 500 (error-based injection's signal), and login-style flows are unaffected
-# because their baseline is a healthy 200 — only the deliberate false-payload
+# because their baseline is a healthy 200 - only the deliberate false-payload
 # returns 401.
 _DEAD_BASELINE_STATUSES = frozenset({401, 403, 404, 405})
 
@@ -56,7 +144,7 @@ def is_dead_baseline(response: "ResponseData | None") -> bool:
 
     Used by injection verifiers to abort a target before spending the payload
     budget on a URL that returned 401/403/404/405 to the plain baseline. A
-    ``None`` or governor-denied (``not_tested``) baseline is NOT dead — the probe
+    ``None`` or governor-denied (``not_tested``) baseline is NOT dead - the probe
     simply never ran, which is handled separately.
     """
     if response is None or response.not_tested:
@@ -380,6 +468,18 @@ class ResponseAnalyzer:
         """
         Calculate similarity between two strings using SequenceMatcher.
 
+        Short bodies are compared character-by-character (exact). Larger bodies
+        are compared as a bounded sequence of content-defined chunks: the raw
+        character comparison is quadratic and measured 505s on 350 KB of real
+        page content, which blocks the event loop long enough for the worker's
+        lease to expire. Chunking covers the whole document and tolerates
+        insertions, so a differential anywhere still registers while an ordinary
+        per-request nonce does not read as a total rewrite.
+
+        ``autojunk`` is disabled throughout: its "popular element" heuristic
+        silently distorts the ratio on inputs this size - it reported 0.56 for
+        two bodies differing by a 200-character insertion.
+
         Args:
             text1: First string
             text2: Second string
@@ -391,14 +491,38 @@ class ResponseAnalyzer:
             return 1.0
         if not text1 or not text2:
             return 0.0
+        if text1 == text2:
+            return 1.0
 
-        matcher = SequenceMatcher(None, text1, text2)
-        return matcher.ratio()
+        if max(len(text1), len(text2)) <= _SIMILARITY_EXACT_CHARS:
+            return SequenceMatcher(None, text1, text2, autojunk=False).ratio()
+
+        modulus = _chunk_modulus(len(text1), len(text2))
+        a = _content_defined_chunks(text1, modulus)
+        b = _content_defined_chunks(text2, modulus)
+        return SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+    @staticmethod
+    async def calculate_similarity_async(text1: str, text2: str) -> float:
+        """Awaitable ``calculate_similarity`` that runs off the event loop.
+
+        Bounded is not free - it is still pure-Python CPU, and held on the event
+        loop it blocks lease renewal, the cancellation watcher, and every
+        concurrent detector. ``difflib`` is pure Python, so a worker thread
+        releases the GIL on the normal switch interval and the loop keeps making
+        progress; an inline call cannot be preempted at all.
+        """
+        return await asyncio.to_thread(ResponseAnalyzer.calculate_similarity, text1, text2)
 
     @staticmethod
     def extract_differences(baseline: str, injected: str, context_chars: int = 100) -> list[str]:
         """
         Extract segments that differ between baseline and injected responses.
+
+        Needs character-level opcodes to slice readable segments, so it cannot
+        use the chunked comparison. Inputs are capped to a head+tail window
+        instead: the output is human-readable evidence only, and the uncapped
+        opcode walk carries the same quadratic cost that stalled the worker.
 
         Args:
             baseline: Baseline response body
@@ -408,7 +532,9 @@ class ResponseAnalyzer:
         Returns:
             List of difference segments with context
         """
-        matcher = SequenceMatcher(None, baseline, injected)
+        baseline = _evidence_window(baseline)
+        injected = _evidence_window(injected)
+        matcher = SequenceMatcher(None, baseline, injected, autojunk=False)
         differences = []
 
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -841,28 +967,74 @@ class ResponseAnalyzer:
         - True condition response (payload that should evaluate to true)
         - False condition response (payload that should evaluate to false)
 
+        Prefer ``analyze_boolean_differential_async`` from async code: the three
+        comparisons are CPU-bound and block the event loop when run inline.
+
         Returns:
             (is_vulnerable, analysis_dict)
         """
+        sims = ResponseAnalyzer._boolean_similarities(
+            baseline.body, true_payload_response.body, false_payload_response.body
+        )
+        return ResponseAnalyzer._assemble_boolean_differential(
+            baseline, true_payload_response, false_payload_response, sims
+        )
+
+    @staticmethod
+    async def analyze_boolean_differential_async(
+        baseline: ResponseData,
+        true_payload_response: ResponseData,
+        false_payload_response: ResponseData,
+    ) -> tuple[bool, dict]:
+        """Awaitable ``analyze_boolean_differential`` that runs off the loop.
+
+        All three comparisons are computed in a single thread hop, so the worker
+        keeps renewing its lease and answering cancellations while the diffing
+        runs. Verdict logic is shared with the sync variant - identical result.
+        """
+        sims = await asyncio.to_thread(
+            ResponseAnalyzer._boolean_similarities,
+            baseline.body,
+            true_payload_response.body,
+            false_payload_response.body,
+        )
+        return ResponseAnalyzer._assemble_boolean_differential(
+            baseline, true_payload_response, false_payload_response, sims
+        )
+
+    @staticmethod
+    def _boolean_similarities(
+        baseline_body: str,
+        true_body: str,
+        false_body: str,
+    ) -> tuple[float, float, float]:
+        """The three body comparisons a boolean differential needs.
+
+        Grouped into one function so the async path pays a single thread hop.
+        """
+        return (
+            ResponseAnalyzer.calculate_similarity(baseline_body, true_body),
+            ResponseAnalyzer.calculate_similarity(baseline_body, false_body),
+            ResponseAnalyzer.calculate_similarity(true_body, false_body),
+        )
+
+    @staticmethod
+    def _assemble_boolean_differential(
+        baseline: ResponseData,
+        true_payload_response: ResponseData,
+        false_payload_response: ResponseData,
+        sims: tuple[float, float, float],
+    ) -> tuple[bool, dict]:
+        """Build the analysis dict and verdict from precomputed similarities."""
+        baseline_to_true, baseline_to_false, true_false_diff = sims
         analysis = {
             "baseline_length": len(baseline.body),
             "true_length": len(true_payload_response.body),
             "false_length": len(false_payload_response.body),
-            "baseline_similarity_to_true": ResponseAnalyzer.calculate_similarity(
-                baseline.body, true_payload_response.body
-            ),
-            "baseline_similarity_to_false": ResponseAnalyzer.calculate_similarity(
-                baseline.body, false_payload_response.body
-            ),
-            "true_vs_false_similarity": ResponseAnalyzer.calculate_similarity(
-                true_payload_response.body, false_payload_response.body
-            ),
+            "baseline_similarity_to_true": baseline_to_true,
+            "baseline_similarity_to_false": baseline_to_false,
+            "true_vs_false_similarity": true_false_diff,
         }
-
-        # Key indicator: true and false responses should differ more than baseline differs from either
-        true_false_diff = analysis["true_vs_false_similarity"]
-        baseline_to_true = analysis["baseline_similarity_to_true"]
-        baseline_to_false = analysis["baseline_similarity_to_false"]
 
         # Vulnerable if: true and false are different, but one matches baseline
         is_vulnerable = (

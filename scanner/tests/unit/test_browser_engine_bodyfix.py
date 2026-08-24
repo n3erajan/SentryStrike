@@ -166,7 +166,7 @@ async def test_confirm_field_echoes_primary_value():
 
 class _DisabledSubmitPage:
     """A cluster whose only submit control is permanently disabled and which has
-    no <form> and no Enter-eligible field — the pure disabled-form no-op."""
+    no <form> and no Enter-eligible field - the pure disabled-form no-op."""
 
     def __init__(self):
         self.clicks = 0
@@ -375,8 +375,8 @@ _IMPOSSIBLE_FORM_HTML = """<!doctype html><html><body>
 
 # A reactive form gated on a CUSTOM ARIA dropdown (role=combobox + a portalled
 # role=listbox of role=option), the shape Angular Material's <mat-select> takes.
-# Native fill/select_option cannot satisfy it — only opening the widget and
-# clicking an option does — so the submit stays disabled until it is engaged.
+# Native fill/select_option cannot satisfy it - only opening the widget and
+# clicking an option does - so the submit stays disabled until it is engaged.
 _ARIA_COMBOBOX_FORM_HTML = """<!doctype html><html><body>
 <form id="reg">
   <input id="email" name="email" type="email" required>
@@ -471,7 +471,7 @@ async def _drive(html):
 async def test_real_chromium_reactive_form_yields_replayable_json_body():
     """A reactive form with a disabled submit (required email, password + matching
     confirm, required <select>, required checkbox) must be filled to validity, its
-    submit enabled and clicked, and its POST JSON body captured — the exact shape
+    submit enabled and clicked, and its POST JSON body captured - the exact shape
     that previously produced replayable_json_bodies == 0."""
     ready, _reason = await BrowserDiscoveryEngine.check_readiness()
     if not ready:
@@ -488,7 +488,7 @@ async def test_real_chromium_reactive_form_yields_replayable_json_body():
 @pytest.mark.asyncio
 async def test_real_chromium_impossible_form_wastes_no_click_and_captures_nothing():
     """A form that can never be made valid must not be counted as submitted and
-    must fire no body — proving the disabled-control fast-skip works end-to-end
+    must fire no body - proving the disabled-control fast-skip works end-to-end
     (and does not stall on the click-actionability timeout)."""
     ready, _reason = await BrowserDiscoveryEngine.check_readiness()
     if not ready:
@@ -501,8 +501,8 @@ async def test_real_chromium_impossible_form_wastes_no_click_and_captures_nothin
 @pytest.mark.asyncio
 async def test_real_chromium_aria_combobox_form_yields_replayable_json_body():
     """A reactive form gated on a CUSTOM ARIA dropdown (mat-select shape: a
-    role=combobox trigger + a portalled role=listbox) must be engaged — opened and
-    an option chosen — so the submit enables and its POST JSON body is captured.
+    role=combobox trigger + a portalled role=listbox) must be engaged - opened and
+    an option chosen - so the submit enables and its POST JSON body is captured.
     Native fill/select_option cannot satisfy such a widget, which left Juice Shop's
     registration (and any framework kit's custom dropdown) unsubmittable."""
     ready, _reason = await BrowserDiscoveryEngine.check_readiness()

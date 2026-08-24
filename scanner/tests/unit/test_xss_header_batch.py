@@ -82,7 +82,7 @@ async def test_header_batch_attributes_reflection_to_correct_header():
                         cookies=None, json_body=None, test_phase="", payload=""):
         if headers and "User-Agent" in headers and headers["User-Agent"].startswith("<"):
             # Only the User-Agent value is reflected (HTML-encoded, non-executable)
-            # into an API/JSON response — the other headers are dropped.
+            # into an API/JSON response - the other headers are dropped.
             reflected = html.escape(headers["User-Agent"])
             return _resp(f'{{"echo":"{reflected}"}}', json=True)
         return _resp("<html><body>clean</body></html>")
