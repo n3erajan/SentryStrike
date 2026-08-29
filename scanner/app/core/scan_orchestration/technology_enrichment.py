@@ -1,6 +1,7 @@
 import logging
 
 from app.integrations import error_fingerprints
+from app.integrations.wappalyzer_engine import canonical_component_name
 from shared.models.vulnerability import TechnologyComponent
 
 logger = logging.getLogger("app.core.scanner")
@@ -46,11 +47,15 @@ class TechnologyEnrichmentMixin:
             return
 
         # 3. Merge into the existing stack: skip known names, back-fill missing versions.
-        existing = {c.name.lower(): c for c in (scan.technology_stack or [])}
+        # Keys use canonical_component_name so alias spellings of one product
+        # ("Apache" vs "Apache HTTP Server") converge instead of duplicating.
+        existing = {
+            canonical_component_name(c.name): c for c in (scan.technology_stack or [])
+        }
         new_components: list[TechnologyComponent] = []
         seen_new: set[str] = set()
         for comp in discovered:
-            key = comp.name.lower()
+            key = canonical_component_name(comp.name)
             if key in existing:
                 if comp.version and not existing[key].version:
                     existing[key].version = comp.version
@@ -126,15 +131,19 @@ class TechnologyEnrichmentMixin:
             return
 
         # 3. Merge: back-fill versions, collect new versioned components, and
-        #    track existing components whose version newly resolved.
-        existing = {c.name.lower(): c for c in (scan.technology_stack or [])}
+        #    track existing components whose version newly resolved. Keys are
+        #    canonicalised so alias spellings of one product ("Apache" vs
+        #    "Apache HTTP Server") merge instead of duplicating the component.
+        existing = {
+            canonical_component_name(c.name): c for c in (scan.technology_stack or [])
+        }
         new_components: list[TechnologyComponent] = []
         resolved_existing: list[TechnologyComponent] = []
         seen_new: dict[str, TechnologyComponent] = {}
         for comp in discovered:
             if not comp.version:
                 continue
-            key = comp.name.lower()
+            key = canonical_component_name(comp.name)
             if key in existing:
                 if not existing[key].version:
                     existing[key].version = comp.version

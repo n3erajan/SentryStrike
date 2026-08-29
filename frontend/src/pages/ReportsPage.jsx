@@ -1,38 +1,30 @@
 import { useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Download, FileBarChart, Search } from "lucide-react";
 import { listAllScans } from "../services/scan.js";
 import { listAllApplications } from "../services/applications.js";
 import { downloadReportPdf } from "../services/reports.js";
-import { parseUTCDate, saveBlob } from "../utils/helpers.js";
+import {
+  formatAbsolute,
+  formatRelative,
+  hostnameOf,
+  navigableRowProps,
+  saveBlob,
+  toISOString,
+} from "../utils/helpers.js";
 import { useToast } from "../components/Toast.jsx";
 import { severityClass } from "../data/constants.js";
 import { useAuth } from "../context/AuthContext.jsx";
 import Tooltip from "../components/Tooltip.jsx";
 import Select from "../components/Select.jsx";
+import Pagination from "../components/Pagination.jsx";
 import { belongsToApplication } from "../utils/reportFilters.js";
 import ErrorNotice from "../components/ErrorNotice.jsx";
 import useQuery from "../hooks/useQuery.js";
 import QuerySwap, { QuerySkeleton, QueryContent } from "../components/QuerySwap.jsx";
 
 const EMPTY_ITEMS = [];
-
-function pages(current, total) {
-  if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
-  const always = [1, total];
-  const around = [current - 1, current, current + 1].filter(
-    (p) => p > 1 && p < total,
-  );
-  const set = new Set([...always, ...around]);
-  const result = [];
-  let prev = 0;
-  for (const p of [...set].sort((a, b) => a - b)) {
-    if (p - prev > 1) result.push("…");
-    result.push(p);
-    prev = p;
-  }
-  return result;
-}
+const PAGE_SIZE = 25;
 
 function severityBand(level, score) {
   const lvl = (level || "").toString().toLowerCase();
@@ -43,35 +35,10 @@ function severityBand(level, score) {
   return "Low";
 }
 
-function crawlLabel(mode) {
-  return mode === "single" ? "Single page" : "Full site";
-}
-
-function formatRelative(iso) {
-  const d = parseUTCDate(iso);
-  if (!d) return "-";
-  const diff = Math.max(0, Date.now() - d.getTime());
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  return `${Math.floor(hrs / 24)}d ago`;
-}
-
-function hostnameOf(url) {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return url || "unknown";
-  }
-}
-
 function ReportsPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const toast = useToast();
-  const PAGE_SIZE = 25;
   const [query, setQuery] = useState("");
   const [applicationId, setApplicationId] = useState("");
   const [page, setPage] = useState(1);
@@ -116,18 +83,25 @@ function ReportsPage() {
         (scan) =>
           !applicationId || belongsToApplication(scan, selectedApplication),
       )
-      .map((s) => ({
-        id: s.id,
-        target: s.target_url,
-        host:
-          s.application_name || s.site_title || hostnameOf(s.target_url),
-        crawl: crawlLabel(s.crawl_mode),
-        date: formatRelative(s.completed_at || s.started_at || s.created_at),
-        score: Math.round(s.risk_score ?? 0),
-        band: severityBand(s.risk_level, Math.round(s.risk_score ?? 0)),
-        count: s.total_findings ?? 0,
-        analysisStatus: s.analysis?.status || "not_requested",
-      }))
+      .map((s) => {
+        const completedAt = s.completed_at || s.started_at || s.created_at;
+        return {
+          id: s.id,
+          target: s.target_url,
+          host: s.application_name || s.site_title || hostnameOf(s.target_url),
+          // Only surface the crawl mode when it deviates from the default. It
+          // read "Full site" on every row before, which cost a line of every
+          // row's height to say nothing.
+          singlePage: s.crawl_mode === "single",
+          completedAt,
+          date: formatRelative(completedAt),
+          exact: formatAbsolute(completedAt),
+          score: Math.round(s.risk_score ?? 0),
+          band: severityBand(s.risk_level, Math.round(s.risk_score ?? 0)),
+          count: s.total_findings ?? 0,
+          analysisStatus: s.analysis?.status || "not_requested",
+        };
+      })
       .filter((r) => (r.host + r.target).toLowerCase().includes(q));
   }, [scans, applications, query, applicationId]);
 
@@ -152,6 +126,7 @@ function ReportsPage() {
       <div className='head'>
         <div>
           <h1>Reports</h1>
+          <p>Finished scans with a risk score and a downloadable PDF.</p>
         </div>
       </div>
 
@@ -159,7 +134,7 @@ function ReportsPage() {
         <label className='search'>
           <Search className='ico' />
           <input
-            placeholder='Search reports'
+            placeholder='Search by name or URL'
             value={query}
             onChange={(e) => { setQuery(e.target.value); setPage(1); }}
           />
@@ -178,6 +153,11 @@ function ReportsPage() {
             ]}
           />
         </div>
+        {!loading && rows.length > 0 && (
+          <span className='result-count'>
+            {rows.length} {rows.length === 1 ? "report" : "reports"}
+          </span>
+        )}
       </div>
 
       {error && hasData && (
@@ -194,19 +174,18 @@ function ReportsPage() {
           aria-label='Loading reports'
         >
           <div className='reports-head' aria-hidden='true'>
-            <span>Target</span><span>Completed</span><span>Score</span><span>Findings</span><span>Report</span>
+            <span>Target</span><span>Completed</span><span>Risk</span><span className='num-cell'>Findings</span><span>PDF</span>
           </div>
           {[0, 1, 2, 3].map((item) => (
             <div className='reports-row skeleton-table-row' key={item} aria-hidden='true'>
               <span className='skeleton-target'>
                 <span className='skeleton-block skeleton-heading' />
                 <span className='skeleton-block skeleton-copy' />
-                <span className='skeleton-block skeleton-copy' />
               </span>
               <span className='skeleton-block skeleton-copy' />
               <span className='skeleton-score'>
                 <span className='skeleton-block skeleton-copy' />
-                <span className='skeleton-block skeleton-action' />
+                <span className='skeleton-block skeleton-pill' />
               </span>
               <span className='skeleton-block skeleton-copy' />
               <span className='skeleton-block skeleton-rowaction' />
@@ -219,93 +198,112 @@ function ReportsPage() {
         <div className='empty-state' key='empty'>
           <FileBarChart size={30} />
           <h2>
-            {applicationId ? "No reports for this application" : "No reports yet"}
+            {query
+              ? "No reports match that search"
+              : applicationId
+                ? "No reports for this application"
+                : "No reports yet"}
           </h2>
           <p>
-            {applicationId
-              ? "Completed scans of this app will appear here."
-              : "Reports appear here after a scan and its analysis finish."}
+            {query
+              ? "Try a different name or URL."
+              : applicationId
+                ? "Completed scans of this app will appear here."
+                : "Reports appear here after a scan and its analysis finish."}
           </p>
-          {user?.role !== "viewer" && <button
-            className='btn primary'
-            onClick={() =>
-              navigate(applicationId ? `/scan?app=${applicationId}` : "/scan")
-            }
-          >
-            New scan
-          </button>}
+          {query ? (
+            <button className='btn' onClick={() => setQuery("")}>
+              Clear search
+            </button>
+          ) : (
+            user?.role !== "viewer" && (
+              <button
+                className='btn primary'
+                onClick={() =>
+                  navigate(applicationId ? `/scan?app=${applicationId}` : "/scan")
+                }
+              >
+                New scan
+              </button>
+            )
+          )}
         </div>
       ) : (
-        <QueryContent settled={contentEntered} className='reports-table'>
-          <div className='reports-head'>
-            <span>Target</span>
-            <span>Completed</span>
-            <span>Score</span>
-            <span>Findings</span>
-            <span>Report</span>
+        <QueryContent settled={contentEntered} className='reports-table' role='table' aria-label='Reports'>
+          <div className='reports-head' role='row'>
+            <span role='columnheader'>Target</span>
+            <span role='columnheader'>Completed</span>
+            <span role='columnheader'>Risk</span>
+            <span role='columnheader' className='num-cell'>Findings</span>
+            <span role='columnheader'>PDF</span>
           </div>
-          {pageRows.map((r) => (
+          {pageRows.map((r) => {
+            const analysisReady = r.analysisStatus === "completed";
+            return (
             <article
               key={r.id}
               className='reports-row'
-              onClick={() =>
-                navigate(`/report/${r.id}`, { state: { target: r.target } })
-              }
+              {...navigableRowProps(() =>
+                navigate(`/report/${r.id}`, { state: { target: r.target } }),
+              )}
             >
-              <div className='rep-target'>
-                <div className='rowtitle'>{r.host}</div>
-                <div className='small mono'>{r.target}</div>
-                <div className='small'>{r.crawl}</div>
+              <div className='rep-target' role='cell'>
+                <Link
+                  className='rowtitle row-link'
+                  to={`/report/${r.id}`}
+                  state={{ target: r.target }}
+                >
+                  {r.host}
+                </Link>
+                <div className='small mono' title={r.target}>{r.target}</div>
+                {r.singlePage && <span className='row-tag'>Single page</span>}
               </div>
-              <span>{r.date}</span>
-              <span className='rep-score'>
-                <b className={severityClass(r.band)}>{r.score}/100</b>
+              <span className='small' role='cell' data-label='Completed'>
+                <time dateTime={toISOString(r.completedAt)} title={r.exact}>
+                  {r.date}
+                </time>
+              </span>
+              <span className='rep-score' role='cell' data-label='Risk'>
+                <b>
+                  {r.score}
+                  <span>/100</span>
+                </b>
                 <span className={`sev-tag ${severityClass(r.band)}`}>
                   {r.band}
                 </span>
               </span>
-              <span>{r.count} findings</span>
-              <span className='rowactions'>
-                <Tooltip label={r.analysisStatus !== "completed" ? `AI analysis: ${r.analysisStatus.replaceAll("_", " ")}` : "Download PDF"}>
+              <span className='num-cell' role='cell' data-label='Findings'>{r.count}</span>
+              <span className='rowactions' role='cell'>
+                <Tooltip
+                  label={
+                    analysisReady
+                      ? "Download PDF"
+                      : `PDF ready once AI analysis finishes (${r.analysisStatus.replaceAll("_", " ")})`
+                  }
+                >
                   <button
                     type='button'
-                    aria-label='Download PDF'
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (r.analysisStatus === "completed") handleDownload(r.id);
-                    }}
-                    disabled={busy === r.id}
-                    aria-disabled={r.analysisStatus !== "completed"}
+                    aria-label={
+                      analysisReady
+                        ? `Download PDF for ${r.host}`
+                        : `PDF unavailable for ${r.host}: analysis ${r.analysisStatus.replaceAll("_", " ")}`
+                    }
+                    onClick={() => handleDownload(r.id)}
+                    disabled={!analysisReady || busy === r.id}
                   >
                     <Download className='ico' />
                   </button>
                 </Tooltip>
               </span>
             </article>
-          ))}
-          {totalPages > 1 && (
-            <div className='pagination'>
-              <button className='btn page-btn' disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
-                ‹ Prev
-              </button>
-              {pages(page, totalPages).map((p, i) =>
-                p === "…" ? (
-                  <span key={`ellipsis-${i}`} className='page-ellipsis'>…</span>
-                ) : (
-                  <button
-                    key={p}
-                    className={`btn page-btn${p === page ? " active" : ""}`}
-                    onClick={() => setPage(p)}
-                  >
-                    {p}
-                  </button>
-                ),
-              )}
-              <button className='btn page-btn' disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>
-                Next ›
-              </button>
-            </div>
-          )}
+            );
+          })}
+          <Pagination
+            page={page}
+            totalPages={totalPages}
+            onChange={setPage}
+            label='Reports pagination'
+          />
         </QueryContent>
       )}
       </QuerySwap>

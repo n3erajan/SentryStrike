@@ -100,7 +100,12 @@ _GEM_ALIASES: dict[str, tuple[str, str]] = {
 # these normalize the common bare tokens to canonical identities.
 _HEADER_ALIASES: dict[str, tuple[str, str]] = {
     "nginx": ("Nginx", "server"),
-    "apache": ("Apache", "server"),
+    # "Apache HTTP Server", not "Apache": the fingerprint DB keys the component
+    # under its full name, and the technology-stack merge matches by exact
+    # lowercase name. A bare "Apache" here sailed past the merge as a new
+    # component, so one product produced two CVE-enriched entries - and a
+    # duplicate supply-chain finding per CVE.
+    "apache": ("Apache HTTP Server", "server"),
     "openresty": ("OpenResty", "server"),
     "iis": ("IIS", "server"),
     "microsoft-iis": ("IIS", "server"),

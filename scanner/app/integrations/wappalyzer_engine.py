@@ -505,3 +505,32 @@ def cpe_for(name: str) -> str | None:
         return index[key]
     alias = _CPE_NAME_ALIASES.get(key)
     return index.get(alias.lower()) if alias else None
+
+
+def canonical_component_name(name: str) -> str:
+    """Canonical key for merging components discovered by different sources.
+
+    Fingerprint matching, header version probing and error-signature
+    fingerprinting each name the same product differently ("Apache HTTP Server"
+    vs "Apache" vs "httpd"). Merging by exact lowercase name let one product
+    enter the stack twice - CVE-enriched twice, reported twice. Alias resolution
+    normalises to the fingerprint-DB identity so every source converges on one
+    key. Unknown names pass through unchanged.
+    """
+    if not name:
+        return name
+    key = name.strip().lower()
+    return _CPE_NAME_ALIASES.get(key, key).lower()
+
+
+def canonical_display_name(name: str) -> str:
+    """Pretty, fingerprint-DB-canonical name for reporting.
+
+    ``canonical_component_name`` lowercases for merge keys; findings should
+    still read with the component's proper name ("Apache HTTP Server", never
+    the bare header spelling "Apache" or the lowercase merge key).
+    """
+    if not name:
+        return name
+    key = name.strip().lower()
+    return _CPE_NAME_ALIASES.get(key, name.strip())

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Request, Response
 
-from shared.verification.oast import OastClient
+from shared.verification.oast import OAST_CALLBACK_BODY, OastClient
 from shared.models.oast_interaction import OastInteractionRecord
 
 router = APIRouter(prefix="/oast", tags=["oast"])
@@ -46,5 +46,9 @@ async def catch(interaction_id: str, request: Request) -> Response:
         path=request.url.path,
         method=request.method,
     ).insert()
-    # Static body - never reflect the id or any input.
-    return Response(content="ok", media_type="text/plain")
+    # Static body - never reflect the id or any input. The body is the shared
+    # OAST_CALLBACK_BODY marker: when a scanned application's response to a
+    # URL-injection contains it, the server-side fetch's response body was
+    # rendered back to the caller, which is how the scanner distinguishes a
+    # full-response SSRF from a blind one.
+    return Response(content=OAST_CALLBACK_BODY, media_type="text/plain")

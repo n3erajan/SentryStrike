@@ -14,6 +14,12 @@ import httpx
 # traversal probes, wrong length/case all fail it, so they are never stored.
 INTERACTION_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}-[0-9a-f]{32}$")
 
+# Body served by the OAST catch endpoint. Deliberately distinctive and static
+# (never reflects the interaction id or any input): a target response
+# containing this exact string proves the SERVER-SIDE fetch's response body
+# was rendered back to the caller - i.e. the SSRF is full-response, not blind.
+OAST_CALLBACK_BODY = "sentrystrike-oast-callback"
+
 
 @dataclass
 class OastInteraction:

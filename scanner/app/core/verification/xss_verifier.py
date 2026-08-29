@@ -1088,6 +1088,55 @@ class XSSVerifier(BaseVerifier):
             return input_type not in cls._UNFILLABLE_INPUT_TYPES
         return True
 
+    @staticmethod
+    def _resolve_form_values(form_inputs: Optional[list]) -> dict:
+        """Normalise crawler form-input records into ``{name: baseline_value}``.
+
+        Records arrive in two shapes: plain dicts (browser cluster captures,
+        ``{"name": ..., "value": ...}``) and dataclasses (``_ObservedFormInput``
+        from attack-surface template recovery, which has attributes but no
+        ``.get``). The old comprehension filtered on ``hasattr(item, "get")`` and
+        silently dropped every dataclass input, so a recovered template still
+        produced an empty fill map - the browser verification then submitted an
+        empty form and a real Stored XSS was discarded as unconfirmed.
+        """
+        if isinstance(form_inputs, dict):
+            return dict(form_inputs)
+        if not isinstance(form_inputs, list):
+            return {}
+        resolved: dict = {}
+        for item in form_inputs:
+            if hasattr(item, "get"):
+                name = item.get("name") or item.get("id")
+                value = item.get("value", "")
+            else:
+                name = getattr(item, "name", None) or getattr(item, "id", None)
+                value = getattr(item, "value", "")
+            if name:
+                resolved[str(name)] = "" if value is None else str(value)
+        return resolved
+
+    async def _fill_parameter_field(self, page, parameter: str, payload: str) -> bool:
+        """Fill the first field addressed by ``parameter`` when no form template
+        exists.
+
+        A POST body parameter observed on the wire (``source=browser_request``)
+        carries no ``form_inputs``; the form it came from can still be driven by
+        addressing the field directly by name/id. Returns True when a field was
+        found and filled.
+        """
+        sel = (
+            f"input[name='{parameter}'], textarea[name='{parameter}'], "
+            f"select[name='{parameter}'], [id='{parameter}']"
+        )
+        try:
+            if await page.query_selector(sel):
+                await page.fill(sel, payload)
+                return True
+        except Exception as exc:
+            logger.debug("could not fill parameter field %s: %s", parameter, exc)
+        return False
+
     async def _fill_form_fields(
         self,
         page,
@@ -1102,6 +1151,7 @@ class XSSVerifier(BaseVerifier):
         whole verification, which is what happened when a named submit button
         raised mid-loop.
         """
+        parameter_filled = False
         for field_name, baseline_val in resolved_inputs.items():
             if not field_name:
                 continue
@@ -1115,8 +1165,16 @@ class XSSVerifier(BaseVerifier):
             try:
                 if await page.query_selector(sel):
                     await page.fill(sel, str(fill_value))
+                    if field_name == parameter:
+                        parameter_filled = True
             except Exception as exc:
                 logger.debug("could not fill form field %s: %s", field_name, exc)
+
+        if not parameter_filled:
+            # The template did not carry (or the DOM does not expose) a field
+            # named like the parameter; the payload must still reach the server
+            # for the submission to mean anything.
+            await self._fill_parameter_field(page, parameter, payload)
 
     @staticmethod
     async def _drop_client_side_input_limits(page) -> None:
@@ -1257,17 +1315,30 @@ class XSSVerifier(BaseVerifier):
                             parts[4] = urlencode(query, doseq=True)
                             navigation_url = urlunparse(parts)
                         await page.goto(navigation_url, wait_until="domcontentloaded", timeout=5000)
-                    elif prepared.method.upper() == "POST" and form_inputs:
+                    elif prepared.method.upper() == "POST":
                         await page.goto(url, wait_until="domcontentloaded", timeout=5000)
                         await self._drop_client_side_input_limits(page)
-                        resolved_inputs = {item.get('name') or item.get('id'): item.get('value', '') for item in form_inputs if hasattr(item, 'get')} if isinstance(form_inputs, list) else form_inputs
-                        await self._fill_form_fields(
-                            page, resolved_inputs, form_inputs, parameter, payload,
-                        )
+                        resolved_inputs = self._resolve_form_values(form_inputs)
+                        if resolved_inputs:
+                            await self._fill_form_fields(
+                                page, resolved_inputs, form_inputs, parameter, payload,
+                            )
+                        else:
+                            # No form template travelled with the candidate (a
+                            # body parameter observed on the wire). Address the
+                            # field directly by name so the submission still
+                            # carries the payload.
+                            await self._fill_parameter_field(page, parameter, payload)
                         await self._submit_form(page)
                         await page.wait_for_load_state("domcontentloaded", timeout=5000)
                     else:
-                        return False
+                        # Methods a browser form cannot drive (PUT/DELETE/…).
+                        # Do NOT bail out: the HTTP phase already planted the
+                        # payload server-side, so the stored-display sweep below
+                        # can still confirm execution. Returning False here is
+                        # how a confirmed-reflection candidate was discarded
+                        # without its sweep ever running.
+                        pass
                 elif is_header_injection:
                     header_name = method.split(":", 1)[1]
                     await page.set_extra_http_headers({header_name: payload})
@@ -1278,13 +1349,16 @@ class XSSVerifier(BaseVerifier):
                     q[parameter] = payload
                     parts[4] = urlencode(q)
                     await page.goto(urlunparse(parts), wait_until="domcontentloaded", timeout=5000)
-                elif method.upper() == "POST" and form_inputs:
+                elif method.upper() == "POST":
                     await page.goto(url, wait_until="domcontentloaded", timeout=5000)
                     await self._drop_client_side_input_limits(page)
-                    resolved_inputs = {item.get('name') or item.get('id'): item.get('value', '') for item in form_inputs if hasattr(item, 'get')} if isinstance(form_inputs, list) else form_inputs
-                    await self._fill_form_fields(
-                        page, resolved_inputs, form_inputs, parameter, payload,
-                    )
+                    resolved_inputs = self._resolve_form_values(form_inputs)
+                    if resolved_inputs:
+                        await self._fill_form_fields(
+                            page, resolved_inputs, form_inputs, parameter, payload,
+                        )
+                    else:
+                        await self._fill_parameter_field(page, parameter, payload)
                     await self._submit_form(page)
                     await page.wait_for_load_state("domcontentloaded", timeout=5000)
 

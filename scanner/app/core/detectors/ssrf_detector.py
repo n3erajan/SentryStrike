@@ -7,7 +7,7 @@ from app.config import get_settings
 from app.core.detectors.base_detector import BaseDetector, Finding
 from app.core.detectors.attack_surface import AttackSurface, AttackTarget
 from app.core.detectors.param_selection import SSRF_NAME_TOKENS, ssrf_candidate
-from shared.verification.oast import OastClient
+from shared.verification.oast import OAST_CALLBACK_BODY, OastClient
 from app.core.verification.response_analyzer import is_dead_baseline
 from app.core.verification.verification_framework import HttpVerifier
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
@@ -313,9 +313,19 @@ class SSRFDetector(BaseDetector):
                         return cand_findings
 
                     for payload, regex_pattern, desc in self.SSRF_PAYLOADS:
-                        # Make sure baseline doesn't already trigger the signature
-                        if baseline.status_code == 200 and re.search(regex_pattern, baseline.body, re.I):
-                            continue
+                        # The enclosing page often matches a generic internal
+                        # signature itself (an HTML page contains "doctype",
+                        # "html", the server's own name in a footer). Presence
+                        # alone is therefore not a signal - what IS a signal is
+                        # the signature occurring MORE often once the payload is
+                        # injected, because the fetched content adds fresh
+                        # occurrences to the page's own. Compare counts, not
+                        # presence, so generic signatures stay usable.
+                        baseline_hits = (
+                            len(re.findall(regex_pattern, baseline.body, re.I))
+                            if baseline.status_code == 200 and baseline.body
+                            else 0
+                        )
 
                         injected_url, injected_params, injected_data, injected_json, injected_headers, injected_cookies = build_request(
                             cand, payload
@@ -332,7 +342,13 @@ class SSRFDetector(BaseDetector):
                         )
 
                         # Check if internal content successfully loaded into the response
-                        if injected.status_code == 200 and re.search(regex_pattern, injected.body, re.I):
+                        # (count-differential: the injected response must contain
+                        # MORE signature occurrences than the baseline page).
+                        if (
+                            injected.status_code == 200
+                            and injected.body
+                            and len(re.findall(regex_pattern, injected.body, re.I)) > baseline_hits
+                        ):
                             cand_findings.append(
                                 Finding(
                                     category=OwaspCategory.a01,
@@ -342,7 +358,13 @@ class SSRFDetector(BaseDetector):
                                     parameter=cand.parameter,
                                     method=cand.method,
                                     payload=payload,
-                                    evidence=f"SSRF verified via payload '{payload}' ({desc}). Response contains internal host signature.",
+                                    evidence=(
+                                        f"SSRF verified via payload '{payload}' ({desc}). "
+                                        "Response contains internal host signature "
+                                        f"{len(re.findall(regex_pattern, injected.body, re.I))} times "
+                                        f"vs {baseline_hits} in the un-injected baseline - the fetched "
+                                        "internal content is rendered back in the response (full-response SSRF)."
+                                    ),
                                     confidence_score=95.0,
                                     detection_method="ssrf_reflection",
                                     reproducible=True,
@@ -383,24 +405,53 @@ class SSRFDetector(BaseDetector):
                             if interactions:
                                 break
                         if interactions:
+                            # Readback classification: the OAST endpoint serves a
+                            # distinctive static body. If the injection response
+                            # contains it, the server-side fetch's response was
+                            # rendered back to the caller - a full-response SSRF,
+                            # materially worse than blind (response content is
+                            # exfiltrable). Only when the marker is absent is the
+                            # SSRF genuinely blind.
+                            readback = (
+                                callback_response.status_code == 200
+                                and callback_response.body is not None
+                                and OAST_CALLBACK_BODY in callback_response.body
+                            )
+                            if readback:
+                                vuln_type = "Server-Side Request Forgery (SSRF)"
+                                classification = (
+                                    "Full-response SSRF: confirmed by a correlated callback to "
+                                    "the SentryStrike OAST collaborator (interaction id "
+                                    f"'{interaction_id}'), AND the fetched collaborator content "
+                                    "is rendered back in the application's response - the "
+                                    "server-side response body is readable by the caller, not "
+                                    "merely triggered out-of-band.\n"
+                                )
+                                detection_method = "ssrf_oast_readback"
+                            else:
+                                vuln_type = "Blind Server-Side Request Forgery (SSRF)"
+                                classification = (
+                                    "Blind SSRF confirmed by a correlated callback to the "
+                                    "SentryStrike OAST collaborator, for interaction id "
+                                    f"'{interaction_id}'.\n"
+                                )
+                                detection_method = "ssrf_oast_callback"
                             cand_findings.append(
                                 Finding(
                                     category=OwaspCategory.a01,
-                                    vuln_type="Blind Server-Side Request Forgery (SSRF)",
+                                    vuln_type=vuln_type,
                                     severity=SeverityLevel.high,
                                     url=cand.url,
                                     parameter=cand.parameter,
                                     method=cand.method,
                                     payload=callback_url,
                                     evidence=(
-                                        "Blind SSRF confirmed by a correlated callback to the "
-                                        "SentryStrike OAST collaborator, for interaction id "
-                                        f"'{interaction_id}'.\n"
-                                        f"INTERACTIONS ({len(interactions)}):\n"
-                                        f"{json.dumps([interaction.raw for interaction in interactions], default=str, indent=2)[:2000]}"
+                                        classification
+                                        + f"INTERACTIONS ({len(interactions)}):\n"
+                                        + f"{json.dumps([interaction.raw for interaction in interactions], default=str, indent=2)[:2000]}"
                                     ),
                                     confidence_score=95.0,
-                                    detection_method="ssrf_oast_callback",
+                                    detection_method=detection_method,
                                     reproducible=True,
                                     verified=True,
                                     verification_request_snippet=callback_response.request_snippet,
@@ -418,6 +469,7 @@ class SSRFDetector(BaseDetector):
                                         "interaction_id": interaction_id,
                                         "interaction_count": len(interactions),
                                         "interactions": [interaction.raw for interaction in interactions],
+                                        "response_readback": readback,
                                     },
                                 )
                             )

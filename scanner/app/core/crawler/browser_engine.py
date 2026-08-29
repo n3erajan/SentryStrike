@@ -2262,6 +2262,16 @@ class BrowserDiscoveryEngine:
             return False
 
         before_url = self._current_url(page, "")
+        # Content fingerprint before the hop. A URL change alone does not prove
+        # the SPA router reacted: on a NON-SPA page (classic server-rendered
+        # HTML with external scripts - which the shell probe's fallback accepts)
+        # pushState rewrites the address bar while the DOM keeps rendering the
+        # previous page. Every subsequent form capture then attributed the
+        # stale DOM's forms to the pushed URL - phantom POST targets on paths
+        # the application never had a form on. A post-hop signature identical
+        # to the pre-hop one means nothing re-rendered: fall back to a full
+        # load so the route's real document is fetched.
+        before_signature = await self._route_content_signature(page)
         parsed = urlparse(route)
         try:
             if parsed.fragment:
@@ -2289,6 +2299,13 @@ class BrowserDiscoveryEngine:
         after_url = self._current_url(page, "")
         if not self._spa_route_landed(after_url, before_url, parsed):
             return False
+        # The URL landed, but did the document? An identical content signature
+        # pre/post-hop means no router re-rendered anything (see the comment at
+        # before_signature) - route it with a real navigation instead.
+        if before_signature is not None:
+            after_signature = await self._route_content_signature(page)
+            if after_signature is not None and after_signature == before_signature:
+                return False
         return True
 
     @staticmethod

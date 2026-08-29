@@ -211,6 +211,24 @@ class AttackSurface:
         request_metadata = cls._request_metadata(requests or [])
         targets: list[AttackTarget] = []
         seen: set[tuple[str, str, str, str, str]] = set()
+        # Key -> target index, so a later duplicate carrying richer evidence
+        # (form_inputs from an observed wire replay) can back-fill a target the
+        # candidates loop registered without it, instead of being discarded.
+        target_index: dict[tuple[str, str, str, str, str], int] = {}
+
+        def _register(target: AttackTarget, key: tuple[str, str, str, str, str]) -> None:
+            seen.add(key)
+            target_index[key] = len(targets)
+            targets.append(target)
+
+        def _merge_duplicate(
+            key: tuple[str, str, str, str, str], form_inputs: list | None
+        ) -> None:
+            existing_idx = target_index.get(key)
+            if existing_idx is None or not form_inputs:
+                return
+            if not targets[existing_idx].form_inputs:
+                targets[existing_idx].form_inputs = form_inputs
 
         for candidate in candidates:
             if cls._is_transport_layer_url(candidate.url):
@@ -286,8 +304,7 @@ class AttackSurface:
             )
             if key in seen:
                 continue
-            seen.add(key)
-            targets.append(
+            _register(
                 AttackTarget(
                     url=candidate.url,
                     parameter=candidate.name,
@@ -307,7 +324,8 @@ class AttackSurface:
                     security_relevance=set(candidate.security_relevance),
                     replayable=bool(candidate.context.get("replayable", True)),
                     body_schema=list(candidate.context.get("body_schema") or []),
-                )
+                ),
+                key,
             )
 
         for request in requests or []:
@@ -362,9 +380,13 @@ class AttackSurface:
                         "",
                     )
                     if key in seen:
+                        # A candidate-loop target may already hold this key with
+                        # no form_inputs (an observed wire parameter); back-fill
+                        # them from the replayed form body rather than dropping
+                        # the richer observation.
+                        _merge_duplicate(key, form_inputs)
                         continue
-                    seen.add(key)
-                    targets.append(
+                    _register(
                         AttackTarget(
                             url=request.url,
                             parameter=name,
@@ -380,7 +402,8 @@ class AttackSurface:
                             replayable=bool(getattr(request, "replayable", True)),
                             body_schema=list(getattr(request, "body_schema", []) or []),
                             source_confidence="browser_replayable" if getattr(request, "replayable", False) else "browser_observed",
-                        )
+                        ),
+                        key,
                     )
             else:
                 endpoint = ApiEndpoint(
@@ -1092,8 +1115,21 @@ class AttackSurface:
             ):
                 continue
             body = AttackSurface._parse_json(endpoint.request_body)
-            if not isinstance(body, dict):
-                continue
+            if isinstance(body, dict):
+                field_items = list(body.items())
+            else:
+                # A urlencoded browser-observed POST body is the raw wire string
+                # (``message=…&submit=…``), not JSON. Falling through here left
+                # form-location candidates with no ``form_inputs``, so the XSS
+                # browser verification could not replay the submission.
+                form_body = AttackSurface._parse_form_data(
+                    endpoint.request_body,
+                    dict(endpoint.headers or {}),
+                    endpoint.content_type,
+                )
+                if not form_body:
+                    continue
+                field_items = list(form_body.items())
             templates[(endpoint.url, endpoint.method.upper())] = (
                 [
                     _ObservedFormInput(
@@ -1106,7 +1142,7 @@ class AttackSurface:
                         ),
                         value=str(value),
                     )
-                    for name, value in body.items()
+                    for name, value in field_items
                     if name and not isinstance(value, (dict, list))
                 ],
                 {

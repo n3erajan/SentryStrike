@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { Boxes, ChevronDown, Pencil, Plus, Trash2, X } from 'lucide-react'
 import {
@@ -7,16 +7,28 @@ import {
   listApplications,
   updateApplication,
 } from '../services/applications.js'
-import { CONFIG_GROUPS } from '../data/constants.js'
+import { listAllScans } from '../services/scan.js'
+import { CONFIG_GROUPS, severityClass } from '../data/constants.js'
 import ConfigField, { configValid } from '../components/ConfigField.jsx'
 import Tooltip from '../components/Tooltip.jsx'
 import { useToast } from '../components/Toast.jsx'
 import { useAuth } from '../context/AuthContext.jsx'
-import { isValidUrl } from '../utils/helpers.js'
+import {
+  formatAbsolute,
+  formatRelative,
+  isValidUrl,
+  parseUTCDate,
+  toISOString,
+} from '../utils/helpers.js'
+import { belongsToApplication } from '../utils/reportFilters.js'
 import ErrorNotice from '../components/ErrorNotice.jsx'
 import useQuery from '../hooks/useQuery.js'
 import { invalidateQueries } from '../services/queryCache.js'
 import QuerySwap, { QuerySkeleton, QueryContent } from '../components/QuerySwap.jsx'
+
+// Stable empty fallbacks: a fresh [] each render would re-run the stats useMemo
+// on every render.
+const EMPTY_ITEMS = []
 
 // Create/edit dialog. `app` is null when creating. Mirrors the invite modal on
 // TeamPage; the scan-config half reuses the same field renderer as ScanPage.
@@ -173,7 +185,48 @@ function AppsPage() {
     queryKey: 'applications:list:default',
     queryFn: listApplications,
   })
-  const apps = Array.isArray(data?.items) ? data.items : []
+  // A saved app told you its name and its URL and nothing else, which left the
+  // card with no reason to be as big as it was. The scan list is already cached
+  // under this key for /reports and /scans, so joining against it client-side
+  // adds a card's worth of real information without a new endpoint. A failure
+  // here is not worth surfacing - the cards simply fall back to name + URL.
+  const scansQuery = useQuery({
+    queryKey: 'scans:list:all',
+    queryFn: listAllScans,
+    staleTime: 30_000,
+  })
+  const apps = Array.isArray(data?.items) ? data.items : EMPTY_ITEMS
+
+  const stats = useMemo(() => {
+    const scans = Array.isArray(scansQuery.data?.items)
+      ? scansQuery.data.items
+      : EMPTY_ITEMS
+    const byApp = new Map()
+    for (const app of apps) {
+      const mine = scans.filter((scan) => belongsToApplication(scan, app))
+      const completed = mine
+        .filter((scan) => scan.status === 'completed')
+        .sort(
+          (a, b) =>
+            (parseUTCDate(b.completed_at || b.created_at)?.getTime() ?? 0) -
+            (parseUTCDate(a.completed_at || a.created_at)?.getTime() ?? 0),
+        )
+      const latest = completed[0]
+      byApp.set(app.id, {
+        total: mine.length,
+        running: mine.filter((scan) =>
+          ['queued', 'running'].includes(scan.status),
+        ).length,
+        lastAt: latest ? latest.completed_at || latest.created_at : null,
+        score: latest ? Math.round(latest.risk_score ?? 0) : null,
+        band: latest?.risk_level
+          ? String(latest.risk_level).charAt(0).toUpperCase() +
+            String(latest.risk_level).slice(1)
+          : null,
+      })
+    }
+    return byApp
+  }, [apps, scansQuery.data])
 
   async function save(payload) {
     const editing = dialog?.app
@@ -242,9 +295,10 @@ function AppsPage() {
           aria-label='Loading applications'
         >
           {[0, 1, 2].map((item) => (
-            <article className='card skeleton-card' key={item} aria-hidden='true'>
+            <article className='card app-card skeleton-card' key={item} aria-hidden='true'>
               <span className='skeleton-block skeleton-heading' />
               <span className='skeleton-block skeleton-copy' />
+              <span className='skeleton-block skeleton-statusline' />
               <div
                 className={`skeleton-cardfoot${canManage ? " has-actions" : ""}`}
               >
@@ -277,28 +331,17 @@ function AppsPage() {
         </div>
       ) : (
         <QueryContent settled={contentEntered} className='app-grid'>
-          {apps.map((a) => (
-            <article key={a.id} className='card'>
-              <h2>{a.name}</h2>
-              <p className='mono' style={{ wordBreak: 'break-all' }}>
-                {a.target_url}
-              </p>
-              <div className='cardfoot'>
-                <Link className='text-btn' to={`/apps/${a.id}`}>
-                  Scan history
-                </Link>
+          {apps.map((a) => {
+            const s = stats.get(a.id)
+            return (
+            <article key={a.id} className='card app-card'>
+              <div className='app-card-top'>
+                <div className='app-card-id'>
+                  <h2>{a.name}</h2>
+                  <p className='mono'>{a.target_url}</p>
+                </div>
                 {canManage && (
-                  <span className='rowactions'>
-                    <Tooltip label={`Start a scan of ${a.name}`}>
-                      <button
-                        type='button'
-                        className='scan-action'
-                        aria-label={`Start a scan of ${a.name}`}
-                        onClick={() => navigate(`/scan?app=${a.id}`)}
-                      >
-                        Scan
-                      </button>
-                    </Tooltip>
+                  <span className='app-card-manage'>
                     <Tooltip label={`Edit ${a.name}`}>
                       <button
                         type='button'
@@ -322,8 +365,49 @@ function AppsPage() {
                   </span>
                 )}
               </div>
+
+              <p className='app-card-status'>
+                {s?.running > 0 && (
+                  <span className='status-pill running'>Scanning</span>
+                )}
+                {s?.band && (
+                  <span className={`sev-tag ${severityClass(s.band)}`}>
+                    {s.band}
+                  </span>
+                )}
+                {s?.lastAt ? (
+                  <span className='app-card-facts'>
+                    {s.score}/100 · {s.total}{' '}
+                    {s.total === 1 ? 'scan' : 'scans'} ·{' '}
+                    <time
+                      dateTime={toISOString(s.lastAt)}
+                      title={formatAbsolute(s.lastAt)}
+                    >
+                      {formatRelative(s.lastAt)}
+                    </time>
+                  </span>
+                ) : (
+                  <span className='app-card-facts'>Not scanned yet</span>
+                )}
+              </p>
+
+              <div className='cardfoot'>
+                <Link className='text-btn' to={`/apps/${a.id}`}>
+                  Scan history
+                </Link>
+                {canManage && (
+                  <button
+                    type='button'
+                    className='scan-action'
+                    onClick={() => navigate(`/scan?app=${a.id}`)}
+                  >
+                    Scan
+                  </button>
+                )}
+              </div>
             </article>
-          ))}
+            )
+          })}
         </QueryContent>
       )}
       </QuerySwap>

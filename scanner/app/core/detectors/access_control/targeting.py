@@ -206,6 +206,26 @@ class TargetingMixin:
                 for value in ids:
                     if value not in values:
                         values.append(value)
+        # Same-shape sibling ids from response bodies. A directory/listing page
+        # leaks other principals' object references; trying them as the second
+        # user is exactly what an attacker does. ±1 digit mutations miss every
+        # app whose ids are not consecutive, while real sibling ids from the
+        # application's own pages are always well-formed. Borrowing is gated on
+        # an exact id-SHAPE match (same non-digit segments, digit runs allowed
+        # to vary) so unrelated tokens are never picked up.
+        raw_value = str(target.value if target.value is not None else "")
+        if raw_value and _is_valid_id_value(raw_value):
+            own_shape = self._id_shape(raw_value)
+            siblings = sorted(
+                value
+                for value in response_ids.get("*", set())
+                if value != raw_value and re.fullmatch(own_shape, value)
+            )
+            for value in siblings:
+                if len(values) >= 3:
+                    break
+                if value not in values:
+                    values.append(value)
         # Do not borrow arbitrary ids for concrete body/query fields. The wildcard
         # pool is only a last resort for unresolved path-like object references.
         if not values and target.location == ParameterLocation.path:
@@ -216,12 +236,64 @@ class TargetingMixin:
                     values.append(value)
         return values[:3]
 
+    _TEXT_ID_PATTERNS = tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            _UUID_RE.pattern,
+            # Prefixed opaque ids: "SID10294", "user_42", "EMP001", "ORD-8891".
+            r"\b[A-Za-z]{2,10}[-_][0-9]{2,10}\b|\b[A-Za-z]{2,10}[0-9]{3,10}\b",
+            # Bare numeric ids (short pure-digit runs; dates/prices rarely collide
+            # once the shape filter is applied downstream).
+            r"\b[0-9]{3,10}\b",
+        )
+    )
+    # Upper bound on wildcard-pool size so a huge listing page cannot blow up
+    # memory or the sibling search.
+    _TEXT_ID_POOL_CAP = 500
+
     def _response_body_ids(self, requests: list[RequestObservation]) -> dict[str, set[str]]:
         ids: dict[str, set[str]] = {"*": set()}
         for request in requests:
-            body = self._parse_json(getattr(request, "response_snippet", None))
-            self._collect_json_ids(body, ids)
+            snippet = getattr(request, "response_snippet", None)
+            body = self._parse_json(snippet)
+            if body is not None:
+                self._collect_json_ids(body, ids)
+            elif isinstance(snippet, str) and snippet:
+                # HTML/text responses carry object references too (a staff
+                # directory, an order history table). JSON-only harvesting is
+                # why sibling ids never existed for classic server-rendered
+                # apps and the ±1 mutations were the only candidates.
+                self._collect_text_ids(snippet, ids)
         return ids
+
+    def _collect_text_ids(self, text: str, ids: dict[str, set[str]]) -> None:
+        pool = ids.setdefault("*", set())
+        if len(pool) >= self._TEXT_ID_POOL_CAP:
+            return
+        for pattern in self._TEXT_ID_PATTERNS:
+            for match in pattern.findall(text):
+                if len(pool) >= self._TEXT_ID_POOL_CAP:
+                    return
+                value = str(match)
+                if _is_valid_id_value(value):
+                    pool.add(value)
+
+    @staticmethod
+    def _id_shape(value: str) -> str:
+        """Regex matching ids of the same shape as ``value``.
+
+        Digit runs become ``\\d+``; non-digit segments stay literal, so
+        ``SID10294`` yields ``^SID\\d+$`` - a sibling ``SID10290`` matches,
+        ``EMP001`` and ``2026`` do not. UUIDs collapse to the generic UUID
+        pattern because every segment of a UUID varies.
+        """
+        if _UUID_RE.fullmatch(value):
+            return _UUID_RE.pattern
+        parts = re.split(r"([0-9]+)", value)
+        pattern = "".join(
+            r"\d+" if part.isdigit() else re.escape(part) for part in parts if part
+        )
+        return f"^{pattern}$"
 
     def _collect_json_ids(self, value: Any, ids: dict[str, set[str]], parent: str = "") -> None:
         if isinstance(value, dict):

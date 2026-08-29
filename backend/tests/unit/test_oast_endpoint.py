@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from shared.verification.oast import OastClient, INTERACTION_ID_RE
+from shared.verification.oast import OAST_CALLBACK_BODY, OastClient, INTERACTION_ID_RE
 
 
 def test_is_valid_interaction_id_accepts_genuine_minted_id():
@@ -66,7 +66,11 @@ async def test_catcher_records_genuine_id_and_returns_ok():
         async with AsyncClient(transport=transport, base_url="http://t") as c:
             resp = await c.get(f"/oast/{genuine}")
     assert resp.status_code == 200
-    assert resp.text == "ok"
+    # The body is the shared OAST_CALLBACK_BODY marker: when a scanned
+    # application's response to a URL-injection contains it, the server-side
+    # fetch's response was rendered back - how the scanner separates
+    # full-response SSRF from blind SSRF.
+    assert resp.text == OAST_CALLBACK_BODY
     assert saved["interaction_id"] == genuine
 
 

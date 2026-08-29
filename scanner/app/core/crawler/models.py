@@ -140,12 +140,26 @@ class CrawlState:
             parameter.name,
             parameter.parent_path or "",
         )
-        existing = {
-            (p.url, p.method.upper(), p.location, p.name, p.parent_path or "")
-            for p in self.parameters
-        }
-        if key not in existing:
-            self.parameters.append(parameter)
+        for existing_param in self.parameters:
+            if key == (
+                existing_param.url,
+                existing_param.method.upper(),
+                existing_param.location,
+                existing_param.name,
+                existing_param.parent_path or "",
+            ):
+                # First-wins dedup must not discard richer evidence: a candidate
+                # observed on the wire (browser_request) carries no form_inputs,
+                # and when it lands first it shadowed the HTML form-derived
+                # candidate that carried them - leaving every later form-driving
+                # verification with nothing to fill. Merge missing context onto
+                # the survivor instead of dropping it.
+                if not existing_param.context.get("form_inputs") and parameter.context.get("form_inputs"):
+                    existing_param.context["form_inputs"] = parameter.context["form_inputs"]
+                if not existing_param.baseline_value and parameter.baseline_value:
+                    existing_param.baseline_value = parameter.baseline_value
+                return
+        self.parameters.append(parameter)
 
     @staticmethod
     def _form_key(form: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:

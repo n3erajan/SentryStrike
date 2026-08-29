@@ -8,6 +8,7 @@ from shared.models.vulnerability import OwaspCategory, SeverityLevel
 
 from app.core.detectors.access_control.common import (
     _MUTATING_AUTHZ_METHODS,
+    _is_valid_id_value,
     _looks_like_login_page,
     _looks_like_error_page,
     _mutate_id,
@@ -146,8 +147,25 @@ class IdorMixin:
                 similarity = _body_similarity(auth_own_resp.body, second_own_resp.body)
                 own_profile = self._response_profile(auth_own_resp)
                 second_profile = self._response_profile(second_own_resp)
+                # Object-identity proof. IDOR is broken access control: the
+                # question is WHO received the object, not whether its content
+                # "looks sensitive". When a second authenticated identity gets a
+                # near-identical rendering of the owner's object AND the same
+                # object reference appears in both bodies, the second user
+                # demonstrably received the owner's object - including HTML
+                # pages, where the JSON-only profile extraction sees nothing.
+                # The reference must be identifier-shaped and long enough that
+                # its presence in a body is evidence, not coincidence.
+                shared_object_reference = (
+                    bool(val)
+                    and len(val) >= 4
+                    and _is_valid_id_value(val)
+                    and val in (auth_own_resp.body or "")
+                    and val in (second_own_resp.body or "")
+                )
                 if similarity > 0.70 and (
-                    self._shared_identifiers(own_profile, second_profile)
+                    shared_object_reference
+                    or self._shared_identifiers(own_profile, second_profile)
                     or self._profile_has_sensitive_data(own_profile)
                 ):
                     is_create = target.method.upper() == "POST"
@@ -177,6 +195,12 @@ class IdorMixin:
                                     f"'{target.parameter}'={val}. "
                                 )
                             )
+                            + (
+                                f"The same object reference '{val}' is present in both the "
+                                "owner's and the second user's response bodies. "
+                                if shared_object_reference
+                                else ""
+                            )
                             + f"Unauthenticated baseline returned HTTP {unauth_own_resp.status_code}. "
                             + f"Body similarity (low vs second user): {similarity:.0%}.",
                             confidence_score=95.0,
@@ -185,6 +209,7 @@ class IdorMixin:
                                 "parameter_location": target.location.value,
                                 "source": target.source,
                                 "shared_identifiers": sorted(self._shared_identifiers(own_profile, second_profile)),
+                                "shared_object_reference": shared_object_reference,
                                 "status_code": second_own_resp.status_code,
                                 **self._reverification_request_evidence(own_request),
                             },

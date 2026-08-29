@@ -5,7 +5,10 @@
   --line: oklch(87% 0.022 255);
   --ink: oklch(19% 0.03 255);
   --sub: oklch(43% 0.04 255);
-  --muted: oklch(58% 0.03 255);
+  /* --muted carries URLs, timestamps and row meta at 12-13px, so it is body
+     text and owes 4.5:1. At the old 58% it measured 4.03:1 on --bg; 50% takes
+     it to 5.6:1 without turning it into a second ink. */
+  --muted: oklch(50% 0.035 255);
   --brand: oklch(55% 0.2 255);
   --brand2: oklch(44% 0.19 255);
   /* Solid-button hover. Kept separate from --brand2, which doubles as an accent
@@ -14,9 +17,21 @@
      blue on hover so the label keeps AA contrast. */
   --brand-hover: oklch(44% 0.19 255);
   --brandsoft: oklch(93% 0.045 255);
-  --good: oklch(55% 0.14 150);
+  /* Brand blue as *text*. --brand is tuned as a solid fill under near-white
+     --on-brand labels, which pins it dark enough that on a near-black dark-mode
+     --bg it only reaches 4.18:1 - so link text needs its own token, the same
+     split --brand-hover already makes for the opposite reason. Light mode can
+     use --brand as-is (4.64:1); dark mode lifts to the --brand2 accent. */
+  --brand-text: var(--brand);
+  /* --good and --bad label live status text ("Complete", "Failed") at 12px, so
+     both are tuned for 4.5:1 on --bg rather than for dot fills: 55%/60% gave
+     4.33:1 and 4.12:1. The -fill variants keep the brighter hue for dots and
+     bars, where contrast is carried by area rather than stroke. */
+  --good: oklch(47% 0.13 150);
+  --good-fill: oklch(55% 0.14 150);
   --warn: oklch(70% 0.15 72);
-  --bad: oklch(60% 0.2 28);
+  --bad: oklch(52% 0.19 28);
+  --bad-fill: oklch(60% 0.2 28);
   --on-brand: oklch(98% 0.006 255);
 
   /* Severity palette - single source of truth for critical/high/medium/low/info.
@@ -25,13 +40,13 @@
      color (readable on light backgrounds) and a soft tint for pill backgrounds. */
   --sev-critical: oklch(47% 0.21 18);
   --sev-critical-bg: oklch(93% 0.05 18);
-  --sev-high: oklch(58% 0.2 28);
+  --sev-high: oklch(53% 0.2 28);
   --sev-high-bg: oklch(96% 0.03 28);
-  --sev-medium: oklch(55% 0.16 68);
+  --sev-medium: oklch(52% 0.16 68);
   --sev-medium-bg: oklch(95% 0.07 78);
-  --sev-low: oklch(52% 0.14 150);
+  --sev-low: oklch(50% 0.14 150);
   --sev-low-bg: oklch(94% 0.06 150);
-  --sev-info: oklch(52% 0.02 255);
+  --sev-info: oklch(50% 0.02 255);
   --sev-info-bg: oklch(94% 0.012 255);
   --dark: oklch(12.471% 0.02666 246.769);
   --dark2: oklch(22% 0.04 255);
@@ -39,6 +54,12 @@
   --ease: cubic-bezier(0.16, 1, 0.3, 1);
   --nav: 20;
   --toast: 200;
+
+  /* Table/list row hover. --paper sits 1.03:1 from --bg in light mode, so the
+     old hover was invisible; an ink tint composites over whatever is beneath
+     and stays legible in both themes. */
+  --row-hover: color-mix(in srgb, var(--ink) 5%, transparent);
+  --row-active: color-mix(in srgb, var(--ink) 8%, transparent);
 
   --brand-2: var(--brand2);
   --brand-soft: var(--brandsoft);
@@ -56,7 +77,22 @@
   --text-1: var(--sub);
   --text-2: var(--muted);
   --font: 'DM Sans', system-ui, sans-serif;
-  --mono: 'IBM Plex Mono', monospace;
+  --mono: 'DM Mono', ui-monospace, SFMono-Regular, monospace;
+
+  /* Type scale. The app previously ran on a swarm of ad-hoc 0.6-0.82rem values
+     (9.6-13.1px, twenty distinct sizes) which is below the floor where DM Sans
+     and DM Mono hold their shape. These are the only sizes app chrome should
+     use; px equivalents are at the 16px root. Fixed rem, not clamp: product UI
+     is read at a consistent distance and a heading that shrinks inside a panel
+     looks worse, not better. The LANDING and LEGAL sections are a brand surface
+     and keep their own fluid scale. */
+  --fs-micro: 0.6875rem; /* 11px - uppercase column headers, tags */
+  --fs-sm: 0.75rem; /* 12px - row meta, secondary copy */
+  --fs-base: 0.8125rem; /* 13px - row body, controls */
+  --fs-md: 0.875rem; /* 14px - card titles, emphasis */
+  --fs-lg: 1rem; /* 16px - section headings */
+  --fs-xl: 1.25rem; /* 20px */
+  --fs-h1: 1.75rem; /* 28px - page title */
 }
 
 /* Workspace, notifications, and finding-collaboration integrations. */
@@ -107,7 +143,7 @@
   background: var(--danger);
   color: white;
   font-size: 10px;
-  font-weight: 800;
+  font-weight: 700;
 }
 .notification-menu {
   position: absolute;
@@ -183,7 +219,7 @@
 }
 .notif-ico.tone-brand {
   background: var(--brandsoft);
-  color: var(--brand);
+  color: var(--brand-text);
 }
 .notif-ico.tone-muted {
   background: var(--soft);
@@ -208,7 +244,7 @@
   white-space: nowrap;
 }
 .notification-item.unread .notif-top b {
-  font-weight: 750;
+  font-weight: 700;
 }
 .notif-top small {
   margin-left: auto;
@@ -339,7 +375,7 @@
   border-bottom: 1px solid var(--line);
 }
 .invite-row b {
-  font-size: 0.8rem;
+  font-size: var(--fs-md);
 }
 .invite-row:last-child {
   border: 0;
@@ -376,11 +412,11 @@
   gap: 5px;
 }
 .audit-copy b {
-  font-size: 0.76rem;
+  font-size: var(--fs-base);
 }
 .audit-detail {
   color: var(--sub);
-  font-size: 0.7rem;
+  font-size: var(--fs-sm);
   line-height: 1.45;
   text-wrap: pretty;
 }
@@ -393,8 +429,8 @@
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  color: var(--brand);
-  font-size: 0.68rem;
+  color: var(--brand-text);
+  font-size: var(--fs-sm);
   font-weight: 700;
   text-decoration: none;
 }
@@ -426,16 +462,36 @@
   margin-top: 20px;
 }
 .page-btn {
-  padding: 5px 11px;
-  font-size: 0.73rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 32px;
+  min-height: 32px;
+  justify-content: center;
+  padding: 5px 10px;
+  font-size: var(--fs-sm);
+  font-weight: 600;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 7px;
   background: transparent;
-  color: var(--text);
+  color: var(--sub);
   cursor: pointer;
+  transition:
+    background-color 0.16s var(--ease),
+    color 0.16s var(--ease),
+    border-color 0.16s var(--ease);
+}
+.page-btn .ico {
+  width: 14px;
+  height: 14px;
 }
 .page-btn:hover:not(:disabled) {
   background: var(--soft);
+  color: var(--ink);
+}
+.page-btn:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
 }
 .page-btn.active {
   background: var(--brand);
@@ -447,19 +503,22 @@
   border-color: var(--brand-hover);
 }
 .page-btn:disabled {
-  opacity: 0.35;
+  opacity: 0.4;
   cursor: default;
 }
 .page-ellipsis {
-  padding: 0 4px;
+  padding: 0 2px;
   color: var(--muted);
-  font-size: 0.8rem;
+  font-size: var(--fs-sm);
 }
+/* Tone is carried by the fill and the heading colour, not by a coloured stripe
+   down the left edge. The stripe was decoration standing in for a state
+   indicator, and it duplicated the word the banner already says out loud
+   ("AI analysis: Failed"). */
 .analysis-banner {
   position: relative;
   margin-bottom: 18px;
   padding: 16px 18px;
-  padding-left: 22px;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -468,16 +527,12 @@
   border-radius: 10px;
   background: color-mix(in srgb, var(--brand) 6%, var(--paper));
 }
-.analysis-banner::before {
-  content: '';
-  position: absolute;
-  inset: -1px auto -1px -1px;
-  width: 4px;
-  background: var(--brand);
-  border-radius: 10px 0 0 10px;
+.analysis-banner.failed {
+  border-color: color-mix(in srgb, var(--bad) 30%, var(--line));
+  background: var(--danger-weak);
 }
-.analysis-banner.failed::before {
-  background: var(--danger);
+.analysis-banner.failed strong {
+  color: var(--bad);
 }
 .analysis-banner > div {
   display: grid;
@@ -524,8 +579,8 @@
   background: transparent;
   color: var(--sub);
   cursor: pointer;
-  font-size: 0.68rem;
-  font-weight: 650;
+  font-size: var(--fs-sm);
+  font-weight: 600;
   transition:
     background 0.18s var(--ease),
     color 0.18s var(--ease),
@@ -566,7 +621,8 @@
   padding: 12px 14px;
   display: grid;
   gap: 4px;
-  border-left: 3px solid var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 32%, var(--line));
+  border-radius: 8px;
   background: color-mix(in srgb, var(--danger) 7%, transparent);
 }
 .reverification-history {
@@ -584,7 +640,7 @@
 }
 .reverification-history-head span {
   color: var(--muted);
-  font-size: 0.64rem;
+  font-size: var(--fs-micro);
 }
 .reverification-list {
   margin: 0;
@@ -610,7 +666,7 @@
   box-shadow: 0 0 0 3px var(--soft);
 }
 .reverification-marker[data-outcome='not_reproduced'] {
-  background: var(--good);
+  background: var(--good-fill);
 }
 .reverification-marker[data-outcome='reproduced'],
 .reverification-marker[data-status='failed'] {
@@ -626,13 +682,13 @@
 }
 .reverification-result strong {
   color: var(--ink);
-  font-size: 0.72rem;
-  font-weight: 650;
+  font-size: var(--fs-base);
+  font-weight: 600;
 }
 .reverification-result span,
 .reverification-list time {
   color: var(--muted);
-  font-size: 0.64rem;
+  font-size: var(--fs-micro);
 }
 .reverification-list time {
   font-variant-numeric: tabular-nums;
@@ -655,7 +711,7 @@
 }
 .comment p {
   margin: 7px 0 0;
-  font-size: 0.82rem;
+  font-size: var(--fs-md);
   white-space: pre-wrap;
 }
 .comment-author {
@@ -665,10 +721,10 @@
 }
 .comment-name {
   font-weight: 600;
-  font-size: 0.82rem;
+  font-size: var(--fs-md);
 }
 .comment-email {
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
   opacity: 0.65;
 }
 .comment-form {
@@ -713,9 +769,20 @@
   /* --brand2: oklch(44% 0.19 255); */
   --brand-hover: oklch(48% 0.21 255);
   --brandsoft: oklch(27% 0.07 255);
+  /* See --brand-text in :root - the dark theme lifts brand link text to the
+     --brand2 accent (10.09:1) rather than reusing the solid-fill blue. */
+  --brand-text: var(--brand2);
   --good: oklch(72% 0.14 150);
+  --good-fill: oklch(72% 0.14 150);
   --warn: oklch(78% 0.14 72);
   --bad: oklch(72% 0.18 28);
+  --bad-fill: oklch(72% 0.18 28);
+
+  /* Dark rows sit on a near-black --bg, so the hover tint lifts with light
+     rather than ink. --paper would work here but is reserved for raised
+     surfaces; keeping hover a tint means rows and cards stay distinguishable. */
+  --row-hover: color-mix(in srgb, var(--ink) 8%, transparent);
+  --row-active: color-mix(in srgb, var(--ink) 12%, transparent);
 
   --sev-critical: oklch(75% 0.17 18);
   --sev-critical-bg: oklch(25% 0.08 18);
@@ -809,7 +876,7 @@ select option {
   padding: 0 12px;
   text-align: left;
   font: inherit;
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
   color: var(--ink);
   cursor: pointer;
   transition:
@@ -883,7 +950,7 @@ select option {
   padding: 9px 10px;
   text-align: left;
   font: inherit;
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
   color: var(--ink);
   cursor: pointer;
   transition:
@@ -896,8 +963,8 @@ select option {
 }
 .sel-opt.active {
   background: var(--brandsoft);
-  color: var(--brand);
-  font-weight: 650;
+  color: var(--brand-text);
+  font-weight: 600;
 }
 .sel-opt.active.focused {
   background: color-mix(in srgb, var(--brand) 16%, var(--paper));
@@ -959,9 +1026,23 @@ svg {
   background: var(--brand);
   color: var(--on-brand);
 }
+/* Mono is for machine-authored strings: URLs, payloads, scores, hashes, CVE
+   ids. DM Mono runs 0.6em per character against DM Sans's ~0.42em average, so
+   any mono string is ~40% wider than the same text in sans - budget width for
+   it, and give it `min-width: 0` plus an ellipsis wherever it sits in a grid
+   cell. Its zero is slashed in the default glyph set, so 0 and O are already
+   distinguishable without a feature flag. Weight is capped at 500 (the heaviest
+   face DM Mono ships); asking for 600+ gets a synthesised faux bold. */
 .mono {
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--mono);
   font-variant-numeric: tabular-nums;
+  letter-spacing: -0.005em;
+}
+.mono b,
+.mono strong,
+b.mono,
+strong.mono {
+  font-weight: 500;
 }
 .ico {
   width: 20px;
@@ -1043,7 +1124,7 @@ svg {
   color: var(--ink);
   /* margin: 10px 0; */
   padding: 0 15px;
-  font-weight: 650;
+  font-weight: 600;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1079,16 +1160,28 @@ svg {
   opacity: 0.5;
   transform: none;
 }
+/* Used on both <button> and <a>. Anchors carry a UA underline and buttons do
+   not, which is how the same class ended up looking like two different controls
+   in one row; the underline is declared here instead so both agree. */
 .text-btn {
   border: 0;
   background: none;
-  color: var(--brand);
-  font-weight: 650;
+  color: var(--brand-text);
+  font-weight: 600;
+  font-size: inherit;
   padding: 0;
+  text-decoration: none;
   cursor: pointer;
 }
 .text-btn:hover {
   color: var(--brand2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.text-btn:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+  border-radius: 3px;
 }
 .theme-toggle {
   width: 42px;
@@ -1274,7 +1367,7 @@ textarea:focus-visible {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--good);
+  background: var(--good-fill);
   margin-right: 7px;
   box-shadow: 0 0 0 5px oklch(55% 0.14 150/0.12);
   animation: breathe 2s var(--ease) infinite;
@@ -1294,9 +1387,8 @@ textarea:focus-visible {
   background: transparent;
   color: var(--light);
   min-width: 0;
-  font:
-    12px 'IBM Plex Mono',
-    monospace;
+  font-family: var(--mono);
+  font-size: var(--fs-base);
 }
 .target button {
   width: 38px;
@@ -1369,7 +1461,7 @@ textarea:focus-visible {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--bad);
+  background: var(--bad-fill);
 }
 .ticker-wrap {
   display: flex;
@@ -1421,7 +1513,7 @@ textarea:focus-visible {
   animation: ticker 90s linear infinite;
   color: var(--sub);
   font-size: 0.72rem;
-  font-weight: 650;
+  font-weight: 600;
 }
 .ticker-wrap:hover .ticker {
   animation-play-state: paused;
@@ -1490,9 +1582,8 @@ textarea:focus-visible {
   background: var(--soft);
   display: grid;
   place-items: center;
-  font:
-    0.68rem 'IBM Plex Mono',
-    monospace;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
 }
 .step.active b {
   background: var(--brand);
@@ -1549,7 +1640,7 @@ textarea:focus-visible {
 .field label {
   font-size: 0.67rem;
   color: var(--sub);
-  font-weight: 650;
+  font-weight: 600;
 }
 .control {
   min-height: 43px;
@@ -1660,7 +1751,7 @@ textarea:focus-visible {
   color: oklch(68% 0.03 255);
   text-align: left;
   padding: 0 8px;
-  font-weight: 650;
+  font-weight: 600;
   position: relative;
   transition: color 0.2s var(--ease);
 }
@@ -1678,9 +1769,9 @@ textarea:focus-visible {
 }
 .owasp-detail span {
   color: oklch(76% 0.13 255);
-  font:
-    500 0.7rem 'IBM Plex Mono',
-    monospace;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-weight: 500;
 }
 .owasp-detail h3 {
   font-size: clamp(2rem, 4vw, 3.4rem);
@@ -1718,7 +1809,7 @@ textarea:focus-visible {
   background: var(--paper);
   padding: 0 14px;
   color: var(--sub);
-  font-weight: 650;
+  font-weight: 600;
   position: relative;
   transition: color 0.2s var(--ease);
 }
@@ -1835,7 +1926,7 @@ textarea:focus-visible {
   justify-content: space-between;
   align-items: center;
   text-align: left;
-  font-weight: 650;
+  font-weight: 600;
   color: inherit;
 }
 .faq-a {
@@ -1950,7 +2041,7 @@ footer.public-footer {
 .auth-switch {
   text-align: center;
   color: var(--muted);
-  font-size: 0.7rem;
+  font-size: var(--fs-sm);
   margin-top: 16px;
 }
 .auth-art {
@@ -1979,7 +2070,7 @@ footer.public-footer {
   grid-template-columns: 125px 1fr;
   padding: 11px 0;
   border-bottom: 1px solid oklch(74% 0.1 255);
-  font-size: 0.7rem;
+  font-size: var(--fs-sm);
 }
 .proof span {
   color: oklch(86% 0.05 255);
@@ -1992,7 +2083,7 @@ footer.public-footer {
   border-radius: 7px;
   background: var(--danger-weak);
   color: var(--bad);
-  font-size: 0.75rem;
+  font-size: var(--fs-base);
   overflow-wrap: break-word;
   word-break: break-word;
 }
@@ -2021,13 +2112,13 @@ footer.public-footer {
   display: block;
   margin-bottom: 3px;
   color: var(--ink);
-  font-size: 0.78rem;
-  font-weight: 650;
+  font-size: var(--fs-md);
+  font-weight: 600;
 }
 .error-notice-copy p {
   margin: 0;
   color: var(--bad);
-  font-size: 0.75rem;
+  font-size: var(--fs-base);
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
@@ -2036,7 +2127,7 @@ footer.public-footer {
   margin-top: 5px;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 0.64rem;
+  font-size: var(--fs-micro);
 }
 .error-notice.compact {
   grid-template-columns: auto minmax(0, 1fr);
@@ -2052,8 +2143,8 @@ footer.public-footer {
   border-radius: 6px;
   background: transparent;
   color: var(--bad);
-  font-size: 0.7rem;
-  font-weight: 650;
+  font-size: var(--fs-sm);
+  font-weight: 600;
 }
 .error-notice-retry:hover {
   background: color-mix(in srgb, var(--bad) 9%, transparent);
@@ -2111,7 +2202,7 @@ footer.public-footer {
   text-align: left;
   font-weight: 600;
   text-decoration: none;
-  font-size: 0.82rem;
+  font-size: var(--fs-md);
   width: 100%;
 }
 .app-nav a:hover,
@@ -2134,7 +2225,7 @@ footer.public-footer {
   border-radius: 999px;
   background: var(--brand);
   color: var(--on-brand);
-  font-size: 0.7rem;
+  font-size: var(--fs-sm);
   font-weight: 700;
   /* .head h1 sets letter-spacing: -0.035em, which inherits as a computed
      length (~-1.5px at the heading's clamped size). On 11px chip text that
@@ -2164,7 +2255,7 @@ footer.public-footer {
   height: 8px;
   margin-top: 3px;
   border-radius: 50%;
-  background: var(--bad);
+  background: var(--bad-fill);
   box-shadow: 0 0 0 3px var(--sev-high-bg);
 }
 .scanner-status.online .scanner-status-dot {
@@ -2188,13 +2279,13 @@ footer.public-footer {
 }
 .scanner-status-copy b {
   color: var(--sub);
-  font-size: 0.7rem;
+  font-size: var(--fs-sm);
   line-height: 1.1;
 }
 .scanner-status-copy small {
   margin-top: 4px;
   color: var(--muted);
-  font-size: 0.62rem;
+  font-size: var(--fs-micro);
   font-variant-numeric: tabular-nums;
 }
 @keyframes scanner-pulse {
@@ -2205,7 +2296,7 @@ footer.public-footer {
 .sidefoot {
   margin-top: 0;
   padding: 12px 9px;
-  font-size: 0.7rem;
+  font-size: var(--fs-sm);
 }
 .sidefoot b {
   display: block;
@@ -2233,7 +2324,7 @@ footer.public-footer {
   padding: 0 28px;
 }
 .crumb {
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
   color: var(--muted);
   display: flex;
   align-items: center;
@@ -2302,13 +2393,15 @@ footer.public-footer {
   margin-bottom: 25px;
 }
 .head h1 {
-  font-size: clamp(1.9rem, 3vw, 2.7rem);
-  letter-spacing: -0.035em;
-  line-height: 1.05;
+  font-size: var(--fs-h1);
+  letter-spacing: -0.02em;
+  line-height: 1.15;
 }
 .head p {
   color: var(--sub);
-  margin-top: 6px;
+  font-size: var(--fs-base);
+  margin-top: 4px;
+  max-width: 68ch;
 }
 .summary {
   display: grid;
@@ -2332,36 +2425,155 @@ footer.public-footer {
   font-size: 1.3rem;
 }
 .stat span {
-  font-size: 0.65rem;
+  font-size: var(--fs-micro);
   color: var(--muted);
 }
 .app-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   gap: 14px;
 }
+/* Column flow with the foot pushed down by `margin-top: auto`. Grid stretches
+   every card in a row to the tallest, and without this the short ones left a
+   gap between the URL and the divider that read as a mistake; now the feet line
+   up across the row. */
 .card {
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--line);
   background: var(--paper);
-  border-radius: 9px;
-  padding: 17px;
+  border-radius: 10px;
+  padding: 16px;
+  transition:
+    border-color 0.18s var(--ease),
+    box-shadow 0.18s var(--ease);
+}
+.card:hover {
+  border-color: color-mix(in srgb, var(--brand) 30%, var(--line));
+  box-shadow: 0 1px 2px oklch(8% 0.025 255 / 0.05);
 }
 .card h2 {
-  font-size: 0.98rem;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 .card p {
-  font-size: 0.68rem;
+  font-size: var(--fs-sm);
   color: var(--muted);
-  margin-top: 3px;
+  margin-top: 5px;
+  /* anywhere, not break-all: keeps http:// and host labels intact and only
+     breaks when a token genuinely cannot fit. */
+  overflow-wrap: anywhere;
 }
 .cardfoot {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
   border-top: 1px solid var(--line);
   padding-top: 12px;
-  margin-top: 15px;
-  font-size: 0.67rem;
+  margin-top: auto;
+  font-size: var(--fs-sm);
+}
+/* The foot needs breathing room from the copy above even when the card is the
+   tallest in its row and `margin-top: auto` collapses to nothing. */
+.card p + .cardfoot,
+.card h2 + .cardfoot {
+  margin-top: 16px;
+}
+
+/* ---- Application card ----
+   Three parts, in order: identity, one status line, one action row. Management
+   actions (edit, delete) live in the top corner rather than the foot, so the
+   foot holds exactly two controls with distinct jobs - a quiet link out to the
+   history and the one button that starts work. Mixing a text link, a bordered
+   button and two borderless icon buttons on one line was the clutter. */
+.app-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.app-card-id {
+  min-width: 0;
+}
+.app-card-id h2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Quiet until wanted: full colour on hover/focus only, so two icons beside the
+   title do not compete with it. */
+.app-card-manage {
+  display: flex;
+  flex-shrink: 0;
+  gap: 2px;
+  margin: -4px -4px 0 0;
+}
+.app-card-manage button {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    background-color 0.16s var(--ease),
+    color 0.16s var(--ease);
+}
+.app-card-manage .ico {
+  width: 15px;
+  height: 15px;
+}
+.app-card-manage button:hover:not(:disabled) {
+  background: var(--soft);
+  color: var(--ink);
+}
+.app-card-manage .danger:hover:not(:disabled) {
+  background: var(--danger-weak);
+  color: var(--bad);
+}
+.app-card-manage button:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+}
+.app-card-manage button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+/* One line, no labels. The same facts as a labelled three-column grid, at a
+   fraction of the visual weight. */
+.app-card-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  margin-top: 12px;
+}
+.app-card-facts {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+}
+/* `margin-top: auto` (not a fixed gap) so a card whose URL wraps to two lines
+   still lines its foot up with its neighbours in the row. The minimum gap comes
+   from the status line's own bottom margin, since a fixed top margin here would
+   defeat the auto. Three classes deliberately: `.card p + .cardfoot` above is
+   (2 classes, 1 element) and would otherwise win. */
+.card.app-card .cardfoot {
+  margin-top: auto;
+  padding-top: 12px;
+}
+.app-card .app-card-status {
+  margin-bottom: 14px;
+}
+.app-card .scan-action {
+  height: 30px;
+  min-width: 62px;
+  border-radius: 7px;
 }
 
 /* Cached routes render immediately. These static placeholders are only used
@@ -2427,69 +2639,76 @@ footer.public-footer {
 }
 .skeleton-search {
   width: min(100%, 420px);
-  height: 43px;
-  margin-bottom: 17px;
+  height: 40px;
+  margin-bottom: 16px;
 }
 .skeleton-input {
   width: min(100%, 280px);
   height: 42px;
 }
-/* Mirrors .card's block flow exactly: h2 line, p line (margin-top 3), then a
-   bordered .cardfoot. Heights below are real line boxes, so nothing shifts
-   when the content replaces the placeholder. Height comes from the content,
-   not a min-height, so the two stay locked together as type changes. */
+/* Mirrors .card's block flow exactly: h2 line, p line (margin-top 5), then a
+   bordered .cardfoot. Heights are the real line boxes, derived from the type
+   tokens times the 1.55 body line-height rather than hardcoded pixels, so the
+   placeholder tracks the content instead of drifting out of step with it. */
 .skeleton-card .skeleton-heading {
-  height: 24px;
+  height: calc(var(--fs-md) * 1.55);
 }
 .skeleton-card .skeleton-copy {
-  height: 17px;
-  margin-top: 3px;
+  height: calc(var(--fs-sm) * 1.55);
+  margin-top: 5px;
 }
 .skeleton-cardfoot {
   display: flex;
   align-items: center;
   border-top: 1px solid var(--line);
   padding-top: 12px;
-  margin-top: 15px;
+  margin-top: 16px;
 }
-/* Default foot holds a .text-btn, whose line box at 0.67rem/1.55 is 16.61px. */
+/* Default foot holds a .text-btn at --fs-sm. */
 .skeleton-cardfoot .skeleton-action {
-  height: 16.61px;
+  height: calc(var(--fs-sm) * 1.55);
 }
-/* AppsPage's foot also carries .rowactions, whose buttons are a fixed 33px.
-   That makes the real foot 12 + 1 + 33 = 46px - 16px taller than a text-only
-   foot - so cards with actions opt into this modifier. */
+/* AppsPage's foot carries a 30px .scan-action beside the history link, which
+   makes the real foot 12 + 1 + 30 taller than a text-only foot - so cards with
+   actions opt into this modifier. */
 .skeleton-cardfoot.has-actions {
-  min-height: 46px;
+  min-height: 43px;
 }
 .skeleton-cardfoot.has-actions .skeleton-action {
-  width: 48px;
-  height: 33px;
-  border-radius: 5px;
+  width: 62px;
+  height: 30px;
+  border-radius: 7px;
+}
+/* Stands in for .app-card-status: one line of pills and facts. */
+.skeleton-statusline {
+  width: min(76%, 210px);
+  height: calc(var(--fs-sm) * 1.55);
+  margin-top: 12px;
 }
 /* Table cells: each bar occupies the real line box of the text it replaces, so
    the column keeps its height and the row's vertical centring doesn't shift.
-   .small is 0.65rem/1.55 → 16.12px; .rowtitle is 0.72rem/1.55 → 17.86px. */
+   Derived from the tokens (.rowtitle is --fs-base, .small is --fs-sm) against
+   the 1.55 body line-height. */
 .skeleton-table-row .skeleton-block {
   width: min(82%, 180px);
-  height: 17.86px;
+  height: calc(var(--fs-base) * 1.55);
 }
 .skeleton-target {
   display: grid;
-  gap: 2px;
+  gap: 3px;
   align-content: center;
 }
 .skeleton-target .skeleton-heading {
   width: min(72%, 180px);
-  height: 17.86px;
+  height: calc(var(--fs-base) * 1.55);
 }
 .skeleton-target .skeleton-copy:nth-child(2) {
   width: min(90%, 260px);
-  height: 16.12px;
+  height: calc(var(--fs-sm) * 1.55);
 }
 .skeleton-target .skeleton-copy:nth-child(3) {
   width: min(40%, 100px);
-  height: 16.12px;
+  height: calc(var(--fs-sm) * 1.55);
 }
 .skeleton-score {
   display: flex;
@@ -2584,13 +2803,13 @@ footer.public-footer {
   margin-bottom: 8px;
 }
 .advanced-panel p {
-  font-size: 0.66rem;
+  font-size: var(--fs-sm);
   color: var(--muted);
   margin-bottom: 12px;
 }
 .advanced-panel p.field-description {
   margin: 0;
-  font-size: 0.64rem;
+  font-size: var(--fs-micro);
 }
 .advanced-panel .panel-intro {
   max-width: 62ch;
@@ -2600,7 +2819,7 @@ footer.public-footer {
 .advanced-toggle-hint {
   color: var(--muted);
   font-weight: 500;
-  font-size: 0.68rem;
+  font-size: var(--fs-sm);
 }
 .advanced-toggle-title {
   white-space: nowrap;
@@ -2621,7 +2840,7 @@ footer.public-footer {
 .credential-account-head p {
   margin: 0;
   color: var(--muted);
-  font-size: 0.65rem;
+  font-size: var(--fs-micro);
   line-height: 1.45;
   text-align: right;
   text-wrap: pretty;
@@ -2641,7 +2860,7 @@ footer.public-footer {
   font-size: 1rem;
 }
 .formsection > p {
-  font-size: 0.68rem;
+  font-size: var(--fs-sm);
   color: var(--muted);
   margin-top: 3px;
 }
@@ -2673,14 +2892,14 @@ footer.public-footer {
   justify-content: space-between;
   padding: 8px 0;
   border-bottom: 1px solid var(--line);
-  font-size: 0.67rem;
+  font-size: var(--fs-sm);
 }
 .review dt {
   color: var(--muted);
 }
 .review dd {
   margin: 0;
-  font-weight: 650;
+  font-weight: 600;
 }
 .review .btn {
   width: 100%;
@@ -2691,11 +2910,11 @@ footer.public-footer {
   align-items: flex-start;
   padding: 12px;
   margin-top: 14px;
-  border-left: 3px solid var(--brand);
+  border: 1px solid color-mix(in srgb, var(--brand) 26%, var(--line));
   background: var(--brandsoft);
   color: var(--sub);
-  font-size: 0.72rem;
-  border-radius: 5px;
+  font-size: var(--fs-base);
+  border-radius: 8px;
 }
 .consent input {
   margin-top: 3px;
@@ -2712,7 +2931,7 @@ footer.public-footer {
   border-radius: 7px;
   background: var(--paper);
   color: var(--sub);
-  font-weight: 650;
+  font-weight: 600;
   margin-top: 20px;
 }
 .advanced-toggle .chev {
@@ -2729,7 +2948,7 @@ footer.public-footer {
   background: var(--paper);
 }
 .advanced-panel h3 {
-  font-size: 0.8rem;
+  font-size: var(--fs-md);
   margin-top: 12px;
 }
 .advanced-panel .grid2 {
@@ -2765,7 +2984,7 @@ footer.public-footer {
 }
 .mode-choice small {
   color: var(--muted);
-  font-size: 0.66rem;
+  font-size: var(--fs-sm);
 }
 .mode-choice button.active small {
   color: var(--brand2);
@@ -2793,12 +3012,12 @@ footer.public-footer {
      row divider's ends. */
   padding: 12px 14px;
   border-bottom: 1px solid var(--line);
-  font-size: 0.68rem;
+  font-size: var(--fs-sm);
   align-items: center;
 }
 .activity time {
   color: var(--muted);
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--mono);
 }
 .scan-log {
   max-height: 260px;
@@ -2808,9 +3027,9 @@ footer.public-footer {
   border-radius: 7px;
   background: var(--dark);
   color: oklch(80% 0.03 255);
-  font:
-    0.66rem/1.75 'IBM Plex Mono',
-    monospace;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.75;
 }
 .scan-log .ok,
 .ok {
@@ -2824,29 +3043,47 @@ footer.public-footer {
 }
 
 .search {
-  min-height: 43px;
+  min-height: 40px;
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: 8px;
   background: var(--paper);
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 10px;
+  padding: 0 11px;
   max-width: 420px;
   margin-bottom: 17px;
+  transition:
+    border-color 0.18s var(--ease),
+    box-shadow 0.18s var(--ease);
+}
+.search:focus-within {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px var(--brandsoft);
+}
+.search .ico {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: var(--muted);
 }
 .search input {
   border: 0;
   outline: 0;
   background: transparent;
+  color: var(--ink);
+  font-size: var(--fs-base);
   width: 100%;
+}
+.search input::placeholder {
+  color: var(--muted);
 }
 .reports-controls {
   display: flex;
   flex-wrap: wrap;
-  align-items: flex-start;
+  align-items: center;
   gap: 10px;
-  margin-bottom: 17px;
+  margin-bottom: 16px;
 }
 .reports-controls .search {
   flex: 1 1 320px;
@@ -2856,12 +3093,67 @@ footer.public-footer {
   flex: 0 1 280px;
   min-width: 220px;
 }
+/* Segmented filter. A status filter is not a primary action, so the selected
+   option reads as a raised segment inside a track rather than as a solid
+   brand-blue button competing with "New scan" in the top bar. */
+.seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--soft);
+}
+.seg button {
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  padding: 6px 12px;
+  color: var(--sub);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color 0.16s var(--ease),
+    color 0.16s var(--ease);
+}
+.seg button:hover:not([aria-pressed='true']) {
+  color: var(--ink);
+}
+.seg button[aria-pressed='true'] {
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: 0 1px 2px oklch(8% 0.025 255 / 0.09);
+}
+.seg button:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+}
+/* Row count sits beside the controls as a quiet total, so the header does not
+   have to carry a number that changes with every filter keystroke. */
+.result-count {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 @media (max-width: 640px) {
   .reports-controls .search,
   .reports-app-filter {
     flex-basis: 100%;
     width: 100%;
     max-width: none;
+  }
+  .seg {
+    width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .result-count {
+    margin-left: 0;
   }
 }
 .table {
@@ -2874,22 +3166,31 @@ footer.public-footer {
   align-items: center;
   min-height: 60px;
   border-bottom: 1px solid var(--line);
-  font-size: 0.7rem;
+  font-size: var(--fs-sm);
   padding: 0 4px;
 }
 .row:hover {
-  background: var(--paper);
+  background: var(--row-hover);
 }
 .rowtitle {
-  font-weight: 700;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+/* Row meta: URLs, timestamps, phase text. 12px is the floor here - the 11px
+   micro step is reserved for uppercase labels, whose caps read a size larger
+   than their nominal px. */
 .small {
-  font-size: 0.65rem;
+  font-size: var(--fs-sm);
   color: var(--muted);
 }
 .rowactions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 4px;
 }
 .rowactions button,
@@ -2897,130 +3198,275 @@ footer.public-footer {
   width: 33px;
   height: 33px;
   border: 0;
-  border-radius: 5px;
+  border-radius: 6px;
   background: transparent;
   display: grid;
   place-items: center;
   color: var(--sub);
+  cursor: pointer;
+  transition:
+    background-color 0.16s var(--ease),
+    color 0.16s var(--ease);
 }
-.rowactions button:hover,
+.rowactions button:hover:not(:disabled),
 .rowactions a:hover {
   background: var(--soft);
-  color: var(--brand);
+  color: var(--brand2);
 }
-.rowactions .scan-action {
+.rowactions button:focus-visible,
+.rowactions a:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+}
+.rowactions button:disabled {
+  color: var(--muted);
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.rowactions .danger:hover:not(:disabled) {
+  background: var(--danger-weak);
+  color: var(--bad);
+}
+/* Standalone, not scoped to .rowactions: the app card's Scan button sits in the
+   card foot on its own now, and a descendant selector would have silently
+   dropped every one of these declarations there. */
+.scan-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: auto;
   min-width: 48px;
-  padding: 0 10px;
+  height: 33px;
+  padding: 0 11px;
   border: 1px solid var(--line);
-  color: var(--brand);
-  font-size: 0.66rem;
-  font-weight: 700;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--brand-text);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background-color 0.16s var(--ease),
+    border-color 0.16s var(--ease);
 }
-.rowactions .scan-action:hover {
+.scan-action:hover {
   border-color: color-mix(in srgb, var(--brand) 45%, var(--line));
   background: var(--brandsoft);
+  color: var(--brand2);
+}
+.scan-action:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+}
+
+/* Status and severity both used to be colour-only text - the background and
+   radius were commented out, which left the padding orphaned and meant the only
+   difference between "Failed" and "Cancelled", or between critical and high,
+   was hue. The tint tokens exist for exactly this; each state now carries a
+   shape and a weight as well as a colour. */
+.status-pill,
+.sev-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  line-height: 1.45;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
 }
 .status-pill {
-  display: inline-flex;
-  padding: 3px 8px;
-  border-radius: 999px;
-  /* background: var(--soft); */
+  background: var(--soft);
   color: var(--sub);
-  font-size: 0.65rem;
-  font-weight: 700;
 }
 .status-pill.running,
 .status-pill.queued,
 .status-pill.incomplete {
-  /* background: var(--brandsoft); */
+  background: var(--brandsoft);
   color: var(--brand2);
 }
 .status-pill.completed {
-  /* background: oklch(94% 0.06 150); */
+  background: var(--sev-low-bg);
   color: var(--good);
 }
-.status-pill.failed,
-.status-pill.cancelled {
-  /* background: oklch(96% 0.03 28); */
+.status-pill.failed {
+  background: var(--sev-high-bg);
   color: var(--bad);
 }
+/* Cancelled is a user decision, not a fault: it shared --bad with failed, so the
+   two were indistinguishable at a glance. Neutral tone, dashed edge. */
+.status-pill.cancelled {
+  background: transparent;
+  border: 1px dashed var(--line);
+  padding: 2px 8px;
+  color: var(--sub);
+}
+/* A running scan's pill gets a slow pulse so an in-flight row is findable in a
+   long list without hunting the progress column. */
+.status-pill.running::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pill-pulse 1.8s var(--ease) infinite;
+}
+@keyframes pill-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
 
-/* ---- Reports table (full-width, labelled columns) ---- */
-.reports-table {
+/* ---- Shared data-table chrome (reports / scans / team) ---- */
+.reports-table,
+.scans-table,
+.team-table {
   width: 100%;
   background: var(--bg);
 }
+/* Sticky beneath the 64px .app-top so column labels survive a 25-row page. */
 .reports-head,
-.reports-row {
-  display: grid;
-  grid-template-columns: minmax(240px, 2fr) 0.9fr 1fr 0.8fr 120px;
-  gap: 16px;
-  align-items: center;
-  padding: 0 14px;
-}
-.reports-head {
-  min-height: 42px;
+.scans-head,
+.team-head {
+  position: sticky;
+  top: 64px;
+  z-index: 1;
+  min-height: 40px;
+  align-content: center;
+  background: var(--bg);
   border-bottom: 1px solid var(--ink);
-  font-size: 0.65rem;
-  font-weight: 700;
-  letter-spacing: 0.06em;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--sub);
 }
-.reports-row {
-  min-height: 68px;
+.reports-row,
+.scans-row,
+.team-row {
+  min-height: 62px;
   border-bottom: 1px solid var(--line);
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
+  transition: background-color 0.14s var(--ease);
+}
+.reports-row:hover,
+.scans-row:hover,
+.team-row:hover {
+  background: var(--row-hover);
+}
+/* The reports and scans rows are activatable (they navigate); the team row is
+   not, so only the first two take a pointer and a focus ring. */
+.reports-row,
+.scans-row {
   cursor: pointer;
 }
-.reports-row:hover {
-  background: var(--paper);
+.reports-row:active,
+.scans-row:active {
+  background: var(--row-active);
+}
+.reports-row:focus-visible,
+.scans-row:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+/* Numeric columns line up on the digit, not the word. */
+.num-cell {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* ---- Reports table ---- */
+.reports-head,
+.reports-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 2.2fr) 0.85fr 1.1fr 0.6fr 72px;
+  gap: 16px 24px;
+  align-items: center;
+  padding: 0 14px;
 }
 .rep-target {
   display: grid;
-  gap: 2px;
+  gap: 3px;
   min-width: 0;
 }
-.rep-target .mono {
+.rep-target .mono,
+.rep-target .rowtitle {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The real keyboard route into a row. It inherits the row's colour so the row
+   still reads as one object, and only shows its link nature on hover/focus. */
+.row-link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+  min-width: 0;
+}
+.row-link:hover {
+  color: var(--brand2);
+}
+.row-link:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+/* Only rendered when a row deviates from the default (a single-page crawl in a
+   list of full-site ones), so it carries information rather than repeating
+   itself down the column. */
+.row-tag {
+  justify-self: start;
+  margin-top: 1px;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+/* Score and band read as one unit: the number anchors, the pill qualifies it.
+   Previously both were saturated red text of the same weight, which made the
+   cell two competing signals instead of one. */
 .rep-score {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
+  min-width: 0;
 }
 .rep-score b {
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--mono);
+  font-size: var(--fs-base);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  flex-shrink: 0;
 }
-.sev-tag {
-  padding: 2px 8px;
-  /* border-radius: 999px; */
-  font-size: 0.63rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+.rep-score b span {
+  color: var(--muted);
+  font-weight: 400;
 }
 .sev-tag.critical {
-  /* background: var(--sev-critical-bg); */
+  background: var(--sev-critical-bg);
   color: var(--sev-critical);
 }
 .sev-tag.high {
-  /* background: var(--sev-high-bg); */
+  background: var(--sev-high-bg);
   color: var(--sev-high);
 }
 .sev-tag.medium {
-  /* background: var(--sev-medium-bg); */
+  background: var(--sev-medium-bg);
   color: var(--sev-medium);
 }
 .sev-tag.low {
-  /* background: var(--sev-low-bg); */
+  background: var(--sev-low-bg);
   color: var(--sev-low);
 }
 .sev-tag.info {
-  /* background: var(--sev-info-bg); */
+  background: var(--sev-info-bg);
   color: var(--sev-info);
 }
 .reports-row .rowactions {
@@ -3029,42 +3475,62 @@ footer.public-footer {
 }
 
 /* ---- Active scans table ---- */
-.scans-table {
-  width: 100%;
-  background: var(--bg);
-}
 .scans-head,
 .scans-row {
   display: grid;
-  grid-template-columns: minmax(240px, 2fr) 120px 100px 1fr 60px;
+  grid-template-columns: minmax(220px, 2.2fr) 116px 132px 1fr 76px;
   gap: 16px;
   align-items: center;
   padding: 0 14px;
 }
-.scans-head {
-  min-height: 42px;
-  border-bottom: 1px solid var(--ink);
-  font-size: 0.65rem;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+/* Progress reads as a figure, plus a bar only when the bar says something. A
+   completed run is always 100%, so 25 identical full bars down the column were
+   pure noise; the bar now appears only for a partial run, which makes the row
+   that stopped at 31% findable at a glance.
+   Both track and fill declare `display: block` - as spans they default to
+   inline, where width/height are ignored and the fill collapses to a zero box.
+   The track alone happened to work by being blockified as a grid item; the fill
+   inside it did not. */
+.scan-progress {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+.scan-progress-track {
+  display: block;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--soft);
+  overflow: hidden;
+}
+.scan-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--brand);
+  transition: width 0.4s var(--ease);
+}
+.scan-progress-fill.done {
+  background: var(--good-fill);
+}
+.scan-progress-fill.stopped {
+  background: var(--muted);
+}
+.scan-progress-fill.failed {
+  background: var(--bad-fill);
+}
+.scan-progress > span:last-child {
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+/* A finished run shows the figure alone, so give it the row's own text colour
+   rather than the dimmer meta grey the partial-progress caption uses. */
+.scan-progress.settled > span:last-child {
   color: var(--sub);
 }
-.scans-row {
-  min-height: 68px;
-  border-bottom: 1px solid var(--line);
-  font-size: 0.72rem;
-  cursor: pointer;
-}
-.scans-row:hover {
-  background: var(--paper);
-}
 
-/* ---- Team table (same style as reports table) ---- */
-.team-table {
-  width: 100%;
-  background: var(--bg);
-}
+/* ---- Team table ---- */
 .team-head,
 .team-row {
   display: grid;
@@ -3073,32 +3539,87 @@ footer.public-footer {
   align-items: center;
   padding: 0 14px;
 }
-.team-head {
-  min-height: 42px;
-  border-bottom: 1px solid var(--ink);
-  font-size: 0.65rem;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--sub);
-}
-.team-row {
-  min-height: 68px;
-  border-bottom: 1px solid var(--line);
-  font-size: 0.72rem;
-}
-.team-row:hover {
-  background: var(--paper);
+
+/* ---- Narrow-viewport data tables ----
+   A five-column grid has no honest narrow form: the 220px minimum on the target
+   column alone leaves the other four fighting over what is left, and the result
+   was cells landing in arbitrary positions under a column header that had
+   wrapped out of alignment with them. Below this width each row becomes its own
+   stacked block - target on its own line, the rest as labelled pairs that wrap -
+   and the header row is dropped, since the labels now travel with the values. */
+@media (max-width: 900px) {
+  .reports-head,
+  .scans-head {
+    display: none;
+  }
+  .reports-row,
+  .scans-row {
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 7px 16px;
+    padding: 14px;
+    min-height: 0;
+  }
+  .reports-row {
+    padding-right: 58px;
+  }
+  .reports-row .rep-target,
+  .scans-row .rep-target {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+  /* Taken out of the wrap flow entirely and pinned to the corner. As a flex item
+     it either stole the first line from the target or was pushed below the meta
+     pairs, depending on how the labels wrapped. */
+  .reports-row .rowactions {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+  }
+  .reports-row > [data-label]::before,
+  .scans-row > [data-label]::before {
+    content: attr(data-label) ' ';
+    color: var(--muted);
+    font-size: var(--fs-micro);
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    margin-right: 5px;
+  }
+  /* .rep-score is a flex row, so its label has to be a flex item rather than
+     inline text on the first child. */
+  .reports-row .rep-score::before {
+    flex-shrink: 0;
+    margin-right: 0;
+  }
+  .reports-row .num-cell,
+  .scans-row .num-cell {
+    text-align: left;
+  }
+  .scans-row .scan-progress {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .scans-row .scan-progress-track {
+    width: 64px;
+  }
+  /* An empty phase cell would still draw its label. */
+  .scans-row > [data-label]:empty {
+    display: none;
+  }
 }
 
 /* ---- Help text utility ---- */
 .help-text {
   margin-top: 16px;
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
   color: var(--muted);
 }
 .muted-text {
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
   color: var(--muted);
 }
 
@@ -3116,7 +3637,7 @@ footer.public-footer {
 .empty-state svg {
   width: 30px;
   height: 30px;
-  color: var(--brand);
+  color: var(--brand-text);
 }
 .empty-state h2 {
   font-size: 1rem;
@@ -3124,7 +3645,7 @@ footer.public-footer {
   margin: 0;
 }
 .empty-state p {
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
   margin: 0;
 }
 .empty-state .btn {
@@ -3133,8 +3654,8 @@ footer.public-footer {
 .back {
   border: 0;
   background: none;
-  color: var(--brand);
-  font-weight: 650;
+  color: var(--brand-text);
+  font-weight: 600;
   padding: 0;
   margin-bottom: 18px;
   cursor: pointer;
@@ -3153,10 +3674,10 @@ footer.public-footer {
 .scorebox strong {
   font-size: 3rem;
   color: oklch(78% 0.12 72);
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--mono);
 }
 .scorebox p {
-  font-size: 0.68rem;
+  font-size: var(--fs-sm);
   color: oklch(74% 0.03 255);
   margin: 7px 0 15px;
 }
@@ -3165,7 +3686,7 @@ footer.public-footer {
   justify-content: space-between;
   padding: 7px 0;
   border-bottom: 1px solid oklch(31% 0.03 255);
-  font-size: 0.65rem;
+  font-size: var(--fs-micro);
 }
 .kv:last-child {
   border: 0;
@@ -3176,7 +3697,7 @@ footer.public-footer {
 }
 .reportbody p {
   max-width: 78ch;
-  font-size: 0.68rem;
+  font-size: var(--fs-sm);
   line-height: 1.55;
   text-align: justify;
   color: var(--sub);
@@ -3200,7 +3721,7 @@ footer.public-footer {
   font-size: 1.1rem;
 }
 .severity span {
-  font-size: 0.66rem;
+  font-size: var(--fs-sm);
   color: var(--muted);
 }
 
@@ -3213,7 +3734,7 @@ footer.public-footer {
 .panel-h {
   padding: 12px 16px;
   border-bottom: 1px solid var(--line);
-  font-size: 0.66rem;
+  font-size: var(--fs-sm);
   font-weight: 700;
   color: var(--muted);
   text-transform: uppercase;
@@ -3238,13 +3759,13 @@ footer.public-footer {
   background: var(--soft);
 }
 .kv-cell span {
-  font-size: 0.65rem;
+  font-size: var(--fs-micro);
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 .kv-cell b {
-  font-size: 0.78rem;
+  font-size: var(--fs-md);
 }
 
 /* Two-column layout that fits the coverage and evidence tables side by side. */
@@ -3277,7 +3798,7 @@ footer.public-footer {
 .metric-head {
   min-height: 42px;
   border-bottom: 1px solid var(--ink);
-  font-size: 0.65rem;
+  font-size: var(--fs-micro);
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -3286,13 +3807,13 @@ footer.public-footer {
 .metric-row {
   min-height: 44px;
   border-bottom: 1px solid var(--line);
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
 }
 .metric-row span {
   color: var(--sub);
 }
 .metric-row b {
-  font-size: 0.78rem;
+  font-size: var(--fs-md);
 }
 .tech-list {
   display: grid;
@@ -3319,7 +3840,7 @@ footer.public-footer {
   border-bottom: 0;
 }
 .chain-item p {
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
   margin: 0;
 }
 .limitations {
@@ -3327,7 +3848,7 @@ footer.public-footer {
   padding-left: 18px;
   display: grid;
   gap: 6px;
-  font-size: 0.7rem;
+  font-size: var(--fs-sm);
   color: var(--sub);
 }
 /* Tested-surface inventory - same header-rule/row-rule language as
@@ -3336,14 +3857,14 @@ footer.public-footer {
   width: 100%;
   border-collapse: collapse;
   margin-top: 16px;
-  font-size: 0.7rem;
+  font-size: var(--fs-sm);
   table-layout: fixed;
 }
 .coverage-table th {
   text-align: left;
   padding: 0 10px 8px;
   border-bottom: 1px solid var(--ink);
-  font-size: 0.62rem;
+  font-size: var(--fs-micro);
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -3383,7 +3904,7 @@ footer.public-footer {
   gap: 8px;
 }
 .coverage-gaps > b {
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
 }
 .findings {
   display: grid;
@@ -3469,7 +3990,7 @@ footer.public-footer {
 .verdict-tag {
   padding: 2px 8px;
   border-radius: 999px;
-  font-size: 0.63rem;
+  font-size: var(--fs-micro);
   font-weight: 700;
   letter-spacing: 0.03em;
   white-space: nowrap;
@@ -3495,14 +4016,14 @@ footer.public-footer {
   opacity: 1;
 }
 .finding-block h4 {
-  font-size: 0.66rem;
+  font-size: var(--fs-sm);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--muted);
   margin-bottom: 5px;
 }
 .finding-block p {
-  font-size: 0.72rem;
+  font-size: var(--fs-base);
   margin: 0;
 }
 .finding-block pre {
@@ -3511,9 +4032,9 @@ footer.public-footer {
   border-radius: 6px;
   background: var(--dark);
   color: oklch(82% 0.03 255);
-  font:
-    0.66rem/1.6 'IBM Plex Mono',
-    monospace;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -3559,7 +4080,7 @@ footer.public-footer {
 }
 .finding-curl-hint {
   margin-top: 6px;
-  font-size: 0.66rem;
+  font-size: var(--fs-sm);
   color: var(--muted);
 }
 
@@ -3576,8 +4097,8 @@ footer.public-footer {
   border-radius: 999px;
   background: var(--paper);
   color: var(--sub);
-  font-size: 0.68rem;
-  font-weight: 650;
+  font-size: var(--fs-sm);
+  font-weight: 600;
 }
 .filter-tab.active {
   background: var(--ink);
@@ -3606,7 +4127,7 @@ footer.public-footer {
   padding: 12px 10px 12px 13px;
   border-radius: 9px;
   animation: toast-in 0.25s var(--ease);
-  font-size: 0.75rem;
+  font-size: var(--fs-base);
 }
 .toast.error {
   border-color: color-mix(in srgb, var(--bad) 55%, var(--ink));
@@ -3654,7 +4175,7 @@ footer.public-footer {
   background: var(--ink);
   box-shadow: 0 8px 24px oklch(8% 0.025 255 / 0.22);
   color: var(--paper);
-  font-size: 0.65rem;
+  font-size: var(--fs-micro);
   font-weight: 600;
   line-height: 1.35;
   pointer-events: none;
@@ -3930,7 +4451,7 @@ footer.public-footer {
     grid-column: 3;
     grid-row: 2;
     color: var(--sub);
-    font-size: 0.65rem;
+    font-size: var(--fs-micro);
     white-space: nowrap;
   }
   .finding-cvss::before {
@@ -3965,36 +4486,10 @@ footer.public-footer {
   .row > *:nth-child(4) {
     display: none;
   }
-  .reports-head {
-    display: none;
-  }
-  .reports-row {
-    grid-template-columns: 1fr auto;
-    gap: 10px;
-    padding: 14px;
-    min-height: 0;
-  }
-  .rep-target {
-    grid-column: 1 / -1;
-  }
-  .reports-row > span:nth-child(3) {
-    order: 3;
-  }
-  .reports-row .rowactions {
-    order: 4;
-    justify-content: flex-start;
-  }
-  .scans-head,
+  /* The reports and scans tables reflow in the 900px block above, which owns
+     their whole narrow layout - rules here would land later in the cascade and
+     silently override it. */
   .team-head {
-    display: none;
-  }
-  .scans-row {
-    grid-template-columns: 1fr auto;
-    gap: 10px;
-    padding: 14px;
-    min-height: 0;
-  }
-  .scans-row > span:nth-child(4) {
     display: none;
   }
   .team-row {
@@ -4003,7 +4498,7 @@ footer.public-footer {
     padding: 14px;
   }
   .team-row > span:nth-child(n + 2) {
-    font-size: 0.68rem;
+    font-size: var(--fs-sm);
   }
   .severity {
     grid-template-columns: 1fr 1fr;
@@ -4026,7 +4521,7 @@ footer.public-footer {
     color: var(--muted);
     display: grid;
     justify-items: center;
-    font-size: 0.65rem;
+    font-size: var(--fs-micro);
     text-decoration: none;
     padding: 6px 0;
   }
@@ -4280,8 +4775,7 @@ html[data-page-transition='back']::view-transition-new(root) {
 .legal-callout {
   margin-top: 22px;
   padding: 20px 22px;
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--brand);
+  border: 1px solid color-mix(in srgb, var(--brand) 24%, var(--line));
   border-radius: 10px;
   background: var(--soft);
 }

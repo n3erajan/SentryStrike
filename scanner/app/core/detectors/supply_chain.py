@@ -1,4 +1,5 @@
 from app.core.detectors.base_detector import BaseDetector, Finding
+from app.integrations.wappalyzer_engine import canonical_component_name, canonical_display_name
 from shared.models.vulnerability import OwaspCategory, SeverityLevel
 
 # Components whose CVE list came from a real assessment. A list left over from a
@@ -31,6 +32,11 @@ class SupplyChainDetector(BaseDetector):
         technologies = kwargs.get("technologies", [])
         findings: list[Finding] = []
         root_url = kwargs.get("root_url", urls[0] if urls else "")
+        # One component + one CVE = one finding, keyed on the canonical
+        # identity. Two detection sources can name one product differently
+        # ("Apache" vs "Apache HTTP Server"); without canonical keying each
+        # would emit its own finding set for the same CVE.
+        seen_components: set[tuple[str, str, str]] = set()
 
         for tech in technologies:
             name = getattr(tech, "name", "unknown")
@@ -52,16 +58,23 @@ class SupplyChainDetector(BaseDetector):
             source = _SOURCE_LABELS.get(getattr(tech, "cve_source", None) or "", "an unnamed source")
 
             for cve_id in cves:
+                component_key = (canonical_component_name(name), version, cve_id)
+                if component_key in seen_components:
+                    continue
+                seen_components.add(component_key)
                 score = scores.get(cve_id)
                 exploited = cve_id in kev
+                # Report under the canonical spelling so an alias-detected
+                # component ("Apache") reads as its proper name.
+                display_name = canonical_display_name(name)
                 findings.append(
                     Finding(
                         category=OwaspCategory.a03,
-                        vuln_type=f"Vulnerable Component: {name}",
+                        vuln_type=f"Vulnerable Component: {display_name}",
                         severity=self._severity(score, exploited),
                         url=root_url,
                         evidence=self._evidence(
-                            name, version, cve_id, score, exploited, epss.get(cve_id), source
+                            display_name, version, cve_id, score, exploited, epss.get(cve_id), source
                         ),
                         verified=True,
                     )
