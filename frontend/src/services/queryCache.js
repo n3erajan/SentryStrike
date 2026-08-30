@@ -1,5 +1,4 @@
 const DEFAULT_STALE_TIME_MS = 60_000;
-const MIN_INITIAL_LOADING_MS = 180;
 
 const EMPTY_SNAPSHOT = Object.freeze({
   data: undefined,
@@ -56,11 +55,6 @@ function isFresh(snapshot, staleTime) {
   );
 }
 
-function wait(milliseconds) {
-  if (milliseconds <= 0) return Promise.resolve();
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
 export function getQuerySnapshot(queryKey) {
   return queries.get(normalizeKey(queryKey))?.snapshot || EMPTY_SNAPSHOT;
 }
@@ -95,8 +89,6 @@ export function fetchQuery({
     return Promise.resolve(entry.snapshot.data);
   }
 
-  const isInitialLoad = !entry.snapshot.hasData;
-  const startedAt = Date.now();
   const requestWriteVersion = entry.writeVersion;
   entry.invalidatedWhileFetching = false;
   publish(entry, {
@@ -109,10 +101,7 @@ export function fetchQuery({
   entry.promise = Promise.resolve()
     .then(queryFn)
     .then(
-      async (data) => {
-        if (isInitialLoad) {
-          await wait(MIN_INITIAL_LOADING_MS - (Date.now() - startedAt));
-        }
+      (data) => {
         if (requestWriteVersion !== entry.writeVersion) {
           return entry.snapshot.data;
         }

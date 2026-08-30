@@ -144,6 +144,7 @@ async def _approve_access_request(request_id: str, member_limit: int) -> int:
                 email=access_request.email,
                 org_name=access_request.organization_name,
                 member_limit=member_limit,
+                full_name=access_request.full_name,
             )
         except InviteError as exc:
             print(f"Error: {exc.message}", file=sys.stderr)

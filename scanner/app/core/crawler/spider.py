@@ -422,6 +422,19 @@ class WebSpider:
                             if record_url not in discovered_set:
                                 discovered_set.add(record_url)
                                 discovered_urls.append(record_url)
+                        elif source == RouteSource.brute_force:
+                            # A brute-force wordlist guess that did not resolve to a
+                            # real resource (404/410/5xx/…) is a probe miss, not
+                            # discovered surface. Mark its enqueued RouteCandidate
+                            # dead so it is excluded from the routes_extracted /
+                            # total_urls_crawled counts (which drop is_dead routes)
+                            # and from SPA browser-seeding, mirroring the shell-
+                            # fallback handling above. Guesses that DO exist
+                            # (200/redirect/403) stay live and counted.
+                            for candidate in crawl_state.routes:
+                                if candidate.url == url:
+                                    candidate.is_dead = True
+                                    break
 
                     if "text/html" not in response.headers.get("content-type", ""):
                         queue.task_done()

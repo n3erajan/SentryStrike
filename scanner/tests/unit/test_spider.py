@@ -469,6 +469,42 @@ async def test_crawl_discovers_linked_paths(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_crawl_marks_dead_brute_force_guesses_that_404(monkeypatch):
+    """Brute-force wordlist guesses that 404 are probe misses, not discovered
+    surface. They must be marked is_dead so the routes_extracted / URLs-crawled
+    counts (which drop is_dead routes) reflect only routes that actually exist.
+    Real routes reached via links stay live."""
+    monkeypatch.setenv("CRAWL_DEPTH", "2")
+    monkeypatch.setenv("CRAWL_MAX_URLS", "60")
+    get_settings = __import__("app.config", fromlist=["get_settings"]).get_settings
+    get_settings.cache_clear()
+
+    base = "http://127.0.0.1:8098"
+    httpd, thread = _start_server(8098)
+    try:
+        spider = WebSpider()
+        result = await spider.crawl(f"{base}/")
+
+        live = {r.url for r in result.routes if not getattr(r, "is_dead", False)}
+        dead = {r.url for r in result.routes if getattr(r, "is_dead", False)}
+
+        # Real, resolvable routes stay live.
+        assert f"{base}/" in live
+        assert any("/xss" in u for u in live)
+
+        # Brute-force wordlist guesses 404 on this server -> must be marked dead
+        # and must not survive as live "crawled" routes.
+        for guess in ("/admin", "/.env", "/phpmyadmin", "/backup.sql"):
+            assert f"{base}{guess}" in dead, f"{guess} 404'd but was not marked dead"
+            assert f"{base}{guess}" not in live
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=1)
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
 async def test_crawl_logs_finished_inventory(monkeypatch, caplog):
     monkeypatch.setenv("CRAWL_DEPTH", "2")
     monkeypatch.setenv("CRAWL_MAX_URLS", "50")

@@ -937,18 +937,27 @@ function ReportPage() {
 
   const reportSkeleton = (
     <>
-          <div className='skeleton-back'>
-            <span className='skeleton-block skeleton-copy' style={{ width: 80 }} />
+          {/* Reuse the loaded view's real boxes (.back, .head, real h2/p tags)
+             with bars inside, so line-heights and margins match the content
+             exactly - no hand-tuned heights that drift out of sync. */}
+          <div className='back' aria-hidden='true'>
+            <span className='skeleton-block' style={{ width: 84, height: 14, display: "inline-block", verticalAlign: "middle" }} />
           </div>
           <div className='head' aria-hidden='true'>
             <div>
-              <span className='skeleton-block skeleton-heading' style={{ width: "min(60%, 280px)", height: 22, marginBottom: 8 }} />
-              <span className='skeleton-block skeleton-copy' style={{ width: "min(80%, 380px)", marginBottom: 6 }} />
-              <span className='skeleton-block skeleton-copy' style={{ width: "min(35%, 160px)" }} />
+              <h2 style={{ margin: 0 }}>
+                <span className='skeleton-block' style={{ width: "min(60%, 280px)", height: 18, display: "inline-block", verticalAlign: "middle" }} />
+              </h2>
+              <p className='mono'>
+                <span className='skeleton-block' style={{ width: "min(80%, 380px)", height: 12, display: "inline-block", verticalAlign: "middle" }} />
+              </p>
+              <p>
+                <span className='skeleton-block' style={{ width: "min(35%, 160px)", height: 12, display: "inline-block", verticalAlign: "middle" }} />
+              </p>
             </div>
             <div className='app-actions'>
-              <span className='skeleton-block' style={{ width: 72, height: 34, borderRadius: 6 }} />
-              <span className='skeleton-block' style={{ width: 72, height: 34, borderRadius: 6 }} />
+              <span className='skeleton-block' style={{ width: 84, height: 42, borderRadius: 8 }} />
+              <span className='skeleton-block' style={{ width: 84, height: 42, borderRadius: 8 }} />
             </div>
           </div>
           <div className='reportgrid' aria-hidden='true'>

@@ -44,6 +44,10 @@ class Invite(Document):
     """
 
     email: Indexed(str)
+    # Name the invitee gave when requesting access, carried onto the invite so the
+    # signup form can prefill it (editable there). Optional: member invites issued
+    # directly by an owner/admin, and legacy invites, have no captured name.
+    full_name: str | None = None
     org_id: str | None = None
     org_name: str | None = None
     # Vendor-selected initial limit for an owner invite. Member invites leave it unset.

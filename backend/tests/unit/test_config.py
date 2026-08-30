@@ -19,6 +19,43 @@ def test_backend_defaults_do_not_require_smtp_credentials(monkeypatch) -> None:
     assert settings.email_smtp_starttls is False
 
 
+def test_auth_cookie_secure_defaults_off_in_debug(monkeypatch) -> None:
+    """Unset + APP_DEBUG=true -> not Secure, so a plain-HTTP dev/LAN deployment
+    sets a cookie the browser will actually send back."""
+    monkeypatch.delenv("AUTH_COOKIE_SECURE", raising=False)
+    monkeypatch.setenv("APP_DEBUG", "true")
+
+    settings = BackendSettings(_env_file=None)
+
+    assert settings.app_debug is True
+    assert settings.auth_cookie_secure is False
+
+
+def test_auth_cookie_secure_defaults_on_in_production(monkeypatch) -> None:
+    """Unset + APP_DEBUG=false -> Secure, so production over HTTPS is hardened."""
+    monkeypatch.delenv("AUTH_COOKIE_SECURE", raising=False)
+    monkeypatch.setenv("APP_DEBUG", "false")
+    # Production also refuses the Turnstile test keys, so supply real-looking ones.
+    monkeypatch.setenv("TURNSTILE_SITE_KEY", "0xLIVEsitekey")
+    monkeypatch.setenv("TURNSTILE_SECRET_KEY", "0xLIVEsecretkey")
+
+    settings = BackendSettings(_env_file=None)
+
+    assert settings.app_debug is False
+    assert settings.auth_cookie_secure is True
+
+
+def test_auth_cookie_secure_explicit_value_overrides_debug_default(monkeypatch) -> None:
+    """An explicit AUTH_COOKIE_SECURE wins (HTTPS-terminating proxy in dev)."""
+    monkeypatch.setenv("APP_DEBUG", "true")
+    monkeypatch.setenv("AUTH_COOKIE_SECURE", "true")
+
+    settings = BackendSettings(_env_file=None)
+
+    assert settings.app_debug is True
+    assert settings.auth_cookie_secure is True
+
+
 def test_infrastructure_settings_exclude_service_configuration() -> None:
     fields = InfrastructureSettings.model_fields
 

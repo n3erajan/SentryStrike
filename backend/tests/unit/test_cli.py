@@ -66,6 +66,7 @@ def test_approve_access_request_smtp_failure_keeps_request(monkeypatch, capsys) 
     invite = SimpleNamespace(id="invite-1")
     access_request = SimpleNamespace(
         email="owner@example.test",
+        full_name="Acme Owner",
         organization_name="Acme",
         deleted=False,
     )

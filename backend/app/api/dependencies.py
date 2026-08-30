@@ -1,5 +1,3 @@
-from http.cookies import SimpleCookie
-
 from fastapi import Depends, Header, HTTPException, Request, status
 
 from app.config import get_settings
@@ -115,14 +113,19 @@ def get_session_token(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> str | None:
-    """Extract the session token from either the Authorization header or the session cookie."""
+    """Extract the session token from either the Authorization header or the session cookie.
+
+    Reads the cookie via Starlette's ``request.cookies`` (a lenient, per-pair
+    parser) rather than ``http.cookies.SimpleCookie``. SimpleCookie aborts on a
+    single malformed sibling cookie - a value with spaces, unquoted JSON, etc.,
+    routinely left on a shared host (e.g. ``localhost``) by another app - and in
+    doing so discards the WHOLE jar, including our valid session cookie. That
+    made every request 401 straight after a successful login (dashboard shown
+    for a blink, then bounced to /login) until the user manually cleared cookies.
+    Starlette skips only the offending pair, so the session cookie survives.
+    """
     settings = get_settings()
-    cookie = SimpleCookie()
-    try:
-        cookie.load(request.headers.get("cookie", ""))
-    except Exception:
-        cookie = SimpleCookie()
-    cookie_token = cookie[settings.auth_cookie_name].value if settings.auth_cookie_name in cookie else None
+    cookie_token = request.cookies.get(settings.auth_cookie_name)
     return _bearer_token(authorization) or cookie_token
 
 

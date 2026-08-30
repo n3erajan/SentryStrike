@@ -224,6 +224,29 @@ def test_session_token_prefers_bearer_token_over_cookie() -> None:
     assert response.json()["token"] == "header-token"
 
 
+def test_session_token_survives_malformed_sibling_cookie() -> None:
+    """A stale/foreign cookie with an unparseable value (unquoted JSON, spaces)
+    left on the same host by another app must not stop us reading the valid
+    session cookie. ``http.cookies.SimpleCookie`` discards the ENTIRE jar on such
+    input - losing the session token and 401-ing every request even straight
+    after a successful login (the observed 'dashboard blink then logout'). The
+    lenient Starlette parser skips only the offending pair."""
+    app = FastAPI()
+
+    @app.get("/token")
+    async def token(value: str | None = Depends(get_session_token)):
+        return {"token": value}
+
+    client = TestClient(app)
+
+    for hostile in ('pref={"theme":"dark"}', "old=a b c"):
+        response = client.get(
+            "/token",
+            headers={"Cookie": f"{hostile}; sentrystrike_session=valid-token"},
+        )
+        assert response.json()["token"] == "valid-token", f"token lost beside sibling: {hostile}"
+
+
 def test_protected_router_requires_authentication() -> None:
     app = FastAPI()
     app.include_router(scan.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])

@@ -38,7 +38,15 @@ function RegisterPage() {
     if (!inviteToken) return;
     const controller = new AbortController();
     previewInvite(inviteToken, controller.signal)
-      .then((data) => { setInvite(data); setInviteState("valid"); })
+      .then((data) => {
+        setInvite(data);
+        // Prefill from the backend invite: email is pinned (rendered read-only
+        // below; the server re-checks it on register regardless), name is a
+        // starting value the invitee can edit.
+        setEmail(data.email || "");
+        setFullName(data.full_name || "");
+        setInviteState("valid");
+      })
       .catch((err) => {
         if (err.name !== "AbortError") { setError(err); setInviteState("invalid"); }
       });
@@ -83,7 +91,6 @@ function RegisterPage() {
   }
 
   const fields = [
-    { key: "email", id: "reg-email", label: "Work email", type: "email", autoComplete: "email", value: email, set: setEmail, valid: emailValid, error: "Enter a valid email address" },
     { key: "fullName", id: "reg-name", label: "Full name", type: "text", autoComplete: "name", value: fullName, set: setFullName, valid: nameValid, error: "Enter your full name" },
     { key: "password", id: "reg-password", label: "Password", type: "password", autoComplete: "new-password", value: password, set: setPassword, valid: passwordValid, error: "Password must be at least 8 characters" },
     { key: "confirmPassword", id: "reg-confirm-password", label: "Confirm password", type: "password", autoComplete: "new-password", value: confirmPassword, set: setConfirmPassword, valid: confirmValid, error: "Passwords do not match" },
@@ -104,6 +111,12 @@ function RegisterPage() {
           {inviteState === "invalid" && <ErrorNotice error={error} fallback='This invitation is invalid or has expired.' compact />}
           {inviteState === "valid" && (
             <form onSubmit={handleSubmit} noValidate style={{ marginTop: 26 }}>
+              <div className='field'>
+                <label htmlFor='reg-email'>Work email</label>
+                <div className='control'>
+                  <input id='reg-email' type='email' autoComplete='email' value={email} readOnly aria-readonly='true' tabIndex={-1} title='This is the address your invitation was sent to and cannot be changed here.' />
+                </div>
+              </div>
               {fields.map((f) => {
                 const passwordField = f.type === "password";
                 return <div key={f.key} className='field'>

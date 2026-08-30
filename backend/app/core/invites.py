@@ -172,6 +172,7 @@ class InviteService:
         email: str,
         org_name: str,
         member_limit: int,
+        full_name: str | None = None,
     ) -> tuple[str, Invite, bool]:
         """Create an owner invite or rotate the token on its failed pending record."""
         normalized = normalize_email(email)
@@ -216,6 +217,7 @@ class InviteService:
                         {
                             "$set": {
                                 "org_name": org_name,
+                                "full_name": full_name,
                                 "member_limit": member_limit,
                                 "token_hash": hash_invite_token(token),
                                 "pending_key": f"owner:{normalized}",
@@ -232,6 +234,7 @@ class InviteService:
                 if retried.modified_count != 1:
                     raise DuplicatePendingInviteError()
                 pending.org_name = org_name
+                pending.full_name = full_name
                 pending.member_limit = member_limit
                 pending.token_hash = hash_invite_token(token)
                 pending.pending_key = f"owner:{normalized}"
@@ -251,6 +254,7 @@ class InviteService:
             org_name=org_name,
             invited_by_user_id=None,
             member_limit=member_limit,
+            full_name=full_name,
         )
         return token, invite, False
 
@@ -263,6 +267,7 @@ class InviteService:
         org_name: str | None,
         invited_by_user_id: str | None,
         member_limit: int | None = None,
+        full_name: str | None = None,
     ) -> tuple[str, Invite]:
         """Create a pending invite and return the raw token alongside the record.
 
@@ -303,6 +308,7 @@ class InviteService:
         settings = get_settings()
         invite = Invite(
             email=normalized,
+            full_name=full_name,
             org_id=org_id,
             org_name=org_name,
             member_limit=member_limit if role == UserRole.owner else None,

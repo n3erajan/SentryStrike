@@ -105,11 +105,14 @@ async def preview_invite(
     token: str = Query(min_length=1, max_length=512),
     invites: InviteService = Depends(get_invite_service),
 ) -> dict:
-    """Validate an invite token and return the role and org info.
+    """Validate an invite token and return the details to prefill the signup form.
 
-    Shows the role and org name before the invitee fills in their details.
-    Does not return the pinned email - the user must enter it.
-    Does not consume the invite.
+    Returns the pinned email and the invited name (both prefilled on the form -
+    email read-only, name editable) plus the role and org. Exposing these to a
+    holder of the single-use, high-entropy invite token grants no capability they
+    lack: the token already authorizes registering this exact account, and
+    ``register`` re-checks the email server-side regardless. Does not consume the
+    invite.
     """
     try:
         invite = await invites.preview(token)
@@ -117,6 +120,8 @@ async def preview_invite(
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     return json_response(
         {
+            "email": invite.email,
+            "full_name": invite.full_name,
             "role": invite.role.value,
             "org_name": invite.org_name,
             "owns_workspace": invite.role == UserRole.owner and invite.org_id is None,

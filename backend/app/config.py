@@ -38,7 +38,14 @@ class BackendSettings(
         min_length=1,
         alias="AUTH_COOKIE_NAME",
     )
-    auth_cookie_secure: bool = Field(default=False, alias="AUTH_COOKIE_SECURE")
+    # None = derive from app_debug (see _default_cookie_secure): Secure in
+    # production, not-Secure in dev. A browser silently refuses to SEND a Secure
+    # cookie back over plain HTTP, so a Secure session cookie on an http:// dev or
+    # LAN deployment (e.g. http://192.168.x.x) is stored but never returned -
+    # every post-login request then 401s. Tying the default to app_debug stops the
+    # flag from contradicting the environment. An explicit AUTH_COOKIE_SECURE still
+    # wins, for the case of a real HTTPS-terminating proxy in front of a debug build.
+    auth_cookie_secure: bool | None = Field(default=None, alias="AUTH_COOKIE_SECURE")
     auth_cookie_samesite: str = Field(default="lax", alias="AUTH_COOKIE_SAMESITE")
 
     # Invitations. Registration is invite-only: a link is emailed to the invited
@@ -111,6 +118,18 @@ class BackendSettings(
         if normalized not in {"lax", "strict", "none"}:
             raise ValueError("AUTH_COOKIE_SAMESITE must be one of: lax, strict, none")
         return normalized
+
+    @model_validator(mode="after")
+    def _default_cookie_secure(self) -> "BackendSettings":
+        """Resolve auth_cookie_secure to a concrete bool.
+
+        Unset -> Secure in production (app_debug false), not-Secure in dev, so a
+        plain-HTTP dev/LAN deployment does not set a Secure cookie the browser
+        will refuse to send back. An explicit env value is preserved.
+        """
+        if self.auth_cookie_secure is None:
+            self.auth_cookie_secure = not self.app_debug
+        return self
 
     @model_validator(mode="after")
     def _validate_smtp_credentials(self) -> "BackendSettings":

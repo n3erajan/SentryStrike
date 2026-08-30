@@ -35,6 +35,7 @@ def test_sqli_detector_excludes_submit_button():
 
 
 from app.core.verification.response_analyzer import ResponseData
+from shared.models.vulnerability import SeverityLevel
 
 
 @pytest.mark.asyncio
@@ -110,6 +111,85 @@ async def test_union_canary_with_literal_query_syntax_is_reflection_not_sqli():
     )
 
     assert result.is_vulnerable is False
+
+
+from app.core.verification.sqli_verifier import _has_sql_specific_error, _new_sql_errors
+
+
+def test_postgres_error_markers_are_sql_specific():
+    """PostgreSQL / node-postgres errors must count as SQL-engine-specific.
+
+    Without these markers, error-based detection cannot fire on a pg target
+    (the app leaks 'unterminated quoted string' / 'syntax error at or near'),
+    so the verifier falls through to time-based and mislabels the finding.
+    """
+    pg_errors = [
+        'error: unterminated quoted string at or near "\'1\'\'"',
+        'error: syntax error at or near "x7e"',
+        'invalid input syntax for type numeric: "abc"',
+        'operator does not exist: text = integer',
+        'error: unterminated quoted identifier at or near """',
+    ]
+    for body in pg_errors:
+        assert _has_sql_specific_error(body), f"Postgres error not recognized: {body}"
+
+
+def test_postgres_error_is_new_against_clean_json_baseline():
+    """The ' payload on a pg endpoint whose baseline is an empty JSON array must
+    surface a new, baseline-absent SQL error so error-based verification confirms."""
+    baseline_body = "[]"
+    injected_body = 'error: unterminated quoted string at or near "\'1\'\'"'
+    errors = _new_sql_errors(baseline_body, injected_body, payload="'", baseline_value="1")
+    assert errors, "a new Postgres error absent from baseline should be detected"
+
+
+@pytest.mark.asyncio
+async def test_error_based_confirms_on_postgres_target():
+    """Two independent payloads must both raise a marker error before error-based
+    reports vulnerable.
+
+    Regression: on a PostgreSQL target the MySQL/Oracle payloads
+    (extractvalue/updatexml/@@version) degrade to non-marker errors ("column
+    \"version\" does not exist", "argument of AND must be type boolean"), so only
+    the bare-quote probe matched - a single hit, which never satisfied the
+    two-hit confirmation, and detection silently fell through to time-based. The
+    added generic/PG syntax-breakers ("')", CAST) give the second hit.
+    """
+    verifier = SQLiVerifier()
+
+    def resp(status, body):
+        return ResponseData(
+            status_code=status, headers={}, body=body,
+            response_time_ms=5.0, request_snippet="GET /search", response_snippet=body,
+        )
+
+    async def mock_send(url, method, params=None, data=None, **kwargs):
+        # Mirror the real pg target: only genuine quote/paren/cast breaks error
+        # with an engine-specific marker; the MySQL/Oracle probes return 200 or a
+        # non-marker error, exactly as observed live.
+        payload = kwargs.get("payload", "")
+        if payload == "'":
+            return resp(500, 'error: unterminated quoted string at or near "\'1\'\'"')
+        if payload in ("')", "'))"):
+            return resp(500, 'error: syntax error at or near ")"')
+        if "CAST('x' AS INT)" in payload:
+            return resp(500, 'error: invalid input syntax for type integer: "x"')
+        return resp(200, "[]")
+
+    verifier._send = mock_send
+
+    result = await verifier._verify_error_based(
+        url="http://pg.test/search",
+        parameter="search",
+        method="GET",
+        value="1",
+        pre_test_baseline=resp(200, "[]"),
+    )
+
+    assert result.is_vulnerable is True
+    assert result.detection_method == "error_based"
+    assert result.findings and result.findings[0].verified
+    assert result.findings[0].severity == SeverityLevel.critical
 
 
 @pytest.mark.asyncio

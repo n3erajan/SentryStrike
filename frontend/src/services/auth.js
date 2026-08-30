@@ -10,7 +10,7 @@
 //   POST /auth/logout                                                 ->     { logged_out: true } + clear-cookie
 //   GET  /auth/session                                                ->     user | null
 //   GET  /auth/me                                                     ->     { id, email, ... }
-//   GET  /auth/invite    ?token                                       ->     { email, role, org_name }
+//   GET  /auth/invite    ?token                                       ->     { email, full_name, role, org_name, owns_workspace }
 import { apiRequest } from "./apiClient.js";
 
 export function getCurrentUser() {

@@ -114,10 +114,12 @@ async def test_owner_invites_use_email_specific_pending_key(monkeypatch) -> None
         org_name="Acme",
         invited_by_user_id=None,
         member_limit=10,
+        full_name="Acme Owner",
     )
 
     assert inserted == [invite]
     assert invite.pending_key == "owner:owner@example.test"
+    assert invite.full_name == "Acme Owner"
 
 
 @pytest.mark.asyncio
@@ -179,6 +181,7 @@ async def test_failed_pending_owner_invite_rotates_token_on_same_record(monkeypa
         email="owner@example.test",
         org_name="Correct name",
         member_limit=25,
+        full_name="Correct Person",
     )
 
     assert token == "rotated-token"
@@ -187,8 +190,10 @@ async def test_failed_pending_owner_invite_rotates_token_on_same_record(monkeypa
     assert pending.pending_key == "owner:owner@example.test"
     assert pending.org_name == "Correct name"
     assert pending.member_limit == 25
+    assert pending.full_name == "Correct Person"
     assert pending.email_delivery_status == InviteEmailStatus.not_attempted
     assert updates[0][1]["$set"]["pending_key"] == "owner:owner@example.test"
+    assert updates[0][1]["$set"]["full_name"] == "Correct Person"
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +208,7 @@ class FakeInviteService:
         self.accepted: dict | None = None
         self.pending = SimpleNamespace(
             email="invitee@example.test",
+            full_name="Invited Person",
             role=SimpleNamespace(value="developer"),
             org_name=None,
             org_id="org-1",
@@ -258,12 +264,14 @@ def _client(invites: FakeInviteService) -> TestClient:
     return TestClient(app)
 
 
-def test_preview_invite_returns_role_without_disclosing_email() -> None:
-    """The preview must not leak the pinned address to an unauthenticated caller.
+def test_preview_invite_returns_email_and_name_for_prefill() -> None:
+    """The token-gated preview returns the pinned email and invited name so the
+    signup form can prefill them.
 
-    Anyone holding the token can call this endpoint, so returning the invited
-    email would turn a leaked link into an address disclosure. The invitee types
-    their own email at registration, where ``accept`` still checks it matches.
+    Possession of the single-use, high-entropy invite token already authorizes
+    registering this exact account, so surfacing the address to a token-holder
+    grants no capability they lack. ``accept`` still enforces the email
+    server-side; the read-only email field is UX only, not a security boundary.
     """
     client = _client(FakeInviteService())
 
@@ -271,8 +279,8 @@ def test_preview_invite_returns_role_without_disclosing_email() -> None:
 
     assert response.status_code == 200
     data = response.json()["data"]
-    assert "email" not in data
-    assert "invitee@example.test" not in response.text
+    assert data["email"] == "invitee@example.test"
+    assert data["full_name"] == "Invited Person"
     assert data["role"] == "developer"
     assert data["owns_workspace"] is False
 
@@ -281,6 +289,7 @@ def test_preview_owner_access_request_identifies_workspace_setup() -> None:
     invites = FakeInviteService()
     invites.pending = SimpleNamespace(
         email="owner@example.test",
+        full_name="Acme Owner",
         role=UserRole.owner,
         org_name="Acme",
         org_id=None,
@@ -292,6 +301,8 @@ def test_preview_owner_access_request_identifies_workspace_setup() -> None:
     assert response.status_code == 200
     data = response.json()["data"]
     assert data["org_name"] == "Acme"
+    assert data["email"] == "owner@example.test"
+    assert data["full_name"] == "Acme Owner"
     assert data["owns_workspace"] is True
 
 
