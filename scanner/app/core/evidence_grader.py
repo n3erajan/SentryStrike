@@ -71,27 +71,28 @@ class EvidenceGrade:
 # is IN the response (command output, file contents, canary execution, data
 # extraction, boolean differential, CSRF token bypass).
 _ACTIVE_OUTPUT_METHODS: frozenset[str] = frozenset({
-    # SQLi - boolean/union extract data from the DB
+    # SQLi - UNION extracts data into the response body. (Boolean-blind SQLi is
+    # a true/false differential with no output; proof_type boolean_differential.)
     "union_based",
-    "boolean_differential",
     # Command injection - command output in response
     "command_output",
     # File inclusion - file contents retrieved
     "file_retrieval",
     "path_traversal_file_read",
     "stream_decoding_oracle",
-    "remote_include_content_fingerprint",
-    "remote_include_error_oracle_content_confirmed",
-    # XSS - browser-confirmed execution
+    # (RFI proven by the remote resource's own content appearing in the response
+    # is proof_type remote_include - the fetched remote body, not reflection.)
+    # XSS - reflected/stored payload present in the response body and executes.
+    # (DOM XSS proven by the browser oracle with no HTTP-body dependency is
+    # proof_type browser_execution, handled separately.)
     "canary_verified",
     "context_breakout",
-    "dom_xss_browser_execution",
     # CSRF - token tampering proved the request succeeded without valid token
     "token_bypass",
     "csrf_tamper_test",
-    # SSRF - server fetched internal content (reflected) or OAST callback received
+    # SSRF - server fetched internal content and reflected it in the response.
+    # (Blind SSRF proven by an OAST callback is proof_type oast_callback.)
     "ssrf_reflection",
-    "ssrf_oast_callback",
     # Open redirect - redirect observed (Location header or external redirect)
     "location_header_redirect",
     "observed_external_location_redirect",
@@ -99,9 +100,11 @@ _ACTIVE_OUTPUT_METHODS: frozenset[str] = frozenset({
     "file_upload_execution",
     "content_type_bypass_execution",
     "double_extension_execution",
-    # Auth - default creds / credential stuffing succeeded (login confirmed)
-    "default_credentials_probe",
+    # Sequential failed-login attempts with no lockout/rate-limit/CAPTCHA - the
+    # absence of protection across many processed attempts is the proof.
     "credential_stuffing_probe",
+    # (Default-creds ACCEPTANCE is a login-success differential; proof_type
+    # login_success - handled separately.)
     # Auth - token still valid after logout (proof: reused token worked)
     "logout_token_reuse_probe",
     "stream_decoding_oracle",
@@ -114,6 +117,27 @@ _ACTIVE_OUTPUT_METHODS: frozenset[str] = frozenset({
     # File handling - protected content or an external entity was returned
     "poison_null_byte_extension_bypass",
     "xxe_external_entity_file_read",
+})
+
+# Blind boolean SQLi: proof is a reproducible TRUE/FALSE response-similarity
+# split that tracks the injected boolean, not output in the response body.
+_BOOLEAN_DIFF_METHODS: frozenset[str] = frozenset({
+    "boolean_differential",
+})
+
+# RFI proven by content: the attacker-specified remote resource's own body
+# appeared in the response (server-side fetch + include), not the URL reflected.
+_REMOTE_INCLUDE_METHODS: frozenset[str] = frozenset({
+    "remote_include_content_fingerprint",
+    "remote_include_error_oracle_content_confirmed",
+})
+
+# Default/guessed credentials accepted: proof is a response consistent with
+# authentication success and distinct from the failed-login baseline. (Only the
+# credentials-ACCEPTED probe; credential_stuffing_probe reports lockout absence,
+# a different class, and stays in active_output.)
+_LOGIN_SUCCESS_METHODS: frozenset[str] = frozenset({
+    "default_credentials_probe",
 })
 
 # Detection methods where a DB/framework error string is echoed - the error
@@ -145,6 +169,24 @@ _AUTH_CONFIRMED_METHODS: frozenset[str] = frozenset({
 # whether the data is genuinely restricted.
 _AUTH_DIFF_METHODS: frozenset[str] = frozenset({
     "authorization_matrix",
+})
+
+# Blind out-of-band proof: a correlated callback our OAST collaborator recorded
+# (e.g. blind SSRF). The proof is the interaction record, not the HTTP response.
+_OAST_CALLBACK_METHODS: frozenset[str] = frozenset({
+    "ssrf_oast_callback",
+})
+
+# Browser-execution proof: our execution-only oracle fired in a real headless
+# browser (DOM-based XSS). No HTTP-body reflection is expected or required.
+_BROWSER_EXECUTION_METHODS: frozenset[str] = frozenset({
+    "dom_xss_browser_execution",
+})
+
+# Write-authorization differential: a state-changing request accepted without the
+# required authentication. Distinct from data-read auth_differential - here an
+# accepted mutation is the signal, not restricted data returned.
+_MUTATING_AUTHZ_METHODS: frozenset[str] = frozenset({
     "mutating_authz_differential",
 })
 
@@ -263,8 +305,14 @@ _PROOF_GRADE_LETTERS: dict[str, str] = {
     "timing_strong": "A",
     "timing_weak": "C",
     "ssrf_differential": "C",
+    "boolean_differential": "B",
+    "oast_callback": "A",
+    "browser_execution": "A",
+    "remote_include": "A",
     "auth_confirmed": "A",
     "auth_differential": "C",
+    "login_success": "A",
+    "mutating_authz": "C",
     "pattern_match": "C",
     "heuristic": "C",
 }
@@ -345,6 +393,24 @@ class EvidenceGrader:
         if method in _ACTIVE_OUTPUT_METHODS:
             return "active_output"
 
+        if method in _OAST_CALLBACK_METHODS:
+            return "oast_callback"
+
+        if method in _BROWSER_EXECUTION_METHODS:
+            return "browser_execution"
+
+        if method in _REMOTE_INCLUDE_METHODS:
+            return "remote_include"
+
+        if method in _BOOLEAN_DIFF_METHODS:
+            return "boolean_differential"
+
+        if method in _LOGIN_SUCCESS_METHODS:
+            return "login_success"
+
+        if method in _MUTATING_AUTHZ_METHODS:
+            return "mutating_authz"
+
         if method in _ERROR_ECHO_METHODS:
             return "error_echo"
 
@@ -419,6 +485,18 @@ class EvidenceGrader:
             lines = self._timing_markers(de)
         elif proof_type == "ssrf_differential":
             lines = self._ssrf_differential_markers(de)
+        elif proof_type == "oast_callback":
+            lines = self._oast_callback_markers(de)
+        elif proof_type == "browser_execution":
+            lines = self._browser_execution_markers(de, vuln)
+        elif proof_type == "remote_include":
+            lines = self._remote_include_markers(de, vuln)
+        elif proof_type == "boolean_differential":
+            lines = self._boolean_differential_markers(de)
+        elif proof_type == "login_success":
+            lines = self._login_success_markers(de)
+        elif proof_type == "mutating_authz":
+            lines = self._mutating_authz_markers(de, vuln)
         elif proof_type == "error_echo":
             lines = self._error_echo_markers(de)
         elif proof_type == "active_output":
@@ -628,6 +706,193 @@ class EvidenceGrader:
                 lines.append(f"  - {key}: {self._truncate_value(samples[:4], 600)}")
         return lines or [f"  - differential_evidence: {self._truncate_value(de)}"]
 
+    def _oast_callback_markers(self, de: dict) -> list[str]:
+        """Surface the correlated out-of-band interaction - the proof for blind
+        SSRF. The target reaching our uniquely-tokened collaborator URL is what
+        confirms the server-side fetch; there is no HTTP response body to read,
+        so the target's returned page is deliberately NOT surfaced here."""
+        lines: list[str] = []
+        interaction_id = self._first_value(de.get("interaction_id"))
+        if interaction_id is not None:
+            lines.append(
+                "  - interaction_id (unique token we planted): "
+                f"{self._truncate_value(interaction_id)}"
+            )
+        count = self._first_value(de.get("interaction_count"))
+        if count is not None:
+            lines.append(f"  - interaction_count: {self._truncate_value(count)}")
+        interactions = [
+            item
+            for item in self._flatten_values(de.get("interactions"))
+            if isinstance(item, dict)
+        ]
+        for interaction in interactions[:4]:
+            lines.append(
+                "  - callback_received: "
+                f"source_ip={interaction.get('source_ip', '?')}, "
+                f"method={interaction.get('method', '?')}, "
+                f"path={interaction.get('path', '?')}, "
+                f"received_at={interaction.get('received_at', '?')}"
+            )
+        readback = self._first_value(de.get("response_readback"))
+        if readback is not None:
+            lines.append(
+                f"  - response_readback: {readback} "
+                "(blind SSRF does not require any response readback)"
+            )
+        return lines or [f"  - detection_evidence: {self._truncate_value(de)}"]
+
+    def _browser_execution_markers(self, de: dict, vuln: Vulnerability) -> list[str]:
+        """Surface the execution proof for DOM XSS: our canaried callback fired in
+        a real browser. The captured DOM excerpt is the page AFTER client-side
+        execution, not the server's HTTP response body."""
+        lines: list[str] = []
+        if vuln.evidence.payload:
+            lines.append(f"  - payload: {self._truncate_value(vuln.evidence.payload)}")
+        for key in (
+            "winning_vector",
+            "injection_location",
+            "winning_surface",
+            "browser_execution_confirmed",
+            "route_backed",
+        ):
+            value = self._first_value(de.get(key))
+            if value is not None:
+                lines.append(f"  - {key}: {self._truncate_value(value)}")
+        events = self._flatten_values(de.get("execution_events"))
+        if events:
+            lines.append(f"  - execution_events: {self._truncate_value(events[:5], 400)}")
+        excerpt = self._first_value(de.get("executed_dom_excerpt"))
+        if excerpt:
+            lines.append(
+                "  - executed_dom_excerpt (rendered DOM AFTER execution, not the "
+                f"HTTP response body): {self._truncate_value(excerpt, 600)}"
+            )
+        return lines or [f"  - detection_evidence: {self._truncate_value(de)}"]
+
+    def _mutating_authz_markers(self, de: dict, vuln: Vulnerability) -> list[str]:
+        """Surface the write-authorization signal: an unauthenticated state-changing
+        request was accepted with the same processed status as the authenticated
+        owner. The proof is the accepted mutation, not returned data."""
+        lines: list[str] = []
+        unauth = self._first_value(de.get("unauth_status"))
+        owner = self._first_value(de.get("owner_status"))
+        if unauth is not None:
+            lines.append(f"  - unauth_status: {unauth}")
+        if owner is not None:
+            lines.append(f"  - owner_status: {owner}")
+        # A processed 2xx/3xx status means the mutation ran; the detector already
+        # drops matching 4xx/5xx statuses (which prove nothing about auth).
+        try:
+            processed = 200 <= int(owner) < 400 if owner is not None else None
+        except (TypeError, ValueError):
+            processed = None
+        if processed is not None:
+            lines.append(
+                f"  - mutation_accepted_and_processed: {processed} "
+                "(2xx/3xx means the state change actually ran)"
+            )
+        destructive = self._first_value(de.get("destructive_confirmed"))
+        if destructive is not None:
+            lines.append(f"  - destructive_confirmed_on_real_object: {destructive}")
+        server_bytes = server_response_bytes(vuln.evidence.response_snippet)
+        if server_bytes:
+            lines.append(f"  - response_excerpt: {server_bytes[:300]}")
+        return lines or [f"  - detection_evidence: {self._truncate_value(de)}"]
+
+    def _boolean_differential_markers(self, de: dict) -> list[str]:
+        """Surface the TRUE/FALSE response split - the discriminator for blind
+        boolean SQLi. The proof is a reproducible difference that tracks the
+        injected boolean, not any content in the response body."""
+        lines: list[str] = []
+        true_sim = self._first_value(de.get("confirm_true_sim"))
+        false_sim = self._first_value(de.get("confirm_false_sim"))
+        if true_sim is not None:
+            lines.append(f"  - confirm_true_sim: {true_sim} (TRUE payload vs true-baseline)")
+        if false_sim is not None:
+            lines.append(f"  - confirm_false_sim: {false_sim} (FALSE payload vs true-baseline)")
+        try:
+            if true_sim is not None and false_sim is not None:
+                delta = abs(float(true_sim) - float(false_sim))
+                lines.append(
+                    f"  - true_vs_false_delta: {delta:.4f} "
+                    "(larger = clearer boolean control; must exceed baseline noise)"
+                )
+        except (TypeError, ValueError):
+            pass
+        context = self._first_value(de.get("injection_context"))
+        if context is not None:
+            lines.append(f"  - injection_context: {self._truncate_value(context)}")
+        # Diff-focused signal: TRUE vs FALSE restricted to the region that varies,
+        # so a real boolean-controlled difference is not diluted by page chrome.
+        focused = self._first_value(de.get("focused_true_vs_false_sim"))
+        if focused is not None:
+            lines.append(
+                f"  - focused_true_vs_false_sim: {focused} "
+                "(TRUE vs FALSE in the varying region only; LOW = clear boolean control)"
+            )
+        fraction = self._first_value(de.get("varying_fraction"))
+        if fraction is not None:
+            lines.append(
+                f"  - varying_fraction: {fraction} "
+                "(share of the page that changed - explains a small whole-page delta)"
+            )
+        first_pair = self._to_dict(self._first_value(de.get("first_pair")))
+        if first_pair:
+            lines.append(
+                "  - independent_pair: "
+                f"true_sim={first_pair.get('baseline_similarity_to_true', '?')}, "
+                f"false_sim={first_pair.get('baseline_similarity_to_false', '?')}"
+            )
+        return lines or [f"  - detection_evidence: {self._truncate_value(de)}"]
+
+    def _remote_include_markers(self, de: dict, vuln: Vulnerability) -> list[str]:
+        """Surface the remote-inclusion proof: which external URL was included and
+        what content unique to it appeared in the response."""
+        lines: list[str] = []
+        target = self._first_value(de.get("remote_target"))
+        if target is None and vuln.evidence.payload:
+            target = vuln.evidence.payload
+        if target is not None:
+            lines.append(
+                f"  - remote_target (external URL included): {self._truncate_value(target)}"
+            )
+        fingerprint = self._first_value(de.get("fingerprint"))
+        if fingerprint is not None:
+            lines.append(
+                "  - fingerprint (content unique to the remote resource): "
+                f"{self._truncate_value(fingerprint)}"
+            )
+        matched = self._first_value(de.get("matched"))
+        if matched is not None:
+            lines.append(f"  - remote_content_matched: {matched}")
+        tokens = self._flatten_values(de.get("matched_tokens"))
+        if tokens:
+            lines.append(f"  - matched_tokens: {self._truncate_value(tokens[:6], 300)}")
+        return lines or [f"  - detection_evidence: {self._truncate_value(de)}"]
+
+    def _login_success_markers(self, de: dict) -> list[str]:
+        """Surface the login-success differential: the credential pair tested and
+        the post-auth signal that distinguished success from the failed-login
+        baseline."""
+        lines: list[str] = []
+        pair = self._first_value(de.get("credential_pair"))
+        if pair is not None:
+            lines.append(f"  - credential_pair: {self._truncate_value(pair)}")
+        baseline = self._first_value(de.get("baseline_status"))
+        authed = self._first_value(de.get("authed_status"))
+        if baseline is not None:
+            lines.append(f"  - failed_login_baseline_status: {baseline}")
+        if authed is not None:
+            lines.append(f"  - credentialed_status: {authed}")
+        delta = self._first_value(de.get("body_delta_bytes"))
+        if delta is not None:
+            lines.append(f"  - body_delta_bytes: {delta}")
+        signal = self._first_value(de.get("post_auth_signal"))
+        if signal is not None:
+            lines.append(f"  - post_auth_signal: {self._truncate_value(signal)}")
+        return lines or [f"  - detection_evidence: {self._truncate_value(de)}"]
+
     def _error_echo_markers(self, de: dict) -> list[str]:
         """Extract error-echo markers."""
         lines: list[str] = []
@@ -695,6 +960,12 @@ class EvidenceGrader:
             "timing_strong": "Strong timing differential - the response delay is large enough to clearly indicate sleep-based SQL injection.",
             "timing_weak": "Weak timing differential - the response delay is small and could be network jitter rather than SQL injection.",
             "ssrf_differential": "Repeated internal-target versus external-control behavior differed, but no outbound callback or internal response content was observed.",
+            "oast_callback": "Blind SSRF confirmed out-of-band: the target fetched a URL carrying a unique token we planted, and our OAST collaborator recorded the incoming request. The proof is that correlated interaction, not the target's HTTP response.",
+            "browser_execution": "DOM-based XSS confirmed by execution: our uniquely-canaried script actually ran in a real headless browser via an execution-only oracle (it fires on execution, never on the canary merely being present as text/markup). The payload reaches the sink through a client-side source, so it need not appear in the server's response.",
+            "mutating_authz": "Write-authorization finding: a state-changing request from a context that should require authentication was accepted and processed (2xx/3xx), identical to the authenticated owner. The proof is the accepted mutation, not data returned.",
+            "boolean_differential": "Blind boolean SQL injection: a TRUE-condition payload and a FALSE-condition payload produced a reproducible difference in the response, consistent with the injected boolean controlling the query. The proof is the differential, not any content in the response.",
+            "remote_include": "Remote File Inclusion: content belonging to the attacker-specified REMOTE resource appeared in the response, i.e. the server fetched and included an external URL. The proof is the remote resource's own body, not the URL string echoed back.",
+            "login_success": "Default/guessed credentials accepted: the credential pair produced a response consistent with successful authentication and distinct from the failed-login baseline (post-auth content, a redirect, or an established session).",
             "auth_confirmed": "Confirmed authorization differential - distinct users or privilege levels received the same restricted object, fields, or privileged capability.",
             "auth_differential": "Access-control finding - responses from different authentication or user contexts indicate a possible boundary bypass. This is real only when a less-privileged context receives restricted data or the same object as another user.",
             "pattern_match": "A pattern was matched in the response body - this could be a genuine error disclosure, reflected payload text, or normal page content.",
@@ -719,6 +990,54 @@ class EvidenceGrader:
             "timing_strong": "Time deltas can have non-SQL causes (network jitter, lock contention, background load). But a large delta matching the SLEEP argument is strong. This would be a false positive only if the delta does not scale with the sleep duration.",
             "timing_weak": "The timing delta is small and could be caused by network jitter, database load, or connection overhead rather than SQL SLEEP. If the delta does not clearly exceed normal latency variation, this is likely a false positive.",
             "ssrf_differential": "A timeout, status, or body-length difference can also be caused by URL validation, denylisting, application timeouts, DNS behavior, or upstream filtering. It does not prove that the server issued an outbound request.",
+            "oast_callback": (
+                "A callback carrying the exact unique token planted for this finding can only "
+                "originate from a server that fetched our URL, so the correlation is strong. It "
+                "would be weak only if the recorded token does not match the one planted here, or "
+                "if the interaction could have been triggered by something other than the target "
+                "processing the payload. Do NOT treat the target's returned HTML page as the "
+                "evidence: blind SSRF is proven out-of-band, and no response readback is expected."
+            ),
+            "browser_execution": (
+                "The oracle fires only when our canaried JavaScript executes, never on mere "
+                "reflection of the canary as inert text or markup, so reflection cannot cause a "
+                "false fire. The captured DOM excerpt is the page AFTER client-side execution, NOT "
+                "the server's HTTP response body - do not evaluate it for payload reflection. It "
+                "would be a false positive only if the execution hook could be reached without the "
+                "injected payload actually running."
+            ),
+            "mutating_authz": (
+                "Identical PROCESSED (2xx/3xx) responses to the unauthenticated and owner requests "
+                "are the confirmation here - not a public-by-design signal (that caveat applies to "
+                "data-read findings). The detector already discarded matching 4xx/5xx statuses, "
+                "which prove nothing. The real question is whether this endpoint is INTENDED to be "
+                "anonymous (e.g. a public feedback or contact form) - some state changes "
+                "legitimately accept anonymous input."
+            ),
+            "boolean_differential": (
+                "Blind injection is confirmed by a CONSISTENT, REPRODUCIBLE true-vs-false split that "
+                "tracks the injected boolean - not by response content and not by the magnitude "
+                "alone. The split can be small when the differing region is a fraction of the page, "
+                "so what matters is that it is stable, reproduced by an independent operator pair, "
+                "and larger than baseline page-to-page variance. A split within normal noise, or one "
+                "not reproduced, is weak."
+            ),
+            "remote_include": (
+                "This is confirmed when content UNIQUE to the remote resource (its fingerprint) "
+                "appears in the response - proving the server fetched and included the external URL, "
+                "as opposed to merely reflecting the URL string we submitted. It would be weak only "
+                "if the matched content could plausibly be produced by the target itself rather than "
+                "fetched from the remote origin. Note: including a remote URL yields THAT resource's "
+                "page, so the remote site's own content appearing is the success signal, not a miss."
+            ),
+            "login_success": (
+                "A login form that returns 200 for every attempt, or that reflects the submitted "
+                "username, can mimic success. It is confirmed when the credentialed response carries "
+                "a post-auth indicator the failed-login baseline lacks - a session cookie, a redirect "
+                "to an authenticated area, or authenticated-only navigation/logout affordances. "
+                "Authenticated-only navigation appearing is itself a post-auth indicator, not generic "
+                "page chrome."
+            ),
             "auth_confirmed": "The proof compares distinct authenticated identities or roles, not merely HTTP success. Treat it as false only if the evidence shows the sessions were not distinct, the identifiers were not shared, or the returned data was explicitly public.",
             "auth_differential": "For anonymous-access findings, identical anonymous and authenticated responses with no restricted fields can mean the endpoint is public by design. For horizontal or vertical findings, compare authenticated identities or roles instead: shared object identifiers, sensitive fields, or privileged capabilities in the less-privileged response support a real boundary bypass.",
             "pattern_match": "The matched pattern could be (a) a genuine error disclosure, (b) reflected payload text that happens to contain the pattern, or (c) normal page content. If the matched text is the injected payload echoed back, or if it appears in navigation HTML / normal page content, this is a false positive.",
@@ -739,6 +1058,12 @@ class EvidenceGrader:
             "timing_strong": "Does the timing delta clearly indicate SQL SLEEP execution, or could it be network noise?",
             "timing_weak": "Is the timing delta clearly caused by SQL SLEEP, or could it be network jitter or normal latency variation?",
             "ssrf_differential": "Do the repeated control and internal samples support a probable server-side fetch, while remaining short of confirmation without an OAST callback or reflected internal content?",
+            "oast_callback": "Does a recorded out-of-band interaction carry the unique token planted for this finding, confirming the target issued the server-side request? (The target's HTML response is not the evidence for blind SSRF.)",
+            "browser_execution": "Did our uniquely-canaried script execute in the browser (the oracle fired), confirming a client-side source-to-sink XSS - independent of any HTTP-body reflection?",
+            "mutating_authz": "Was a state-changing operation accepted and processed without the required authentication, or is this endpoint intentionally anonymous (e.g. a public submission form)?",
+            "boolean_differential": "Do the TRUE and FALSE payloads produce a stable, reproducible response split that tracks the injected boolean and exceeds baseline page-to-page noise?",
+            "remote_include": "Does the response contain the remote resource's own content (proving a server-side fetch and include), as opposed to the target echoing back the URL string we submitted?",
+            "login_success": "Did the credential pair move the session from unauthenticated to authenticated (a post-auth indicator absent from the failed-login baseline), or does the response merely resemble the login page / a generic 200?",
             "auth_confirmed": "Do the markers show distinct identities or roles crossing an object or privilege boundary? Do not require a further exploit chain once that boundary crossing is proven.",
             "auth_differential": "Did a less-privileged context receive genuinely restricted data or the same object/capability as another user or privileged role, or do the responses only show public/benign behavior?",
             "pattern_match": "Is the matched text a genuine error disclosure causally connected to the payload, or could it be reflected payload text or normal page content?",
@@ -777,6 +1102,38 @@ class EvidenceGrader:
                 "Indirect SSRF differential: repeated internal/control behavior differs, "
                 "but there is no callback or reflected internal content. Treat as probable, "
                 "not confirmed."
+            )
+        if proof_type == "oast_callback":
+            return (
+                f"Blind SSRF confirmed out-of-band (method={method}): a correlated callback "
+                f"carrying our planted token reached the OAST collaborator."
+            )
+        if proof_type == "browser_execution":
+            return (
+                f"Browser execution confirmed (method={method}, confidence={confidence:.0f}): "
+                f"the canaried payload executed in a real headless browser."
+            )
+        if proof_type == "mutating_authz":
+            return (
+                f"Write-authorization differential (method={method}): an unauthenticated "
+                f"state-changing request was accepted with the owner's processed status. AI "
+                f"must judge whether the endpoint is intended to be anonymous."
+            )
+        if proof_type == "boolean_differential":
+            return (
+                f"Blind boolean SQLi differential (method={method}): a reproducible TRUE/FALSE "
+                f"response split that tracks the injected boolean. AI must judge whether the "
+                f"split is stable and exceeds baseline noise."
+            )
+        if proof_type == "remote_include":
+            return (
+                f"Remote file inclusion confirmed by content (method={method}): the remote "
+                f"resource's own body appeared in the response, proving a server-side fetch."
+            )
+        if proof_type == "login_success":
+            return (
+                f"Login-success differential (method={method}): the credential pair produced a "
+                f"response consistent with authentication, distinct from the failed-login baseline."
             )
         if proof_type == "timing_strong":
             de = self._to_dict(vuln.evidence.detection_evidence)

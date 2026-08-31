@@ -615,3 +615,149 @@ async def test_check_failure_never_blocks_startup(monkeypatch, caplog):
         await _log_model_availability(_Broken())
 
     assert caplog.records == []
+
+
+class RecordingFindingService:
+    """Records which findings it is asked to analyze, so a test can prove that
+    findings already analyzed at the current revision are skipped on resume."""
+
+    def __init__(self) -> None:
+        self.analyzed_ids: list[str] = []
+
+    async def analyze(self, vulnerability, **kwargs):
+        self.analyzed_ids.append(vulnerability.id)
+        return (
+            AiAnalysis(
+                revision=kwargs["revision"],
+                description="Reflected input is echoed without encoding.",
+                remediation="Encode output on render.",
+                ai_analysis_status=AiAnalysisStatus.success,
+            ),
+            ProviderResult(
+                data={}, request_id="finding-request", input_tokens=4, output_tokens=2
+            ),
+        )
+
+
+def _scan_two_findings(*, done_revision: int):
+    done = Vulnerability(
+        id="v-done",
+        category=OwaspCategory.a05,
+        vuln_type="SQL Injection",
+        severity=SeverityLevel.high,
+        cvss_score=8.8,
+        location=LocationInfo(url="https://target.test/a"),
+        evidence=Evidence(evidence_grade="A", proof_type="error_echo"),
+        ai_analysis=AiAnalysis(
+            revision=done_revision,
+            remediation="Use parameterized queries.",
+            ai_analysis_status=AiAnalysisStatus.success,
+        ),
+    )
+    pending = Vulnerability(
+        id="v-pending",
+        category=OwaspCategory.a03,
+        vuln_type="Reflected XSS",
+        severity=SeverityLevel.medium,
+        cvss_score=6.1,
+        location=LocationInfo(url="https://target.test/b"),
+        evidence=Evidence(evidence_grade="B", proof_type="reflection"),
+    )
+    return SimpleNamespace(
+        status=ScanStatus.completed,
+        target_url="https://target.test",
+        vulnerabilities=[done, pending],
+        technology_stack=[],
+        statistics=ScanStatistics(total_vulnerabilities=2),
+        overall_risk_score=70.0,
+        overall_risk_level="High",
+        report_metadata=ReportMetadata(),
+        submitted_by_user_id="user-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_skips_findings_already_analyzed_for_current_revision(monkeypatch) -> None:
+    # A prior attempt already analyzed v-done at revision 1 but died before the
+    # job completed. The resumed attempt must re-analyze only v-pending, not redo
+    # the whole scan.
+    scan = _scan_two_findings(done_revision=1)
+    scan_repository = FakeScanRepository(scan)
+    job_repository = FakeJobRepository()
+    monkeypatch.setattr(
+        "app.worker.get_settings",
+        lambda: SimpleNamespace(
+            ai_analysis_enabled=True,
+            ai_model="model-1",
+            analysis_lease_renew_seconds=60,
+            analysis_lease_seconds=300,
+        ),
+    )
+    finding_service = RecordingFindingService()
+    job = SimpleNamespace(
+        id="job-1",
+        scan_id="scan-1",
+        org_id="org-1",
+        revision=1,
+        attempt=2,
+        max_attempts=3,
+        finding_count=2,
+        progress=0,
+        started_at=datetime.now(timezone.utc),
+    )
+
+    await process_analysis_job(
+        job,
+        worker_id="worker-1",
+        job_repository=job_repository,
+        scan_repository=scan_repository,
+        finding_service=finding_service,
+        report_service=SuccessfulReportService(),
+    )
+
+    # Only the outstanding finding is sent to the model; the revision-1 one is skipped.
+    assert finding_service.analyzed_ids == ["v-pending"]
+    assert [u["finding_id"] for u in scan_repository.finding_updates] == ["v-pending"]
+    # The job still reaches completion (summary runs, terminal completion recorded).
+    assert len(job_repository.completed) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_retry_revision_reanalyzes_prior_revision_findings(monkeypatch) -> None:
+    # A finding analyzed at revision 1 must NOT be skipped when a new revision
+    # (manual retry) runs - a retry is a full fresh re-analysis.
+    scan = _scan_two_findings(done_revision=1)
+    scan_repository = FakeScanRepository(scan)
+    job_repository = FakeJobRepository()
+    monkeypatch.setattr(
+        "app.worker.get_settings",
+        lambda: SimpleNamespace(
+            ai_analysis_enabled=True,
+            ai_model="model-1",
+            analysis_lease_renew_seconds=60,
+            analysis_lease_seconds=300,
+        ),
+    )
+    finding_service = RecordingFindingService()
+    job = SimpleNamespace(
+        id="job-2",
+        scan_id="scan-1",
+        org_id="org-1",
+        revision=2,
+        attempt=1,
+        max_attempts=3,
+        finding_count=2,
+        progress=0,
+        started_at=datetime.now(timezone.utc),
+    )
+
+    await process_analysis_job(
+        job,
+        worker_id="worker-1",
+        job_repository=job_repository,
+        scan_repository=scan_repository,
+        finding_service=finding_service,
+        report_service=SuccessfulReportService(),
+    )
+
+    assert finding_service.analyzed_ids == ["v-done", "v-pending"]

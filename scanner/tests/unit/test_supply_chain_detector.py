@@ -168,3 +168,25 @@ async def test_findings_are_ordered_most_urgent_first() -> None:
         SeverityLevel.critical, SeverityLevel.critical, SeverityLevel.low
     ]
     assert "CVE-2024-KEV" in findings[0].evidence
+
+
+@pytest.mark.asyncio
+async def test_findings_are_capped_per_component_keeping_the_worst() -> None:
+    """An EOL version can match hundreds of CVEs. One finding per CVE floods the
+    report (and, after merge, the evidence). Keep only the top few - exploited in
+    the wild first, then highest CVSS."""
+    cves = [f"CVE-2015-{n:04d}" for n in range(20)]
+    findings = await _detect(_assessed(
+        name="PHP", version="5.3.2", category="language",
+        cves=cves,
+        cve_scores={c: 5.0 for c in cves} | {"CVE-2015-0011": 9.8},
+        cve_kev=["CVE-2015-0007"],
+    ))
+
+    assert len(findings) == 6
+    reported = " ".join(f.evidence for f in findings)
+    # The exploited CVE and the 9.8 must survive the cap.
+    assert "CVE-2015-0007" in reported
+    assert "CVE-2015-0011" in reported
+    # A middling 5.0 ranked below the cap is dropped.
+    assert "CVE-2015-0019" not in reported

@@ -553,6 +553,11 @@ class XSSDetector(BaseDetector):
                 winning_payload = result.get("payload") or (
                     f"<img src=x onerror=window.sentry_hook('{canary}')>"
                 )
+                # The rendered DOM captured at execution time (post client-side
+                # execution, not the server response). Surfaced to the adjudicator
+                # so it can read the page content the injection produced.
+                dom_excerpt = result.get("executed_dom_excerpt")
+                dom_evidence = {"executed_dom_excerpt": dom_excerpt} if dom_excerpt else {}
                 findings.append(
                     verifier._create_finding(
                         category=OwaspCategory.a05,
@@ -577,6 +582,7 @@ class XSSDetector(BaseDetector):
                             "winning_surface": winning_surface,
                             "browser_execution_confirmed": True,
                             "route_backed": route_url in route_urls,
+                            **dom_evidence,
                         },
                         reproducible=True,
                         verified=True,

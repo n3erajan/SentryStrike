@@ -1012,11 +1012,25 @@ class XSSVerifier(BaseVerifier):
             
             vuln_type = "Stored XSS" if is_stored else ("Header-Reflected XSS" if method.upper().startswith("HEADER:") else "Reflected XSS")
 
+            # Center the evidence snippet on the reflected payload when the static
+            # analyzer recorded its offset, so a payload deep in a large page is not
+            # buried under top-of-page chrome in the excerpt the adjudicator reads.
+            reflected_snippet = injected.response_snippet
+            proof_offset = self._location_proof_offset(context_analysis)
+            if proof_offset >= 0 and injected.body:
+                reflected_snippet = ResponseAnalyzer.build_evidence_response_snippet(
+                    status_code=injected.status_code,
+                    headers=dict(injected.headers or {}),
+                    body=injected.body,
+                    payload=injected_payload,
+                    proof_offset=proof_offset,
+                )
+
             finding = self._create_finding(
                 category=OwaspCategory.a05, vuln_type=vuln_type, severity=severity, url=url, parameter=parameter, payload=injected_payload,
                 evidence=f"Payload {'stored and ' if is_stored else ''}reflected and executed successfully inside browser window. Context: {context_analysis['context_type']}.",
                 confidence_score=confidence_score, detection_method=f"reflection_{payload_type}", method=method, detection_evidence=context_analysis,
-                reproducible=True, verified=True, verification_request_snippet=injected.request_snippet, verification_response_snippet=injected.response_snippet,
+                reproducible=True, verified=True, verification_request_snippet=injected.request_snippet, verification_response_snippet=reflected_snippet,
             )
 
             return VerificationResult(is_vulnerable=True, confidence_score=confidence_score, detection_method=f"reflection_{payload_type}", findings=[finding], evidence=context_analysis, reproducible=True)
@@ -1253,6 +1267,50 @@ class XSSVerifier(BaseVerifier):
         except Exception:
             return bool(getattr(page, "_fired", False))
 
+    @staticmethod
+    def _dom_excerpt(html: str, canary: str, cap: int = 2000) -> str:
+        """A bounded slice of the rendered DOM for the adjudicator to read.
+
+        Windowed on the canary when present, so the injected sink is visible;
+        otherwise the head of the document. The model is text-only, so this
+        excerpt - not a screenshot - is the page content it can judge on.
+        """
+        if not html:
+            return ""
+        if len(html) <= cap:
+            return html
+        idx = html.find(canary) if canary else -1
+        if idx == -1:
+            return html[:cap]
+        start = max(0, idx - cap // 2)
+        return html[start:start + cap]
+
+    async def _capture_executed_dom(self, page, canary: str, cap: int = 2000) -> str:
+        """Grab the rendered DOM after execution and return a bounded excerpt.
+
+        Best-effort: a closed or navigated-away page yields an empty excerpt
+        rather than raising, so capture never breaks confirmation.
+        """
+        try:
+            html = await page.evaluate("() => document.documentElement.outerHTML")
+        except Exception:
+            return ""
+        return self._dom_excerpt(str(html or ""), canary, cap)
+
+    @staticmethod
+    def _location_proof_offset(context_analysis: dict) -> int:
+        """Earliest reflection byte-offset the static analyzer recorded, so the
+        evidence snippet can be centered on the reflected payload instead of
+        top-of-page chrome. Handles the dedup list-wrapping of ``locations``.
+        Returns -1 when no location is known."""
+        flat: list[int] = []
+        for loc in (context_analysis or {}).get("locations") or []:
+            if isinstance(loc, (list, tuple)):
+                flat.extend(item for item in loc if isinstance(item, int))
+            elif isinstance(loc, int):
+                flat.append(loc)
+        return min(flat) if flat else -1
+
     async def _verify_browser_execution(
         self, url: str, parameter: str, method: str, payload: str, canary: str,
         form_inputs: Optional[list], stored_display_urls: Optional[list[str]], is_header_injection: bool,
@@ -1260,6 +1318,7 @@ class XSSVerifier(BaseVerifier):
     ) -> bool:
         """Isolated Headless Engine handles explicit runtime execution proofs securely."""
         xss_fired = False
+        self._last_executed_dom = ""
         prepared = target.build_request(payload) if isinstance(target, AttackTarget) else None
         async with async_playwright() as p:
             browser = None
@@ -1392,6 +1451,11 @@ class XSSVerifier(BaseVerifier):
 
                 await asyncio.sleep(0.3)
                 xss_fired = xss_fired or bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page)
+                # Capture the rendered DOM while the firing page is still open, so
+                # the finding carries the display-page bytes that contain the canary
+                # - not the injection-phase response (which often does not).
+                if xss_fired and page is not None:
+                    self._last_executed_dom = await self._capture_executed_dom(page, canary)
             except Exception as e:
                 logger.debug(f"Playwright runtime loop bypassed safely: {e}")
                 if page is not None:
@@ -1549,6 +1613,7 @@ class XSSVerifier(BaseVerifier):
                         "surface": surface_name,
                         "payload": payload,
                         "url": probe_url,
+                        "executed_dom_excerpt": result.get("dom"),
                     }
         return {"fired": False, "csp": csp_seen}
 
@@ -1692,7 +1757,8 @@ class XSSVerifier(BaseVerifier):
                 pass
             await asyncio.sleep(0.35)
             if bool(getattr(page, "_fired", False)) or await self._browser_xss_fired(page):
-                return {"fired": True, "csp": csp_seen}
+                dom = await self._capture_executed_dom(page, canary)
+                return {"fired": True, "csp": csp_seen, "dom": dom}
         except Exception as exc:
             logger.debug("Reflected DOM XSS probe failed for %s: %s", probe_url, exc)
         finally:
@@ -1731,6 +1797,18 @@ class XSSVerifier(BaseVerifier):
             "Browser execution confirmed.",
         )
         job.context_analysis["is_executable"] = True
+        # Browser execution is now the proof, not HTTP-body reflection. Reclassify
+        # so the grader applies the browser_execution frame (execution oracle fired)
+        # instead of the reflection-skeptic pattern_match frame, and attach the
+        # captured display DOM as the proof-bearing evidence.
+        job.partial_finding.detection_method = "dom_xss_browser_execution"
+        evidence = dict(job.partial_finding.detection_evidence or {})
+        evidence["browser_execution_confirmed"] = True
+        executed_dom = getattr(self, "_last_executed_dom", "") or ""
+        if executed_dom:
+            evidence["executed_dom_excerpt"] = executed_dom
+            job.partial_finding.verification_response_snippet = executed_dom
+        job.partial_finding.detection_evidence = evidence
         return [job.partial_finding]
 
     async def _probe_stored(

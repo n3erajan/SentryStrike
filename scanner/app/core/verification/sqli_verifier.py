@@ -759,6 +759,12 @@ class SQLiVerifier(BaseVerifier):
                 )
 
             confidence = 85.0
+            # Diff-focused true/false signal: isolates the region the boolean
+            # controls so the adjudicator is not misled by a whole-page similarity
+            # diluted to ~1.0 either way on a large page.
+            focused_signal = ResponseAnalyzer.focused_boolean_signal(
+                confirmed_true_resp.body or "", confirmed_false_resp.body or "",
+            )
             finding = self._create_finding(
                 category=OwaspCategory.a05,
                 vuln_type="SQL Injection (Boolean-Based Blind)",
@@ -775,6 +781,7 @@ class SQLiVerifier(BaseVerifier):
                     "first_pair": confirmed_analysis,
                     "confirm_true_sim": ct_sim, "confirm_false_sim": cf_sim,
                     "injection_context": confirmed_context,
+                    **focused_signal,
                 },
                 reproducible=True, verified=True,
                 verification_request_snippet=ct_resp.request_snippet,

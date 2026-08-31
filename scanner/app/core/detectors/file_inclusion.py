@@ -57,6 +57,24 @@ class FileInclusionDetector(BaseDetector):
     # the content-confirmation step after an error-oracle hit on an unreachable URL.
     _RFI_CONFIRM_PAYLOAD = "http://example.com/"
 
+    @staticmethod
+    def _rfi_content_evidence(*, remote_target: str, fingerprint: str, matched_tokens: list) -> dict:
+        """Structured proof for a content-confirmed RFI: the external URL that was
+        included and the tokens unique to its body that appeared in the response.
+
+        Fed to the grader's ``remote_include`` evidence brief so the adjudicator
+        judges the fetched remote content rather than mistaking it for the URL
+        being reflected back (Cause C: findings previously shipped empty
+        detection_evidence and were dismissed).
+        """
+        tokens = list(matched_tokens or [])
+        return {
+            "remote_target": remote_target,
+            "fingerprint": fingerprint,
+            "matched": bool(tokens),
+            "matched_tokens": tokens[:6],
+        }
+
     @classmethod
     def _payload_family(cls, payload: str) -> str:
         lowered = payload.lower()
@@ -704,10 +722,11 @@ class FileInclusionDetector(BaseDetector):
                             for sig in rfi_signatures
                         }
 
-                        fp_match = any(
-                            sig in injected_text_lower and (sig not in baseline_text_lower or injected_text_lower.count(sig) > baseline_text_lower.count(sig))
-                            for sig in rfi_signatures
-                        )
+                        fp_matched_sigs = [
+                            sig for sig in rfi_signatures
+                            if sig in injected_text_lower and (sig not in baseline_text_lower or injected_text_lower.count(sig) > baseline_text_lower.count(sig))
+                        ]
+                        fp_match = bool(fp_matched_sigs)
 
                         if fp_match:
                             cand_findings.append(
@@ -722,6 +741,11 @@ class FileInclusionDetector(BaseDetector):
                                     evidence=f"RFI vulnerability confirmed via content fingerprint validation ({desc}).",
                                     confidence_score=98.0,
                                     detection_method="remote_include_content_fingerprint",
+                                    detection_evidence=self._rfi_content_evidence(
+                                        remote_target=payload,
+                                        fingerprint=desc,
+                                        matched_tokens=fp_matched_sigs,
+                                    ),
                                     reproducible=True,
                                     verified=True,
                                     verification_request_snippet=injected.request_snippet,
@@ -778,10 +802,11 @@ class FileInclusionDetector(BaseDetector):
                                 r"\s+", " ", re.sub(r"<[^>]+>", " ", clean_confirm)
                             ).strip().lower()
 
-                            confirm_fp_match = any(
-                                sig in confirm_text_lower and sig not in baseline_text_lower
-                                for sig in rfi_signatures
-                            )
+                            confirm_matched_sigs = [
+                                sig for sig in rfi_signatures
+                                if sig in confirm_text_lower and sig not in baseline_text_lower
+                            ]
+                            confirm_fp_match = bool(confirm_matched_sigs)
 
                             if confirm_fp_match:
                                 logger.info(
@@ -804,6 +829,11 @@ class FileInclusionDetector(BaseDetector):
                                         ),
                                         confidence_score=97.0,
                                         detection_method="remote_include_error_oracle_content_confirmed",
+                                        detection_evidence=self._rfi_content_evidence(
+                                            remote_target=self._RFI_CONFIRM_PAYLOAD,
+                                            fingerprint=desc,
+                                            matched_tokens=confirm_matched_sigs,
+                                        ),
                                         reproducible=True,
                                         verified=True,
                                         verification_request_snippet=confirm_res.request_snippet,

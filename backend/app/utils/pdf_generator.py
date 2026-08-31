@@ -1396,16 +1396,6 @@ def build_tested_surface(data: dict, styles: dict) -> list:
         rows.append(("Detectors That Sent Traffic", len(detectors)))
         elems.append(_metric_table(rows, styles))
 
-        if absent:
-            elems.append(Spacer(1, 2*mm))
-            elems.append(Paragraph(
-                f"Path-guessing checks probed <b>{absent}</b> candidate path(s) the target answered "
-                "only with 404/410. Those probes prove a resource is absent, so they are counted "
-                "here but excluded from the tested surface above and from the itemised inventory - "
-                "counting them would inflate coverage with paths that do not exist.",
-                styles["body_sm"],
-            ))
-
         if unconfirmed:
             elems.append(Spacer(1, 2*mm))
             elems.append(Paragraph(
@@ -1425,13 +1415,6 @@ def build_tested_surface(data: dict, styles: dict) -> list:
                 styles["body_sm"],
             ))
 
-        if detectors:
-            elems.append(Spacer(1, 2*mm))
-            elems.append(Paragraph(
-                "Detectors that sent traffic: " + _para_escape(", ".join(_detector_label(name) for name in detectors)) + ".",
-                styles["body_sm"],
-            ))
-
         notes: list[str] = []
         if surface.get("tested_paths_truncated"):
             notes.append(
@@ -1444,23 +1427,10 @@ def build_tested_surface(data: dict, styles: dict) -> list:
                 f"{surface.get('ledger_entries_omitted', 0)} distinct parameter probes exceeded the "
                 "recording ceiling; the request total above still includes them."
             )
-        if not surface.get("browser_probes_itemised", False):
-            notes.append(
-                "Browser-driven probes (DOM XSS verification and browser crawling) do not pass "
-                "through the request ledger, so this inventory covers HTTP-layer traffic only. "
-                "Browser-only coverage is understated here, not absent from the scan."
-            )
         if notes:
             elems.append(Spacer(1, 2*mm))
             for note in notes:
                 elems.append(Paragraph(f"- {_para_escape(note)}", styles["body_sm"]))
-
-        elems.append(Spacer(1, 2*mm))
-        elems.append(Paragraph(
-            "The itemised inventory - every path, method, and parameter tested, with the detectors "
-            "that probed it - is included in the JSON report for this scan.",
-            styles["body_sm"],
-        ))
 
     elems.append(Spacer(1, 5*mm))
     elems += sub_header("Coverage Gaps - What Was Not Tested", styles)
@@ -1484,40 +1454,60 @@ def build_tested_surface(data: dict, styles: dict) -> list:
     return elems
 
 
-_CVE_SOURCE_LABELS = {
-    "osv": "OSV.dev",
-    "nvd-cpe": "NVD (CPE match)",
-    "wordfence": "Wordfence Intelligence",
-}
+# The most CVEs we enumerate in a component's cell. An EOL version can resolve to
+# hundreds; rendering them all makes a table row taller than the page, which
+# reportlab cannot split across pages (LayoutError). The count carries the signal;
+# a ranked handful carries the specifics.
+_CVE_DISPLAY_CAP = 6
 
 
 def _cve_cell_text(tech: dict) -> str:
     """Describe a component's CVE status without ever implying an unchecked one is clean.
 
-    "None found" is only true when a source that covers the component was queried
-    and answered. When no source could identify it - no version, no CPE, no
-    ecosystem package - or when the query failed, the report has to say so;
-    otherwise an unassessed component is indistinguishable from a patched one.
+    The three no-CVE states stay distinct - "Not assessed" (could not be checked),
+    "Lookup failed" (a source errored) and "None found" (checked, nothing applies) -
+    because collapsing them would let an unchecked component read as patched. The
+    per-component reason and the data-source name are omitted as cell noise.
     """
     cves = tech.get("cves", []) or []
     # Records written before assessment tracking existed carry no status field.
     # Treat them as assessed so historical scans still render as they used to.
     status = tech.get("cve_assessment") or "assessed"
-    reason = tech.get("cve_assessment_reason")
 
     if status == "not_assessed":
-        return f"Not assessed - {reason}" if reason else "Not assessed"
+        return "Not assessed"
     if status == "failed":
-        return f"Lookup failed - {reason}" if reason else "Lookup failed"
-
+        return "Lookup failed"
     if not cves:
-        source = _CVE_SOURCE_LABELS.get(tech.get("cve_source") or "")
-        return f"None found ({source})" if source else "None found"
+        return "None found"
 
+    # Show the counts (the real signal) plus only the CVEs that matter most:
+    # exploited-in-the-wild first, then by CVSS score. Never enumerate them all -
+    # a hundreds-long list becomes a table row taller than a page (LayoutError).
     kev = set(tech.get("cve_kev", []) or [])
-    listed = ", ".join(f"{c} (exploited)" if c in kev else c for c in cves)
-    source = _CVE_SOURCE_LABELS.get(tech.get("cve_source") or "")
-    return f"{listed} - via {source}" if source else listed
+    scores = tech.get("cve_scores", {}) or {}
+
+    ranked = sorted(cves, key=lambda c: (0 if c in kev else 1, -(scores.get(c) or 0.0), c))
+    shown = ranked[:_CVE_DISPLAY_CAP]
+
+    def _fmt(cve: str) -> str:
+        marks = []
+        score = scores.get(cve)
+        if score is not None:
+            marks.append(f"{score:g}")
+        if cve in kev:
+            marks.append("exploited")
+        return f"{cve} ({', '.join(marks)})" if marks else cve
+
+    total = len(cves)
+    exploited = len(kev & set(cves))
+    header = f"{total} known CVE{'s' if total != 1 else ''}"
+    if exploited:
+        header += f", {exploited} exploited in the wild"
+    listed = "; ".join(_fmt(cve) for cve in shown)
+    remainder = total - len(shown)
+    tail = f"; +{remainder} more" if remainder > 0 else ""
+    return f"{header}. Top: {listed}{tail}"
 
 
 def build_technology_detected(data: dict, styles: dict) -> list:

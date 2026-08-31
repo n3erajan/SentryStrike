@@ -62,26 +62,20 @@ class TestActiveOutputMethods:
 
     @pytest.mark.parametrize("method", [
         "union_based",
-        "boolean_differential",
         "command_output",
         "file_retrieval",
         "path_traversal_file_read",
         "stream_decoding_oracle",
-        "remote_include_content_fingerprint",
-        "remote_include_error_oracle_content_confirmed",
         "canary_verified",
         "context_breakout",
-        "dom_xss_browser_execution",
         "token_bypass",
         "csrf_tamper_test",
         "ssrf_reflection",
-        "ssrf_oast_callback",
         "location_header_redirect",
         "observed_external_location_redirect",
         "file_upload_execution",
         "content_type_bypass_execution",
         "double_extension_execution",
-        "default_credentials_probe",
         "credential_stuffing_probe",
         "logout_token_reuse_probe",
         "nosql_boolean_operator",
@@ -169,7 +163,6 @@ class TestAuthDifferentialMethods:
 
     @pytest.mark.parametrize("method", [
         "authorization_matrix",
-        "mutating_authz_differential",
     ])
     def test_auth_diff_method(self, method):
         grade = grader.grade(_vuln("Unauthenticated API Data Exposure",
@@ -253,6 +246,290 @@ def test_ssrf_inband_is_indirect_differential_not_pattern_match() -> None:
     assert "not confirmed" in grade.reason.lower()
     assert "control_samples" in brief
     assert "internal_samples" in brief
+
+class TestOastCallbackProof:
+    """Blind SSRF confirmed by a correlated out-of-band callback. The proof is the
+    interaction our collaborator recorded, NOT the target's HTTP response body.
+    Regression guard for the mis-classification that fed the profile-page HTML to
+    the model as 'response_excerpt' and got the finding dismissed as reflection."""
+
+    def _oast_vuln(self):
+        return _vuln(
+            "Blind Server-Side Request Forgery (SSRF)",
+            detection_method="ssrf_oast_callback",
+            detection_evidence={
+                "interaction_id": ["ssrf-abc123"],
+                "interaction_count": [1],
+                "interactions": [[{
+                    "interaction_id": "ssrf-abc123",
+                    "source_ip": "172.20.0.1",
+                    "path": "/oast/ssrf-abc123",
+                    "method": "GET",
+                    "received_at": "2026-09-05T04:39:19",
+                }]],
+                "response_readback": [False],
+            },
+            response_snippet=(
+                "VERIFICATION EVIDENCE:\nBlind SSRF confirmed by a correlated callback.\n\n"
+                "RESPONSE EXCERPT:\n<form action='./profile/image/url' method='post'>...</form>"
+            ),
+            category=OwaspCategory.a01,
+        )
+
+    def test_oast_callback_is_its_own_proof_type(self):
+        grade = grader.grade(self._oast_vuln())
+        assert grade.proof_type == "oast_callback"
+        assert grade.fp_ceiling == get_fp_ceiling("oast_callback")
+        assert grade.grade == "A"
+
+    def test_oast_brief_surfaces_the_correlated_interaction(self):
+        vuln = self._oast_vuln()
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        assert "interaction_id" in brief
+        assert "ssrf-abc123" in brief
+        assert "172.20.0.1" in brief
+        assert "out-of-band" in brief.lower() or "callback" in brief.lower()
+
+    def test_oast_brief_does_not_dump_target_html_as_proof(self):
+        """The bug: the HTML profile form was surfaced as response_excerpt and the
+        model read the reflected payload as 'just a form'. The OAST brief must not
+        feed the page body as the evidence."""
+        vuln = self._oast_vuln()
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        assert "profile/image/url" not in brief
+        assert "response_excerpt" not in brief
+
+
+class TestBrowserExecutionProof:
+    """DOM XSS confirmed by our execution-only oracle firing in a real browser.
+    The proof is execution, not HTTP-body reflection."""
+
+    def _dom_vuln(self):
+        return _vuln(
+            "DOM-Based XSS",
+            detection_method="dom_xss_browser_execution",
+            payload="<img src=x onerror=window.sentry_hook('sentryprobe_b426')>",
+            detection_evidence={
+                "parameter": ["q"],
+                "injection_location": ["hash_query"],
+                "winning_vector": ["img_onerror"],
+                "winning_surface": ["hash_query"],
+                "browser_execution_confirmed": [True],
+                "route_backed": [True],
+                "executed_dom_excerpt": [
+                    "<div><img src=x onerror=window.sentry_hook('sentryprobe_b426')></div>"
+                ],
+            },
+        )
+
+    def test_browser_execution_is_its_own_proof_type(self):
+        grade = grader.grade(self._dom_vuln())
+        assert grade.proof_type == "browser_execution"
+        assert grade.fp_ceiling == get_fp_ceiling("browser_execution")
+        assert grade.grade == "A"
+
+    def test_browser_execution_brief_surfaces_execution_and_dom(self):
+        vuln = self._dom_vuln()
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        assert "browser_execution_confirmed: True" in brief
+        assert "executed_dom_excerpt" in brief
+        assert "onerror=window.sentry_hook" in brief
+        assert "execut" in brief.lower()
+
+    def test_browser_execution_brief_frames_dom_as_post_execution_not_reflection(self):
+        """The DOM excerpt must be labelled as post-execution rendered DOM, NOT
+        the server's HTTP response body to scan for reflection - the frame that
+        produced the false positive."""
+        vuln = self._dom_vuln()
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        low = brief.lower()
+        assert "http response" in low
+        assert "reflect" in low
+
+
+class TestMutatingAuthzProof:
+    """Missing auth on a state-changing request is a WRITE-authorization finding:
+    an accepted unauthenticated mutation is the proof, not data disclosure. It was
+    being routed through the auth_differential (data-read) frame and dismissed."""
+
+    def _mut_vuln(self, destructive=False):
+        return _vuln(
+            "Missing Authorization on State-Changing Request",
+            detection_method="mutating_authz_differential",
+            detection_evidence={
+                "unauth_status": [201],
+                "owner_status": [201],
+                "destructive_confirmed": [destructive],
+            },
+            response_snippet=(
+                "VERIFICATION EVIDENCE:\n...\nRESPONSE EXCERPT:\n{\"status\":\"success\"}"
+            ),
+            category=OwaspCategory.a01,
+        )
+
+    def test_mutating_authz_is_its_own_proof_type(self):
+        grade = grader.grade(self._mut_vuln())
+        assert grade.proof_type == "mutating_authz"
+        assert grade.fp_ceiling == get_fp_ceiling("mutating_authz")
+
+    def test_mutating_authz_brief_frames_accepted_write(self):
+        vuln = self._mut_vuln()
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        assert "unauth_status: 201" in brief
+        assert "owner_status: 201" in brief
+        low = brief.lower()
+        assert "state-chang" in low or "mutat" in low
+        assert "accepted" in low or "processed" in low
+
+    def test_mutating_authz_judge_question_is_about_auth_not_data_read(self):
+        vuln = self._mut_vuln()
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        low = brief.lower()
+        assert "authentication" in low or "authoriz" in low
+        # Must not pose the IDOR data-disclosure question.
+        assert "restricted data" not in low
+
+
+class TestNewProofTypeCeilings:
+    def test_confirmed_oob_and_execution_share_the_strong_tier(self):
+        assert get_fp_ceiling("oast_callback") == 0.80
+        assert get_fp_ceiling("browser_execution") == 0.80
+
+    def test_mutating_authz_keeps_full_ai_latitude(self):
+        # Some state-changing endpoints are legitimately anonymous, so the AI must
+        # retain judgment - but now with the write-authz frame.
+        assert get_fp_ceiling("mutating_authz") == 1.00
+
+
+class TestBooleanDifferentialProof:
+    """Blind boolean SQLi: the proof is a reproducible true/false response split,
+    not output in the response body."""
+
+    def _bool_vuln(self, true_sim=1.0, false_sim=0.6):
+        return _vuln(
+            "SQL Injection (Boolean-Based Blind)",
+            detection_method="boolean_differential",
+            detection_evidence={
+                "confirm_true_sim": [[true_sim]],
+                "confirm_false_sim": [[false_sim]],
+                "injection_context": [["' AND '1'='1"]],
+                "focused_true_vs_false_sim": [0.12],
+                "varying_fraction": [0.004],
+                "first_pair": [[{
+                    "baseline_similarity_to_true": true_sim,
+                    "baseline_similarity_to_false": false_sim,
+                    "context": "' AND '1'='1",
+                }]],
+            },
+        )
+
+    def test_boolean_differential_is_its_own_proof_type(self):
+        grade = grader.grade(self._bool_vuln())
+        assert grade.proof_type == "boolean_differential"
+        assert grade.fp_ceiling == get_fp_ceiling("boolean_differential")
+
+    def test_boolean_brief_surfaces_true_false_split_and_delta(self):
+        vuln = self._bool_vuln(true_sim=1.0, false_sim=0.6)
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        assert "confirm_true_sim" in brief
+        assert "confirm_false_sim" in brief
+        # The discriminator (the split between true and false) must be surfaced.
+        assert "delta" in brief.lower() or "split" in brief.lower()
+
+    def test_boolean_brief_surfaces_diff_focused_signal(self):
+        """The non-diluted true/false signal must reach the adjudicator so a thin
+        whole-page delta on a large page is not read as noise."""
+        vuln = self._bool_vuln()
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        assert "focused_true_vs_false_sim" in brief
+        assert "varying_fraction" in brief
+
+    def test_boolean_judge_question_is_about_reproducible_split_not_output(self):
+        vuln = self._bool_vuln()
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln)).lower()
+        assert "reproducib" in brief or "consisten" in brief
+        assert "true" in brief and "false" in brief
+
+
+class TestRemoteIncludeProof:
+    """RFI: the proof is the remote resource's own content appearing in the
+    response (a server-side fetch+include), not the URL string reflected back."""
+
+    def _rfi_vuln(self):
+        return _vuln(
+            "Remote File Inclusion (RFI)",
+            detection_method="remote_include_content_fingerprint",
+            payload="http://example.com/",
+            detection_evidence={
+                "remote_target": ["http://example.com/"],
+                "fingerprint": ["Example Domain landing page"],
+                "matched": [True],
+            },
+            category=OwaspCategory.a03,
+        )
+
+    def test_remote_include_is_its_own_proof_type(self):
+        grade = grader.grade(self._rfi_vuln())
+        assert grade.proof_type == "remote_include"
+        assert grade.fp_ceiling == get_fp_ceiling("remote_include")
+        assert grade.grade == "A"
+
+    def test_remote_include_brief_surfaces_target_and_fingerprint(self):
+        vuln = self._rfi_vuln()
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        assert "remote_target" in brief
+        assert "example.com" in brief
+        assert "fingerprint" in brief.lower()
+
+    def test_remote_include_brief_frames_fetched_content_not_reflection(self):
+        vuln = self._rfi_vuln()
+        low = grader.build_evidence_brief(vuln, grader.grade(vuln)).lower()
+        assert "fetch" in low or "include" in low
+        assert "reflect" in low  # must contrast against URL reflection
+
+
+class TestLoginSuccessProof:
+    """Default/guessed credentials accepted: the proof is a response consistent
+    with authentication success, distinct from the failed-login baseline."""
+
+    def _login_vuln(self):
+        return _vuln(
+            "Default Credentials Accepted",
+            detection_method="default_credentials_probe",
+            detection_evidence={
+                "credential_pair": ["admin/admin"],
+                "baseline_status": [200],
+                "authed_status": [200],
+                "body_delta_bytes": [0],
+                "post_auth_signal": [
+                    "status 200->200; body size delta 0 bytes; "
+                    "post-auth language detected in response body"
+                ],
+            },
+            category=OwaspCategory.a07,
+        )
+
+    def test_login_success_is_its_own_proof_type(self):
+        grade = grader.grade(self._login_vuln())
+        assert grade.proof_type == "login_success"
+        assert grade.fp_ceiling == get_fp_ceiling("login_success")
+
+    def test_login_success_brief_surfaces_post_auth_signal(self):
+        vuln = self._login_vuln()
+        brief = grader.build_evidence_brief(vuln, grader.grade(vuln))
+        assert "post_auth_signal" in brief
+        assert "post-auth" in brief.lower()
+        assert "authenticat" in brief.lower()
+
+
+class TestSecondBatchCeilings:
+    def test_boolean_differential_is_interpretive(self):
+        assert get_fp_ceiling("boolean_differential") == 0.85
+
+    def test_remote_include_and_login_success_are_confirmed_tier(self):
+        assert get_fp_ceiling("remote_include") == 0.80
+        assert get_fp_ceiling("login_success") == 0.80
+
 
 class TestStructuralVulnTypes:
     """Structural vuln types - observation IS the proof - ceiling 0.10."""

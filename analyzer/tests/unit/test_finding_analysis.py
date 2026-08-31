@@ -11,6 +11,7 @@ from shared.models.vulnerability import (
     LocationInfo,
     OwaspCategory,
     SeverityLevel,
+    TechnologyComponent,
     Vulnerability,
 )
 
@@ -182,3 +183,57 @@ async def test_disabled_model_uses_fallbacks_without_provider_calls() -> None:
     assert finding_result.request_id is None
     assert "1 security finding" in summary
     assert report_result.request_id is None
+
+
+@pytest.mark.asyncio
+async def test_report_input_excludes_cve_arrays_and_keeps_findings() -> None:
+    """A CVE-heavy technology stack must not dump its CVE lists into the summary
+    prompt. Serialized in full, hundreds of CVEs blow past the truncation budget
+    and (being placed before the findings) push the findings out of the prompt
+    entirely, so the model produces a CVE-structured report with no
+    executive_summary. The stack is sent as names + counts instead."""
+    client = FakeReportClient()
+    service = ReportAnalysisService(client)
+    service.settings = SimpleNamespace(
+        ai_analysis_enabled=True,
+        analysis_report_input_max_chars=24000,
+    )
+    heavy = TechnologyComponent(
+        name="Apache HTTP Server",
+        version="2.4.7",
+        cves=[f"CVE-2007-{n:04d}" for n in range(300)],
+        cve_scores={f"CVE-2007-{n:04d}": 7.5 for n in range(300)},
+        cve_kev=["CVE-2007-0005"],
+        cve_assessment="assessed",
+    )
+    finding = Vulnerability(
+        id="v-1",
+        category=OwaspCategory.a05,
+        vuln_type="SQL Injection",
+        severity=SeverityLevel.high,
+        cvss_score=8.8,
+        location=LocationInfo(url="https://target.test/items"),
+        evidence=Evidence(evidence_strength=EvidenceStrength.confirmed_exploit),
+    )
+    scan = SimpleNamespace(
+        target_url="https://target.test",
+        statistics=SimpleNamespace(model_dump=lambda **kwargs: {"total_vulnerabilities": 1}),
+        overall_risk_score=88.0,
+        overall_risk_level="High",
+        technology_stack=[heavy],
+        vulnerabilities=[finding],
+        report_metadata=SimpleNamespace(coverage_warnings=[]),
+    )
+
+    summary, result = await service.analyze(scan)
+
+    prompt = client.prompts[0]
+    # Individual CVE identifiers must not appear - the arrays are the bloat.
+    assert "CVE-2007-0005" not in prompt
+    # The component is still named, with a CVE count standing in for the list.
+    assert "Apache HTTP Server" in prompt
+    assert "known_cve_count" in prompt
+    # Findings must survive into the prompt (they were being truncated out).
+    assert "SQL Injection" in prompt
+    assert summary == "One high-severity finding requires remediation."
+    assert result.request_id == "report-request-1"

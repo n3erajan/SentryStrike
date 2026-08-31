@@ -25,8 +25,22 @@ class ReportAnalysisService:
             "statistics": scan.statistics.model_dump(mode="json"),
             "risk_score": scan.overall_risk_score,
             "risk_level": scan.overall_risk_level,
+            # Names, versions, and CVE counts only - never the full matched-CVE
+            # arrays. A CVE-rich stack (e.g. Apache/OpenSSL/PHP with hundreds of
+            # matches) serializes to tens of KB; dumped ahead of the findings it
+            # overruns ANALYSIS_REPORT_INPUT_MAX_CHARS, truncates the findings out
+            # of the prompt, and leaves the model a raw CVE dump to echo back as a
+            # structured report with no executive_summary. The summary needs the
+            # counts, not the identifiers.
             "technology_stack": [
-                technology.model_dump(mode="json")
+                {
+                    "name": technology.name,
+                    "version": technology.version,
+                    "category": technology.category,
+                    "known_cve_count": len(technology.cves),
+                    "known_exploited_count": len(technology.cve_kev),
+                    "cve_assessment": technology.cve_assessment,
+                }
                 for technology in scan.technology_stack
             ],
             "findings": [

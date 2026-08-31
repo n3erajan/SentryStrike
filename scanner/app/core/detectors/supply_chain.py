@@ -24,6 +24,11 @@ _SOURCE_LABELS = {
     "wordfence": "Wordfence Intelligence",
 }
 
+# An EOL version can match hundreds of CVEs. One finding per CVE floods the report
+# and, after same-component merge, makes the evidence unreadable. Keep only the
+# highest-priority few per component: exploited-in-the-wild first, then CVSS.
+_MAX_CVES_PER_COMPONENT = 6
+
 
 class SupplyChainDetector(BaseDetector):
     name = "supply_chain"
@@ -57,7 +62,11 @@ class SupplyChainDetector(BaseDetector):
             epss = getattr(tech, "cve_epss", {}) or {}
             source = _SOURCE_LABELS.get(getattr(tech, "cve_source", None) or "", "an unnamed source")
 
-            for cve_id in cves:
+            ranked_cves = sorted(
+                cves,
+                key=lambda c: (0 if c in kev else 1, -(scores.get(c) or 0.0), c),
+            )
+            for cve_id in ranked_cves[:_MAX_CVES_PER_COMPONENT]:
                 component_key = (canonical_component_name(name), version, cve_id)
                 if component_key in seen_components:
                     continue

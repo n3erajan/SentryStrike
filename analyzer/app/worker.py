@@ -252,6 +252,16 @@ async def process_analysis_job(
 
     try:
         for vulnerability in scan.vulnerabilities:
+            # Idempotent resume: a prior attempt of this same revision may have
+            # already analyzed and persisted some findings before the worker was
+            # interrupted. Skip those - re-running them wastes provider calls and
+            # re-publishes identical results. They are still counted so progress
+            # and the findings-done total stay accurate. A manual retry bumps the
+            # revision, so its findings never match here and are re-analyzed.
+            existing = vulnerability.ai_analysis
+            if existing is not None and existing.revision == job.revision:
+                analyzed += 1
+                continue
             logger.info(
                 "analysis job %s analyzing finding %s (%s, %s) [%s/%s]",
                 job.id,

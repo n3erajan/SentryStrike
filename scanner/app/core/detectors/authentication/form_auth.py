@@ -9,6 +9,38 @@ logger = logging.getLogger("app.core.detectors.auth_detector")
 
 
 class FormAuthProbeMixin:
+    @staticmethod
+    def _default_credentials_evidence(
+        *,
+        username: str,
+        password: str,
+        baseline_status: int,
+        authed_status: int,
+        body_delta_bytes: int,
+        post_auth_language: bool,
+    ) -> dict:
+        """Structured proof that a default credential pair was accepted: the pair
+        tested and the response differential vs the failed-login baseline.
+
+        Fed to the grader's ``login_success`` evidence brief so the adjudicator
+        judges the login-success signal rather than the raw post-auth page (Cause
+        C: the finding previously shipped empty detection_evidence and the AI read
+        the authenticated navigation menu as "not a successful authentication").
+        """
+        parts = [
+            f"status {baseline_status}->{authed_status}",
+            f"body size delta {body_delta_bytes} bytes",
+        ]
+        if post_auth_language:
+            parts.append("post-auth language detected in response body")
+        return {
+            "credential_pair": f"{username}/{password}",
+            "baseline_status": baseline_status,
+            "authed_status": authed_status,
+            "body_delta_bytes": body_delta_bytes,
+            "post_auth_signal": "; ".join(parts),
+        }
+
     async def _test_active_auth(self, form_url: str, method: str, raw_inputs: list, session_cookies: dict, kwargs: dict | None = None) -> list[Finding]:
         findings = []
         kwargs = kwargs or {}
@@ -307,6 +339,14 @@ class FormAuthProbeMixin:
                             verified=True,
                             detection_method="default_credentials_probe",
                             confidence_score=90.0,
+                            detection_evidence=self._default_credentials_evidence(
+                                username=dc_user,
+                                password=dc_pass,
+                                baseline_status=bl_status,
+                                authed_status=dc_status,
+                                body_delta_bytes=size_delta,
+                                post_auth_language=bool(auth_words),
+                            ),
                             verification_request_snippet=dc_resp.request_snippet,
                             verification_response_snippet=dc_resp.response_snippet,
                         )

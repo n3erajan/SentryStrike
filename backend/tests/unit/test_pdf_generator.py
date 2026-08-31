@@ -1,6 +1,7 @@
 from app.utils.pdf_generator import (
     _clean_category,
     _clean_enum,
+    _cve_cell_text,
     _dedupe_semicolon_text,
     _response_evidence_label_and_text,
     _split_response_evidence,
@@ -38,6 +39,39 @@ def test_pdf_helpers_strip_enum_prefixes_and_map_owasp_category() -> None:
     assert _clean_enum("SeverityLevel.medium") == "Medium"
     assert _clean_enum("Exploitability.easy") == "Easy"
     assert _clean_category("OwaspCategory.a05") == "A05-Injection"
+
+
+def test_cve_cell_caps_and_ranks_by_exploited_then_severity() -> None:
+    # An ancient version resolves to hundreds of CVEs. Rendering them all makes a
+    # table row taller than the page, which reportlab cannot split (LayoutError,
+    # the observed 500). The cell must stay bounded: total + exploited counts,
+    # then only the top few ranked by exploited-in-the-wild, then CVSS.
+    cves = [f"CVE-2015-{n:04d}" for n in range(50)]
+    tech = {
+        "name": "PHP",
+        "version": "5.3.2",
+        "cve_assessment": "assessed",
+        "cve_source": "nvd-cpe",
+        "cves": cves,
+        "cve_kev": ["CVE-2015-0007"],
+        "cve_scores": {c: 5.0 for c in cves} | {"CVE-2015-0042": 9.8, "CVE-2015-0007": 4.0},
+    }
+
+    text = _cve_cell_text(tech)
+
+    # Bounded length is the whole point - it must fit in one table row on a page.
+    assert len(text) < 400
+    # The count is the signal, not the enumeration.
+    assert "50 known CVEs" in text
+    assert "1 exploited in the wild" in text
+    # Only a handful are listed, with a remainder pointer and the source.
+    assert "+44 more" in text
+    # Exploited leads even at a lower CVSS; the 9.8 leads the rest on severity.
+    assert text.index("CVE-2015-0007") < text.index("CVE-2015-0042")
+    assert "CVE-2015-0007 (4, exploited)" in text
+    assert "CVE-2015-0042 (9.8)" in text
+    # A low-severity, non-exploited CVE must be dropped from the shown set.
+    assert "CVE-2015-0049" not in text
 
 
 def test_pdf_labels_evidence_only_response_blocks() -> None:
@@ -608,8 +642,8 @@ def test_pdf_tested_surface_reports_measured_coverage_and_gaps() -> None:
     # The reached-but-never-probed gap is spelled out, not left for the reader.
     assert "3 of the 12 existing paths reached" in text
     assert "treat" in text and "untested" in text
-    # Browser probes are disclosed as unlisted rather than silently missing.
-    assert "Browser-driven probes" in text
+    # The browser-probes caveat was removed from the report as redundant narrative.
+    assert "Browser-driven probes" not in text
     # The scanner's own coverage warning is reproduced verbatim.
     assert "horizontal IDOR comparison was not tested" in text
     assert "Coverage Gaps" in text
@@ -677,9 +711,6 @@ def test_pdf_tested_surface_separates_404_probes_from_tested_surface() -> None:
     assert "Existing Paths Reached" in text and "34" in text
     assert "Candidate Paths Found Absent" in text and "2839" in text
     assert "Requests Proving a Path Absent (404)" in text and "4102" in text
-    # The reader is told plainly why those are not coverage.
-    assert "excluded from the tested surface" in text
-    assert "inflate coverage with paths that do not exist" in text
     # Unanswered probes are their own bucket, not silently folded into either.
     assert "Paths With Existence Unconfirmed" in text
     assert "not established in either direction" in text
@@ -719,7 +750,6 @@ def test_pdf_distinguishes_an_assessed_clean_component_from_an_unassessed_one() 
 
     assert "None found" in text
     assert "Not assessed" in text
-    assert "no version detected for PHP" in text
 
 
 def test_pdf_reports_a_failed_lookup_as_failed() -> None:
@@ -730,18 +760,18 @@ def test_pdf_reports_a_failed_lookup_as_failed() -> None:
     }])
 
     assert "Lookup failed" in text
-    assert "HTTP 429" in text
     assert "None found" not in text
 
 
-def test_pdf_names_the_source_behind_each_cve_list() -> None:
+def test_pdf_omits_the_cve_source_from_the_table() -> None:
     text = _tech_section([{
         "name": "Express", "version": "4.18.2", "category": "framework",
         "cves": ["CVE-2024-43796"], "cve_assessment": "assessed", "cve_source": "osv",
     }])
 
     assert "CVE-2024-43796" in text
-    assert "OSV.dev" in text
+    # The data source is intentionally not named in the report.
+    assert "OSV.dev" not in text
 
 
 def test_pdf_flags_known_exploited_cves_in_the_technology_table() -> None:

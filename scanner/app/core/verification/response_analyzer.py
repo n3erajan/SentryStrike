@@ -1065,3 +1065,53 @@ class ResponseAnalyzer:
         )
 
         return is_vulnerable, analysis
+
+    @staticmethod
+    def focused_boolean_signal(
+        true_body: str,
+        false_body: str,
+        *,
+        max_core_chars: int = 20000,
+    ) -> dict:
+        """TRUE-vs-FALSE similarity restricted to the region of the page that varies.
+
+        Boolean-blind SQLi confidence is diluted when the differing result is a
+        small fraction of a large page - whole-page similarity reads ~1.0 for both
+        conditions. Stripping the prefix/suffix the two responses share isolates the
+        region the injected boolean controls, so a genuine content difference reads
+        as a low focused similarity even when the whole-page delta looks like noise.
+
+        Additive evidence for the adjudicator only; it does not change detection.
+        """
+        t = true_body or ""
+        f = false_body or ""
+        page_chars = max(len(t), len(f))
+        if page_chars == 0:
+            return {
+                "focused_true_vs_false_sim": 1.0,
+                "varying_region_chars": 0,
+                "page_chars": 0,
+                "varying_fraction": 0.0,
+            }
+        limit = min(len(t), len(f))
+        prefix = 0
+        while prefix < limit and t[prefix] == f[prefix]:
+            prefix += 1
+        suffix = 0
+        while suffix < (limit - prefix) and t[len(t) - 1 - suffix] == f[len(f) - 1 - suffix]:
+            suffix += 1
+        t_core = t[prefix: len(t) - suffix]
+        f_core = f[prefix: len(f) - suffix]
+        core_chars = max(len(t_core), len(f_core))
+        if not t_core and not f_core:
+            focused = 1.0
+        else:
+            focused = ResponseAnalyzer.calculate_similarity(
+                t_core[:max_core_chars], f_core[:max_core_chars]
+            )
+        return {
+            "focused_true_vs_false_sim": round(focused, 4),
+            "varying_region_chars": core_chars,
+            "page_chars": page_chars,
+            "varying_fraction": round(core_chars / page_chars, 4) if page_chars else 0.0,
+        }
